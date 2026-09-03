@@ -1,0 +1,47 @@
+# Python / uv
+.venv/
+__pycache__/
+*.pyc
+*.egg-info/
+dist/
+build/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# Secrets / local config
+.env
+.env.*
+!.env.example
+
+# Per-mix work directories: downloaded audio, windows, engine caches
+work/
+cache/
+
+# Downloaded / generated audio anywhere
+*.mp3
+*.m4a
+*.aac
+*.opus
+*.ogg
+*.wav
+*.flac
+*.aiff
+*.aif
+
+# Panako / Olaf indexes (Stage 6)
+panako-db/
+olaf-db/
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# Codex / Claude local state
+.codex/
+
+# Raw research dumps (public comments with usernames) — local only, never committed.
+# Derived, minimised fixtures are produced by scripts/derive_fixtures.py.
+data/raw/
