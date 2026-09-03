@@ -1,0 +1,1 @@
+{"L_min_ms":null,"adapter_bias_ms":null,"adapter_bias_uncertainty_ms":null,"capability":"clip_recognizer","config":{"library_retries":0,"segment_duration_seconds":12},"generated_by":"id-detector/0.1.0","id":"d9be861aa760195113e05259b830f3c5f74d4a63","measured":false,"provider":"shazam","schema_version":"1.0.0","source_ids":[],"version":"shazam-unmeasured.json"}
