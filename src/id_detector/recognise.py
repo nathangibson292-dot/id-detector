@@ -186,16 +186,26 @@ def _write_immutable_sidecar(path: Path, upstream: dict[str, Path]) -> None:
     write_completion_sidecar(path, upstream)
 
 
-def cache_valid(raw_path: Path, state: str) -> bool:
-    """Apply the shared positive/no-match TTL contract; errors are never cacheable."""
+def cache_valid(
+    raw_path: Path,
+    state: str,
+    *,
+    positive_max_age_seconds: int = POSITIVE_MAX_AGE_SECONDS,
+    no_match_max_age_seconds: int = NO_MATCH_MAX_AGE_SECONDS,
+) -> bool:
+    """Apply the shared positive/no-match TTL contract; errors are never cacheable.
+
+    The TTLs default to the plan's 180 d / 30 d but are overridable so ``[cache]`` config can widen
+    or tighten them for a run.
+    """
 
     if not path_is_file(raw_path):
         return False
     age = max(0.0, time.time() - path_mtime(raw_path))
     if state == "succeeded":
-        return age <= POSITIVE_MAX_AGE_SECONDS
+        return age <= positive_max_age_seconds
     if state == "no_match":
-        return age <= NO_MATCH_MAX_AGE_SECONDS
+        return age <= no_match_max_age_seconds
     return False
 
 
@@ -345,6 +355,8 @@ async def recognise_generation(
     refresh: bool = False,
     max_requests: int = DEFAULT_SHAZAM_MAX_REQUESTS,
     adapter: ShazamAdapter | None = None,
+    positive_max_age_seconds: int = POSITIVE_MAX_AGE_SECONDS,
+    no_match_max_age_seconds: int = NO_MATCH_MAX_AGE_SECONDS,
 ) -> RecognitionResult:
     config, config_name = load_provider_config(project_root)
     queries = build_queries(media_key, windows, config, generation)
@@ -388,7 +400,12 @@ async def recognise_generation(
             if not existing.result_path:
                 continue
             stored = media_dir / existing.result_path
-            if cache_valid(stored, existing.state):
+            if cache_valid(
+                stored,
+                existing.state,
+                positive_max_age_seconds=positive_max_age_seconds,
+                no_match_max_age_seconds=no_match_max_age_seconds,
+            ):
                 cached_by_content.setdefault(
                     Path(existing.result_path).stem, (existing.result_path, existing.state)
                 )
@@ -405,7 +422,12 @@ async def recognise_generation(
                 "permanent_failure",
             }:
                 await store.reset_for_refresh(job.id)
-            elif cached_raw_path is not None and cache_valid(cached_raw_path, job.state):
+            elif cached_raw_path is not None and cache_valid(
+                cached_raw_path,
+                job.state,
+                positive_max_age_seconds=positive_max_age_seconds,
+                no_match_max_age_seconds=no_match_max_age_seconds,
+            ):
                 _write_immutable_bytes(raw_path, read_bytes(cached_raw_path))
                 cache_hits += 1
             elif job.state == "pending" and query.cache_key in cached_by_content:

@@ -1,75 +1,214 @@
 # id-detector
 
-Evidence-first track identification for DJ sets. Stage 4c adds the orchestrator-owned generation
-loop (rescan plan -> windows -> recognise -> re-fuse the union of every generation), per-trigger
-rescan policies with local spectral-novelty change points, file-scanner fusion with the plan's
-second-commercial-engine dependence prior, an explicit event-truth contract, and the controlled
-ablations that Stage 4d will freeze profiles from.
+**Find out what tracks are in a DJ set.** You give it a link to a mix (SoundCloud, YouTube, or
+Mixcloud); it downloads the audio, listens to it in short overlapping windows, asks music-recognition
+engines "what is this?", reads any tracklist hints people left in the comments, and builds an honest
+**timeline of track episodes** — each with its own confidence and a *click-to-jump* web page. It
+tells you where a track *starts* only as far as the evidence proves, marks stretches it could not
+identify as "no evidence" (never "no track"), and shows you where you can get each track.
 
-Recognition evidence is immutable per invocation under
-`work/<source_key>/<media_key>/recognise/invocations/<invocation_key>/`. The active packaged
-Shazam measurement is `shazam-v3.json`; `--refresh` creates a new evidence namespace and never
-replaces an earlier raw response.
+The guiding rule is **accuracy over cost or speed**, and **honesty over completeness**: it will say
+"unclear" rather than guess.
 
-## Quick start
+---
 
-```powershell
-uv sync --dev
-uv run id-detector doctor
-uv run id-detector calibrate-shazam --track <released-file-or-url> --positions 10,40,70,100,140
-uv run id-detector analyse <mix-url> --raw
-uv run id-detector analyse <mix-url> --tracklist <tracklist.txt>
-uv run id-detector analyse <mix-url> --config id-detector.toml
-uv run id-detector analyse <mix-url> --max-generations 3 --novelty
-uv run id-detector hints <mix-url>
-uv run id-detector hints <mix-url> --confirm-mirror <ALLOWLISTED_MIRROR_URL>
-uv run id-detector benchmark hints --corpus dev-2 --out data/local/benchmark/dev-2/hints-gate.json
-uv run id-detector show <source-key>
-uv run id-detector benchmark run --corpus controlled-synth-1 --profile free --out data/corpus/controlled-synth-1/baseline-free.json
-uv run id-detector benchmark shortlist --corpus controlled-synth-1 --out data/corpus/controlled-synth-1/shortlist.json
-uv run id-detector benchmark ablations --corpus controlled-events-1 `
-  --out data/corpus/controlled-synth-1/ablations.json `
-  --work-root data/local/work-ablations
-uv run id-detector benchmark render --sources <local-audio-dir> --out data/corpus/controlled-events-1 `
-  --audio-out data/local/controlled/controlled-events-1 --seed 20260904 `
-  --cases events --corpus-version controlled-events-1
-uv run id-detector benchmark transforms-schedule --corpus controlled-synth-1 `
-  --out data/corpus/controlled-synth-1/transforms-schedule.json `
-  --work-root data/local/work-transforms-schedule
-uv run id-detector benchmark render --sources <local-audio-dir> --out <truth-json-dir> `
-  --audio-out <local-audio-output-dir> --seed 7
-uv run id-detector benchmark score --truth <truth-dir> --episodes <predictions.json> --out <report.json>
-uv run id-detector truth seed --help
-uv run id-detector truth verify --help
-uv run id-detector truth second-pass --help
-uv run id-detector truth resolve --help
-uv run id-detector truth freeze --help
-uv run id-detector truth manifest-draft --help
-uv run pytest -q
-uv run ruff check .
-uv run python scripts/derive_fixtures.py
-uv run python scripts/audit_fixtures.py
-```
+## Quick start (for the owner)
 
-JSON Schemas are checked in under `docs/schemas/`. Regenerate them after a contract change with:
+You need three things installed first: **[uv](https://docs.astral.sh/uv/)** (the Python runner) and
+**ffmpeg** (audio decoding). Everything else `uv` installs for you.
 
 ```powershell
-uv run python scripts/export_schemas.py
+uv sync                                  # 1. install the tool and its dependencies
+uv run id-detector doctor                # 2. check your machine is ready (ffmpeg, Python, etc.)
+uv run id-detector analyse "<mix-url>"   # 3. analyse a set (paste a SoundCloud/YouTube/Mixcloud URL)
+uv run id-detector serve                 # 4. open the results in your browser
 ```
 
-Live tests are excluded by default. Run them explicitly with `uv run pytest -q -m live`.
+`serve` prints a `http://127.0.0.1:8765` address. Open it, pick your set, and you get a player with a
+timeline: **click any track row and the player jumps to that moment.**
 
-Third-party uploads are denied by default. To evaluate AudD or ACRCloud, copy
-`id-detector.example.toml` to the ignored local file `id-detector.toml`, set
-`allow_third_party_upload = true`, provide only the environment variables listed in
-`.env.example`, and pass `--i-own-this-audio-or-have-permission` to `benchmark shortlist`.
-The same config contains the Stage 4b schedules and transform grid. `[schedule]` is the
-generation-0 window (12,000 ms window / 9,000 ms hop, plan rev 5.2) and `[rescan]` is the denser
-12,000 / 5,000 base policy the Stage 4c generation loop consumes, together with
-`max_generations`. `transforms.policy` accepts `off`, `rescan_only` (the default), or `global`;
-global applies all 13 hypotheses to generation 0, `rescan_only` keeps them for rescans.
+Two more everyday commands:
 
-Rescan geometry is per trigger: `contested` and `long_episode` use the `[rescan]` table verbatim,
-while `edge`, `gap`, `novelty`, `hint_cluster` and `question_cluster` use the plan's shorter
-6-8 s windows with shifted phases, because only a shorter window can lower the proved start
-bound. Generations stop at the first of: no requests, `max_generations`, or an exhausted budget.
+```powershell
+uv run id-detector acquire "<mix-url>"   # add "where to buy / download" links to the results
+uv run id-detector config show           # see every setting and its current value
+```
+
+That is the whole daily loop: **doctor → analyse → serve** (and `acquire` when you want buy links).
+
+### What each run produces
+
+Under `work/<...>/present/` you get, for every set:
+
+| File | What it is |
+|---|---|
+| `index.html` | the interactive page `serve` shows (player + clickable timeline) |
+| `tracklist.md` | a human-readable table (time, badge, track, where-to-get) |
+| `tracklist.cue` | a **CUE sheet** for CD/DJ software; overlapping tracks are noted on `REM` lines |
+| `tracklist.m3u` | a **playlist** — open it in VLC and each entry jumps to that track's moment |
+| `tracklist.json` | the same data for other tools |
+
+---
+
+## Reading the results: badges, version status, and "provisional"
+
+Every identified track shows a **badge** and a **version status**. They answer two *different*
+questions, so read them together.
+
+**Badge — "is this the right track (the work)?"**
+
+| Badge | Meaning |
+|---|---|
+| `LIKELY` | strong, agreeing evidence across several independent windows |
+| `POSSIBLE` | some agreeing evidence, but less of it |
+| `UNCLEAR` | a little evidence, not enough to stand behind |
+
+**Version status — "is it exactly this recording (original vs. remix vs. edit)?"**
+
+| Version status | Meaning |
+|---|---|
+| `VERIFIED` | the exact recording is corroborated by recording-specific IDs from ≥ 2 independent sources |
+| `UNVERIFIED` | the track is probably right, but *which version* is not proven |
+| `CONTESTED` | sources disagree about the recording |
+
+In the **free (Shazam-only) profile**, a single engine can identify the *work* well but can almost
+never *verify the exact version*, so you will normally see e.g. `LIKELY / UNVERIFIED`. That is
+expected and honest — not a bug. The badge is never a full `VERIFIED` unless the version is verified
+too.
+
+**What "provisional" means.** The badges are computed by **sensible rules, not by a certified
+benchmark.** To *certify* a tier ("when we say LIKELY, we are right ≥ 95% of the time") we would need
+a funded, human-verified test corpus (see the owner questions below). None exists yet, so every
+real-mix tier is shown as **provisional**. Treat the badges as well-reasoned guidance, not a
+guarantee.
+
+**"No evidence" is not "no track."** Grey gaps on the timeline mean the engines heard something they
+could not identify — never that nothing was playing.
+
+---
+
+## What is *excluded* from v1, and why
+
+- **Reference-pool recognition (Panako).** Panako can match a mix against your own library of
+  reference files, and reportedly does best on electronic music with pitch/tempo changes. It needs a
+  **Java runtime (JDK ≥ 11)**, which is not installed here. Until you decide to add a JDK, Panako is
+  **excluded** and `doctor` reports it as disabled. Nothing else depends on it.
+- **Certified accuracy tiers.** Without a funded, second-pass-annotated test corpus the tiers stay
+  **provisional** (see above). The one small development set (`dev-1`) is enough to *build* and
+  *sanity-check* the tool, not to *certify* it.
+
+Neither exclusion stops the tool from working; they only limit what it is allowed to *claim*.
+
+---
+
+## Adding paid engines (optional)
+
+By default the tool uses **only Shazam** (free). Two paid engines can be added for harder sets:
+
+- **AudD** — long-file native, good offsets. Roughly **$1.50 per hour** of audio (plan-dependent),
+  with 300 free requests to start.
+- **ACRCloud** — reportedly strong on electronic music. Gated pricing (**~$1.40 per hour**
+  anecdotally); needs a Windows VC++ runtime.
+
+To enable one, you must do **both** of these (this is a deliberate safety gate, because these engines
+upload your audio to a third party):
+
+1. Put the credentials in **environment variables** (never in a file) — see `.env.example` for the
+   exact names.
+2. In your `id-detector.toml`, set `allow_third_party_upload = true`, **and** pass
+   `--i-own-this-audio-or-have-permission` on the command that uploads.
+
+If either is missing, uploads are refused with a message telling you exactly what to add.
+
+### Cost expectations
+
+- **Shazam:** free. The tool self-limits to ≤ 18 requests/minute and caches every result, so re-runs
+  cost nothing. A per-run ceiling (`max_requests`, default 2000) caps the work.
+- **AudD / ACRCloud:** you pay per hour of audio as above. Budgets are enforced up front and every
+  network attempt is counted against the ceiling, so a set cannot silently overspend.
+
+---
+
+## Configuration
+
+All non-secret settings live in one file, **`id-detector.toml`** (git-ignored). Create and inspect it
+with:
+
+```powershell
+uv run id-detector config init     # writes a fully-commented id-detector.toml
+uv run id-detector config show     # prints the effective settings (file + defaults), no secrets
+```
+
+It covers: the default **profile**, the request **budget**, **transform** hypotheses, the window
+**schedule** and **rescan** policy, recognition **cache** lifetimes, the seek **lead-in**, the
+per-connector **hint** switches, and the `allow_third_party_upload` gate. Each key is documented in
+the file itself.
+
+**Precedence (highest wins):** command-line flags → a chosen `--profile` (fixes engines and
+window geometry) → your `id-detector.toml` → built-in defaults.
+
+**Secrets never go in the config file.** Provider credentials are read only from the environment
+variables in `.env.example`, and the logger redacts them. `config show` never prints a secret.
+
+---
+
+## Verifying accuracy yourself, and freezing a corpus
+
+If you want to move tiers from *provisional* to *certified*, you build a **truth corpus** — sets with
+human-checked tracklists — and freeze it. The `truth` commands walk you through it:
+
+```powershell
+uv run id-detector truth seed --help          # start a truth file for a set
+uv run id-detector truth verify --help         # first-pass verification
+uv run id-detector truth second-pass --help    # independent blind second pass
+uv run id-detector truth resolve --help         # resolve annotator disagreements
+uv run id-detector truth freeze --help          # freeze a corpus version (immutable manifest)
+```
+
+Once a real-mix corpus is frozen you can run a single, pre-registered certification pass
+(`benchmark certify`), which is the only thing allowed to change a tier from *provisional* to
+*certified*. The controlled (synthetic) benchmark can be run today and is used to tune the engine
+grid and rescan policy without any real-world audio.
+
+See **[docs/STATUS.md](docs/STATUS.md)** for the honest, per-stage status of everything, and
+**[docs/PLAN.md](docs/PLAN.md)** for the full specification.
+
+---
+
+## Legal and terms-of-service notes
+
+This tool is built for **personal use**. Please keep it that way:
+
+- It uses an **unofficial** Shazam path and reads SoundCloud/YouTube/Mixcloud metadata and comments.
+  These are fine for personal research but are **not cleared for a commercial service** — a separate
+  review is required first (see the *Commercial release checklist* in `docs/PLAN.md`).
+- **"Where to get it" links never automate a purchase or a download gate.** They only take you to the
+  page (Bandcamp, Beatport, a SoundCloud download button, etc.). You buy or download yourself.
+- **Uploading your audio to AudD/ACRCloud is opt-in** and double-gated (see *Adding paid engines*).
+  Only upload audio you own or have permission to share.
+- Panako is **AGPL**; reference-pool indexing has its own licensing/patent considerations, which is
+  part of why it is deferred.
+
+---
+
+## For developers
+
+Full command reference, the schema-regeneration step, and the benchmark/calibration tooling live in
+the stage reports under `docs/stage-reports/`. The essentials:
+
+```powershell
+uv run pytest -q                 # fast, offline test suite (slow + live tests deselected)
+uv run pytest -m "not live"      # everything except the network tests (includes the slow ones)
+uv run pytest -m live            # opt-in live/network tests
+uv run ruff check .              # lint
+uv run ruff format --check .     # format check
+uv run python scripts/audit_fixtures.py   # privacy/committed-data audit
+```
+
+- Python 3.12, a `uv` project (`pyproject.toml`, `uv.lock`), source under `src/id_detector/`, a
+  `typer` CLI exposed as `id-detector`, tests under `tests/`.
+- JSON Schemas are checked in under `docs/schemas/`; regenerate them after a contract change with
+  `uv run python scripts/export_schemas.py`.
+- Everything is content-addressed and deterministic: recognition evidence is immutable per invocation
+  under `work/<source_key>/<media_key>/recognise/invocations/<key>/`, and `--refresh` opens a new
+  evidence namespace rather than overwriting an old response.

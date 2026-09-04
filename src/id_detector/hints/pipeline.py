@@ -389,8 +389,13 @@ async def run_hints(
     confirmed_mirrors: tuple[str, ...] = (),
     refresh: bool = False,
     http: httpx.AsyncClient | None = None,
+    disabled_connectors: frozenset[str] = frozenset(),
 ) -> HintRunResult:
-    """Run platform primary flow; failures are recorded and never block audio recognition."""
+    """Run platform primary flow; failures are recorded and never block audio recognition.
+
+    ``disabled_connectors`` (from the ``[hints]`` config table) names connectors to skip; a skipped
+    connector runs no network I/O and is recorded with state ``disabled`` in ``connector_status``.
+    """
 
     cache_root = project_root.resolve() / "data" / "local" / "hints"
     outputs: list[ConnectorOutput] = []
@@ -418,6 +423,22 @@ async def run_hints(
         item_cap: int = 5_000,
         input_content_sha256: str = source_content_sha256,
     ) -> ConnectorOutput:
+        if connector in disabled_connectors:
+            disabled_output = ConnectorOutput()
+            statuses.append(
+                {
+                    "connector": connector,
+                    "state": "disabled",
+                    "items_fetched": 0,
+                    "input_records": 0,
+                    "hints_emitted": 0,
+                    "parse_success_rate_e4": 0,
+                    "tracklist_blocks": 0,
+                    "truncated": False,
+                    "error": None,
+                }
+            )
+            return disabled_output
         output, status, result_path = await _execute(
             store=store,
             source=source,

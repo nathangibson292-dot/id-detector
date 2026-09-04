@@ -7,6 +7,7 @@ from id_detector.present.exports import (
     export_tracklist,
     flatten_tracklist,
     render_cue,
+    render_m3u,
 )
 from id_detector.present.page import (
     DEFAULT_LEAD_IN_MS,
@@ -43,6 +44,7 @@ __all__ = [
     "plan_embed",
     "read_rescan_queue",
     "render_cue",
+    "render_m3u",
     "render_page",
     "rescan_queue_path",
     "seek_argument",

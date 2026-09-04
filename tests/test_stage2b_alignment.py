@@ -156,6 +156,55 @@ def test_replay_and_continuation_gap_boundaries(
     assert len(align_candidate_points(points)) == expected_occurrences
 
 
+def test_real_dev1_intro_replay_is_granularity_not_fragmentation() -> None:
+    """Anonymised (mix, ref) anchor pairs from the real dev-1 candidate ``dcd68806bb24``.
+
+    The intro region (ref near 0) is played, then recurs near 0 again after a 36 s mix gap. That is
+    a genuine *replay* (a second occurrence), not a continuous forward run chopped over a small gap:
+    the resolution of the 39-vs-55 question is that every dev-1 multi-occurrence candidate is such a
+    reference recurrence, never fragmentation. The first four forward points on their own stay a
+    single occurrence, proving the intro itself is not fragmented.
+    """
+
+    anchors = [
+        (396_000, -577),
+        (405_000, 433),
+        (414_000, 1_440),
+        (423_000, 2_447),
+        (459_000, -1_551),
+        (468_000, -539),
+        (477_000, 474),
+        (486_000, 1_472),
+    ]
+    points = [_point(index, mix, ref) for index, (mix, ref) in enumerate(anchors, 1)]
+    occurrences = align_candidate_points(points)
+    assert len(occurrences) == 2
+    assert "replay" in _non_continuations(points)
+    # The continuous intro on its own is one occurrence: no fragmentation over the in-region gaps.
+    assert len(align_candidate_points(points[:4])) == 1
+
+
+def test_reference_consistent_forward_run_across_a_long_drought_stays_one_occurrence() -> None:
+    """A forward-advancing, reference-consistent match after a 36 s recognition drought continues.
+
+    This is the anti-fragmentation guarantee behind the 39-vs-55 resolution: continuation-by-
+    reference-consistency fires for any gap <= 120 s where the reference keeps advancing, so a
+    genuinely continuous track is never split just because recognition went quiet for > 30 s.
+    """
+
+    points = [
+        _point(1, 0, 0),
+        _point(2, 9_000, 9_000),
+        _point(3, 18_000, 18_000),
+        _point(4, 54_000, 54_000),  # 36 s drought, reference still on the same line
+        _point(5, 63_000, 63_000),
+        _point(6, 72_000, 72_000),
+    ]
+    occurrences = align_candidate_points(points)
+    assert len(occurrences) == 1
+    assert "replay" not in _non_continuations(points)
+
+
 def test_anonymised_real_anchor_excerpt_is_one_continuous_occurrence() -> None:
     anchors = [
         (225_000, 4_694),

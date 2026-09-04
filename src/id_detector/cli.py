@@ -7,6 +7,7 @@ import json
 import sys
 import tomllib
 import uuid
+from dataclasses import replace
 from decimal import Decimal
 from hashlib import sha256
 from pathlib import Path
@@ -25,6 +26,7 @@ from id_detector.calibrate.certify import CorpusNotFrozen, DuplicateTestVersion,
 from id_detector.calibrate.model import load_calibration
 from id_detector.calibrate.validate import run_calibration_validation
 from id_detector.calibration import calibrate_shazam
+from id_detector.config_template import CONFIG_TEMPLATE, render_effective_config
 from id_detector.contracts import SourceRecord
 from id_detector.decode import decode
 from id_detector.doctor import run_doctor
@@ -62,8 +64,10 @@ from id_detector.windows import TransformGrid, WindowSchedule, generate_windows_
 app = typer.Typer(no_args_is_help=True, pretty_exceptions_enable=False)
 benchmark_app = typer.Typer(no_args_is_help=True)
 truth_app = typer.Typer(no_args_is_help=True)
+config_app = typer.Typer(no_args_is_help=True, help="Show or create the id-detector.toml config.")
 app.add_typer(benchmark_app, name="benchmark")
 app.add_typer(truth_app, name="truth")
+app.add_typer(config_app, name="config")
 PROJECT_ROOT = Path.cwd()
 DEFAULT_WORK_ROOT = Path("work")
 
@@ -84,6 +88,58 @@ def main() -> None:
 def doctor() -> None:
     """Check the runtime and offline signature-generation path."""
     raise typer.Exit(run_doctor())
+
+
+@config_app.command("show")
+def config_show(
+    config: Path = typer.Option(  # noqa: B008
+        Path("id-detector.toml"),
+        "--config",
+        help="TOML config to resolve (missing file is fine: built-in defaults are shown).",
+    ),
+) -> None:
+    """Print the effective, resolved configuration (file + defaults). No secrets are shown."""
+
+    loaded = _load_app_config(config)
+    source = (
+        f"{config} + defaults" if config.is_file() else f"built-in defaults ({config} not found)"
+    )
+    typer.echo(f"# source: {source}")
+    typer.echo(render_effective_config(loaded), nl=False)
+
+
+@config_app.command("init")
+def config_init(
+    path: Path = typer.Option(  # noqa: B008
+        Path("id-detector.toml"), "--path", help="Where to write the documented template."
+    ),
+    force: bool = typer.Option(False, "--force", help="Overwrite an existing file."),
+) -> None:
+    """Write the documented id-detector.toml template (never contains secrets)."""
+
+    if path.exists() and not force:
+        typer.echo(f"{path} already exists; pass --force to overwrite", err=True)
+        raise typer.Exit(1)
+    _validate_config_or_exit()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(CONFIG_TEMPLATE, encoding="utf-8", newline="\n")
+    typer.echo(f"wrote {path}; edit it and keep it un-committed (it is git-ignored).")
+
+
+def _validate_config_or_exit() -> None:
+    """Fail fast if the packaged template ever stops parsing (guards against edit drift)."""
+
+    import tempfile
+
+    with tempfile.NamedTemporaryFile(
+        "w", suffix=".toml", delete=False, encoding="utf-8", newline="\n"
+    ) as handle:
+        handle.write(CONFIG_TEMPLATE)
+        temp_path = Path(handle.name)
+    try:
+        AppConfig.load(temp_path)
+    finally:
+        temp_path.unlink(missing_ok=True)
 
 
 async def _analyse(
@@ -163,6 +219,8 @@ async def _analyse(
                 generation=generation,
                 refresh=refresh,
                 max_requests=max_requests,
+                positive_max_age_seconds=app_config.cache_positive_max_age_seconds,
+                no_match_max_age_seconds=app_config.cache_no_match_max_age_seconds,
             )
 
         recognised = await recognise_windows(windows=windows, generation=0)
@@ -192,6 +250,7 @@ async def _analyse(
                 manual_tracklist=tracklist,
                 confirmed_mirrors=confirmed_mirrors,
                 refresh=refresh,
+                disabled_connectors=app_config.disabled_hint_connectors,
             )
             timer.finish_stage("hints_ms")
             counts["hints"] = len(hint_result.hints)
@@ -234,6 +293,7 @@ async def _analyse(
             episodes_path=fused.final_path,
             identities_path=fused.identities_path,
             title=ingested.record.title,
+            media_target=ingested.record.canonical_url,
         )
         generate_page(
             media_dir=media_dir,
@@ -243,6 +303,7 @@ async def _analyse(
             duration_ms=decoded.record.pcm.duration_ms,
             episodes_path=fused.final_path,
             identities_path=fused.identities_path,
+            lead_in_ms=app_config.lead_in_ms,
         )
         timer.finish_stage("export_ms")
         if print_raw:
@@ -335,7 +396,12 @@ def analyse(
     raw: bool = typer.Option(False, "--raw", help="Print raw match tuples with mix times."),
     refresh: bool = typer.Option(False, "--refresh", help="Bypass positive/no-match TTLs."),
     work_root: Path = typer.Option(DEFAULT_WORK_ROOT, "--work-root"),  # noqa: B008
-    max_requests: int = typer.Option(2_000, "--max-requests", min=1),
+    max_requests: int = typer.Option(
+        -1,
+        "--max-requests",
+        min=-1,
+        help="Per-run Shazam request ceiling; -1 uses max_requests from config (default 2000).",
+    ),
     tracklist: Path | None = typer.Option(  # noqa: B008
         None, "--tracklist", help="Manual UTF-8 tracklist."
     ),
@@ -374,9 +440,27 @@ def analyse(
 ) -> None:
     """Run the full multi-generation pipeline and export a flattened tracklist."""
     calibrator = None
-    if profile is not None:
-        frozen = _load_profile_or_exit(profile)
-        loaded_config = profile_app_config(frozen)
+    # The file config is always the source of non-schedule preferences (lead-in, budget, cache TTLs,
+    # per-connector hint switches).  A --profile (or the file's default_profile) is the authority on
+    # engines and the transform/schedule/rescan geometry, so it overrides those tables while the
+    # file still supplies the preferences above.
+    file_config = _load_app_config(config)
+    if not file_config.hints_enabled:
+        no_hints = True
+    selected_profile = profile if profile is not None else file_config.default_profile
+    if selected_profile is not None:
+        frozen = _load_profile_or_exit(selected_profile)
+        loaded_config = replace(
+            profile_app_config(frozen),
+            allow_third_party_upload=file_config.allow_third_party_upload,
+            default_profile=file_config.default_profile,
+            max_requests=file_config.max_requests,
+            lead_in_ms=file_config.lead_in_ms,
+            cache_positive_max_age_days=file_config.cache_positive_max_age_days,
+            cache_no_match_max_age_days=file_config.cache_no_match_max_age_days,
+            hints_enabled=file_config.hints_enabled,
+            disabled_hint_connectors=file_config.disabled_hint_connectors,
+        )
         # A frozen profile is the authority on its feature toggles.
         novelty = frozen.novelty_enabled
         no_hints = no_hints or not frozen.hints_enabled
@@ -385,7 +469,9 @@ def analyse(
         # is committed, so this is heuristic by default until an owner-verified corpus fits one.
         calibrator = load_calibration(PROJECT_ROOT, frozen.name)
     else:
-        loaded_config = _load_app_config(config)
+        loaded_config = file_config
+    if max_requests < 0:
+        max_requests = loaded_config.max_requests
     if no_hints and (tracklist is not None or confirm_mirror):
         typer.echo("--tracklist/--confirm-mirror cannot be combined with --no-hints", err=True)
         raise typer.Exit(2)
@@ -450,6 +536,7 @@ async def _acquire(
         enable_soundcloud=enable_soundcloud,
     )
     episodes, identities = load_analysis(media_dir)
+    acquire_config = _load_app_config(Path("id-detector.toml"))
     duration_ms = PcmRecord.model_validate_json(
         read_text(media_dir / "decode" / "pcm.json")
     ).pcm.duration_ms
@@ -464,6 +551,7 @@ async def _acquire(
         acquire=result.record,
         acquire_path=result.path,
         title=cached.record.title,
+        media_target=cached.record.canonical_url,
     )
     generate_page(
         media_dir=media_dir,
@@ -475,6 +563,7 @@ async def _acquire(
         identities_path=final_identities_path(media_dir),
         acquire=result.record,
         acquire_path=result.path,
+        lead_in_ms=acquire_config.lead_in_ms,
     )
     typer.echo(
         f"acquire: {result.counts['episodes']} identified episodes; "

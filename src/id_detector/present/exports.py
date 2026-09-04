@@ -25,6 +25,7 @@ class ExportResult:
     markdown_path: Path
     entries: tuple[dict[str, Any], ...]
     cue_path: Path | None = None
+    m3u_path: Path | None = None
 
 
 def _format_time(milliseconds: int) -> str:
@@ -96,9 +97,17 @@ def flatten_tracklist(
     acquire_by_episode = (
         {item.episode_id: item for item in acquire.episodes} if acquire is not None else {}
     )
+    label_by_episode = {
+        episode.id: " - ".join(_candidate_label(identities, episode.candidate_id))
+        for episode in episodes.episodes
+    }
     entries: list[dict[str, Any]] = []
     for episode in episodes.episodes:
         artist, title = _candidate_label(identities, episode.candidate_id)
+        overlap_labels = sorted(
+            {label_by_episode[other] for other in episode.overlaps if other in label_by_episode}
+        )
+        has_layer = any(segment.role == "layer" for segment in episode.role_segments)
         primary = min(
             episode.role_segments,
             key=lambda item: (_ROLE_PRECEDENCE[item.role], item.from_ms, item.to_ms),
@@ -120,6 +129,8 @@ def flatten_tracklist(
             "title": title,
             "occurrence_index": episode.occurrence_index,
             "primary_role": primary_role,
+            "overlap_labels": overlap_labels,
+            "has_layer": has_layer,
             "badge": episode.badge,
             "version_status": episode.version_status,
             "hint_supported": "hint_supported" in episode.flags,
@@ -170,6 +181,7 @@ def export_tracklist(
     acquire: AcquireFile | None = None,
     acquire_path: Path | None = None,
     title: str | None = None,
+    media_target: str | None = None,
 ) -> ExportResult:
     entries = flatten_tracklist(episodes, identities, acquire)
     json_path = media_dir / "present" / "tracklist.json"
@@ -225,7 +237,13 @@ def export_tracklist(
     atomic_write_bytes(cue_path, render_cue(entries, title=title).encode("utf-8"))
     write_completion_sidecar(cue_path, upstream)
 
-    return ExportResult(json_path, markdown_path, entries, cue_path)
+    m3u_path = media_dir / "present" / "tracklist.m3u"
+    atomic_write_bytes(
+        m3u_path, render_m3u(entries, media_target=media_target or "audio").encode("utf-8")
+    )
+    write_completion_sidecar(m3u_path, upstream)
+
+    return ExportResult(json_path, markdown_path, entries, cue_path, m3u_path)
 
 
 def render_cue(entries: tuple[dict[str, Any], ...], *, title: str | None = None) -> str:
@@ -251,5 +269,37 @@ def render_cue(entries: tuple[dict[str, Any], ...], *, title: str | None = None)
         body.append(f"  TRACK {number:02d} AUDIO")
         body.append(f"    TITLE {_cue_quote(track_title)}")
         body.append(f"    PERFORMER {_cue_quote(performer)}")
+        # Overlapping episodes (loops, layers, mixes-in-progress) are noted on REM lines: a flat CUE
+        # sheet can hold only one track per instant, so the co-sounding tracks are recorded here for
+        # honesty rather than silently dropped.
+        for other in entry.get("overlap_labels", ()):
+            keyword = "LAYER" if entry.get("has_layer") else "OVERLAP"
+            body.append(f"    REM {keyword} {_cue_quote(str(other))}")
         body.append(f"    INDEX 01 {_cue_index(int(entry['start_ms']))}")
     return "\n".join(header + body) + "\n"
+
+
+def _m3u_seconds(milliseconds: int) -> int:
+    return max(0, milliseconds // 1000)
+
+
+def render_m3u(entries: tuple[dict[str, Any], ...], *, media_target: str) -> str:
+    """Render an extended M3U whose entries seek with VLC's ``#EXTVLCOPT:start-time``.
+
+    Every entry points at the same ``media_target`` (the mix's URL or a local file) and carries a
+    ``#EXTVLCOPT:start-time=<seconds>`` so opening the playlist in VLC and picking a track jumps to
+    that moment of the one continuous set.  ID gaps become their own labelled entries so the
+    playlist stays a faithful partition of the mix.
+    """
+
+    lines = ["#EXTM3U"]
+    for entry in entries:
+        if entry["kind"] == "id":
+            label = f"ID - no evidence through {_format_time(int(entry['end_ms']))}"
+        else:
+            label = f"{entry['artist']} - {entry['title']}"
+        label = label.replace("\n", " ").replace("\r", " ")
+        lines.append(f"#EXTINF:-1,{label}")
+        lines.append(f"#EXTVLCOPT:start-time={_m3u_seconds(int(entry['start_ms']))}")
+        lines.append(media_target)
+    return "\n".join(lines) + "\n"

@@ -22,6 +22,22 @@ DEFAULT_RESCAN_HOP_MS = 5_000
 DEFAULT_RESCAN_PHASE_MS = 0
 #: Plan rev 5.2: the generation loop stops after this many rescan generations.
 DEFAULT_MAX_GENERATIONS = 3
+#: Seek lead-in applied by the web page and exports (jump this many ms before the proved start).
+DEFAULT_LEAD_IN_MS = 5_000
+#: Default per-run Shazam request budget (a hard ceiling on billable/physical attempts).
+DEFAULT_MAX_REQUESTS = 2_000
+#: Cache TTLs (plan): a positive match is trusted for 180 days, a ``no_match`` for 30 days.
+DEFAULT_CACHE_POSITIVE_MAX_AGE_DAYS = 180
+DEFAULT_CACHE_NO_MATCH_MAX_AGE_DAYS = 30
+#: Every hint connector a ``[hints]`` table may switch on or off by name.
+HINT_CONNECTORS: tuple[str, ...] = (
+    "sc_comments",
+    "mixesdb",
+    "yt_comments",
+    "mixcloud",
+    "tl1001",
+    "pointer_import",
+)
 
 
 class ProviderUnavailable(RuntimeError):
@@ -63,6 +79,21 @@ class AppConfig:
     rescan_hop_ms: int = DEFAULT_RESCAN_HOP_MS
     rescan_phase_ms: int = DEFAULT_RESCAN_PHASE_MS
     rescan_max_generations: int = DEFAULT_MAX_GENERATIONS
+    default_profile: str | None = None
+    max_requests: int = DEFAULT_MAX_REQUESTS
+    lead_in_ms: int = DEFAULT_LEAD_IN_MS
+    cache_positive_max_age_days: int = DEFAULT_CACHE_POSITIVE_MAX_AGE_DAYS
+    cache_no_match_max_age_days: int = DEFAULT_CACHE_NO_MATCH_MAX_AGE_DAYS
+    hints_enabled: bool = True
+    disabled_hint_connectors: frozenset[str] = frozenset()
+
+    @property
+    def cache_positive_max_age_seconds(self) -> int:
+        return self.cache_positive_max_age_days * 24 * 60 * 60
+
+    @property
+    def cache_no_match_max_age_seconds(self) -> int:
+        return self.cache_no_match_max_age_days * 24 * 60 * 60
 
     @classmethod
     def load(cls, path: Path | None) -> AppConfig:
@@ -76,12 +107,18 @@ class AppConfig:
         transforms = payload.get("transforms", {})
         schedule = payload.get("schedule", {})
         rescan = payload.get("rescan", {})
+        cache = payload.get("cache", {})
+        hints = payload.get("hints", {})
         if not isinstance(transforms, dict):
             raise ValueError("transforms must be a TOML table")
         if not isinstance(schedule, dict):
             raise ValueError("schedule must be a TOML table")
         if not isinstance(rescan, dict):
             raise ValueError("rescan must be a TOML table")
+        if not isinstance(cache, dict):
+            raise ValueError("cache must be a TOML table")
+        if not isinstance(hints, dict):
+            raise ValueError("hints must be a TOML table")
         policy = transforms.get("policy", "rescan_only")
         if policy not in {"off", "rescan_only", "global"}:
             raise ValueError("transforms.policy must be off, rescan_only, or global")
@@ -116,6 +153,28 @@ class AppConfig:
             raise ValueError("rescan.max_generations must be a non-negative integer")
         if max_generations < 0:
             raise ValueError("rescan.max_generations must be a non-negative integer")
+        default_profile = payload.get("default_profile")
+        if default_profile is not None and (
+            not isinstance(default_profile, str) or not default_profile.strip()
+        ):
+            raise ValueError("default_profile must be a non-empty string or absent")
+        max_requests = _positive_integer(
+            payload.get("max_requests", DEFAULT_MAX_REQUESTS), "config", "max_requests"
+        )
+        lead_in_ms = payload.get("lead_in_ms", DEFAULT_LEAD_IN_MS)
+        if isinstance(lead_in_ms, bool) or not isinstance(lead_in_ms, int) or lead_in_ms < 0:
+            raise ValueError("lead_in_ms must be a non-negative integer")
+        positive_days = _positive_integer(
+            cache.get("positive_max_age_days", DEFAULT_CACHE_POSITIVE_MAX_AGE_DAYS),
+            "cache",
+            "positive_max_age_days",
+        )
+        no_match_days = _positive_integer(
+            cache.get("no_match_max_age_days", DEFAULT_CACHE_NO_MATCH_MAX_AGE_DAYS),
+            "cache",
+            "no_match_max_age_days",
+        )
+        hints_enabled, disabled_connectors = _hints_table(hints)
         return cls(
             allow_third_party_upload=value,
             transforms_policy=policy,
@@ -128,6 +187,13 @@ class AppConfig:
             rescan_hop_ms=rescan_hop_ms,
             rescan_phase_ms=rescan_phase_ms,
             rescan_max_generations=max_generations,
+            default_profile=default_profile,
+            max_requests=max_requests,
+            lead_in_ms=lead_in_ms,
+            cache_positive_max_age_days=positive_days,
+            cache_no_match_max_age_days=no_match_days,
+            hints_enabled=hints_enabled,
+            disabled_hint_connectors=disabled_connectors,
         )
 
 
@@ -140,6 +206,31 @@ def _integer_tuple(value: object, *, name: str) -> tuple[int, ...]:
     if len(result) != len(set(result)):
         raise ValueError(f"{name} must not contain duplicates")
     return result
+
+
+def _hints_table(table: dict[str, object]) -> tuple[bool, frozenset[str]]:
+    """Read the optional ``[hints]`` table: a global ``enabled`` plus per-connector switches.
+
+    ``[hints] enabled = false`` turns every connector off (equivalent to ``--no-hints``); naming a
+    connector with ``false`` turns just that one off.  Unknown keys are rejected so a typo in a
+    connector name can never silently leave a connector running.
+    """
+
+    enabled = table.get("enabled", True)
+    if not isinstance(enabled, bool):
+        raise ValueError("hints.enabled must be true or false")
+    disabled: set[str] = set()
+    for key, switch in table.items():
+        if key == "enabled":
+            continue
+        if key not in HINT_CONNECTORS:
+            known = ", ".join(HINT_CONNECTORS)
+            raise ValueError(f"unknown hints connector {key!r}; known: {known}")
+        if not isinstance(switch, bool):
+            raise ValueError(f"hints.{key} must be true or false")
+        if not switch:
+            disabled.add(key)
+    return enabled, frozenset(disabled)
 
 
 def _positive_integer(value: object, table: str, name: str) -> int:

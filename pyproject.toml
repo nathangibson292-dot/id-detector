@@ -36,9 +36,12 @@ dev = [
 packages = ["src/id_detector"]
 
 [tool.pytest.ini_options]
-addopts = "-m 'not live'"
+# Default run is fast and offline: it deselects both slow (controlled-render / full-pipeline) and
+# live (network) tests. Full offline run: `uv run pytest -m "not live"`. Live: `uv run pytest -m live`.
+addopts = "-m 'not slow and not live'"
 markers = [
   "live: requires network access or a live external provider",
+  "slow: renders audio or drives the full pipeline; deselected by default (see tests/conftest.py)",
 ]
 testpaths = ["tests"]
 pythonpath = ["."]

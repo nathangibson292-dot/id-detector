@@ -1,3 +1,16 @@
+"""The single documented ``id-detector.toml`` template and the ``config show`` renderer.
+
+``id-detector config init`` writes :data:`CONFIG_TEMPLATE` verbatim; the committed
+``id-detector.example.toml`` is the same bytes (a test asserts they never drift).  No secret ever
+belongs in this file — provider credentials are read only from environment variables (see
+``.env.example``) and the logger redacts them.
+"""
+
+from __future__ import annotations
+
+from id_detector.providers.base import HINT_CONNECTORS, AppConfig
+
+CONFIG_TEMPLATE = """\
 # id-detector configuration.  This file holds only NON-SECRET runtime preferences.
 #
 # Secrets (SoundCloud/AudD/ACRCloud/Discogs credentials) are NEVER read from here; they come only
@@ -58,7 +71,7 @@ positive_max_age_days = 180
 no_match_max_age_days = 30
 
 # Text-hint connectors.  enabled = false is the same as --no-hints.  Set any connector below to
-# false to turn just that one off.  Known connectors: sc_comments, mixesdb, yt_comments, mixcloud, tl1001, pointer_import.
+# false to turn just that one off.  Known connectors: {connectors}.
 [hints]
 enabled = true
 sc_comments = true
@@ -67,3 +80,50 @@ yt_comments = true
 mixcloud = true
 tl1001 = true
 pointer_import = true
+""".replace("{connectors}", ", ".join(HINT_CONNECTORS))
+
+
+def _toml_list(values: tuple[int, ...]) -> str:
+    return "[" + ", ".join(str(value) for value in values) + "]"
+
+
+def render_effective_config(config: AppConfig) -> str:
+    """Render the fully-resolved :class:`AppConfig` as readable TOML for ``config show``."""
+
+    disabled = sorted(config.disabled_hint_connectors)
+    lines = [
+        "# Effective id-detector configuration (resolved: file + profile + defaults).",
+        "# Secrets are never shown here; they come only from environment variables.",
+        f"allow_third_party_upload = {str(config.allow_third_party_upload).lower()}",
+        f"default_profile = {config.default_profile!r}"
+        if config.default_profile
+        else "# default_profile = (unset)",
+        f"max_requests = {config.max_requests}",
+        f"lead_in_ms = {config.lead_in_ms}",
+        "",
+        "[transforms]",
+        f'policy = "{config.transforms_policy}"',
+        f"rate_e4 = {_toml_list(config.transform_rates_e4)}",
+        f"semitones = {_toml_list(config.transform_semitones)}",
+        "",
+        "[schedule]",
+        f"window_ms = {config.window_ms}",
+        f"hop_ms = {config.hop_ms}",
+        f"phase_ms = {config.phase_ms}",
+        "",
+        "[rescan]",
+        f"window_ms = {config.rescan_window_ms}",
+        f"hop_ms = {config.rescan_hop_ms}",
+        f"phase_ms = {config.rescan_phase_ms}",
+        f"max_generations = {config.rescan_max_generations}",
+        "",
+        "[cache]",
+        f"positive_max_age_days = {config.cache_positive_max_age_days}",
+        f"no_match_max_age_days = {config.cache_no_match_max_age_days}",
+        "",
+        "[hints]",
+        f"enabled = {str(config.hints_enabled).lower()}",
+    ]
+    for connector in HINT_CONNECTORS:
+        lines.append(f"{connector} = {str(connector not in disabled).lower()}")
+    return "\n".join(lines) + "\n"
