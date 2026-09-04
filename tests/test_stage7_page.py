@@ -20,6 +20,7 @@ from id_detector.present.page import (
     DEFAULT_LEAD_IN_MS,
     generate_page,
     plan_embed,
+    playhead_x,
     render_page,
     seek_argument,
     seek_target_ms,
@@ -257,6 +258,54 @@ def test_page_seek_lands_within_one_second_of_target(platform: str) -> None:
         assert abs(realised_ms - expected) <= 1000
     # The page carries the byte-identical JS formula, not a divergent copy.
     assert "Math.max(0, bestStartMs - leadInMs)" in page
+
+
+def test_playhead_x_matches_documented_formula() -> None:
+    """The shared position→pixel mapping clamps at both ends, lands the midpoint, and collapses when
+    there is nothing to place the head against (matching the page's ``playheadX``)."""
+
+    assert playhead_x(0, 100_000, 800) == 0.0  # left edge (== 0)
+    assert playhead_x(100_000, 100_000, 800) == 800.0  # right edge (== duration)
+    assert playhead_x(200_000, 100_000, 800) == 800.0  # clamp past the end
+    assert playhead_x(-5_000, 100_000, 800) == 0.0  # clamp before the start
+    assert playhead_x(50_000, 100_000, 800) == 400.0  # midpoint
+    assert playhead_x(50_000, 0, 800) == 0.0  # no duration → collapse
+    assert playhead_x(50_000, 100_000, 0) == 0.0  # no width → collapse
+
+
+@pytest.mark.parametrize("platform", ["soundcloud", "youtube", "mixcloud"])
+def test_playhead_markup_and_hooks_present(platform: str) -> None:
+    """The live playhead element, its shared arithmetic, the per-platform position hooks, the
+    current-track partition and timeline click-to-seek all reach the generated page."""
+
+    episodes = _episodes_file()
+    page = render_page(
+        source=_source(platform),
+        episodes=episodes,
+        identities=_identities(),
+        duration_ms=DURATION_MS,
+    )
+    # Playhead element (starts hidden) and its shared arithmetic + time label.
+    assert '<div class="playhead" id="playhead" hidden' in page
+    assert 'id="playhead-time"' in page
+    assert "function playheadX" in page
+    assert "function updatePlayhead" in page
+    # Current-track partition: a span per episode, the highlight logic and its CSS.
+    assert "const EPISODE_SPANS = [" in page
+    for episode in episodes.episodes:
+        assert f'"id": "{episode.id}"' in page
+    assert "function highlightCurrent" in page
+    assert "classList.add('current')" in page
+    assert "tr.track.current" in page  # CSS row highlight
+    assert ".tl-lane.current" in page  # CSS lane highlight
+    # Per-platform position wiring is emitted for all three players in the one shared script.
+    assert "SC.Widget.Events.PLAY_PROGRESS" in page  # SoundCloud
+    assert "currentPosition" in page
+    assert "getCurrentTime" in page and "setInterval" in page  # YouTube polling
+    assert "mcWidget.events.progress" in page  # Mixcloud progress event
+    # Timeline click-to-seek reuses the shared seek arithmetic (zero lead-in).
+    assert "function seekToPositionMs" in page
+    assert "getBoundingClientRect" in page
 
 
 def test_page_is_parseable_and_lists_every_episode_id() -> None:

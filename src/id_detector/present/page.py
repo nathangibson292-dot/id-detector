@@ -80,6 +80,51 @@ _SEEK_JS = """
 """
 
 
+# --------------------------------------------------------------------------------------------------
+# Shared playhead arithmetic.  Like ``seek_target_ms``/``seek_argument`` above, ``playhead_x`` is
+# the single source of truth for placing the moving playhead on the timeline; ``render_page`` emits
+# byte-identical ``playheadX`` JavaScript and the Stage 11 playhead test imports this function to
+# prove the position→pixel mapping clamps at both ends and lands the midpoint.
+# --------------------------------------------------------------------------------------------------
+def playhead_x(position_ms: int, duration_ms: int, width_px: float) -> float:
+    """Pixel x-offset of the timeline playhead for ``position_ms``.
+
+    The fraction ``position_ms / duration_ms`` is clamped to ``[0, 1]`` and scaled by the timeline's
+    measured pixel width, so a position at or before 0 pins the head to the left edge and one at or
+    past the duration pins it to the right.  A non-positive duration or width collapses to 0 — there
+    is nothing to place the head against.
+    """
+
+    if duration_ms <= 0 or width_px <= 0:
+        return 0.0
+    fraction = position_ms / duration_ms
+    fraction = max(0.0, min(1.0, fraction))
+    return fraction * width_px
+
+
+_PLAYHEAD_JS = """
+    // Shared playhead arithmetic — kept byte-for-byte in step with id_detector.present.page.
+    function playheadX(positionMs, durationMs, widthPx) {
+      if (durationMs <= 0 || widthPx <= 0) { return 0.0; }
+      var fraction = positionMs / durationMs;
+      fraction = Math.max(0, Math.min(1, fraction));
+      return fraction * widthPx;
+    }
+    function formatTime(ms) {
+      var total = Math.floor(ms / 1000);
+      var hours = Math.floor(total / 3600);
+      var minutes = Math.floor((total % 3600) / 60);
+      var seconds = total % 60;
+      var ss = (seconds < 10 ? '0' : '') + seconds;
+      if (hours > 0) {
+        var mm = (minutes < 10 ? '0' : '') + minutes;
+        return hours + ':' + mm + ':' + ss;
+      }
+      return minutes + ':' + ss;
+    }
+"""
+
+
 @dataclass(frozen=True)
 class EmbedPlan:
     """How (or whether) to embed the run's platform player."""
@@ -337,6 +382,13 @@ def _timeline_html(lanes: list[dict[str, Any]], gaps: list[dict[str, Any]]) -> s
                 f'style="left:{solid["left"]:.3f}%;width:{solid["width"]:.3f}%"></div>'
             )
         parts.append("</div>")
+    # Live playhead: an absolutely-positioned vertical line that tracks the embedded player.  It
+    # starts hidden and is revealed by the first position event; ``pointer-events:none`` lets clicks
+    # fall through to the timeline's click-to-seek handler.
+    parts.append(
+        '<div class="playhead" id="playhead" hidden aria-hidden="true">'
+        '<span class="playhead-time" id="playhead-time"></span></div>'
+    )
     parts.append("</div>")
     return "".join(parts)
 
@@ -394,7 +446,7 @@ margin-bottom:16px}.yt{aspect-ratio:16/9;width:100%}.yt iframe{width:100%;height
 .controls input{width:88px;padding:4px 6px;border:1px solid var(--line);border-radius:6px;
 background:var(--card);color:var(--fg)}
 .timeline{position:relative;height:46px;background:var(--card);border:1px solid var(--line);
-border-radius:8px;overflow:hidden;margin-bottom:6px}
+border-radius:8px;overflow:hidden;margin-bottom:6px;cursor:pointer}
 .tl-lane{position:absolute;top:0;height:100%;left:0;width:100%}
 .tl-extent{position:absolute;top:16px;height:14px;background:var(--extent);border-radius:3px}
 .tl-solid{position:absolute;top:16px;height:14px;background:var(--solid);border-radius:3px}
@@ -403,6 +455,13 @@ border-radius:8px;overflow:hidden;margin-bottom:6px}
 background:repeating-linear-gradient(45deg,var(--unresolved),var(--unresolved) 4px,
 transparent 4px,transparent 8px);opacity:.8}
 .tl-gap{position:absolute;top:0;height:100%;background:var(--gap);opacity:.22}
+.playhead{position:absolute;top:0;left:0;height:100%;width:2px;background:var(--accent);
+z-index:4;pointer-events:none;box-shadow:0 0 4px var(--accent)}
+.playhead[hidden]{display:none}
+.playhead-time{position:absolute;top:1px;left:3px;font-size:10px;line-height:1.3;
+font-variant-numeric:tabular-nums;background:var(--accent);color:#fff;border-radius:3px;
+padding:0 3px;white-space:nowrap}
+.tl-lane.current .tl-extent{box-shadow:0 0 0 2px var(--accent)}
 .legend{display:flex;gap:14px;flex-wrap:wrap;color:var(--muted);font-size:12px;margin-bottom:16px}
 .legend span::before{content:"";display:inline-block;width:12px;height:12px;border-radius:3px;
 margin-right:5px;vertical-align:-2px}
@@ -415,6 +474,7 @@ border-radius:8px;overflow:hidden}
 th,td{padding:7px 9px;text-align:left;border-bottom:1px solid var(--line);vertical-align:top}
 th{font-size:12px;color:var(--muted);text-transform:uppercase;letter-spacing:.03em}
 tr.track{cursor:pointer}tr.track:hover,tr.track:focus{background:rgba(43,108,176,.09);outline:none}
+tr.track.current{background:rgba(43,108,176,.16);box-shadow:inset 3px 0 0 var(--accent)}
 tr.gap{color:var(--muted)}
 .time{font-variant-numeric:tabular-nums;white-space:nowrap}
 .badge{font-weight:700;font-size:11px;white-space:nowrap}
@@ -460,6 +520,20 @@ def render_page(
     ]
     gap_markers = [_gap_marker(gap, duration_ms) for gap in episodes.gaps]
 
+    # Playhead → current-track partition: each episode owns time from its ``best_start_ms`` up to
+    # the next episode's start (the plan's ``[best_start_ms, next episode start)`` interval); the
+    # last episode owns the tail of the set.  The page uses these spans to add ``.current`` to the
+    # row and timeline lane whose interval contains the live player position.
+    ordered = sorted(episodes.episodes, key=lambda ep: (ep.best_start_ms, ep.id))
+    episode_spans: list[dict[str, Any]] = []
+    for index, episode in enumerate(ordered):
+        start = episode.best_start_ms
+        following = [ep.best_start_ms for ep in ordered[index + 1 :] if ep.best_start_ms > start]
+        end = following[0] if following else max(episode.best_end_ms, duration_ms)
+        if end <= start:
+            end = max(episode.best_end_ms, start + 1)
+        episode_spans.append({"id": episode.id, "start": start, "end": end})
+
     rows: list[str] = []
     for entry in entries:
         if entry["kind"] == "track":
@@ -484,6 +558,7 @@ def render_page(
             "leadInMs": lead_in_ms,
         }
     )
+    episode_spans_js = json.dumps(episode_spans)
 
     body = f"""<main>
 <h1>{_esc(title)}</h1>
@@ -515,28 +590,96 @@ def render_page(
 <script>
 const CONFIG = {config_js};
 const PLATFORM = CONFIG.platform;
+const EPISODE_SPANS = {episode_spans_js};
 let LEAD_IN_MS = CONFIG.leadInMs;
+let CURRENT_POSITION_MS = null, PLAYER_DURATION_MS = 0;
 {_SEEK_JS}
-let scWidget = null, ytPlayer = null, mcWidget = null;
+{_PLAYHEAD_JS}
+let scWidget = null, ytPlayer = null, mcWidget = null, ytTimer = null;
 function ready(fn){{ if(document.readyState!=='loading'){{fn();}}
   else{{document.addEventListener('DOMContentLoaded',fn);}} }}
 function toast(msg){{ const t=document.getElementById('toast'); if(!t) return;
   t.textContent=msg; t.classList.add('show'); setTimeout(()=>t.classList.remove('show'),2200); }}
+// Playhead readout -----------------------------------------------------------
+function playheadDuration(){{
+  return (CONFIG.durationMs > 0) ? CONFIG.durationMs : PLAYER_DURATION_MS;
+}}
+function updatePlayhead(positionMs){{
+  if(typeof positionMs !== 'number' || isNaN(positionMs)) return;
+  CURRENT_POSITION_MS = positionMs;
+  const timeline = document.querySelector('.timeline');
+  const head = document.getElementById('playhead');
+  if(!timeline || !head) return;
+  const x = playheadX(positionMs, playheadDuration(), timeline.clientWidth);
+  head.style.left = x + 'px';
+  head.hidden = false;
+  const label = document.getElementById('playhead-time');
+  if(label) label.textContent = formatTime(positionMs);
+  highlightCurrent(positionMs);
+}}
+function highlightCurrent(positionMs){{
+  let currentId = null;
+  for(let i=0;i<EPISODE_SPANS.length;i++){{
+    const span = EPISODE_SPANS[i];
+    if(positionMs >= span.start && positionMs < span.end){{ currentId = span.id; break; }}
+  }}
+  document.querySelectorAll('tr.track.current, .tl-lane.current').forEach(function(el){{
+    el.classList.remove('current'); }});
+  if(currentId){{
+    document.querySelectorAll('[data-episode-id="'+currentId+'"]').forEach(function(el){{
+      if(el.classList.contains('track') || el.classList.contains('tl-lane')){{
+        el.classList.add('current'); }}
+    }});
+  }}
+}}
 // Player bindings ------------------------------------------------------------
 ready(function(){{
-  if(CONFIG.embedKind==='soundcloud' && window.SC){{
-    scWidget = SC.Widget(document.getElementById('sc-player'));
-  }} else if(CONFIG.embedKind==='mixcloud' && window.Mixcloud){{
-    mcWidget = Mixcloud.PlayerWidget(document.getElementById('mc-player'));
-  }}
+  try{{
+    if(CONFIG.embedKind==='soundcloud' && window.SC){{
+      scWidget = SC.Widget(document.getElementById('sc-player'));
+      if(scWidget && scWidget.bind){{
+        scWidget.bind(SC.Widget.Events.READY, function(){{
+          scWidget.getDuration(function(d){{
+            if(typeof d === 'number' && d > 0) PLAYER_DURATION_MS = d; }});
+        }});
+        scWidget.bind(SC.Widget.Events.PLAY_PROGRESS, function(e){{
+          if(e && typeof e.currentPosition === 'number') updatePlayhead(e.currentPosition); }});
+        scWidget.bind(SC.Widget.Events.SEEK, function(e){{
+          if(e && typeof e.currentPosition === 'number') updatePlayhead(e.currentPosition); }});
+      }}
+    }} else if(CONFIG.embedKind==='mixcloud' && window.Mixcloud){{
+      mcWidget = Mixcloud.PlayerWidget(document.getElementById('mc-player'));
+      if(mcWidget && mcWidget.ready && mcWidget.events && mcWidget.events.progress){{
+        mcWidget.ready.then(function(){{
+          mcWidget.events.progress.on(function(position){{
+            if(typeof position === 'number') updatePlayhead(position * 1000); }});
+        }});
+      }}
+    }}
+  }} catch(err){{ /* embedding disabled or API missing — timeline still works, no playhead */ }}
 }});
 function onYouTubeIframeAPIReady(){{
   if(CONFIG.embedKind!=='youtube') return;
   ytPlayer = new YT.Player('yt-player', {{videoId: CONFIG.identifier,
-    playerVars: {{playsinline:1}} }});
+    playerVars: {{playsinline:1}},
+    events: {{
+      onReady: function(){{
+        if(ytPlayer.getDuration){{
+          const d = ytPlayer.getDuration(); if(d > 0) PLAYER_DURATION_MS = d * 1000; }}
+      }},
+      onStateChange: function(e){{
+        if(e.data === YT.PlayerState.PLAYING){{ startYtPolling(); }} else {{ stopYtPolling(); }}
+      }}
+    }} }});
 }}
-function seekToMs(bestStartMs){{
-  const arg = seekArgument(bestStartMs, LEAD_IN_MS);
+function startYtPolling(){{
+  if(ytTimer) return;
+  ytTimer = setInterval(function(){{
+    if(ytPlayer && ytPlayer.getCurrentTime) updatePlayhead(ytPlayer.getCurrentTime() * 1000);
+  }}, 250);
+}}
+function stopYtPolling(){{ if(ytTimer){{ clearInterval(ytTimer); ytTimer = null; }} }}
+function seekPlayerArg(arg){{
   if(CONFIG.embedKind==='soundcloud' && scWidget){{
     scWidget.seekTo(arg); scWidget.play(); return true; }}
   if(CONFIG.embedKind==='youtube' && ytPlayer && ytPlayer.seekTo){{
@@ -545,13 +688,30 @@ function seekToMs(bestStartMs){{
     mcWidget.ready.then(function(){{ mcWidget.seek(arg); mcWidget.play(); }}); return true; }}
   return false;
 }}
-// Tracklist interactions -----------------------------------------------------
+// Seek with the lead-in (a tracklist row) or exactly to a point (a timeline click); both reuse the
+// shared seek arithmetic — a timeline click is a zero-lead-in seek to the clicked position.
+function seekToMs(bestStartMs){{ return seekPlayerArg(seekArgument(bestStartMs, LEAD_IN_MS)); }}
+function seekToPositionMs(positionMs){{ return seekPlayerArg(seekArgument(positionMs, 0)); }}
+// Tracklist + timeline interactions ------------------------------------------
 ready(function(){{
   const leadin = document.getElementById('leadin');
   leadin.addEventListener('change', function(){{
     const v = parseInt(leadin.value, 10);
     LEAD_IN_MS = (isNaN(v) || v<0) ? 0 : v;
   }});
+  const timeline = document.querySelector('.timeline');
+  if(timeline){{
+    timeline.addEventListener('click', function(e){{
+      const rect = timeline.getBoundingClientRect();
+      if(rect.width <= 0) return;
+      const frac = Math.max(0, Math.min(1, (e.clientX - rect.left) / rect.width));
+      const ms = Math.round(frac * playheadDuration());
+      updatePlayhead(ms);
+      if(!seekToPositionMs(ms)){{ toast('Player not ready — open the set link'); }}
+    }});
+  }}
+  window.addEventListener('resize', function(){{
+    if(CURRENT_POSITION_MS !== null) updatePlayhead(CURRENT_POSITION_MS); }});
   document.querySelectorAll('tr.track').forEach(function(row){{
     function go(){{
       const ms = parseInt(row.getAttribute('data-best-start-ms'), 10) || 0;
