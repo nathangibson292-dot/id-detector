@@ -16,6 +16,7 @@ build/
 
 # Per-mix work directories: downloaded audio, windows, engine caches
 work/
+work-*/
 cache/
 
 # Downloaded / generated audio anywhere

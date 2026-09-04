@@ -8,7 +8,6 @@ import importlib
 import importlib.metadata
 import math
 import shutil
-import subprocess
 import sys
 import tempfile
 import wave
@@ -16,7 +15,7 @@ from array import array
 from dataclasses import dataclass
 from pathlib import Path
 
-import psutil
+from id_detector.process import ProcessTimeout, run_process
 
 
 @dataclass(frozen=True)
@@ -26,83 +25,14 @@ class Check:
     detail: str
 
 
-def _kill_tree(process: subprocess.Popen[str]) -> None:
-    """Bounded, repeated process-tree cleanup after a timeout on every platform."""
-
-    try:
-        root = psutil.Process(process.pid)
-        # Keep the root alive while descendants are enumerated repeatedly so a child created
-        # during cleanup is seen on a later pass. Stage 1 will replace this with the shared
-        # Windows Job Object launcher used by long-running pipeline commands.
-        for _ in range(3):
-            descendants = root.children(recursive=True)
-            if not descendants:
-                break
-            for child in descendants:
-                try:
-                    child.terminate()
-                except psutil.Error:
-                    continue
-            _, alive = psutil.wait_procs(descendants, timeout=0.25)
-            for item in alive:
-                try:
-                    item.kill()
-                except psutil.Error:
-                    continue
-            psutil.wait_procs(alive, timeout=0.25)
-        root.terminate()
-        try:
-            root.wait(timeout=0.5)
-        except psutil.TimeoutExpired:
-            root.kill()
-            root.wait(timeout=0.5)
-    except psutil.Error:
-        if process.poll() is None:
-            process.kill()
-    try:
-        process.wait(timeout=1)
-    except subprocess.TimeoutExpired:
-        if process.poll() is None:
-            process.kill()
-
-
-def _drain_after_timeout(process: subprocess.Popen[str]) -> None:
-    """Drain pipes without allowing inherited descendant handles to block indefinitely."""
-
-    try:
-        process.communicate(timeout=2)
-    except subprocess.TimeoutExpired:
-        _kill_tree(process)
-        if process.stdout is not None:
-            process.stdout.close()
-        if process.stderr is not None and process.stderr is not process.stdout:
-            process.stderr.close()
-        try:
-            process.wait(timeout=1)
-        except subprocess.TimeoutExpired:
-            if process.poll() is None:
-                process.kill()
-
-
 def _run_version(command: list[str], timeout: int = 10) -> tuple[bool, str]:
-    creationflags = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
-    process = subprocess.Popen(
-        command,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
-        creationflags=creationflags,
-    )
     try:
-        output, _ = process.communicate(timeout=timeout)
-    except subprocess.TimeoutExpired:
-        _kill_tree(process)
-        _drain_after_timeout(process)
+        result = asyncio.run(run_process(command, timeout=timeout, check=False))
+    except ProcessTimeout:
         return False, f"timed out after {timeout}s"
+    output = result.stdout + result.stderr
     first_line = next((line.strip() for line in output.splitlines() if line.strip()), "no output")
-    return process.returncode == 0, first_line
+    return result.returncode == 0, first_line
 
 
 def _write_test_tone(path: Path) -> None:

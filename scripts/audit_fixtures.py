@@ -10,7 +10,12 @@ from pathlib import Path
 from typing import Any
 
 ROOT = Path(__file__).resolve().parents[1]
-SCAN_ROOTS = (ROOT / "data" / "fixtures", ROOT / "docs", ROOT / "tests" / "golden")
+SCAN_ROOTS = (
+    ROOT / "data" / "fixtures",
+    ROOT / "docs",
+    ROOT / "tests" / "fixtures",
+    ROOT / "tests" / "golden",
+)
 RAW_ROOT = ROOT / "data" / "raw" / "comments"
 
 _HANDLE = re.compile(r"(?<!\w)@[A-Za-z0-9_]\w*")

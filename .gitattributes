@@ -1,0 +1,8 @@
+* text=auto eol=lf
+*.sqlite binary
+*.wav binary
+*.mp3 binary
+*.m4a binary
+*.opus binary
+*.flac binary
+*.png binary

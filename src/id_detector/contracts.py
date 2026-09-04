@@ -719,6 +719,8 @@ class InvocationJournalEntry(Record):
     status: Literal["running", "succeeded", "failed", "cancelled"]
     exit_code: int | None
     duration_ms: NonNegativeInt | None
+    tool_versions: dict[str, str]
+    timings: dict[str, NonNegativeInt]
     counts: dict[str, int]
     costs: dict[str, int]
     source_ids: list[str]

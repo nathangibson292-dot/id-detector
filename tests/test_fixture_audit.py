@@ -48,6 +48,19 @@ def test_fixture_audit_rejects_opaque_contextual_ids_without_raw_data(
     assert any("non-null raw identifier field" in failure for failure in failures)
 
 
+def test_fixture_audit_scans_test_fixtures(tmp_path: Path, monkeypatch) -> None:
+    fixtures = tmp_path / "tests" / "fixtures"
+    fixtures.mkdir(parents=True)
+    (fixtures / "leak.json").write_text(
+        json.dumps({"platform_id": "opaque-private-id"}), encoding="utf-8"
+    )
+    monkeypatch.setattr(fixture_audit, "ROOT", tmp_path)
+    monkeypatch.setattr(fixture_audit, "RAW_ROOT", tmp_path / "missing-raw")
+    monkeypatch.setattr(fixture_audit, "SCAN_ROOTS", (fixtures,))
+    failures = fixture_audit.audit()
+    assert any("non-null raw identifier" in failure for failure in failures)
+
+
 def test_fixture_derivation_is_byte_deterministic_with_sequential_authors(
     tmp_path: Path,
 ) -> None:
