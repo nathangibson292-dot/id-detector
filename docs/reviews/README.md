@@ -25,3 +25,15 @@ These are acknowledged and will be handled in the named stage rather than in fur
 1. Provisional tiers for v1 (default) vs funding a certified corpus.
 2. AudD/ACRCloud trial credentials and a hard test budget before Stage 3.
 3. JDK for a minimum Panako path before profile freeze, or exclude reference-pool recognition from v1.
+
+## Code-review rounds (per build stage)
+
+| Stage | Reviewer | Verdict | P0/P1/P2 | Outcome |
+|---|---|---|---|---|
+| 0 | Codex gpt-5.6-sol xhigh | FIX_FIRST | 0/7/4 | all 11 fixed, committed `6fbfde3` |
+| 1 | Codex | FIX_FIRST | 0/9/3 | all 12 fixed, committed `9fda080` |
+| 2a | Codex | FIX_FIRST | 0/6/3 (+1 by Claude) | all 10 fixed, committed `3bcf29a` |
+| 2b | Codex | FIX_FIRST | 0/9/3 (+2 by Claude) | 13 fixed, 1 owner-blocked, committed `3ee2c61` |
+| 3 | Codex | FIX_FIRST | 0/5/3 | all 8 fixed, committed `53a5bae` |
+| 4a | Codex | FIX_FIRST | 0/9/3 | 11 fixed, 1 owner-blocked, committed `c4ddd4a` |
+| 4b → | **Claude (Codex usage limit reached 2026-09-04; resets 2026-09-07 11:59)** | — | — | same prompts and discipline; reviewer and builder are separate agents |
