@@ -1,0 +1,2 @@
+Index; Total ; Query path;Query start (s);Query stop (s); Match path;Match id; Match start (s); Match stop (s); Match score; Time factor (%); Frequency factor(%); Seconds with match (%)
+1 ; 1 ; refpool/query-window.wav ; 0.360 ; 14.496 ; refpool/artist-a - untitled-edit.wav ; 700123 ; 20.360 ; 34.496 ; 516 ; 1.000 % ; 1.000 %; 1.00

@@ -31,9 +31,12 @@ cache/
 *.aiff
 *.aif
 
-# Panako / Olaf indexes (Stage 6)
+# Panako / Olaf indexes and the pinned Panako jar (Stage 8; also covered by data/local/)
 panako-db/
 olaf-db/
+tools/panako/
+data/local/panako/
+data/local/panako-db/
 
 # OS / editor
 .DS_Store

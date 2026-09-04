@@ -48,7 +48,7 @@ from id_detector.providers.base import (
     ProviderProtocolError,
     UploadPermissionError,
 )
-from id_detector.providers.panako import CAPABILITY, PanakoConfig, PanakoProvider, doctor_detail
+from id_detector.providers.panako import PanakoRuntime, doctor_detail, resolve_java
 
 ROOT = Path(__file__).resolve().parents[1]
 MEDIA_KEY = "a" * 64
@@ -1103,13 +1103,19 @@ def test_acrcloud_persistent_deadline_terminalizes_without_another_poll(tmp_path
     assert poll_delay_seconds(450) == 300
 
 
-def test_panako_is_declared_disabled_and_every_operation_is_clear(tmp_path: Path) -> None:
-    provider = PanakoProvider(PanakoConfig(index_path=tmp_path / "index"))
-    assert CAPABILITY.capability == "local_index_query"
-    assert not CAPABILITY.available
-    for method in (provider.create_index, provider.query, provider.recognise, provider.close):
-        with pytest.raises(ProviderUnavailable, match="^JDK not found$"):
-            method()
+def test_panako_jdk_discovery_and_runtime_gate(tmp_path: Path) -> None:
+    """Stage 8: JDK discovery follows JAVA_HOME -> install globs -> PATH; a missing jar is clean."""
+
+    home = tmp_path / "jdk"
+    (home / "bin").mkdir(parents=True)
+    java = home / "bin" / ("java.exe" if os.name == "nt" else "java")
+    java.write_text("", encoding="utf-8")
+    resolution = resolve_java(env={"JAVA_HOME": str(home)}, install_globs=(), which=lambda _: None)
+    assert resolution is not None and resolution.source == "JAVA_HOME"
+    # A missing jar is reported as a clean ProviderUnavailable, never a crash.
+    with pytest.raises(ProviderUnavailable):
+        PanakoRuntime.resolve(jar=tmp_path / "missing.jar", env={"JAVA_HOME": str(home)})
+    # The doctor reports the JDK it can resolve (PASS with a version) or WARN when none exists.
     status, detail = doctor_detail()
-    assert status == "WARN"
-    assert "Panako" in detail
+    assert status in {"PASS", "WARN"}
+    assert "JDK" in detail or "Panako" in detail

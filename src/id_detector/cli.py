@@ -90,6 +90,166 @@ def doctor() -> None:
     raise typer.Exit(run_doctor())
 
 
+@app.command("panako-setup")
+def panako_setup_command(
+    tool_dir: Path = typer.Option(  # noqa: B008
+        Path("data/local/panako"), "--tool-dir", help="Where the pinned Panako jar + config live."
+    ),
+    index_root: Path = typer.Option(  # noqa: B008
+        Path("data/local/panako-db"), "--index-root", help="Git-ignored root for index stores."
+    ),
+    offline: bool = typer.Option(
+        False, "--offline", help="Verify and configure an already-present jar; never download."
+    ),
+) -> None:
+    """Download+verify the pinned Panako jar, write its config, and confirm it starts."""
+
+    from id_detector.providers.panako_setup import (
+        PanakoSetupError,
+        manual_instructions,
+        run_setup,
+    )
+
+    try:
+        result = asyncio.run(
+            run_setup(tool_dir=tool_dir, index_root=index_root, allow_download=not offline)
+        )
+    except PanakoSetupError as exc:
+        typer.echo(redact_text(str(exc)), err=True)
+        typer.echo(manual_instructions(tool_dir), err=True)
+        raise typer.Exit(1) from None
+    typer.echo(f"Panako jar: {result.jar} (sha256 {result.sha256})")
+    typer.echo(f"config:     {result.config}")
+    typer.echo(f"index root: {result.index_root}")
+    typer.echo(f"JDK:        {result.java if result.java else 'not found — Panako cannot run'}")
+    typer.echo(f"Panako starts: {result.help_first_line}")
+
+
+@app.command("build-index")
+def build_index_command(
+    set_url: str | None = typer.Argument(  # noqa: B008
+        None, help="Public set URL whose uploader's own uploads seed the candidate pool."
+    ),
+    uploader_url: str | None = typer.Option(  # noqa: B008
+        None, "--uploader-url", help="Uploader uploads URL to list directly (skip set lookup)."
+    ),
+    extra_artist: list[str] | None = typer.Option(  # noqa: B008
+        None, "--extra-artist", help="Search SoundCloud for this artist; repeatable."
+    ),
+    extra_url: list[str] | None = typer.Option(  # noqa: B008
+        None, "--extra-url", help="Index this exact track URL (user-supplied); repeatable."
+    ),
+    file: list[Path] | None = typer.Option(  # noqa: B008
+        None, "--file", help="Index this local audio file directly; repeatable."
+    ),
+    from_hints: bool = typer.Option(
+        False, "--from-hints", help="Add artists parsed from --hints to the search set."
+    ),
+    hints: Path | None = typer.Option(  # noqa: B008
+        None, "--hints", help="hints.jsonl artefact to read artist names from (with --from-hints)."
+    ),
+    index: bool = typer.Option(
+        False, "--index", help="Confirm: download and fingerprint the discovered candidates."
+    ),
+    index_label: str = typer.Option(  # noqa: B008
+        "default", "--index-label", help="Names the index; its id enters the local-index cache key."
+    ),
+    tool_dir: Path = typer.Option(  # noqa: B008
+        Path("data/local/panako"), "--tool-dir"
+    ),
+    index_root: Path = typer.Option(  # noqa: B008
+        Path("data/local/panako-db"), "--index-root"
+    ),
+) -> None:
+    """Discover candidate reference tracks (emits links) and, only on --index, fingerprint them.
+
+    Discovery never auto-rips: the default prints a candidate list. Audio is downloaded and
+    indexed only for candidates you confirm with --index, or that you supply explicitly via
+    --extra-url / --file. Downloaded audio is deleted after fingerprinting; only the DB is kept.
+    """
+
+    from id_detector.candidates import (
+        Candidate,
+        artists_from_hints,
+        build_manifest,
+        deduplicate_candidates,
+        discover_candidates,
+        format_candidate_list,
+        index_candidates,
+        write_manifest,
+    )
+    from id_detector.providers.panako import PanakoIndexPaths, PanakoProvider, PanakoRuntime
+    from id_detector.providers.panako_setup import jar_path
+
+    artists = list(extra_artist or [])
+    if from_hints and hints is not None:
+        artists.extend(artists_from_hints(hints))
+
+    candidates = asyncio.run(
+        discover_candidates(
+            set_url=set_url,
+            uploader_url=uploader_url,
+            artists=artists,
+            extra_urls=list(extra_url or []),
+        )
+    )
+    typer.echo(format_candidate_list(candidates))
+
+    explicit_files = list(file or [])
+    if not index and not explicit_files:
+        return  # links only; the owner must confirm before anything is downloaded or read
+
+    try:
+        runtime = PanakoRuntime.resolve(jar=jar_path(tool_dir))
+    except Exception as exc:  # ProviderUnavailable and friends: a usage error, not a traceback
+        typer.echo(redact_text(str(exc)), err=True)
+        raise typer.Exit(1) from None
+
+    index_dir = index_root / index_label
+    provider = PanakoProvider(runtime=runtime, paths=PanakoIndexPaths(root=index_dir))
+    to_index: list[Candidate] = list(candidates) if index else []
+    for local in explicit_files:
+        to_index.append(
+            Candidate(
+                url=local.resolve().as_uri(),
+                title=local.stem,
+                uploader=None,
+                source="local_file",
+            )
+        )
+    to_index = deduplicate_candidates(to_index)
+
+    async def _run() -> list[object]:
+        from id_detector.candidates import download_audio
+
+        async def _local_or_download(candidate: Candidate, dest: Path) -> Path:
+            if candidate.source == "local_file":
+                import shutil
+
+                source = Path(candidate.url.removeprefix("file:///"))
+                if not source.is_file():  # file URIs on POSIX begin with a single slash
+                    source = Path(candidate.url.removeprefix("file://"))
+                target = dest / source.name
+                shutil.copyfile(source, target)
+                return target
+            return await download_audio(candidate, dest)
+
+        return await index_candidates(
+            provider,
+            to_index,
+            download_dir=index_dir / "downloads",
+            downloader=_local_or_download,
+        )
+
+    resources = asyncio.run(_run())
+    manifest = build_manifest(index_label=index_label, resources=resources)  # type: ignore[arg-type]
+    write_manifest(PanakoIndexPaths(root=index_dir).manifest_path, manifest)
+    typer.echo(
+        f"indexed {len(resources)} track(s) into {index_dir} "
+        f"(index_id {manifest['index_id']}, index_version {manifest['index_version']})"
+    )
+
+
 @config_app.command("show")
 def config_show(
     config: Path = typer.Option(  # noqa: B008

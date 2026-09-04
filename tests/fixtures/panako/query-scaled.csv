@@ -1,0 +1,2 @@
+Index; Total ; Query path;Query start (s);Query stop (s); Match path;Match id; Match start (s); Match stop (s); Match score; Time factor (%); Frequency factor(%); Seconds with match (%)
+1 ; 1 ; refpool/query-window.wav ; 1.200 ; 13.680 ; refpool/artist-b - warehouse-dub.wav ; 700124 ; 61.200 ; 73.680 ; 342 ; 1.041 % ; 0.972 %; 0.87

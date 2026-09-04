@@ -123,7 +123,11 @@ def _shortlist_engine(shortlist: dict[str, Any], provider: str) -> tuple[int, di
 
 
 def _engine_rows(
-    *, name: str, shortlist: dict[str, Any], shortlist_citer: _Citer
+    *,
+    name: str,
+    shortlist: dict[str, Any],
+    shortlist_citer: _Citer,
+    panako_index: PanakoProfileInput | None = None,
 ) -> list[ProfileEngine]:
     free_only = name == "free"
     rows: list[ProfileEngine] = []
@@ -185,23 +189,47 @@ def _engine_rows(
             )
         )
 
-    panako_index, _ = _shortlist_engine(shortlist, "panako")
+    panako_shortlist_index, _ = _shortlist_engine(shortlist, "panako")
     panako_evidence: list[ProfileEvidence] = []
-    panako_status = shortlist_citer.cite(f"engines.{panako_index}.status", panako_evidence)
+    panako_status = shortlist_citer.cite(
+        f"engines.{panako_shortlist_index}.status", panako_evidence
+    )
+    # rev 5.2 / Stage 8: Panako becomes an *enabled* independent engine in max_accuracy only when a
+    # JDK and a built reference pool are present (a v2 profile). The free profile and the v1
+    # max_accuracy derivation are unaffected: with ``panako_index=None`` this row is byte-for-byte
+    # the Stage 4d row.
+    # The reference pool is a local operator artefact, not a field of either committed report, so
+    # its identity is recorded in ``status``/``reason`` rather than as report-cited evidence (the
+    # ``evidence`` list stays confined to the shortlist status, keeping the profile re-derivable).
+    panako_available = panako_index is not None and name == "max_accuracy"
     rows.append(
         ProfileEngine(
             provider="panako",
             capability="local_index_query",
             cost_class="self_hosted_free",
-            enabled=False,
+            enabled=panako_available,
             eligible_when_available=True,
             eligibility_condition=(
-                "install a JDK >= 11 and build a reference pool (plan Stage 8); free, self-hosted"
+                ""
+                if panako_available
+                else "install a JDK >= 11 and build a reference pool (plan Stage 8); free, "
+                "self-hosted"
             ),
-            status=str(panako_status),
+            status=(
+                f"enabled ({panako_index.resource_count} reference tracks, JDK "
+                f"{panako_index.jdk_version})"
+                if panako_available
+                else str(panako_status)
+            ),
             reason=(
-                "Free, self-hosted reference-pool matcher, excluded from v1 because no JDK is "
-                "installed. Eligible when available in either profile once a JDK exists; until "
+                "Free, self-hosted reference-pool matcher, enabled in max_accuracy because a JDK "
+                f"({panako_index.jdk_version}) and a built reference pool (index_id "
+                f"{panako_index.index_id}, {panako_index.resource_count} tracks) are present. It "
+                "runs over the whole set as an independent source, unsuppressed, exactly like the "
+                "file-scanner path."
+                if panako_available
+                else "Free, self-hosted reference-pool matcher, excluded from v1 because no JDK "
+                "is installed. Eligible when available in either profile once a JDK exists; until "
                 "then reference-pool recognition is excluded."
             ),
             evidence=panako_evidence,
@@ -436,6 +464,17 @@ class ReportRef:
     corpus_version: str
 
 
+@dataclass(frozen=True)
+class PanakoProfileInput:
+    """The JDK + built reference pool that enables Panako in a ``max_accuracy`` v2 profile."""
+
+    index_id: str
+    index_version: str
+    resource_count: int
+    panako_version: str
+    jdk_version: str
+
+
 def derive_profile(
     *,
     name: str,
@@ -444,8 +483,14 @@ def derive_profile(
     shortlist: dict[str, Any],
     ablations_ref: ReportRef,
     shortlist_ref: ReportRef,
+    panako_index: PanakoProfileInput | None = None,
 ) -> ProfileRecord:
-    """Derive one frozen profile mechanically from the two reports."""
+    """Derive one frozen profile mechanically from the two reports.
+
+    ``panako_index`` (a JDK + built reference pool) enables Panako as an independent engine in the
+    ``max_accuracy`` profile only; the ``free`` profile and the Stage 4d v1 derivation are
+    unaffected, so passing ``None`` reproduces the committed profiles byte-for-byte.
+    """
 
     if name not in PROFILE_NAMES:
         raise ValueError(f"unknown profile {name!r}; expected one of {PROFILE_NAMES}")
@@ -455,7 +500,12 @@ def derive_profile(
     ablations_citer = _Citer("ablations", ablations)
     shortlist_citer = _Citer("shortlist", shortlist)
 
-    engines = _engine_rows(name=name, shortlist=shortlist, shortlist_citer=shortlist_citer)
+    engines = _engine_rows(
+        name=name,
+        shortlist=shortlist,
+        shortlist_citer=shortlist_citer,
+        panako_index=panako_index,
+    )
     features, hints_gate_status = _feature_rows(ablations, ablations_citer)
     feature_by_name = {feature.name: feature for feature in features}
     transforms_policy = feature_by_name["transforms"].setting["policy"]
@@ -498,6 +548,15 @@ def derive_profile(
         notes.append(
             "engine_policy free_only: only free engines may ever be enabled here; paid scanners "
             "are out of scope and belong to max_accuracy."
+        )
+    elif panako_index is not None:
+        notes.append(
+            "engine_policy all_available: every available independent engine runs over the whole "
+            f"set with no suppression. A JDK ({panako_index.jdk_version}) and a built reference "
+            f"pool (index_id {panako_index.index_id}, index_version {panako_index.index_version}, "
+            f"{panako_index.resource_count} tracks) are present, so Panako is enabled as an "
+            "independent local_index_query source alongside Shazam; the paid scanners remain "
+            "eligible-when-available with their cost."
         )
     else:
         notes.append(
@@ -602,6 +661,32 @@ def freeze_profiles(
         profiles[name] = profile
         written[name] = destination
     return FreezeResult(profiles=profiles, written=written)
+
+
+def derive_max_accuracy_v2(
+    *,
+    ablations_path: Path,
+    shortlist_path: Path,
+    panako_index: PanakoProfileInput,
+) -> ProfileRecord:
+    """Derive the ``max_accuracy`` v2 profile that enables Panako, from the two committed reports.
+
+    Stage 8: with a JDK and a built reference pool present, Panako joins the enabled independent
+    engines.  This does not touch the ``free`` or v1 ``max_accuracy`` artefacts; the operator
+    freezes it explicitly by writing the returned record to ``profiles/max_accuracy-v2.json``.
+    """
+
+    ablations = json.loads(read_text(ablations_path))
+    shortlist = json.loads(read_text(shortlist_path))
+    return derive_profile(
+        name="max_accuracy",
+        version_number=2,
+        ablations=ablations,
+        shortlist=shortlist,
+        ablations_ref=_report_ref(ablations_path),
+        shortlist_ref=_report_ref(shortlist_path),
+        panako_index=panako_index,
+    )
 
 
 # --------------------------------------------------------------------------------------------------

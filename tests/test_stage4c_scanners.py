@@ -29,8 +29,7 @@ from id_detector.fuse.scanners import (
 )
 from id_detector.providers import acrcloud, audd
 from id_detector.providers.base import ProviderUnavailable
-from id_detector.providers.panako import CAPABILITY as PANAKO_CAPABILITY
-from id_detector.providers.panako import PanakoConfig, PanakoProvider
+from id_detector.providers.panako import PanakoRuntime, resolve_java
 
 ROOT = Path(__file__).parent
 MEDIA_KEY = "c" * 64
@@ -191,13 +190,12 @@ def test_scanner_evidence_fuses_into_episodes_without_windows() -> None:
     assert isinstance(requests, list)
 
 
-def test_panako_is_disabled_and_excluded_from_v1() -> None:
-    assert PANAKO_CAPABILITY.available is False
-    assert "JDK not found" in PANAKO_CAPABILITY.detail
-    provider = PanakoProvider(PanakoConfig(index_path=Path("index")))
-    for call in (provider.create_index, provider.query, provider.recognise, provider.close):
-        with pytest.raises(ProviderUnavailable):
-            call()
+def test_panako_reference_pool_provider_gates_on_jar_and_jdk(tmp_path: Path) -> None:
+    """Stage 8: Panako is the reference-pool provider; discovery order and jar gate are exact."""
+
+    assert resolve_java(env={}, install_globs=(), which=lambda _: "java-on-path").source == "PATH"
+    with pytest.raises(ProviderUnavailable):
+        PanakoRuntime.resolve(jar=tmp_path / "missing.jar", env={})
 
 
 def test_no_scanner_window_type_records_are_required(tmp_path: Path) -> None:

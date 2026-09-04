@@ -1,0 +1,11 @@
+{
+  "_type": "playlist",
+  "id": "uploads",
+  "title": "Example Uploader tracks",
+  "uploader": "Example Uploader",
+  "entries": [
+    {"id": "trka", "title": "Untitled Edit 01", "uploader": "Example Uploader", "url": "example-uploader/untitled-edit-01"},
+    {"id": "trkb", "title": "Warehouse Dub", "uploader": "Example Uploader", "url": "example-uploader/warehouse-dub"},
+    {"id": "trkc", "title": "ID - Forthcoming", "uploader": "Example Uploader", "url": "example-uploader/id-forthcoming"}
+  ]
+}

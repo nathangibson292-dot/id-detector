@@ -1,0 +1,9 @@
+{
+  "_type": "playlist",
+  "id": "scsearch",
+  "title": "scsearch3:Example Artist",
+  "entries": [
+    {"id": "srcha", "title": "Example Artist - Peak Time Weapon", "uploader": "Example Artist", "url": "example-artist/peak-time-weapon"},
+    {"id": "srchb", "title": "Example Artist - Rework", "uploader": "Example Artist", "url": "example-artist/rework"}
+  ]
+}

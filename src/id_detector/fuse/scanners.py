@@ -33,7 +33,17 @@ ANCHOR_CONVERSIONS: dict[str, str] = {
         "mix = offset * 1000; reference = play_offset_ms; explicitly unreliable"
     ),
     "local_fixture_content_hash": "controlled fixture; mix = first matched sample",
+    "panako_query_offset_to_reference_offset": (
+        "mix = window start + Panako in-query offset (s*1000); reference = Panako reference "
+        "offset (s*1000); Panako reports its own time/frequency scale factor, so the observation "
+        "carries transform=null"
+    ),
 }
+
+#: Capabilities whose observations enter the fuser through the scanner path (transform=null,
+#: chunk-indexed logical trials, independent source, no cascading suppression).  Panako's
+#: ``local_index_query`` joins ``file_scanner`` here in Stage 8.
+SCANNER_CAPABILITIES: frozenset[str] = frozenset({"file_scanner", "local_index_query"})
 
 
 def scanner_logical_trial_id(provider: str, chunk_index: int) -> str:
@@ -81,7 +91,7 @@ def validate_scanner_observations(
     """Reject scanner evidence that would break the plan's fusion contract."""
 
     for item in observations:
-        if item.capability != "file_scanner":
+        if item.capability not in SCANNER_CAPABILITIES:
             continue
         if item.transform is not None:
             raise ValueError(f"scanner observation {item.id} must carry transform null")

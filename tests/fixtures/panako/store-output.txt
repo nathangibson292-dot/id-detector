@@ -1,0 +1,5 @@
+Audiofile;Audio duration;Fingerprinting duration;ratio
+Sep 04, 2026 6:07:01 PM be.panako.strategy.olaf.OlafStrategy store
+INFO: Stored 2920 fingerprints for 'refpool/artist-a - untitled-edit.wav', id: 700123
+Sep 04, 2026 6:07:02 PM be.panako.strategy.olaf.OlafStrategy store
+INFO: Stored 2333 fingerprints for 'refpool/artist-b - warehouse-dub.wav', id: 700124
