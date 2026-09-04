@@ -16,6 +16,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from id_detector.process import ProcessTimeout, run_process
+from id_detector.providers.panako import doctor_detail as panako_doctor_detail
 
 
 @dataclass(frozen=True)
@@ -119,6 +120,8 @@ def collect_checks() -> list[Check]:
     checks.append(Check("Node", "PASS" if ok else "FAIL", detail))
     checks.append(_check_shazam())
     checks.append(_check_vc_runtime())
+    panako_status, panako_detail = panako_doctor_detail()
+    checks.append(Check("Panako", panako_status, panako_detail))
 
     free = shutil.disk_usage(Path.cwd()).free
     gib = free // (1024**3)

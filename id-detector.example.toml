@@ -1,0 +1,3 @@
+# Third-party audio uploads require this local setting AND the CLI ownership confirmation.
+# Copy this file to id-detector.toml; that destination is ignored by Git.
+allow_third_party_upload = false

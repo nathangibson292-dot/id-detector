@@ -174,7 +174,9 @@ def _write_immutable_sidecar(path: Path, upstream: dict[str, Path]) -> None:
     write_completion_sidecar(path, upstream)
 
 
-def _cache_valid(raw_path: Path, state: str) -> bool:
+def cache_valid(raw_path: Path, state: str) -> bool:
+    """Apply the shared positive/no-match TTL contract; errors are never cacheable."""
+
     if not path_is_file(raw_path):
         return False
     age = max(0.0, time.time() - path_mtime(raw_path))
@@ -183,6 +185,10 @@ def _cache_valid(raw_path: Path, state: str) -> bool:
     if state == "no_match":
         return age <= NO_MATCH_MAX_AGE_SECONDS
     return False
+
+
+# Kept for Stage-1 callers while scanners share the public cache predicate above.
+_cache_valid = cache_valid
 
 
 def _raw_index_entry(
@@ -370,7 +376,7 @@ async def recognise_generation_zero(
                 "permanent_failure",
             }:
                 await store.reset_for_refresh(job.id)
-            elif cached_raw_path is not None and _cache_valid(cached_raw_path, job.state):
+            elif cached_raw_path is not None and cache_valid(cached_raw_path, job.state):
                 _write_immutable_bytes(raw_path, read_bytes(cached_raw_path))
                 cache_hits += 1
             elif job.state in {"succeeded", "no_match", "permanent_failure"}:

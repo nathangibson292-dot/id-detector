@@ -13,6 +13,7 @@ build/
 .env
 .env.*
 !.env.example
+id-detector.toml
 
 # Per-mix work directories: downloaded audio, windows, engine caches
 work/

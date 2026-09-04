@@ -298,6 +298,28 @@ class AsyncJobStore:
 
         await self._call(operation)
 
+    async def extend_budget(
+        self, media_key: str, provider: str, *, requests: int, usd: int = 0
+    ) -> None:
+        """Add one explicitly requested execution allowance to an existing hard ceiling."""
+
+        if requests < 0 or usd < 0:
+            raise ValueError("budget extension cannot be negative")
+
+        def operation(connection: sqlite3.Connection) -> None:
+            cursor = connection.execute(
+                """
+                UPDATE budgets SET max_requests=max_requests+?, max_usd=max_usd+?
+                WHERE media_key=? AND provider=?
+                """,
+                (requests, usd, media_key, provider),
+            )
+            connection.commit()
+            if cursor.rowcount != 1:
+                raise RuntimeError("provider budget has not been created")
+
+        await self._call(operation)
+
     async def ensure_job(self, media_key: str, query_id: str, provider: str) -> Job:
         job_id = sha1(f"{media_key}job{query_id}".encode(), usedforsecurity=False).hexdigest()
         now = utc_now()
@@ -412,7 +434,8 @@ class AsyncJobStore:
         def operation(connection: sqlite3.Connection) -> None:
             cursor = connection.execute(
                 """
-                UPDATE jobs SET state='submission_started', submission_started_at=?, updated_at=?
+                UPDATE jobs SET state='submission_started',
+                    submission_started_at=COALESCE(submission_started_at, ?), updated_at=?
                 WHERE id=? AND state='leased' AND lease_owner=?
                 """,
                 (now, now, job_id, owner),
@@ -423,8 +446,75 @@ class AsyncJobStore:
 
         await self._call(operation)
 
-    async def begin_physical_attempt(self, job_id: str) -> int:
-        """Transactionally reserve and count one request immediately before transport I/O."""
+    async def reserve_billing(self, job_id: str, *, units: int, usd: int) -> None:
+        """Reserve scanner units and integer cents before submission begins.
+
+        Scanner units are provider billing units (AudD chunks or ACRCloud scan-seconds). Their
+        upload/list/poll HTTP calls are still counted in ``physical_attempts``, but are not each a
+        separately billable recognition request.
+        """
+
+        if units < 0 or usd < 0:
+            raise ValueError("billing reservation cannot be negative")
+        now = utc_now()
+
+        def operation(connection: sqlite3.Connection) -> None:
+            connection.execute("BEGIN IMMEDIATE")
+            job = connection.execute("SELECT * FROM jobs WHERE id=?", (job_id,)).fetchone()
+            if job is None or job["state"] != "leased":
+                connection.rollback()
+                raise RuntimeError("billing reservation requires a leased job")
+            existing_units = int(job["reserved_units"])
+            existing_usd = int(job["reserved_usd"])
+            if existing_units or existing_usd:
+                if (existing_units, existing_usd) != (units, usd):
+                    connection.rollback()
+                    raise RuntimeError("existing billing reservation differs from requested amount")
+                # A crash can occur after this transaction and before submission_started. The
+                # recovered lease must reuse, rather than duplicate, that durable reservation.
+                connection.commit()
+                return
+            budget = connection.execute(
+                "SELECT * FROM budgets WHERE media_key=? AND provider=?",
+                (job["media_key"], job["provider"]),
+            ).fetchone()
+            if budget is None:
+                connection.rollback()
+                raise RuntimeError("provider budget has not been created")
+            if (
+                budget["used_requests"] + budget["reserved_requests"] + units
+                > budget["max_requests"]
+            ):
+                connection.rollback()
+                raise BudgetExhausted("provider-unit ceiling exhausted")
+            if budget["used_usd"] + budget["reserved_usd"] + usd > budget["max_usd"]:
+                connection.rollback()
+                raise BudgetExhausted("provider cost ceiling exhausted")
+            connection.execute(
+                """
+                UPDATE budgets SET reserved_requests=reserved_requests+?,
+                    reserved_usd=reserved_usd+? WHERE media_key=? AND provider=?
+                """,
+                (units, usd, job["media_key"], job["provider"]),
+            )
+            connection.execute(
+                """
+                UPDATE jobs SET reserved_units=reserved_units+?, reserved_usd=reserved_usd+?,
+                    updated_at=? WHERE id=?
+                """,
+                (units, usd, now, job_id),
+            )
+            connection.commit()
+
+        await self._call(operation)
+
+    async def begin_physical_attempt(self, job_id: str, *, reserve_request: bool = True) -> int:
+        """Count network I/O, optionally reserving one billable request.
+
+        Clip recognizers use the default because each HTTP attempt is billable. File scanners
+        reserve their duration-derived units up front and pass ``reserve_request=False`` for
+        upload/reconciliation/poll traffic.
+        """
 
         now = utc_now()
 
@@ -441,22 +531,25 @@ class AsyncJobStore:
             if budget is None:
                 connection.rollback()
                 raise RuntimeError("provider budget has not been created")
-            if budget["used_requests"] + budget["reserved_requests"] >= budget["max_requests"]:
+            if reserve_request and (
+                budget["used_requests"] + budget["reserved_requests"] >= budget["max_requests"]
+            ):
                 connection.rollback()
                 raise BudgetExhausted("request ceiling exhausted")
-            connection.execute(
-                """
-                UPDATE budgets SET reserved_requests=reserved_requests+1
-                WHERE media_key=? AND provider=?
-                """,
-                (job["media_key"], job["provider"]),
-            )
+            if reserve_request:
+                connection.execute(
+                    """
+                    UPDATE budgets SET reserved_requests=reserved_requests+1
+                    WHERE media_key=? AND provider=?
+                    """,
+                    (job["media_key"], job["provider"]),
+                )
             connection.execute(
                 """
                 UPDATE jobs SET physical_attempts=physical_attempts+1,
-                    reserved_units=reserved_units+1, updated_at=? WHERE id=?
+                    reserved_units=reserved_units+?, updated_at=? WHERE id=?
                 """,
-                (now, job_id),
+                (int(reserve_request), now, job_id),
             )
             connection.commit()
             return int(job["physical_attempts"]) + 1
@@ -469,7 +562,8 @@ class AsyncJobStore:
         def operation(connection: sqlite3.Connection) -> None:
             cursor = connection.execute(
                 """
-                UPDATE jobs SET state='submitted', submitted_at=?, remote_ref=?, updated_at=?
+                UPDATE jobs SET state='submitted', submitted_at=COALESCE(submitted_at, ?),
+                    remote_ref=COALESCE(remote_ref, ?), updated_at=?
                 WHERE id=? AND state='submission_started'
                 """,
                 (now, remote_ref, now, job_id),
@@ -501,6 +595,7 @@ class AsyncJobStore:
         *,
         result_path: str | None,
         error: str | None = None,
+        actual_units: int | None = None,
         actual_usd: int = 0,
     ) -> Job:
         if state not in {"succeeded", "no_match", "permanent_failure", "cancelled"}:
@@ -516,7 +611,19 @@ class AsyncJobStore:
             # ``physical_attempts`` is the cumulative audit total. Only this execution's
             # outstanding reservation is newly chargeable to the provider budget.
             charged_units = int(row["reserved_units"])
-            actual_units = int(row["physical_attempts"])
+            settled_units = charged_units if actual_units is None else actual_units
+            if settled_units < 0 or settled_units > charged_units:
+                connection.rollback()
+                raise ValueError("actual units must be within the reserved amount")
+            if actual_usd < 0 or actual_usd > int(row["reserved_usd"]):
+                connection.rollback()
+                raise ValueError("actual cost must be within the reserved amount")
+            job_actual_units = (
+                int(row["physical_attempts"])
+                if actual_units is None
+                else int(row["actual_units"]) + settled_units
+            )
+            job_actual_usd = int(row["actual_usd"]) + actual_usd
             connection.execute(
                 """
                 UPDATE budgets SET
@@ -527,7 +634,7 @@ class AsyncJobStore:
                 (
                     row["reserved_units"],
                     row["reserved_usd"],
-                    charged_units,
+                    settled_units,
                     actual_usd,
                     row["media_key"],
                     row["provider"],
@@ -540,12 +647,35 @@ class AsyncJobStore:
                     actual_units=?, actual_usd=?, result_path=?, error=?, updated_at=?
                 WHERE id=?
                 """,
-                (state, actual_units, actual_usd, result_path, error, now, job_id),
+                (state, job_actual_units, job_actual_usd, result_path, error, now, job_id),
             )
             connection.commit()
             final = connection.execute("SELECT * FROM jobs WHERE id=?", (job_id,)).fetchone()
             assert final is not None
             return Job.from_row(final)
+
+        return await self._call(operation)
+
+    async def mark_outcome_unknown(self, job_id: str, *, error: str) -> Job:
+        """Conservatively retain reservations when a billed outcome cannot be reconciled."""
+
+        now = utc_now()
+
+        def operation(connection: sqlite3.Connection) -> Job:
+            cursor = connection.execute(
+                """
+                UPDATE jobs SET state='outcome_unknown', lease_owner=NULL,
+                    lease_expires_at=NULL, heartbeat_at=NULL, error=?, updated_at=?
+                WHERE id=? AND state IN ('submission_started', 'submitted')
+                """,
+                (error[:1000], now, job_id),
+            )
+            connection.commit()
+            if cursor.rowcount != 1:
+                raise RuntimeError("outcome_unknown requires an active submission")
+            row = connection.execute("SELECT * FROM jobs WHERE id=?", (job_id,)).fetchone()
+            assert row is not None
+            return Job.from_row(row)
 
         return await self._call(operation)
 
@@ -585,20 +715,45 @@ class AsyncJobStore:
         await self._call(operation)
 
     async def acknowledge_retry(self, job_id: str) -> Job:
+        """Conservatively settle unknown exposure and fund one acknowledged replacement."""
+
         now = utc_now()
 
         def operation(connection: sqlite3.Connection) -> Job:
-            cursor = connection.execute(
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute("SELECT * FROM jobs WHERE id=?", (job_id,)).fetchone()
+            if row is None or row["state"] != "outcome_unknown":
+                connection.rollback()
+                raise ValueError("job is not in outcome_unknown")
+            units = int(row["reserved_units"])
+            usd = int(row["reserved_usd"])
+            budget = connection.execute(
+                "SELECT * FROM budgets WHERE media_key=? AND provider=?",
+                (row["media_key"], row["provider"]),
+            ).fetchone()
+            if budget is None:
+                connection.rollback()
+                raise RuntimeError("provider budget has not been created")
+            connection.execute(
+                """
+                UPDATE budgets SET
+                    reserved_requests=reserved_requests-?, reserved_usd=reserved_usd-?,
+                    used_requests=used_requests+?, used_usd=used_usd+?,
+                    max_requests=max_requests+?, max_usd=max_usd+?
+                WHERE media_key=? AND provider=?
+                """,
+                (units, usd, units, usd, units, usd, row["media_key"], row["provider"]),
+            )
+            connection.execute(
                 """
                 UPDATE jobs SET state='pending', lease_owner=NULL, lease_expires_at=NULL,
-                    heartbeat_at=NULL, next_retry_at=NULL, error=NULL, updated_at=?
+                    heartbeat_at=NULL, next_retry_at=NULL, reserved_units=0, reserved_usd=0,
+                    actual_units=actual_units+?, actual_usd=actual_usd+?, error=NULL, updated_at=?
                 WHERE id=? AND state='outcome_unknown'
                 """,
-                (now, job_id),
+                (units, usd, now, job_id),
             )
             connection.commit()
-            if cursor.rowcount != 1:
-                raise ValueError("job is not in outcome_unknown")
             row = connection.execute("SELECT * FROM jobs WHERE id=?", (job_id,)).fetchone()
             assert row is not None
             return Job.from_row(row)
@@ -661,3 +816,13 @@ class AsyncJobStore:
             return dict(row) if row else None
 
         return await self._call(operation)
+
+
+async def heartbeat_job(
+    store: AsyncJobStore, job_id: str, owner: str, *, interval_seconds: int = HEARTBEAT_SECONDS
+) -> None:
+    """Keep a long-running provider lease live until the owning task cancels this coroutine."""
+
+    while True:
+        await asyncio.sleep(interval_seconds)
+        await store.heartbeat(job_id, owner)

@@ -178,11 +178,13 @@ def verify_completion_sidecar(
 
 
 _QUOTED_SECRET = re.compile(
-    r'(?i)(["\']?(?:client_id|oauth_token|api_key|authorization|cookie)["\']?\s*[:=]\s*)'
+    r'(?i)(["\']?(?:client_id|oauth_token|api_key|api_token|access_key|access_secret|'
+    r'client_secret|authorization|cookie)["\']?\s*[:=]\s*)'
     r'(["\'])(.*?)\2'
 )
 _PLAIN_SECRET = re.compile(
-    r"(?i)\b(client_id|oauth_token|api_key|authorization|cookie)(\s*[:=]\s*)"
+    r"(?i)\b(client_id|oauth_token|api_key|api_token|access_key|access_secret|client_secret|"
+    r"authorization|cookie)(\s*[:=]\s*)"
     r"(?:Bearer\s+)?[^\s,;}]+"
 )
 
@@ -257,18 +259,22 @@ def redact_text(value: str) -> str:
     return _PLAIN_SECRET.sub(lambda match: f"{match.group(1)}{match.group(2)}[REDACTED]", value)
 
 
-def _redact(value: Any) -> Any:
+def redact_value(value: Any) -> Any:
+    """Recursively redact supported secret fields and credential-shaped text."""
+
     if isinstance(value, str):
         return redact_text(value)
     if isinstance(value, Mapping):
         return {
-            key: "[REDACTED]" if str(key).casefold() in SENSITIVE_FIELD_NAMES else _redact(item)
+            key: (
+                "[REDACTED]" if str(key).casefold() in SENSITIVE_FIELD_NAMES else redact_value(item)
+            )
             for key, item in value.items()
         }
     if isinstance(value, tuple):
-        return tuple(_redact(item) for item in value)
+        return tuple(redact_value(item) for item in value)
     if isinstance(value, list):
-        return [_redact(item) for item in value]
+        return [redact_value(item) for item in value]
     return value
 
 

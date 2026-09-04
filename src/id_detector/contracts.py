@@ -18,7 +18,17 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 SCHEMA_VERSION = "1.0.0"
 GENERATED_BY = "id-detector/0.1.0"
 SENSITIVE_FIELD_NAMES = frozenset(
-    {"client_id", "oauth_token", "api_key", "authorization", "cookie"}
+    {
+        "client_id",
+        "oauth_token",
+        "api_key",
+        "api_token",
+        "access_key",
+        "access_secret",
+        "client_secret",
+        "authorization",
+        "cookie",
+    }
 )
 
 Sha256 = Annotated[str, Field(pattern=r"^[0-9a-f]{64}$")]
@@ -827,6 +837,38 @@ class BenchmarkReportRecord(Record):
     unverified_seed_comparison: bool
 
 
+class ShortlistPairwiseAgreement(ContractModel):
+    provider_a: str
+    provider_b: str
+    n_sets: NonNegativeInt
+    agreement_e4: ConfidenceE4
+
+
+class ShortlistEngine(ContractModel):
+    provider: str
+    capability: Literal["clip_recognizer", "file_scanner", "local_index_query"]
+    provider_config_version: str
+    status: str
+    set_count: NonNegativeInt
+    observation_count: NonNegativeInt
+    match_count: NonNegativeInt
+    oracle_coverage_e4: ConfidenceE4
+    metrics: BenchmarkMetrics | None
+    cost: BenchmarkCost
+    expected_trial_cost_usd_e2: MoneyE2
+
+
+class ShortlistReportRecord(Record):
+    corpus_version: str
+    engines: list[ShortlistEngine]
+    pairwise_agreement: list[ShortlistPairwiseAgreement]
+    union_coverage_e4: ConfidenceE4
+    oracle_coverage_e4: ConfidenceE4
+    cost: BenchmarkCost
+    reference_pool_status: Literal["excluded_from_v1_pending_owner_jdk_decision"]
+    notes: list[str]
+
+
 class InvocationJournalEntry(Record):
     invocation_id: str
     command: list[str]
@@ -932,6 +974,7 @@ SCHEMA_MODELS: dict[str, type[BaseModel]] = {
     "episodes": EpisodesFile,
     "ground_truth": GroundTruthRecord,
     "benchmark_report": BenchmarkReportRecord,
+    "shortlist_report": ShortlistReportRecord,
     "invocation_journal_entry": InvocationJournalEntry,
     "raw_index_entry": RawIndexEntry,
     "provider_config": ProviderConfigRecord,

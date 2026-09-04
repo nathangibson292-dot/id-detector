@@ -15,15 +15,18 @@ import typer
 from id_detector.benchmark.controlled import render_controlled
 from id_detector.benchmark.corpus import run_corpus
 from id_detector.benchmark.scorer import score_corpus
+from id_detector.benchmark.shortlist import run_shortlist
 from id_detector.calibration import calibrate_shazam
 from id_detector.contracts import SourceRecord
 from id_detector.decode import decode
 from id_detector.doctor import run_doctor
 from id_detector.fuse.episodes import fuse_generation_zero
 from id_detector.ingest import ingest
+from id_detector.io import redact_text
 from id_detector.jobs import AsyncJobStore, ProcessLock
 from id_detector.journal import InvocationTimer, append_invocation
 from id_detector.present import export_tracklist
+from id_detector.providers.base import AppConfig
 from id_detector.recognise import recognise_generation_zero
 from id_detector.truth import (
     freeze_truth,
@@ -437,6 +440,53 @@ def benchmark_run(
         f"scored {len(result.report.sets)} sets; "
         f"unverified_seed_comparison={str(result.report.unverified_seed_comparison).lower()}; "
         f"report={out}"
+    )
+
+
+@benchmark_app.command("shortlist")
+def benchmark_shortlist(
+    corpus: Annotated[str, typer.Option("--corpus", help="Controlled corpus version.")],
+    out: Annotated[Path, typer.Option("--out", help="Shortlist report JSON.")],
+    config: Annotated[
+        Path, typer.Option("--config", help="Non-secret TOML config with the upload gate.")
+    ] = Path("id-detector.toml"),
+    i_own_this_audio_or_have_permission: Annotated[
+        bool,
+        typer.Option(
+            "--i-own-this-audio-or-have-permission",
+            help="Per-run confirmation required before any paid-provider upload.",
+        ),
+    ] = False,
+    work_root: Annotated[Path, typer.Option("--work-root")] = Path("data/local/work-shortlist"),
+    max_requests: Annotated[int, typer.Option("--max-requests", min=1)] = 2_000,
+    refresh: Annotated[
+        bool, typer.Option("--refresh", help="Bypass positive/no-match scanner cache TTLs.")
+    ] = False,
+) -> None:
+    """Run every available engine independently and write the Stage-3 shortlist."""
+
+    try:
+        result = asyncio.run(
+            run_shortlist(
+                corpus_version=corpus,
+                out_path=out,
+                project_root=PROJECT_ROOT,
+                work_root=work_root,
+                app_config=AppConfig.load(config),
+                cli_confirmation=i_own_this_audio_or_have_permission,
+                max_requests=max_requests,
+                refresh=refresh,
+            )
+        )
+    except KeyboardInterrupt:
+        raise typer.Exit(130) from None
+    except (ValueError, RuntimeError, OSError, json.JSONDecodeError) as exc:
+        typer.echo(redact_text(str(exc)), err=True)
+        raise typer.Exit(1) from None
+    statuses = ", ".join(f"{engine.provider}={engine.status}" for engine in result.report.engines)
+    typer.echo(
+        f"shortlisted {len(result.report.engines)} engines on "
+        f"{result.report.corpus_version}; {statuses}; report={out}"
     )
 
 
