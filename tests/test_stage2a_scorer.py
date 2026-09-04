@@ -16,6 +16,7 @@ from id_detector.benchmark.scorer import (
     _interval_values,
     clopper_pearson_lower_e4,
     exact_equivalent,
+    is_certification_stratum,
     paired_non_inferiority,
     score_corpus,
     score_set,
@@ -646,6 +647,73 @@ def test_certification_uses_profile_dimension_tier_preregistration(tmp_path: Pat
     assert entries[("version", "possible")].target_e4 == 9_500
     assert entries[("start", "possible")].status == "provisional"
     assert entries[("start", "possible")].target_e4 is None
+
+
+def test_is_certification_stratum_is_a_real_mix_allowlist() -> None:
+    assert is_certification_stratum("catalogue-covered")
+    assert is_certification_stratum("reference-pool")
+    assert is_certification_stratum("hard-id")
+    # Non-real strata and any future/mislabelled stratum are excluded (allowlist, not blocklist).
+    assert not is_certification_stratum("controlled")
+    assert not is_certification_stratum("self-index")
+    assert not is_certification_stratum("brand-new-stratum")
+
+
+def test_certification_population_excludes_unknown_stratum(tmp_path: Path) -> None:
+    truth_root = tmp_path / "truth"
+    prediction_sets = []
+    for index in range(10):
+        truth, predictions = _vector()
+        set_id = f"test-set-{index:02d}"
+        truth = GroundTruthRecord.model_validate(
+            {
+                **truth.model_dump(mode="json"),
+                "set_id": set_id,
+                "split": "test",
+                "stratum": "brand-new-stratum",
+            }
+        )
+        set_dir = truth_root / set_id
+        set_dir.mkdir(parents=True)
+        atomic_write_json(set_dir / "ground_truth.json", truth)
+        prediction_sets.append(
+            PredictionSet(
+                set_id=set_id,
+                identities=predictions.identities,
+                episodes=predictions.episodes,
+            )
+        )
+    _write_freeze_manifest(
+        truth_root,
+        [
+            GroundTruthRecord.model_validate_json(
+                (truth_root / f"test-set-{index:02d}" / "ground_truth.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            for index in range(10)
+        ],
+    )
+    targets = [{"profile": "vector", "dimension": "work", "tier": "possible", "target_e4": 9_000}]
+    snapshot, config_hash = _config(31, targets)
+    predictions_path = tmp_path / "predictions.json"
+    atomic_write_json(
+        predictions_path,
+        {
+            "corpus_version": "vector-v1",
+            "profile": "vector",
+            "config_hash": config_hash,
+            "config_snapshot": snapshot,
+            "sets": prediction_sets,
+            "unverified_seed_comparison": False,
+        },
+    )
+    report = score_corpus(truth_root, predictions_path)
+    # Even though these 10 test sets carry certifiable predictions, an unknown stratum keeps every
+    # one of them out of the certified population, so no triple can certify.
+    assert all(item.n == 0 for item in report.certification)
+    entries = {(item.dimension, item.tier): item for item in report.certification}
+    assert entries[("work", "possible")].status == "provisional"
 
 
 def test_scorer_uses_resolved_work_identity_instead_of_episode_text() -> None:

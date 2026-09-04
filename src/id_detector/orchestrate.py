@@ -135,6 +135,7 @@ async def run_generation_loop(
     novelty_enabled: bool = True,
     gen0_requests: int = 0,
     gen0_physical_attempts: int = 0,
+    calibrator: object | None = None,
 ) -> OrchestrationResult:
     """Run generation 0's fusion and every budgeted rescan generation after it."""
 
@@ -167,6 +168,7 @@ async def run_generation_loop(
         novelty_change_points_ms=novelty_points,
         scanned_window_shapes=window_shapes(all_windows),
         config=app_config,
+        calibrator=calibrator,
     )
     generations = [
         GenerationRecord(
@@ -246,6 +248,7 @@ async def run_generation_loop(
             prior_request_keys=frozenset(prior_keys),
             scanned_window_shapes=window_shapes(all_windows),
             config=app_config,
+            calibrator=calibrator,
         )
         generations.append(
             GenerationRecord(

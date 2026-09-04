@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import re
 import unicodedata
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -66,6 +67,50 @@ def _provider_nodes(observation: ObservationRecord) -> list[tuple[str, str]]:
         if value:
             nodes.append((ns, value))
     return nodes
+
+
+def candidate_recording_supported(
+    *,
+    contested: bool,
+    member_nodes: Iterable[str],
+    recording_node_sources: Mapping[str, set[str]],
+) -> bool:
+    """Authoritative recording-support test, shared by fusion and calibration reconstruction.
+
+    A candidate's recording (version) identity is *supported* when it is not contested and either
+    at least two of its member nodes are recording-specific ids, or a single recording node is
+    asserted by at least two independent sources.  Computed identically at analyse time (the
+    identity graph) and at fit time (``calibrate.reconstruct``) so the version feature can never
+    differ between the two.
+    """
+
+    if contested:
+        return False
+    nodes = list(member_nodes)
+    recording_nodes = [node for node in nodes if node.split(":", 1)[0] in RECORDING_NAMESPACES]
+    if len(recording_nodes) >= 2:
+        return True
+    return any(len(recording_node_sources.get(node, ())) >= 2 for node in nodes)
+
+
+def recording_node_sources_from_observations(
+    observations: Iterable[ObservationRecord],
+) -> dict[str, set[str]]:
+    """Recompute, from persisted observations, the independent sources for each recording node.
+
+    Mirrors the analyse-time construction inside :func:`build_identity_graph` (final matches only,
+    provider node ids, one ``provider:<name>`` source per node) so that
+    :func:`candidate_recording_supported` sees the same evidence at fit time as at analyse time.
+    """
+
+    sources: dict[str, set[str]] = {}
+    for observation in observations:
+        if not (observation.is_final and observation.status == "match"):
+            continue
+        for ns, value in _provider_nodes(observation):
+            if ns in RECORDING_NAMESPACES:
+                sources.setdefault(f"{ns}:{value}", set()).add(f"provider:{observation.provider}")
+    return sources
 
 
 def _assertion(
@@ -361,19 +406,10 @@ def build_identity_graph(
     recording_supported = frozenset(
         candidate.canonical_id
         for candidate in candidates
-        if not candidate.contested
-        and (
-            len(
-                [
-                    node
-                    for node in candidate.member_nodes
-                    if node.split(":", 1)[0] in RECORDING_NAMESPACES
-                ]
-            )
-            >= 2
-            or any(
-                len(recording_node_sources.get(node, set())) >= 2 for node in candidate.member_nodes
-            )
+        if candidate_recording_supported(
+            contested=candidate.contested,
+            member_nodes=candidate.member_nodes,
+            recording_node_sources=recording_node_sources,
         )
     )
     record = IdentitiesRecord(

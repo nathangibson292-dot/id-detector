@@ -67,6 +67,26 @@ _RECORDING_NAMESPACES = frozenset(
 _DIMENSIONS = ("work", "version", "start", "end", "boundary")
 _CERTIFICATION_TIERS = ("possible", "likely", "verified")
 
+#: The plan certifies only the real-mix strata (strata 1--2: catalogue-covered and reference-pool
+#: real mixes, plus the annotated real-mix subtypes).  This is an **allowlist**: any stratum not
+#: named here -- ``controlled``, self-index, or a future/mislabelled stratum -- is kept out of the
+#: certified population, so a non-real stratum can never leak in and be certified.
+CERTIFICATION_STRATA: frozenset[str] = frozenset(
+    {
+        "catalogue-covered",
+        "reference-pool",
+        "hard-id",
+        "long-blend",
+        "transition-heavy",
+    }
+)
+
+
+def is_certification_stratum(stratum: str) -> bool:
+    """True only for the real-mix strata eligible for the certified population (allowlist)."""
+
+    return stratum.strip().casefold() in CERTIFICATION_STRATA
+
 
 class CertificationTarget(ContractModel):
     profile: str
@@ -1277,9 +1297,7 @@ def score_corpus_detailed(
     test_scores = [
         score
         for score in scores
-        if score.truth.split == "test"
-        and "controlled" not in score.truth.stratum.casefold()
-        and "self-index" not in score.truth.stratum.casefold()
+        if score.truth.split == "test" and is_certification_stratum(score.truth.stratum)
     ]
     registered_targets = {
         (item.dimension, item.tier): item.target_e4

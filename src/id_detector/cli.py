@@ -21,6 +21,9 @@ from id_detector.benchmark.hints import run_hint_gate
 from id_detector.benchmark.scorer import score_corpus
 from id_detector.benchmark.shortlist import run_shortlist
 from id_detector.benchmark.transforms_schedule import run_transform_schedule_benchmark
+from id_detector.calibrate.certify import CorpusNotFrozen, DuplicateTestVersion, run_certify
+from id_detector.calibrate.model import load_calibration
+from id_detector.calibrate.validate import run_calibration_validation
 from id_detector.calibration import calibrate_shazam
 from id_detector.contracts import SourceRecord
 from id_detector.decode import decode
@@ -93,6 +96,7 @@ async def _analyse(
     app_config: AppConfig | None = None,
     max_generations: int = DEFAULT_MAX_GENERATIONS,
     novelty: bool = True,
+    calibrator: object | None = None,
 ) -> int:
     app_config = app_config or AppConfig()
     run_id = uuid.uuid4().hex
@@ -205,6 +209,7 @@ async def _analyse(
             novelty_enabled=novelty,
             gen0_requests=recognised.requests,
             gen0_physical_attempts=recognised.physical_attempts,
+            calibrator=calibrator,
         )
         fused = orchestrated.fusion
         counts.update(
@@ -355,12 +360,17 @@ def analyse(
     ),
 ) -> None:
     """Run the full multi-generation pipeline and export a flattened tracklist."""
+    calibrator = None
     if profile is not None:
         frozen = _load_profile_or_exit(profile)
         loaded_config = profile_app_config(frozen)
         # A frozen profile is the authority on its feature toggles.
         novelty = frozen.novelty_enabled
         no_hints = no_hints or not frozen.hints_enabled
+        # Use calibrated scores/tiers only if a frozen calibration artefact exists for the profile;
+        # otherwise the pipeline stays heuristic (current behaviour). No real-mix calibration model
+        # is committed, so this is heuristic by default until an owner-verified corpus fits one.
+        calibrator = load_calibration(PROJECT_ROOT, frozen.name)
     else:
         loaded_config = _load_app_config(config)
     if no_hints and (tracklist is not None or confirm_mirror):
@@ -384,6 +394,7 @@ def analyse(
                     else loaded_config.rescan_max_generations
                 ),
                 novelty=novelty,
+                calibrator=calibrator,
             )
         )
     except KeyboardInterrupt:
@@ -842,6 +853,87 @@ def benchmark_freeze_profiles(
             f"hints={str(profile.hints_enabled).lower()}(certified=false); "
             f"-> {result.written[name]}"
         )
+
+
+@benchmark_app.command("certify")
+def benchmark_certify(
+    corpus: Annotated[
+        str, typer.Option("--corpus", help="Frozen corpus version under data/corpus.")
+    ],
+    profile: Annotated[str, typer.Option("--profile", help="Frozen profile name.")],
+    test_version: Annotated[
+        str, typer.Option("--test-version", help="Immutable test-set version identifier.")
+    ],
+    out: Annotated[
+        Path | None,
+        typer.Option("--out", help="Certification report JSON (default under data/local)."),
+    ] = None,
+    work_root: Annotated[Path, typer.Option("--work-root")] = Path("data/local/work-certify"),
+) -> None:
+    """Evaluate one frozen test version once and write the pre-registered certification report."""
+
+    try:
+        result = asyncio.run(
+            run_certify(
+                corpus_version=corpus,
+                profile=profile,
+                test_version=test_version,
+                project_root=PROJECT_ROOT,
+                work_root=work_root,
+                out_path=out,
+            )
+        )
+    except KeyboardInterrupt:
+        raise typer.Exit(130) from None
+    except (CorpusNotFrozen, DuplicateTestVersion) as exc:
+        typer.echo(redact_text(str(exc)), err=True)
+        raise typer.Exit(2) from None
+    except (ValueError, RuntimeError, OSError, json.JSONDecodeError) as exc:
+        typer.echo(redact_text(str(exc)), err=True)
+        raise typer.Exit(1) from None
+    typer.echo(
+        f"certified corpus={corpus} profile={profile} test_version={test_version}; "
+        f"certified_triples={result.n_certified}; n_test_predictions={result.n_test_predictions}; "
+        f"report={result.report_path}"
+    )
+
+
+@benchmark_app.command("calibration-validate")
+def benchmark_calibration_validate(
+    corpus: Annotated[str, typer.Option("--corpus", help="Frozen controlled corpus version.")],
+    out: Annotated[
+        Path | None,
+        typer.Option("--out", help="Validation report JSON (default under data/corpus)."),
+    ] = None,
+    work_root: Annotated[Path, typer.Option("--work-root")] = Path(
+        "data/local/work-calibration-validate"
+    ),
+    seed: Annotated[int, typer.Option("--seed", min=0)] = 20_260_904,
+) -> None:
+    """Fit and validate the calibration machinery on a controlled corpus (not certification)."""
+
+    try:
+        result = asyncio.run(
+            run_calibration_validation(
+                corpus_version=corpus,
+                project_root=PROJECT_ROOT,
+                work_root=work_root,
+                split_seed=seed,
+                out_path=out,
+            )
+        )
+    except KeyboardInterrupt:
+        raise typer.Exit(130) from None
+    except (ValueError, RuntimeError, OSError, json.JSONDecodeError) as exc:
+        typer.echo(redact_text(str(exc)), err=True)
+        raise typer.Exit(1) from None
+    certified = sum(entry.status == "certified" for entry in result.record.certification)
+    typer.echo(
+        f"validated calibration machinery on {corpus} "
+        f"({result.n_calibration_sets} calibration sets, {result.n_test_sets} test sets); "
+        f"certified_triples={certified} (controlled -- not real-mix certification); "
+        f"model={result.model_path}; report={result.validation_path}"
+    )
 
 
 @benchmark_app.command("shortlist")

@@ -1094,6 +1094,192 @@ class ProfileRecord(Record):
     notes: list[str]
 
 
+# --------------------------------------------------------------------------------------------------
+# Stage 5 — calibration & test
+# --------------------------------------------------------------------------------------------------
+TierLabel = Literal["unclear", "possible", "likely", "verified"]
+CalibrationDimensionName = Literal["work", "version", "boundary"]
+CalibrationSideName = Literal["start", "end"]
+
+
+class CalibrationFeatures(Record):
+    """Deterministic, integer/fixed-point features of one episode used by the calibrator.
+
+    Every value is an integer, a boolean, or a fixed enum so a fitted calibrator re-derives
+    byte-for-byte from the evidence.  ``median_score_raw`` is nullable because most clip
+    recognizers (Shazam, the controlled oracle) never emit a per-window score.
+    """
+
+    episode_id: Sha1
+    candidate_id: Sha1
+    # Evidence strength (the plan's ``T`` and ``S``).
+    t_ind_e4: NonNegativeInt
+    n_logical_trials: NonNegativeInt
+    n_selected_observations: NonNegativeInt
+    span_ms: NonNegativeInt
+    support_total_ms: NonNegativeInt
+    # Alignment residuals and segment count.
+    n_alignment_segments: NonNegativeInt
+    max_residual_ms: NonNegativeInt
+    n_alignment_events: NonNegativeInt
+    has_global_alignment: bool
+    # Engine agreement discounted by the correlation prior.
+    n_providers: NonNegativeInt
+    engine_agreement_e4: ConfidenceE4
+    # Transform consistency and provider score.
+    transform_consistency_e4: ConfidenceE4
+    n_score_raw: NonNegativeInt
+    median_score_raw: int | None
+    # One vote per ``provenance_group`` from supporting hints.
+    n_provenance_groups: NonNegativeInt
+    hint_vote_e4: ConfidenceE4
+    # Contradictions, identity conflicts and version agreement.
+    competing: bool
+    n_competing_candidates: NonNegativeInt
+    identity_conflicts: NonNegativeInt
+    contested: bool
+    recording_supported: bool
+    version_ids_count: NonNegativeInt
+    claim: Literal["performed", "component_evidence"]
+    heuristic_work_tier: TierLabel
+    heuristic_version_tier: TierLabel
+    heuristic_boundary_tier: TierLabel
+
+
+class CalibrationBin(ContractModel):
+    """One step of a monotone (pool-adjacent-violators) isotonic step function.
+
+    For an ordering index ``x`` the calibrated precision is the ``calibrated_e4`` of the last bin
+    whose ``index_ge <= x`` (``0`` below the first bin).  Values are non-decreasing by construction.
+    """
+
+    index_ge: int
+    calibrated_e4: ConfidenceE4
+    n: NonNegativeInt
+
+
+class CalibrationTierThreshold(ContractModel):
+    tier: Literal["possible", "likely", "verified"]
+    target_e4: ConfidenceE4
+    # ``null`` when no ordering index on the calibration split reaches the target precision.
+    min_index: int | None
+    achieved_precision_e4: ConfidenceE4 | None
+
+
+class CalibrationDimensionModel(ContractModel):
+    dimension: CalibrationDimensionName
+    index_formula: str
+    isotonic: list[CalibrationBin]
+    tier_thresholds: list[CalibrationTierThreshold]
+    n: NonNegativeInt
+    n_positive: NonNegativeInt
+
+
+class CalibrationIntervalModel(ContractModel):
+    """Empirical prediction interval for a proved bound, learned on the calibration split.
+
+    The offsets are quantiles of ``(true boundary - proved bound)`` in milliseconds; applying them
+    to a new episode's proved bound gives ``[proved + q_lo_ms, proved + q_hi_ms]``.
+    """
+
+    side: CalibrationSideName
+    q_lo_ms: int
+    q_hi_ms: int
+    coverage_target_e4: ConfidenceE4
+    achieved_coverage_e4: ConfidenceE4
+    method: str
+    n: NonNegativeInt
+
+
+class CalibrationCertEntry(ContractModel):
+    dimension: Literal["work", "version", "start", "end", "boundary"]
+    tier: Literal["possible", "likely", "verified"]
+    status: Literal["certified", "provisional"]
+    n_test_predictions: NonNegativeInt
+    lower_bound_e4: ConfidenceE4
+    test_version: str
+
+
+class CalibrationProvenance(ContractModel):
+    corpus_version: str
+    population: str
+    split_seed: NonNegativeInt
+    calibration_set_ids: list[str]
+    method: str
+
+
+class CalibrationModelRecord(Record):
+    """A frozen, immutable, versioned score/tier/PI calibrator for one ``(profile, dimension)`` set.
+
+    ``population`` names what the calibrator was fit on; a calibrator fit on the controlled corpus
+    carries the controlled label and is machinery validation only, never real-mix certification.
+    """
+
+    id: Sha1
+    profile: str
+    version: str
+    frozen: bool
+    corpus_version: str
+    config_hash: Sha256
+    population: str
+    method: str
+    n_calibration_sets: NonNegativeInt
+    n_calibration_predictions: NonNegativeInt
+    feature_names: list[str]
+    dimensions: list[CalibrationDimensionModel]
+    intervals: list[CalibrationIntervalModel]
+    certification: list[CalibrationCertEntry]
+    frozen_from: CalibrationProvenance
+    notes: list[str]
+
+
+class CalibrationValidationSet(ContractModel):
+    set_id: str
+    split: str
+    n_episodes: NonNegativeInt
+
+
+class CalibrationValidationTier(ContractModel):
+    dimension: Literal["work", "version", "start", "end", "boundary"]
+    tier: Literal["possible", "likely", "verified"]
+    n: NonNegativeInt
+    correct: NonNegativeInt
+    precision_e4: ConfidenceE4
+    cp_lower_e4: ConfidenceE4
+    cluster_lower_e4: ConfidenceE4
+
+
+class CalibrationValidationInterval(ContractModel):
+    side: Literal["start", "end", "boundary"]
+    coverage_e4: ConfidenceE4
+    median_width_ms: NonNegativeInt
+    p90_width_ms: NonNegativeInt
+    winkler_score: NonNegativeInt
+
+
+class CalibrationValidationRecord(Record):
+    """Machinery-validation report for the calibration code path on a controlled corpus.
+
+    ``population`` is fixed to the controlled label: this proves the code path end-to-end, it is not
+    a real-mix certification and certifies no tier.
+    """
+
+    corpus_version: str
+    profile: str
+    config_hash: Sha256
+    population: str
+    calibration_model_ref: Sha256
+    split_seed: NonNegativeInt
+    calibration_sets: list[CalibrationValidationSet]
+    test_sets: list[CalibrationValidationSet]
+    n_calibration_predictions: NonNegativeInt
+    n_test_predictions: NonNegativeInt
+    tiers: list[CalibrationValidationTier]
+    intervals: list[CalibrationValidationInterval]
+    certification: list[CalibrationCertEntry]
+    notes: list[str]
+
+
 SCHEMA_MODELS: dict[str, type[BaseModel]] = {
     "source": SourceRecord,
     "pcm": PcmRecord,
@@ -1118,6 +1304,9 @@ SCHEMA_MODELS: dict[str, type[BaseModel]] = {
     "raw_index_entry": RawIndexEntry,
     "provider_config": ProviderConfigRecord,
     "profile": ProfileRecord,
+    "calibration_features": CalibrationFeatures,
+    "calibration_model": CalibrationModelRecord,
+    "calibration_validation": CalibrationValidationRecord,
 }
 
 
@@ -1152,6 +1341,9 @@ NATURAL_KEY_FIELDS: dict[str, tuple[str, ...]] = {
     "raw_index_entry": ("cache_key",),
     "provider_config": ("provider", "version"),
     "profile": ("name", "version"),
+    "calibration_features": ("episode_id",),
+    "calibration_model": ("profile", "version"),
+    "calibration_validation": ("corpus_version", "profile", "config_hash"),
 }
 
 

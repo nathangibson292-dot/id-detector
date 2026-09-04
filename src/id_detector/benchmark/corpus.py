@@ -196,7 +196,8 @@ async def _run_controlled(
     *,
     project_root: Path,
     work_root: Path,
-) -> tuple[Path, FusionResult, BenchmarkCost]:
+    calibrator: object | None = None,
+) -> tuple[Path, FusionResult, tuple[Any, ...], BenchmarkCost]:
     ingested = await ingest(str(audio), work_root)
     decoded = await decode(ingested)
     _validate_source_media(
@@ -225,6 +226,7 @@ async def _run_controlled(
         windows=windows.records,
         windows_path=windows.record_path,
         pcm_path=decoded.record_path,
+        calibrator=calibrator,
     )
     export_tracklist(
         media_dir=ingested.media_dir,
@@ -238,25 +240,27 @@ async def _run_controlled(
     return (
         ingested.media_dir,
         fused,
+        tuple(recognised.observations),
         BenchmarkCost(requests=0, physical_attempts=0, billable_seconds=0, usd_e2=0, wall_ms=0),
     )
 
 
-async def _run_real(
+def _real_analyse_command(
     source: str,
     *,
-    truth: GroundTruthRecord,
     work_root: Path,
     max_requests: int,
     include_hints: bool,
-) -> tuple[Path, None, BenchmarkCost]:
-    ingested = await ingest(source, work_root)
-    decoded = await decode(ingested)
-    _validate_source_media(
-        truth,
-        media_key=ingested.record.media_key,
-        duration_ms=decoded.record.pcm.duration_ms,
-    )
+    profile: str | None,
+) -> list[str]:
+    """Build the ``analyse`` subprocess command for a real-mix set.
+
+    A ``profile`` is threaded through as ``--profile`` so the real-set predictions are the profile's
+    actual production output: its frozen engine/schedule/transform/toggle geometry *and* any
+    committed calibration model (``analyse`` loads it for the profile).  Certification must never
+    score profile-agnostic heuristic predictions, so this is required, not optional.
+    """
+
     command = [
         sys.executable,
         "-m",
@@ -268,8 +272,36 @@ async def _run_real(
         "--max-requests",
         str(max_requests),
     ]
+    if profile is not None:
+        command.extend(["--profile", profile])
     if not include_hints:
         command.append("--no-hints")
+    return command
+
+
+async def _run_real(
+    source: str,
+    *,
+    truth: GroundTruthRecord,
+    work_root: Path,
+    max_requests: int,
+    include_hints: bool,
+    profile: str | None,
+) -> tuple[Path, None, BenchmarkCost]:
+    ingested = await ingest(source, work_root)
+    decoded = await decode(ingested)
+    _validate_source_media(
+        truth,
+        media_key=ingested.record.media_key,
+        duration_ms=decoded.record.pcm.duration_ms,
+    )
+    command = _real_analyse_command(
+        source,
+        work_root=work_root,
+        max_requests=max_requests,
+        include_hints=include_hints,
+        profile=profile,
+    )
     result = await run_process(
         command,
         timeout=28_800,
@@ -368,6 +400,7 @@ def _scoring_config(
     max_requests: int,
     project_root: Path,
     include_hints: bool = False,
+    certification_targets: list[Any] | None = None,
 ) -> ScoringConfigSnapshot:
     controlled_run = any("controlled" in truth.stratum.casefold() for truth in truths)
     real_run = any("controlled" not in truth.stratum.casefold() for truth in truths)
@@ -429,7 +462,7 @@ def _scoring_config(
         config_version="baseline-fuser-v1",
         profile=profile,
         bootstrap_seed=20_260_904,
-        certification_targets=[],
+        certification_targets=certification_targets or [],
         run_config=run_config,
     )
 
@@ -465,7 +498,7 @@ async def run_corpus(
             audio = audio or _controlled_audio(project_root, truth.set_id)
             if audio is None:
                 raise ValueError(f"local controlled audio is missing for {truth.set_id}")
-            media_dir, fusion, cost = await _run_controlled(
+            media_dir, fusion, _observations, cost = await _run_controlled(
                 truth, audio, project_root=project_root, work_root=work_root
             )
         else:
@@ -482,6 +515,7 @@ async def run_corpus(
                 work_root=work_root,
                 max_requests=max_requests,
                 include_hints=include_hints,
+                profile=profile,
             )
         prediction_sets.append(_prediction_set(truth.set_id, fusion, media_dir))
         costs.append(cost)

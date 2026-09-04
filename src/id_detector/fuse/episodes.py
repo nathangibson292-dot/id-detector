@@ -205,20 +205,36 @@ def _eligible_tracklist_hint(hint: HintRecord) -> bool:
     )
 
 
+def competing_candidate_count(
+    supports: list[tuple[int, int]],
+    candidate_id: str,
+    all_supports: dict[str, list[tuple[int, int]]],
+    duration_ms: int,
+) -> int:
+    """Number of *other* candidates whose evidence support covers >= 50% of ``supports``.
+
+    Shared by the fuser (analyse time) and :mod:`id_detector.calibrate.reconstruct` (fit time) so
+    the ``competing`` flag and the ``n_competing_candidates`` feature are computed identically in
+    both places, from the per-trial selected supports only (rev 5.2).
+    """
+
+    support_length = interval_length(supports, duration_ms)
+    if support_length == 0:
+        return 0
+    return sum(
+        other != candidate_id
+        and _interval_overlap_ms(supports, other_supports, duration_ms) * 2 >= support_length
+        for other, other_supports in all_supports.items()
+    )
+
+
 def _competition(
     supports: list[tuple[int, int]],
     candidate_id: str,
     all_supports: dict[str, list[tuple[int, int]]],
     duration_ms: int,
 ) -> bool:
-    support_length = interval_length(supports, duration_ms)
-    if support_length == 0:
-        return False
-    return any(
-        other != candidate_id
-        and _interval_overlap_ms(supports, other_supports, duration_ms) * 2 >= support_length
-        for other, other_supports in all_supports.items()
-    )
+    return competing_candidate_count(supports, candidate_id, all_supports, duration_ms) > 0
 
 
 def _assign_observations(
@@ -364,7 +380,22 @@ def _role_segments(episodes: list[dict[str, Any]]) -> list[list[RoleSegment]]:
     return roles
 
 
-def _certification(profile: str) -> CertificationBlock:
+def _certification(profile: str, calibrator: Any | None = None) -> CertificationBlock:
+    if calibrator is not None:
+        return CertificationBlock(
+            profile=profile,
+            per=[
+                CertificationEntry(
+                    dimension=entry.dimension,
+                    tier=entry.tier,
+                    status=entry.status,
+                    n_test_predictions=entry.n_test_predictions,
+                    lower_bound_e4=entry.lower_bound_e4,
+                    test_version=entry.test_version,
+                )
+                for entry in calibrator.model.certification
+            ],
+        )
     return CertificationBlock(
         profile=profile,
         per=[
@@ -397,6 +428,7 @@ def build_episodes(
     prior_request_keys: frozenset[str] | set[str] | None = None,
     scanned_window_shapes: frozenset[tuple[int, int]] | None = None,
     config: AppConfig | None = None,
+    calibrator: Any | None = None,
 ) -> tuple[EpisodesFile, list[RescanRequestRecord]]:
     final = [item for item in observations if item.is_final]
     selection = select_logical_trial_points(final, identity.observation_candidates)
@@ -437,7 +469,10 @@ def build_episodes(
                 bool({hint.provenance_group for hint in supporting_hints})
             )
             span = supports[-1][1] - supports[0][0]
-            competing = _competition(supports, candidate_id, all_supports, duration_ms)
+            n_competing = competing_candidate_count(
+                supports, candidate_id, all_supports, duration_ms
+            )
+            competing = n_competing > 0
             has_global = alignment.has_global_alignment if alignment is not None else False
             if (
                 independent_trials_e4 >= 4 * FULL_TRIAL_E4
@@ -463,11 +498,10 @@ def build_episodes(
             else:
                 work_tier = "unclear"
             candidate = candidate_by_id[candidate_id]
-            version_tier = (
-                audio_work_tier
-                if candidate_id in identity.recording_supported and not candidate.contested
-                else "unclear"
+            recording_supported = (
+                candidate_id in identity.recording_supported and not candidate.contested
             )
+            version_tier = audio_work_tier if recording_supported else "unclear"
             boundary_tier = "possible" if has_global else "unclear"
             claim = (
                 "performed"
@@ -512,6 +546,13 @@ def build_episodes(
                     "supports": supports,
                     "outer_hull": (supports[0][0], supports[-1][1]),
                     "trials_in": trials_in,
+                    "competing": competing,
+                    "n_competing": n_competing,
+                    "recording_supported": recording_supported,
+                    "version_ids_count": sum(
+                        node.split(":", 1)[0] in RECORDING_NAMESPACES
+                        for node in candidate.member_nodes
+                    ),
                     "claim": claim,
                     "start_bound": start_bound,
                     "end_bound": end_bound,
@@ -542,6 +583,58 @@ def build_episodes(
         work_tier = item["work_tier"]
         version_tier = item["version_tier"]
         boundary_tier = item["boundary_tier"]
+        scores = {
+            "work": _tier_score(work_tier),
+            "version": _tier_score(version_tier),
+            "boundary": _tier_score(boundary_tier),
+        }
+        score_kind = "heuristic"
+        start_pi = None
+        end_pi = None
+        best_start_ms = item["start_bound"]
+        best_end_ms = item["end_bound"]
+        if calibrator is not None:
+            calibration = calibrator.apply_episode(
+                episode_id=item["id"],
+                candidate_id=item["candidate_id"],
+                votes=tuple(item["votes"]),
+                supporting_hints=tuple(item["supporting_hints"]),
+                n_alignment_segments=len(alignment.segments) if alignment is not None else 0,
+                max_residual_ms=(
+                    max((segment.residual_ms for segment in alignment.segments), default=0)
+                    if alignment is not None
+                    else 0
+                ),
+                n_alignment_events=len(alignment.episode_events) if alignment is not None else 0,
+                has_global_alignment=item["has_global"],
+                span_ms=item["outer_hull"][1] - item["outer_hull"][0],
+                support_total_ms=interval_length(item["supports"], duration_ms),
+                competing=item["competing"],
+                n_competing_candidates=item["n_competing"],
+                identity_conflicts=len(item["candidate"].conflicts),
+                contested=item["candidate"].contested,
+                recording_supported=item["recording_supported"],
+                version_ids_count=item["version_ids_count"],
+                claim=item["claim"],
+                heuristic_work_tier=work_tier,
+                heuristic_version_tier=version_tier,
+                heuristic_boundary_tier=boundary_tier,
+                start_proved_ms=item["start_bound"],
+                end_proved_ms=item["end_bound"],
+            )
+            score_kind = "calibrated"
+            work_tier = calibration.tiers.work
+            version_tier = calibration.tiers.version
+            boundary_tier = calibration.tiers.boundary
+            scores = {
+                "work": calibration.scores.work,
+                "version": calibration.scores.version,
+                "boundary": calibration.scores.boundary,
+            }
+            start_pi = calibration.start_pi
+            end_pi = calibration.end_pi
+            best_start_ms = calibration.best_start_ms
+            best_end_ms = calibration.best_end_ms
         episode_records.append(
             EpisodeRecord(
                 schema_version=SCHEMA_VERSION,
@@ -555,10 +648,10 @@ def build_episodes(
                 evidence_support_ms=item["supports"],
                 start_no_earlier_than_ms=item["start_censored"],
                 end_no_later_than_ms=item["end_censored"],
-                start_pi=None,
-                end_pi=None,
-                best_start_ms=item["start_bound"],
-                best_end_ms=item["end_bound"],
+                start_pi=start_pi,
+                end_pi=end_pi,
+                best_start_ms=best_start_ms,
+                best_end_ms=best_end_ms,
                 role_segments=roles[index],
                 occurrence_index=item["occurrence_index"],
                 overlaps=sorted(overlaps[index]),
@@ -569,12 +662,8 @@ def build_episodes(
                 ),
                 alignment_events=(alignment.episode_events if alignment is not None else []),
                 has_global_alignment=item["has_global"],
-                scores={
-                    "work": _tier_score(work_tier),
-                    "version": _tier_score(version_tier),
-                    "boundary": _tier_score(boundary_tier),
-                },
-                score_kind="heuristic",
+                scores=scores,
+                score_kind=score_kind,
                 tiers={
                     "work": work_tier,
                     "version": version_tier,
@@ -668,7 +757,7 @@ def build_episodes(
             generated_by=GENERATED_BY,
             **duration_values,
         ),
-        certification=_certification(profile),
+        certification=_certification(profile, calibrator),
     )
     input_hashes: dict[str, str] = {}
     requests: list[RescanRequestRecord] = []
@@ -824,6 +913,7 @@ def fuse_generation(
     prior_request_keys: frozenset[str] | set[str] | None = None,
     scanned_window_shapes: frozenset[tuple[int, int]] | None = None,
     config: AppConfig | None = None,
+    calibrator: Any | None = None,
     write_final: bool = True,
 ) -> FusionResult:
     """Fuse the union of every generation's evidence and publish generation ``N``'s artefacts.
@@ -854,6 +944,7 @@ def fuse_generation(
         prior_request_keys=prior_request_keys,
         scanned_window_shapes=scanned_window_shapes,
         config=config,
+        calibrator=calibrator,
     )
     generation_path = media_dir / "fuse" / f"episodes.gen{generation}.json"
     upstream = {
@@ -912,6 +1003,7 @@ def fuse_generation_zero(
     rescan_transforms: tuple[Transform, ...] | list[Transform] | None = None,
     novelty_change_points_ms: tuple[int, ...] | list[int] = (),
     config: AppConfig | None = None,
+    calibrator: Any | None = None,
     write_final: bool = True,
 ) -> FusionResult:
     """Generation-0 convenience wrapper used by the single-generation callers."""
@@ -932,5 +1024,6 @@ def fuse_generation_zero(
         rescan_transforms=rescan_transforms,
         novelty_change_points_ms=novelty_change_points_ms,
         config=config,
+        calibrator=calibrator,
         write_final=write_final,
     )

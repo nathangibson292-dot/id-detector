@@ -36,3 +36,17 @@ hop_ms = 5000
 phase_ms = 0
 # Generations after generation 0; 0 disables rescans. --max-generations overrides this.
 max_generations = 3
+
+# --------------------------------------------------------------------------------------------------
+# Stage 5 -- calibration & test (no TOML keys; commands only)
+# --------------------------------------------------------------------------------------------------
+# Scores/tiers are HEURISTIC unless a frozen calibration model exists for the selected profile at
+# calibration/<profile>-v<K>.json. None is committed for `free`/`max_accuracy` (no owner-verified
+# real-mix calibration corpus exists), so `analyse --profile <name>` stays heuristic and every
+# real-mix tier stays provisional. To exercise the machinery on the controlled corpus, and to run a
+# single frozen-test certification (real-mix tiers stay provisional with n_test_predictions 0):
+#
+#   id-detector benchmark calibration-validate --corpus controlled-synth-1
+#   id-detector benchmark certify --corpus <frozen-corpus> --profile <name> --test-version <v>
+#
+# `certify` refuses an unfrozen corpus and refuses to reuse a (profile, test_version) pair.
