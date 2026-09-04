@@ -82,6 +82,7 @@ class AppConfig:
     default_profile: str | None = None
     max_requests: int = DEFAULT_MAX_REQUESTS
     lead_in_ms: int = DEFAULT_LEAD_IN_MS
+    collapse: bool = True
     cache_positive_max_age_days: int = DEFAULT_CACHE_POSITIVE_MAX_AGE_DAYS
     cache_no_match_max_age_days: int = DEFAULT_CACHE_NO_MATCH_MAX_AGE_DAYS
     hints_enabled: bool = True
@@ -109,6 +110,7 @@ class AppConfig:
         rescan = payload.get("rescan", {})
         cache = payload.get("cache", {})
         hints = payload.get("hints", {})
+        present = payload.get("present", {})
         if not isinstance(transforms, dict):
             raise ValueError("transforms must be a TOML table")
         if not isinstance(schedule, dict):
@@ -119,6 +121,8 @@ class AppConfig:
             raise ValueError("cache must be a TOML table")
         if not isinstance(hints, dict):
             raise ValueError("hints must be a TOML table")
+        if not isinstance(present, dict):
+            raise ValueError("present must be a TOML table")
         policy = transforms.get("policy", "rescan_only")
         if policy not in {"off", "rescan_only", "global"}:
             raise ValueError("transforms.policy must be off, rescan_only, or global")
@@ -164,6 +168,9 @@ class AppConfig:
         lead_in_ms = payload.get("lead_in_ms", DEFAULT_LEAD_IN_MS)
         if isinstance(lead_in_ms, bool) or not isinstance(lead_in_ms, int) or lead_in_ms < 0:
             raise ValueError("lead_in_ms must be a non-negative integer")
+        collapse = present.get("collapse", True)
+        if not isinstance(collapse, bool):
+            raise ValueError("present.collapse must be true or false")
         positive_days = _positive_integer(
             cache.get("positive_max_age_days", DEFAULT_CACHE_POSITIVE_MAX_AGE_DAYS),
             "cache",
@@ -190,6 +197,7 @@ class AppConfig:
             default_profile=default_profile,
             max_requests=max_requests,
             lead_in_ms=lead_in_ms,
+            collapse=collapse,
             cache_positive_max_age_days=positive_days,
             cache_no_match_max_age_days=no_match_days,
             hints_enabled=hints_enabled,

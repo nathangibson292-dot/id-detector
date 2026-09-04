@@ -483,6 +483,7 @@ async def _analyse(
             identities_path=fused.identities_path,
             title=ingested.record.title,
             media_target=ingested.record.canonical_url,
+            collapse=app_config.collapse,
         )
         generate_page(
             media_dir=media_dir,
@@ -493,6 +494,7 @@ async def _analyse(
             episodes_path=fused.final_path,
             identities_path=fused.identities_path,
             lead_in_ms=app_config.lead_in_ms,
+            collapse=app_config.collapse,
         )
         timer.finish_stage("export_ms")
         _report(progress, "present", 1, 1, "result page ready")
@@ -627,6 +629,14 @@ def analyse(
         "--novelty/--no-novelty",
         help="Compute local spectral-novelty change points as rescan triggers.",
     ),
+    collapse: bool | None = typer.Option(
+        None,
+        "--collapse/--no-collapse",
+        help=(
+            "Collapse a contiguous run of competing near-duplicate matches of the same underlying "
+            "track into one row with 'could also be' alternatives (default: present.collapse, on)."
+        ),
+    ),
 ) -> None:
     """Run the full multi-generation pipeline and export a flattened tracklist."""
     calibrator = None
@@ -660,6 +670,8 @@ def analyse(
         calibrator = load_calibration(PROJECT_ROOT, frozen.name)
     else:
         loaded_config = file_config
+    if collapse is not None:
+        loaded_config = replace(loaded_config, collapse=collapse)
     if max_requests < 0:
         max_requests = loaded_config.max_requests
     if no_hints and (tracklist is not None or confirm_mirror):
@@ -746,6 +758,7 @@ async def _acquire(
         acquire_path=result.path,
         title=cached.record.title,
         media_target=cached.record.canonical_url,
+        collapse=acquire_config.collapse,
     )
     generate_page(
         media_dir=media_dir,
@@ -758,6 +771,7 @@ async def _acquire(
         acquire=result.record,
         acquire_path=result.path,
         lead_in_ms=acquire_config.lead_in_ms,
+        collapse=acquire_config.collapse,
     )
     _report(progress, "present", 1, 1, "result page updated")
     typer.echo(

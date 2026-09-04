@@ -241,6 +241,7 @@ def test_page_seek_lands_within_one_second_of_target(platform: str) -> None:
         episodes=episodes,
         identities=_identities(),
         duration_ms=DURATION_MS,
+        collapse=False,
     )
     config = _config(page)
     lead_in = config["leadInMs"]
@@ -284,6 +285,7 @@ def test_playhead_markup_and_hooks_present(platform: str) -> None:
         episodes=episodes,
         identities=_identities(),
         duration_ms=DURATION_MS,
+        collapse=False,
     )
     # Playhead element (starts hidden) and its shared arithmetic + time label.
     assert '<div class="playhead" id="playhead" hidden' in page
@@ -315,6 +317,7 @@ def test_page_is_parseable_and_lists_every_episode_id() -> None:
         episodes=episodes,
         identities=_identities(),
         duration_ms=DURATION_MS,
+        collapse=False,
     )
     validator = _Validator()
     validator.feed(page)
@@ -378,7 +381,7 @@ def test_cue_export_flattens_with_role_precedence(tmp_path: Path) -> None:
     from id_detector.present.exports import flatten_tracklist
 
     episodes = _episodes_file()
-    entries = flatten_tracklist(episodes, _identities())
+    entries = flatten_tracklist(episodes, _identities(), collapse=False)
     cue = render_cue(entries, title="Fixture Live Set")
     assert cue.startswith('TITLE "Fixture Live Set"')
     assert 'FILE "audio" WAVE' in cue

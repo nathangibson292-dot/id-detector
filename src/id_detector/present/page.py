@@ -299,6 +299,28 @@ def _acquire_links_html(acquire: dict[str, Any] | None) -> str:
     return "".join(chips) if chips else '<span class="acq none">—</span>'
 
 
+def _alternatives_html(entry: dict[str, Any]) -> str:
+    """A native ``<details>`` disclosure listing the collapsed "could also be" alternatives.
+
+    Everything is inline — the list is already in the page, so expanding it makes no request.
+    """
+
+    alternatives = entry.get("alternatives") or ()
+    count = entry.get("also_count") or 0
+    if not count:
+        return ""
+    items = "".join(
+        f'<li><span class="alt-badge badge-{_esc(alt["badge"])}">'
+        f"{_esc(str(alt['badge']).upper())}</span> {_esc(alt['track'])}</li>"
+        for alt in alternatives
+    )
+    plural = "s" if count != 1 else ""
+    return (
+        f'<details class="alts"><summary>▸ {count} other version{plural}</summary>'
+        f'<ul class="altlist">{items}</ul></details>'
+    )
+
+
 def _track_row_html(entry: dict[str, Any], platform: str) -> str:
     badge = _esc(entry["badge"]).upper()
     version_status = _esc(entry["version_status"])
@@ -311,6 +333,7 @@ def _track_row_html(entry: dict[str, Any], platform: str) -> str:
     )
     acquire = _acquire_links_html(entry.get("acquire"))
     best_start = int(entry["start_ms"])
+    alternatives = _alternatives_html(entry)
     return (
         f'<tr class="track" data-episode-id="{_esc(entry["episode_id"])}" '
         f'data-best-start-ms="{best_start}" tabindex="0" role="button" '
@@ -319,7 +342,7 @@ def _track_row_html(entry: dict[str, Any], platform: str) -> str:
         f'<td class="badge badge-{_esc(entry["badge"])}">{badge}</td>'
         f'<td class="ver ver-{version_status}">{version_status}</td>'
         f'<td class="role">{role}</td>'
-        f'<td class="label">{label}{hint}</td>'
+        f'<td class="label">{label}{hint}{alternatives}</td>'
         f'<td class="acquire">{acquire}</td>'
         f'<td class="ops"><button type="button" class="rescan" '
         f'data-trigger="edge" data-start-ms="{best_start}" '
@@ -483,6 +506,13 @@ tr.gap{color:var(--muted)}
 .ver{font-size:12px}.ver-verified{color:#1f7a4d}.ver-contested{color:#b23b3b}
 .role{font-size:12px;color:var(--muted)}
 .hint{font-size:10px;background:var(--accent);color:#fff;border-radius:4px;padding:1px 4px}
+.alts{margin-top:3px;font-size:12px}
+.alts>summary{cursor:pointer;color:var(--muted);list-style:none;display:inline-block}
+.alts>summary::-webkit-details-marker{display:none}
+.alts[open]>summary{color:var(--accent)}
+.altlist{margin:4px 0 2px;padding-left:14px;color:var(--muted)}
+.altlist li{margin:1px 0}
+.alt-badge{font-weight:700;font-size:10px;margin-right:4px}
 .acq{display:inline-block;margin:0 4px 2px 0;font-size:12px;text-decoration:none;
 border:1px solid var(--line);border-radius:5px;padding:1px 6px;color:var(--accent)}
 .acq.free{border-color:var(--solid);color:var(--solid)}.acq.buy,.acq.gate{border-color:#b8860b;
@@ -503,12 +533,36 @@ def render_page(
     duration_ms: int,
     acquire: AcquireFile | None = None,
     lead_in_ms: int = DEFAULT_LEAD_IN_MS,
+    collapse: bool = True,
 ) -> str:
-    """Render the complete self-contained HTML page as a string."""
+    """Render the complete self-contained HTML page as a string.
+
+    With ``collapse`` (the default), a contiguous run of competing near-duplicate matches of the
+    same underlying track collapses to one display-track row (with a "▸ N other versions"
+    disclosure); the timeline lane, the current-row highlight and the seek all use that display
+    track's primary.  ``collapse=False`` restores the one-lane-per-episode view.
+    """
 
     embed = plan_embed(source)
-    entries = flatten_tracklist(episodes, identities, acquire)
+    entries = flatten_tracklist(episodes, identities, acquire, collapse=collapse)
     boundaries = _evidence_boundaries(list(episodes.episodes))
+
+    # A display track is one collapsed row (primary + folded-in alternatives); ungrouped, it is one
+    # episode.  Lanes, the highlight partition and the row all key off the primary's id so the
+    # Stage 11 playhead lights the same row + lane as the tracklist.
+    if collapse:
+        from id_detector.present.grouping import group_display_tracks
+
+        display_tracks = group_display_tracks(list(episodes.episodes), identities, duration_ms)
+        lane_episodes = [track.primary for track in display_tracks]
+        span_items = [(track.primary.id, track.start_ms, track.end_ms) for track in display_tracks]
+    else:
+        lane_episodes = list(episodes.episodes)
+        span_items = [
+            (episode.id, episode.best_start_ms, episode.best_end_ms)
+            for episode in episodes.episodes
+        ]
+
     lanes = [
         _timeline_lane(
             episode,
@@ -516,23 +570,22 @@ def render_page(
             boundaries,
             duration_ms,
         )
-        for episode in episodes.episodes
+        for episode in lane_episodes
     ]
     gap_markers = [_gap_marker(gap, duration_ms) for gap in episodes.gaps]
 
-    # Playhead → current-track partition: each episode owns time from its ``best_start_ms`` up to
-    # the next episode's start (the plan's ``[best_start_ms, next episode start)`` interval); the
-    # last episode owns the tail of the set.  The page uses these spans to add ``.current`` to the
-    # row and timeline lane whose interval contains the live player position.
-    ordered = sorted(episodes.episodes, key=lambda ep: (ep.best_start_ms, ep.id))
+    # Playhead → current-track partition: each display track owns time from its start up to the
+    # next display track's start (the plan's ``[start, next start)`` interval); the last one owns
+    # the tail of the set.  The page uses these spans to add ``.current`` to the row and timeline
+    # lane whose interval contains the live player position.
+    ordered = sorted(span_items, key=lambda item: (item[1], item[0]))
     episode_spans: list[dict[str, Any]] = []
-    for index, episode in enumerate(ordered):
-        start = episode.best_start_ms
-        following = [ep.best_start_ms for ep in ordered[index + 1 :] if ep.best_start_ms > start]
-        end = following[0] if following else max(episode.best_end_ms, duration_ms)
+    for index, (track_id, start, end_fallback) in enumerate(ordered):
+        following = [other[1] for other in ordered[index + 1 :] if other[1] > start]
+        end = following[0] if following else max(end_fallback, duration_ms)
         if end <= start:
-            end = max(episode.best_end_ms, start + 1)
-        episode_spans.append({"id": episode.id, "start": start, "end": end})
+            end = max(end_fallback, start + 1)
+        episode_spans.append({"id": track_id, "start": start, "end": end})
 
     rows: list[str] = []
     for entry in entries:
@@ -717,7 +770,8 @@ ready(function(){{
       const ms = parseInt(row.getAttribute('data-best-start-ms'), 10) || 0;
       if(!seekToMs(ms)){{ toast('Player not ready — open the set link'); }}
     }}
-    row.addEventListener('click', function(e){{ if(e.target.closest('a,button')) return; go(); }});
+    row.addEventListener('click', function(e){{
+      if(e.target.closest('a,button,details,summary')) return; go(); }});
     row.addEventListener('keydown', function(e){{
       if(e.key==='Enter' || e.key===' '){{ e.preventDefault(); go(); }} }});
   }});
@@ -760,6 +814,7 @@ def generate_page(
     acquire: AcquireFile | None = None,
     acquire_path: Path | None = None,
     lead_in_ms: int = DEFAULT_LEAD_IN_MS,
+    collapse: bool = True,
 ) -> Path:
     """Render and atomically write ``present/index.html`` with a completion sidecar."""
 
@@ -770,6 +825,7 @@ def generate_page(
         duration_ms=duration_ms,
         acquire=acquire,
         lead_in_ms=lead_in_ms,
+        collapse=collapse,
     )
     index_path = media_dir / "present" / "index.html"
     atomic_write_bytes(index_path, html_text.encode("utf-8"))

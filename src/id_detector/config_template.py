@@ -80,6 +80,14 @@ yt_comments = true
 mixcloud = true
 tl1001 = true
 pointer_import = true
+
+# Presentation.  collapse = true (the default, or --collapse) folds a contiguous run of competing
+# near-duplicate matches of the same underlying track (e.g. six "Work (X Remix)" rows) into ONE
+# tracklist / page row whose closest match is shown, with the other candidates listed as "could
+# also be" alternatives.  collapse = false (or --no-collapse) emits the old one-row-per-episode
+# view.
+[present]
+collapse = true
 """.replace("{connectors}", ", ".join(HINT_CONNECTORS))
 
 
@@ -126,4 +134,5 @@ def render_effective_config(config: AppConfig) -> str:
     ]
     for connector in HINT_CONNECTORS:
         lines.append(f"{connector} = {str(connector not in disabled).lower()}")
+    lines.extend(["", "[present]", f"collapse = {str(config.collapse).lower()}"])
     return "\n".join(lines) + "\n"

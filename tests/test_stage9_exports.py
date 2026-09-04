@@ -171,7 +171,9 @@ def test_flatten_populates_overlap_labels_and_export_writes_cue_and_m3u(tmp_path
     episodes = _overlapping_episodes_file()
     identities = _identities()
     _seed_upstream(tmp_path, episodes, identities)
-    entries = flatten_tracklist(episodes, identities)
+    # This case pins the ungrouped one-row-per-episode view (overlap/layer REM lines); the
+    # display-layer collapse is exercised separately in tests/test_collapse.py.
+    entries = flatten_tracklist(episodes, identities, collapse=False)
     tracks = [entry for entry in entries if entry["kind"] == "track"]
     assert len(tracks) == 2
     # Each overlapping episode names the other on its overlap_labels, and both are layer role.
@@ -188,6 +190,7 @@ def test_flatten_populates_overlap_labels_and_export_writes_cue_and_m3u(tmp_path
         identities_path=tmp_path / "fuse" / "identities.gen0.json",
         title="Overlap Set",
         media_target="https://example.invalid/set",
+        collapse=False,
     )
     cue = (tmp_path / "present" / "tracklist.cue").read_text(encoding="utf-8")
     m3u = (tmp_path / "present" / "tracklist.m3u").read_text(encoding="utf-8")

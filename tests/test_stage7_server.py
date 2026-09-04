@@ -48,6 +48,8 @@ def _seed_work_root(root: Path, source: SourceRecord) -> Path:
         duration_ms=3_600_000,
         episodes_path=episodes_path,
         identities_path=identities_path,
+        # This server fixture pins one served row per episode; collapse is covered in test_collapse.
+        collapse=False,
     )
     return media_dir
 

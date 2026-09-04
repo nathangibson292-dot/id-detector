@@ -6,7 +6,13 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from id_detector.contracts import AcquireEpisode, AcquireFile, EpisodesFile, IdentitiesRecord
+from id_detector.contracts import (
+    AcquireEpisode,
+    AcquireFile,
+    EpisodeRecord,
+    EpisodesFile,
+    IdentitiesRecord,
+)
 from id_detector.io import atomic_write_bytes, atomic_write_json, write_completion_sidecar
 
 _ROLE_PRECEDENCE = {
@@ -70,6 +76,20 @@ def _candidate_label(identities: IdentitiesRecord, candidate_id: str) -> tuple[s
     return tuple(label.split(" - ", 1))  # type: ignore[return-value]
 
 
+def _display_start(episode: EpisodeRecord) -> int:
+    """Role-aware row placement: an ``incoming`` episode starts at ``best_start_ms`` (its mix-in),
+    any other primary role starts at that role segment's ``from_ms``."""
+
+    primary = min(
+        episode.role_segments,
+        key=lambda item: (_ROLE_PRECEDENCE[item.role], item.from_ms, item.to_ms),
+        default=None,
+    )
+    if primary is None or primary.role == "incoming":
+        return episode.best_start_ms
+    return primary.from_ms
+
+
 def _acquire_summary(episode: AcquireEpisode) -> dict[str, Any]:
     classification = episode.soundcloud.classification if episode.soundcloud else "none"
     free_download = classification == "free_download_native"
@@ -87,12 +107,78 @@ def _acquire_summary(episode: AcquireEpisode) -> dict[str, Any]:
     }
 
 
+def _track_entry(
+    episode: EpisodeRecord,
+    identities: IdentitiesRecord,
+    acquire_by_episode: dict[str, AcquireEpisode],
+    label_by_episode: dict[str, str],
+) -> dict[str, Any]:
+    """The one-episode tracklist row shared by the collapsed and ungrouped views."""
+
+    artist, title = _candidate_label(identities, episode.candidate_id)
+    overlap_labels = sorted(
+        {label_by_episode[other] for other in episode.overlaps if other in label_by_episode}
+    )
+    has_layer = any(segment.role == "layer" for segment in episode.role_segments)
+    primary = min(
+        episode.role_segments,
+        key=lambda item: (_ROLE_PRECEDENCE[item.role], item.from_ms, item.to_ms),
+        default=None,
+    )
+    primary_role = primary.role if primary is not None else "uncertain"
+    start_ms = (
+        episode.best_start_ms if primary_role == "incoming" or primary is None else primary.from_ms
+    )
+    acquire_episode = acquire_by_episode.get(episode.id)
+    return {
+        "kind": "track",
+        "start_ms": start_ms,
+        "episode_id": episode.id,
+        "candidate_id": episode.candidate_id,
+        "artist": artist,
+        "title": title,
+        "occurrence_index": episode.occurrence_index,
+        "primary_role": primary_role,
+        "overlap_labels": overlap_labels,
+        "has_layer": has_layer,
+        "badge": episode.badge,
+        "version_status": episode.version_status,
+        "hint_supported": "hint_supported" in episode.flags,
+        "n_rejected_hypotheses": len(episode.rejected_evidence),
+        "tiers": episode.tiers.model_dump(mode="json"),
+        "acquire": _acquire_summary(acquire_episode) if acquire_episode is not None else None,
+        "alternatives": [],
+        "also_count": 0,
+    }
+
+
+def _alternative_summary(episode: EpisodeRecord, identities: IdentitiesRecord) -> dict[str, Any]:
+    artist, title = _candidate_label(identities, episode.candidate_id)
+    return {
+        "badge": episode.badge,
+        "version_status": episode.version_status,
+        "artist": artist,
+        "title": title,
+        "track": f"{artist} — {title}",
+        "candidate_id": episode.candidate_id,
+        "episode_id": episode.id,
+        "start_ms": _display_start(episode),
+    }
+
+
 def flatten_tracklist(
     episodes: EpisodesFile,
     identities: IdentitiesRecord,
     acquire: AcquireFile | None = None,
+    *,
+    collapse: bool = True,
 ) -> tuple[dict[str, Any], ...]:
-    """Flatten overlapping episodes using primary-role precedence and honest ID gaps."""
+    """Flatten episodes to tracklist rows using primary-role precedence and honest ID gaps.
+
+    With ``collapse`` (the default), a contiguous run of competing near-duplicate matches of the
+    same underlying track becomes ONE row: the closest match is shown and the others ride along as
+    ``alternatives``.  ``collapse=False`` restores the historical one-row-per-episode view.
+    """
 
     acquire_by_episode = (
         {item.episode_id: item for item in acquire.episodes} if acquire is not None else {}
@@ -102,43 +188,31 @@ def flatten_tracklist(
         for episode in episodes.episodes
     }
     entries: list[dict[str, Any]] = []
-    for episode in episodes.episodes:
-        artist, title = _candidate_label(identities, episode.candidate_id)
-        overlap_labels = sorted(
-            {label_by_episode[other] for other in episode.overlaps if other in label_by_episode}
-        )
-        has_layer = any(segment.role == "layer" for segment in episode.role_segments)
-        primary = min(
-            episode.role_segments,
-            key=lambda item: (_ROLE_PRECEDENCE[item.role], item.from_ms, item.to_ms),
-            default=None,
-        )
-        primary_role = primary.role if primary is not None else "uncertain"
-        start_ms = (
-            episode.best_start_ms
-            if primary_role == "incoming" or primary is None
-            else primary.from_ms
-        )
-        acquire_episode = acquire_by_episode.get(episode.id)
-        entry = {
-            "kind": "track",
-            "start_ms": start_ms,
-            "episode_id": episode.id,
-            "candidate_id": episode.candidate_id,
-            "artist": artist,
-            "title": title,
-            "occurrence_index": episode.occurrence_index,
-            "primary_role": primary_role,
-            "overlap_labels": overlap_labels,
-            "has_layer": has_layer,
-            "badge": episode.badge,
-            "version_status": episode.version_status,
-            "hint_supported": "hint_supported" in episode.flags,
-            "n_rejected_hypotheses": len(episode.rejected_evidence),
-            "tiers": episode.tiers.model_dump(mode="json"),
-            "acquire": _acquire_summary(acquire_episode) if acquire_episode is not None else None,
-        }
-        entries.append(entry)
+    if collapse:
+        from id_detector.present.grouping import group_display_tracks
+
+        duration_ms = 0
+        for episode in episodes.episodes:
+            duration_ms = max(
+                duration_ms, episode.best_end_ms, *(s[1] for s in episode.evidence_support_ms)
+            )
+        for track in group_display_tracks(list(episodes.episodes), identities, duration_ms):
+            entry = _track_entry(track.primary, identities, acquire_by_episode, label_by_episode)
+            entry["start_ms"] = track.start_ms
+            entry["end_ms"] = track.end_ms
+            alternatives = [_alternative_summary(alt, identities) for alt in track.alternatives]
+            entry["alternatives"] = alternatives
+            entry["also_count"] = len(alternatives)
+            # The folded-in versions are already listed as alternatives, so drop them from the
+            # primary's overlap note to keep the CUE REM lines about genuinely co-sounding tracks.
+            folded = {alt["track"].replace(" — ", " - ") for alt in alternatives}
+            entry["overlap_labels"] = [
+                label for label in entry["overlap_labels"] if label not in folded
+            ]
+            entries.append(entry)
+    else:
+        for episode in episodes.episodes:
+            entries.append(_track_entry(episode, identities, acquire_by_episode, label_by_episode))
     entries.extend(
         {
             "kind": "id",
@@ -182,8 +256,9 @@ def export_tracklist(
     acquire_path: Path | None = None,
     title: str | None = None,
     media_target: str | None = None,
+    collapse: bool = True,
 ) -> ExportResult:
-    entries = flatten_tracklist(episodes, identities, acquire)
+    entries = flatten_tracklist(episodes, identities, acquire, collapse=collapse)
     json_path = media_dir / "present" / "tracklist.json"
     markdown_path = media_dir / "present" / "tracklist.md"
     atomic_write_json(
@@ -223,6 +298,12 @@ def export_tracklist(
                 badge += " +HINT"
             version_status = str(entry["version_status"]).upper()
             label = f"{entry['artist']} — {entry['title']}"
+            if entry.get("also_count"):
+                others = "; ".join(alt["track"] for alt in entry["alternatives"])
+                label += (
+                    f"<br>also: {entry['also_count']} other version"
+                    f"{'s' if entry['also_count'] != 1 else ''} matched — {others}"
+                )
             search_cell = "yes" if entry.get("acquire") else "—"
             lines.append(
                 f"| {_format_time(entry['start_ms'])} | {badge} | {version_status} | "

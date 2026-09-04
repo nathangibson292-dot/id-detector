@@ -236,6 +236,8 @@ async def _run_controlled(
         identities=fused.identities.record,
         episodes_path=fused.final_path,
         identities_path=fused.identities_path,
+        # The benchmark scores one row per episode; grouping is a display-only concern.
+        collapse=False,
     )
     return (
         ingested.media_dir,

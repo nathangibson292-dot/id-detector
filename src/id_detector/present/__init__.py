@@ -9,6 +9,12 @@ from id_detector.present.exports import (
     render_cue,
     render_m3u,
 )
+from id_detector.present.grouping import (
+    DisplayTrack,
+    group_display_tracks,
+    normalise_title,
+    work_key,
+)
 from id_detector.present.page import (
     DEFAULT_LEAD_IN_MS,
     EmbedPlan,
@@ -31,6 +37,7 @@ from id_detector.present.server import (
 
 __all__ = [
     "DEFAULT_LEAD_IN_MS",
+    "DisplayTrack",
     "EmbedPlan",
     "ExportResult",
     "RunningServer",
@@ -40,6 +47,9 @@ __all__ = [
     "export_tracklist",
     "flatten_tracklist",
     "generate_page",
+    "group_display_tracks",
+    "normalise_title",
+    "work_key",
     "make_server",
     "plan_embed",
     "read_rescan_queue",
