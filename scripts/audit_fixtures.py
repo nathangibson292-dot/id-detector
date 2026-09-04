@@ -8,6 +8,7 @@ import sys
 from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 
 ROOT = Path(__file__).resolve().parents[1]
 SCAN_ROOTS = (
@@ -89,6 +90,62 @@ def _pattern_exempt(relative: Path) -> bool:
         or relative.is_relative_to(Path("docs/research"))
         or relative.is_relative_to(Path("docs/reviews"))
     )
+
+
+# Stage 6 per-path allow rule.  The committed enrichment artefact `enrich/acquire.json` and the
+# `present/tracklist.{json,md}` exports (and their `tests/golden/` fixtures) legitimately carry
+# **public catalogue item URLs** — Deezer/Apple/MusicBrainz/Discogs/SoundCloud/Bandcamp/Beatport/
+# Traxsource pages and download-gate links.  These are *acquisition targets*, not personal data, so
+# on these paths only the URL and long-numeric-id pattern checks are relaxed, and every URL must
+# still resolve to a known acquisition host below.  The handle/username, raw-dump-line, raw-dump-
+# string, and identifier-field checks stay in force here exactly as everywhere else.
+_ACQUISITION_NAMES = frozenset({"acquire.json", "tracklist.json", "tracklist.md"})
+_ACQUISITION_PARENTS = frozenset({"enrich", "present", "golden"})
+_CATALOGUE_HOSTS = frozenset(
+    {
+        "deezer.com",
+        "apple.com",
+        "musicbrainz.org",
+        "discogs.com",
+        "soundcloud.com",
+        "sndcdn.com",
+        "bandcamp.com",
+        "beatport.com",
+        "traxsource.com",
+        "hypeddit.com",
+        "hypeddit.co",
+        "bettergate.com",
+        "timbrgate.com",
+        "backstaged.com",
+        "backstaged.io",
+        "fangate.eu",
+        "stillhype.com",
+        "toneden.io",
+        "theartistunion.com",
+        "gate.fm",
+    }
+)
+
+
+def _acquisition_artifact(relative: Path) -> bool:
+    return relative.name in _ACQUISITION_NAMES and relative.parent.name in _ACQUISITION_PARENTS
+
+
+def _catalogue_host(host: str) -> bool:
+    host = host.casefold()
+    registrable = ".".join(host.split(".")[-2:])
+    return registrable in _CATALOGUE_HOSTS
+
+
+def _non_catalogue_urls(text: str) -> list[str]:
+    offenders: list[str] = []
+    for match in _URL.finditer(text):
+        raw = match.group(0).strip("\",'")
+        candidate = raw if "://" in raw else f"https://{raw}"
+        host = urlsplit(candidate).hostname or ""
+        if not host or not _catalogue_host(host):
+            offenders.append(raw)
+    return offenders
 
 
 def _strings(value: Any) -> Iterator[str]:
@@ -226,16 +283,24 @@ def audit() -> list[str]:
             if not _pattern_exempt(relative):
                 if re.search(r"\d{6,}", relative.as_posix()):
                     failures.append(f"{relative}: filename contains a numeric platform ID")
-                for label, pattern in (
-                    ("handle", _HANDLE),
-                    ("URL", _URL),
-                    ("long numeric platform ID", _LONG_NUMERIC_ID),
-                    ("numeric identifier field", _ID_FIELD),
-                ):
+                acquisition = _acquisition_artifact(relative)
+                # `enrich/acquire.json` and the tracklist exports may carry public catalogue URLs
+                # (acquisition targets, not personal data); there the URL and long-numeric-id checks
+                # are replaced by a catalogue-host allowlist. Handle/username and identifier-field
+                # checks stay in force on every path.
+                checks = [("handle", _HANDLE), ("numeric identifier field", _ID_FIELD)]
+                if not acquisition:
+                    checks += [("URL", _URL), ("long numeric platform ID", _LONG_NUMERIC_ID)]
+                for label, pattern in checks:
                     match = pattern.search(text)
                     if match:
                         line = text.count("\n", 0, match.start()) + 1
                         failures.append(f"{relative}:{line}: contains {label}")
+                if acquisition:
+                    for offender in _non_catalogue_urls(text):
+                        failures.append(
+                            f"{relative}: contains a non-catalogue URL {offender[:60]!r}"
+                        )
             for line_number, line in enumerate(text.splitlines(), 1):
                 stripped = line.strip()
                 if len(stripped) >= 16 and stripped in raw_fragments:

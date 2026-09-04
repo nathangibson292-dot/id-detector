@@ -28,9 +28,11 @@ from id_detector.calibration import calibrate_shazam
 from id_detector.contracts import SourceRecord
 from id_detector.decode import decode
 from id_detector.doctor import run_doctor
+from id_detector.enrich.benchmark import build_link_sample, score_link_sample
+from id_detector.enrich.run import enrich_media_dir
 from id_detector.fuse.episodes import fuse_generation_zero  # noqa: F401  (public re-export)
 from id_detector.hints.pipeline import run_hints
-from id_detector.ingest import ingest
+from id_detector.ingest import _load_cached, ingest
 from id_detector.io import read_text, redact_text
 from id_detector.jobs import AsyncJobStore, ProcessLock
 from id_detector.journal import InvocationTimer, append_invocation
@@ -400,6 +402,91 @@ def analyse(
     except KeyboardInterrupt:
         typer.echo("cancelled; safe job states were restored", err=True)
         raise typer.Exit(130) from None
+    raise typer.Exit(exit_code)
+
+
+async def _acquire(
+    url: str,
+    *,
+    work_root: Path,
+    refresh: bool,
+    enable_soundcloud: bool,
+) -> int:
+    from id_detector.contracts import PcmRecord
+    from id_detector.enrich.run import final_identities_path, load_analysis
+
+    work_root = work_root.resolve()
+    cached = _load_cached(work_root, url)
+    if cached is None:
+        typer.echo(
+            f"no cached analysis for {redact_text(url)} under {work_root}; run `analyse` first",
+            err=True,
+        )
+        return 2
+    media_dir = cached.media_dir
+    if not (media_dir / "fuse" / "episodes.json").is_file():
+        typer.echo(
+            f"analysis at {media_dir} has no fuse/episodes.json; run `analyse` first", err=True
+        )
+        return 2
+
+    cache_root = PROJECT_ROOT / "data" / "local" / "enrich"
+    result = await enrich_media_dir(
+        source=cached.record,
+        media_dir=media_dir,
+        cache_root=cache_root,
+        refresh=refresh,
+        enable_soundcloud=enable_soundcloud,
+    )
+    episodes, identities = load_analysis(media_dir)
+    duration_ms = PcmRecord.model_validate_json(
+        read_text(media_dir / "decode" / "pcm.json")
+    ).pcm.duration_ms
+    export_tracklist(
+        media_dir=media_dir,
+        media_key=cached.record.media_key,
+        duration_ms=duration_ms,
+        episodes=episodes,
+        identities=identities,
+        episodes_path=media_dir / "fuse" / "episodes.json",
+        identities_path=final_identities_path(media_dir),
+        acquire=result.record,
+        acquire_path=result.path,
+    )
+    typer.echo(
+        f"acquire: {result.counts['episodes']} identified episodes; "
+        f"{result.counts['direct_links_total']} direct links "
+        f"{result.counts['direct_links_by_source']}; "
+        f"free_dl={result.counts['free_download_flags']}; "
+        f"gate={result.counts['gate_links']}; buy={result.counts['buy_links']}; "
+        f"search_only={result.counts['search_only_rows']}; out={result.path}"
+    )
+    return 0
+
+
+@app.command()
+def acquire(
+    url: str = typer.Argument(
+        ..., help="A URL (or local file) already analysed under --work-root."
+    ),
+    work_root: Path = typer.Option(DEFAULT_WORK_ROOT, "--work-root"),  # noqa: B008
+    refresh: bool = typer.Option(False, "--refresh", help="Bypass the local enrichment cache."),
+    soundcloud: bool = typer.Option(
+        True,
+        "--soundcloud/--no-soundcloud",
+        help="Resolve SoundCloud acquisition flags (api-v2, zero-auth). Never automates gates.",
+    ),
+) -> None:
+    """Attach non-authoritative acquisition links to an existing analysis (writes acquire.json)."""
+
+    exit_code = asyncio.run(
+        _acquire(
+            url,
+            work_root=work_root,
+            refresh=refresh,
+            enable_soundcloud=soundcloud,
+        )
+    )
     raise typer.Exit(exit_code)
 
 
@@ -1011,6 +1098,64 @@ def benchmark_hints(
         f"Stage 4a gate pass={str(result.passed).lower()}; "
         f"coverage_delta_e4={result.coverage_delta_e4}; "
         f"coverage_cluster_lower_e4={result.coverage_cluster_lower_e4}; report={out}"
+    )
+
+
+def _collect_acquire_files(root: Path) -> list[Path]:
+    if root.is_file():
+        return [root]
+    return sorted(root.rglob("acquire.json"))
+
+
+@benchmark_app.command("links")
+def benchmark_links(
+    episodes: Annotated[
+        Path,
+        typer.Option(
+            "--episodes",
+            help="An acquire.json file, or a directory searched for **/enrich/acquire.json.",
+        ),
+    ],
+    out: Annotated[Path, typer.Option("--out", help="Marking-sheet JSON to write.")],
+    sample: Annotated[int, typer.Option("--sample", min=1, help="Stratified sample size.")] = 60,
+) -> None:
+    """Draw a stratified (version-ambiguity) sample of direct links for a human to mark."""
+
+    from id_detector.contracts import AcquireFile
+    from id_detector.io import atomic_write_json
+
+    paths = _collect_acquire_files(episodes)
+    if not paths:
+        typer.echo(f"no acquire.json found under {episodes}", err=True)
+        raise typer.Exit(2)
+    records = [AcquireFile.model_validate_json(read_text(path)) for path in paths]
+    sheet = build_link_sample(records, sample_size=sample)
+    atomic_write_json(out, sheet)
+    typer.echo(
+        f"link sample: {len(sheet['links'])} of {sheet['total_direct_links']} direct links "
+        f"across {len(paths)} analyses; strata={sheet['strata_sampled']}; "
+        f"gate pending owner marking; out={out}"
+    )
+
+
+@benchmark_app.command("links-score")
+def benchmark_links_score(
+    marked: Annotated[Path, typer.Option("--marked", help="A human-marked link sample JSON.")],
+    out: Annotated[Path | None, typer.Option("--out", help="Optional score JSON to write.")] = None,
+) -> None:
+    """Score a marked link sample: precision and a one-sided 95% Clopper-Pearson lower bound."""
+
+    from id_detector.io import atomic_write_json
+
+    sheet = json.loads(read_text(marked))
+    score = score_link_sample(sheet)
+    if out is not None:
+        atomic_write_json(out, score)
+    typer.echo(
+        f"marked={score['marked_links']} correct={score['correct']} "
+        f"incorrect={score['incorrect']} precision_e4={score['precision_e4']} "
+        f"one_sided_95_lower_e4={score['one_sided_95_lower_e4']} "
+        f"gate_pass={str(score['gate']['pass']).lower()}"
     )
 
 

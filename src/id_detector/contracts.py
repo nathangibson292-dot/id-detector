@@ -1280,6 +1280,60 @@ class CalibrationValidationRecord(Record):
     notes: list[str]
 
 
+class AcquireDirectLink(ContractModel):
+    """A direct item link, shown only on exact-ID or strong artist/title/version agreement."""
+
+    source: Literal["deezer", "apple", "musicbrainz", "discogs"]
+    url: str
+    kind: Literal["stream", "purchase", "catalogue"]
+    match_confidence: ConfidenceE4
+    corroborates_version: bool
+
+
+class AcquireSearchLink(ContractModel):
+    """A labelled search link — always safe, never implying an exact catalogue match."""
+
+    source: Literal[
+        "bandcamp", "beatport", "traxsource", "deezer", "apple", "musicbrainz", "discogs"
+    ]
+    url: str
+
+
+class AcquireSoundcloud(ContractModel):
+    """SoundCloud acquisition flags (never automated — gates are linked to only)."""
+
+    classification: Literal["free_download_native", "gate_link", "buy_link", "none"]
+    downloadable: bool | None
+    has_downloads_left: bool | None
+    purchase_url: str | None
+    purchase_title: str | None
+    license: str | None
+    permalink_url: str | None
+    match_confidence: ConfidenceE4 | None
+
+
+class AcquireEpisode(ContractModel):
+    """Per-episode acquisition offer. ``version_status`` may only rise by the corroboration rule."""
+
+    episode_id: Sha1
+    candidate_id: Sha1
+    artist: str
+    title: str
+    version_qualifier: str | None
+    version_status: Literal["verified", "unverified", "contested"]
+    direct: list[AcquireDirectLink]
+    search: list[AcquireSearchLink]
+    soundcloud: AcquireSoundcloud | None
+
+
+class AcquireFile(Record):
+    """``enrich/acquire.json`` — non-authoritative acquisition links for identified episodes."""
+
+    media_key: Sha256
+    generation: NonNegativeInt
+    episodes: list[AcquireEpisode]
+
+
 SCHEMA_MODELS: dict[str, type[BaseModel]] = {
     "source": SourceRecord,
     "pcm": PcmRecord,
@@ -1307,6 +1361,7 @@ SCHEMA_MODELS: dict[str, type[BaseModel]] = {
     "calibration_features": CalibrationFeatures,
     "calibration_model": CalibrationModelRecord,
     "calibration_validation": CalibrationValidationRecord,
+    "acquire": AcquireFile,
 }
 
 
