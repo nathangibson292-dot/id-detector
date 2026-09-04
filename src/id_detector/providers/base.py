@@ -20,6 +20,8 @@ DEFAULT_PHASE_MS = 0
 DEFAULT_RESCAN_WINDOW_MS = 12_000
 DEFAULT_RESCAN_HOP_MS = 5_000
 DEFAULT_RESCAN_PHASE_MS = 0
+#: Plan rev 5.2: the generation loop stops after this many rescan generations.
+DEFAULT_MAX_GENERATIONS = 3
 
 
 class ProviderUnavailable(RuntimeError):
@@ -60,6 +62,7 @@ class AppConfig:
     rescan_window_ms: int = DEFAULT_RESCAN_WINDOW_MS
     rescan_hop_ms: int = DEFAULT_RESCAN_HOP_MS
     rescan_phase_ms: int = DEFAULT_RESCAN_PHASE_MS
+    rescan_max_generations: int = DEFAULT_MAX_GENERATIONS
 
     @classmethod
     def load(cls, path: Path | None) -> AppConfig:
@@ -108,6 +111,11 @@ class AppConfig:
                 DEFAULT_RESCAN_PHASE_MS,
             ),
         )
+        max_generations = rescan.get("max_generations", DEFAULT_MAX_GENERATIONS)
+        if isinstance(max_generations, bool) or not isinstance(max_generations, int):
+            raise ValueError("rescan.max_generations must be a non-negative integer")
+        if max_generations < 0:
+            raise ValueError("rescan.max_generations must be a non-negative integer")
         return cls(
             allow_third_party_upload=value,
             transforms_policy=policy,
@@ -119,6 +127,7 @@ class AppConfig:
             rescan_window_ms=rescan_window_ms,
             rescan_hop_ms=rescan_hop_ms,
             rescan_phase_ms=rescan_phase_ms,
+            rescan_max_generations=max_generations,
         )
 
 

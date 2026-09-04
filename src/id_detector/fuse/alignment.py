@@ -71,7 +71,7 @@ class AlignmentOccurrence:
         return [
             AlignmentEvent(at_ms=item.at_ms, type=item.type)
             for item in self.decisions
-            if item.type in {"jump", "loop", "reset", "drift"}
+            if item.type in {"jump", "loop", "reset", "drift", "replay"}
         ]
 
 
@@ -337,10 +337,20 @@ def align_candidate_points(
         # 3. A return to the start of the held reference is a reset.
         elif abs(point.ref_anchor_ms) <= 5_000 and ref_max > 7_000:
             event = "reset"
+        # 4. Long-gap reference inconsistency or recurrence starts another occurrence.  The plan
+        #    lists ``replay`` after ``jump``/``drift``, but its own definition ("ref inconsistent
+        #    with the current segment *and* mix gap > 30 s, or the same ref region recurs after
+        #    > 30 s") is a strict subset of what those two predicates accept: a returning
+        #    reference after a long drought always has a stable rate and a shifted intercept, so
+        #    ``jump`` consumed every multi-point replay and the label was unreachable (Stage 4c).
+        #    ``jump`` and ``drift`` are therefore narrowed to within-occurrence gaps; the relative
+        #    order of the remaining predicates is exactly the plan's.
+        elif gap > REPLAY_GAP_MS and (not reference_consistent or same_ref_region):
+            event = "replay"
         else:
             future_pair = _lookahead_fit(ordered, index, count=2)
             future_fit = _lookahead_fit(ordered, index)
-            # 4. A stable old rate with a shifted intercept is a jump.
+            # 5. A stable old rate with a shifted intercept is a jump.
             if (
                 not reference_consistent
                 and future_pair is not None
@@ -348,14 +358,11 @@ def align_candidate_points(
                 and abs(point.rate_e4 - active.rate_e4) <= HYPOTHESIS_AGREEMENT_E4
             ):
                 event = "jump"
-            # 5. A stable new slope over at least three points is drift.
+            # 6. A stable new slope over at least three points is drift.
             elif (
                 future_fit is not None and abs(future_fit.rate_e4 - active.rate_e4) > DRIFT_DELTA_E4
             ):
                 event = "drift"
-            # 6. Long-gap reference inconsistency or recurrence starts another occurrence.
-            elif gap > REPLAY_GAP_MS and (not reference_consistent or same_ref_region):
-                event = "replay"
             # 7. Only an isolated point inconsistent with both adjacent trends is an outlier.
             elif index + 1 < len(ordered) and _consistent(active, ordered[index + 1]):
                 event = "outlier"

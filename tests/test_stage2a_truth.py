@@ -338,6 +338,7 @@ def _valid_timeline_payload() -> dict:
                 "draft": False,
             }
         ],
+        "events": [],
         "regions": [{"start_ms": 10_000, "end_ms": 20_000, "type": "unresolved"}],
     }
 

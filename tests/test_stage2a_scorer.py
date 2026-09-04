@@ -205,25 +205,18 @@ def _identities(predictions: list[dict]) -> dict:
 
 def _vector() -> tuple[GroundTruthRecord, PredictionSet]:
     truth_episodes = [
-        _truth_episode("Long", 10_000, 310_000, note="event:jump@110000"),
-        _truth_episode("Repeat", 320_000, 360_000, note="event:loop@340000"),
-        _truth_episode(
-            "Layer A",
-            370_000,
-            430_000,
-            role="outgoing",
-            overlaps=[3],
-            note="event:reset@400000",
-        ),
-        _truth_episode(
-            "Layer B",
-            390_000,
-            450_000,
-            role="incoming",
-            overlaps=[2],
-            note="event:drift@410000",
-        ),
+        _truth_episode("Long", 10_000, 310_000),
+        _truth_episode("Repeat", 320_000, 360_000),
+        _truth_episode("Layer A", 370_000, 430_000, role="outgoing", overlaps=[3]),
+        _truth_episode("Layer B", 390_000, 450_000, role="incoming", overlaps=[2]),
         _truth_episode("Repeat", 450_000, 490_000, occurrence=1),
+    ]
+    truth_events = [
+        {"type": "jump", "at_ms": 110_000, "episode_index": 0, "note": None},
+        {"type": "loop", "at_ms": 340_000, "episode_index": 1, "note": None},
+        {"type": "reset", "at_ms": 400_000, "episode_index": 2, "note": None},
+        {"type": "drift", "at_ms": 410_000, "episode_index": 3, "note": None},
+        {"type": "replay", "at_ms": 450_000, "episode_index": 4, "note": None},
     ]
     truth = GroundTruthRecord.model_validate(
         {
@@ -244,6 +237,7 @@ def _vector() -> tuple[GroundTruthRecord, PredictionSet]:
             "corpus_version": "vector-v1",
             "selection_basis": "authored before implementation",
             "episodes": truth_episodes,
+            "events": truth_events,
             "regions": [
                 {"start_ms": 500_000, "end_ms": 520_000, "type": "out_of_pool"},
                 {"start_ms": 520_000, "end_ms": 540_000, "type": "unresolved"},
@@ -322,7 +316,7 @@ def test_hand_computed_scorer_vector_covers_every_metric_family() -> None:
     assert metrics["episode_iou_e4"] == 10_000
     assert metrics["repeated_occurrence_recall_e4"] == 10_000
     assert metrics["overlap_recall_e4"] == 10_000
-    for event in ("jump", "loop", "reset", "drift"):
+    for event in ("jump", "loop", "reset", "drift", "replay"):
         assert metrics[f"event_{event}"] == {
             "precision_e4": 10_000,
             "recall_e4": 10_000,
@@ -446,7 +440,9 @@ def test_work_only_truth_is_excluded_from_exact_version_metrics() -> None:
         update={"version_verified": False, "verified_against": "audio"}
     )
     truth = GroundTruthRecord.model_validate(
-        truth.model_copy(update={"episodes": [only_truth], "regions": []}).model_dump(mode="json")
+        truth.model_copy(update={"episodes": [only_truth], "events": [], "regions": []}).model_dump(
+            mode="json"
+        )
     )
     prediction = predictions.episodes[0]
     identities = predictions.identities.model_copy(

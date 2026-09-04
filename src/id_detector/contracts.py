@@ -433,7 +433,9 @@ class AlignmentSegment(ContractModel):
 
 class AlignmentEvent(ContractModel):
     at_ms: NonNegativeInt
-    type: Literal["jump", "loop", "reset", "drift"]
+    # rev 5.2 / Stage 4c adds ``replay``: the plan's precedence decides it and its metrics are
+    # required per type, but the episode contract otherwise gave the decision nowhere to be dated.
+    type: Literal["jump", "loop", "reset", "drift", "replay"]
 
 
 class EpisodeScores(ContractModel):
@@ -629,6 +631,20 @@ class TruthRegion(ContractModel):
         return self
 
 
+class TruthEvent(ContractModel):
+    """Explicit event truth (rev 5.2 / Stage 4c).
+
+    ``at_ms`` is the exact mix time of the rendered or annotated discontinuity.  ``episode_index``
+    names the truth episode the event belongs to (``null`` for a set-level event).  Stage 2a
+    encoded these in the free-text ``note`` field; the scorer now reads this contract instead.
+    """
+
+    type: Literal["jump", "loop", "reset", "drift", "replay"]
+    at_ms: NonNegativeInt
+    episode_index: NonNegativeInt | None
+    note: str | None
+
+
 class GroundTruthRecord(Record):
     set_id: str
     source: TruthSource
@@ -637,6 +653,7 @@ class GroundTruthRecord(Record):
     corpus_version: str
     selection_basis: str
     episodes: list[TruthEpisode]
+    events: list[TruthEvent]
     regions: list[TruthRegion]
 
     @model_validator(mode="after")
@@ -685,6 +702,17 @@ class GroundTruthRecord(Record):
                     raise ValueError(
                         f"episode overlap {index}<->{other} has no audible intersection"
                     )
+
+        event_keys: set[tuple[str, int, int | None]] = set()
+        for index, event in enumerate(self.events):
+            if event.at_ms > duration_ms:
+                raise ValueError(f"truth event {index} exceeds source duration_ms")
+            if event.episode_index is not None and event.episode_index >= len(self.episodes):
+                raise ValueError(f"truth event {index} has an invalid episode_index")
+            key = (event.type, event.at_ms, event.episode_index)
+            if key in event_keys:
+                raise ValueError("truth events must be unique by type, at_ms and episode_index")
+            event_keys.add(key)
 
         ordered_regions = sorted(
             self.regions, key=lambda item: (item.start_ms, item.end_ms, item.type)
@@ -765,6 +793,9 @@ class BenchmarkMetrics(ContractModel):
     event_loop: EventMetric
     event_reset: EventMetric
     event_drift: EventMetric
+    # rev 5.2 / Stage 4c. Defaulted so reports written before replay was scored stay readable;
+    # every report produced by the current scorer sets it explicitly.
+    event_replay: EventMetric = EventMetric(precision_e4=0, recall_e4=0, n=0)
     performed_component_confusion: PerformedComponentConfusion
     dominant_layer: PrecisionRecall
     secondary_layer: PrecisionRecall

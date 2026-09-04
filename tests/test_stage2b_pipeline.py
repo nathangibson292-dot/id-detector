@@ -66,6 +66,7 @@ def _truth(media_key: str, duration_ms: int) -> GroundTruthRecord:
                     "draft": False,
                 }
             ],
+            "events": [],
             "regions": [],
         }
     )

@@ -122,7 +122,10 @@ def load_provider_config(project_root: Path) -> tuple[ProviderConfigRecord, str]
 
 
 def build_queries(
-    media_key: str, windows: WindowsResult, provider_config: ProviderConfigRecord
+    media_key: str,
+    windows: WindowsResult,
+    provider_config: ProviderConfigRecord,
+    generation: int = 0,
 ) -> tuple[QueryRecord, ...]:
     queries: list[QueryRecord] = []
     seen_cache_keys: set[str] = set()
@@ -145,7 +148,7 @@ def build_queries(
                 schema_version=SCHEMA_VERSION,
                 generated_by=GENERATED_BY,
                 id=query_id,
-                generation=0,
+                generation=generation,
                 provider="shazam",
                 capability="clip_recognizer",
                 target=target,
@@ -240,7 +243,7 @@ def _error_observation(
         schema_version=SCHEMA_VERSION,
         generated_by=GENERATED_BY,
         id=make_id(media_key, "observation", compose_natural_key("observation", natural)),
-        generation=0,
+        generation=query.generation,
         query_id=query.id,
         provider="shazam",
         capability="clip_recognizer",
@@ -331,32 +334,33 @@ async def _run_job(
         await asyncio.gather(heartbeat, return_exceptions=True)
 
 
-async def recognise_generation_zero(
+async def recognise_generation(
     *,
     media_key: str,
     media_dir: Path,
     windows: WindowsResult,
     project_root: Path,
     run_id: str,
+    generation: int = 0,
     refresh: bool = False,
     max_requests: int = DEFAULT_SHAZAM_MAX_REQUESTS,
     adapter: ShazamAdapter | None = None,
 ) -> RecognitionResult:
     config, config_name = load_provider_config(project_root)
-    queries = build_queries(media_key, windows, config)
+    queries = build_queries(media_key, windows, config, generation)
     invocation_key = sha256(run_id.encode("utf-8")).hexdigest()[:20]
     invocation_dir = media_dir / "recognise" / "invocations" / invocation_key
     raw_dir = invocation_dir / "raw"
-    queries_path = invocation_dir / "queries.gen0.jsonl"
-    observations_path = invocation_dir / "observations.gen0.jsonl"
-    raw_index_path = invocation_dir / "raw_index.json"
+    queries_path = invocation_dir / f"queries.gen{generation}.jsonl"
+    observations_path = invocation_dir / f"observations.gen{generation}.jsonl"
+    raw_index_path = invocation_dir / f"raw_index.gen{generation}.json"
     config_snapshot_path = invocation_dir / config_name
     _write_immutable_json(config_snapshot_path, config)
     _write_jsonl(queries_path, list(queries))
     _write_immutable_sidecar(
         queries_path,
         {
-            "windows/windows.gen0.jsonl": windows.record_path,
+            windows.record_path.relative_to(media_dir).as_posix(): windows.record_path,
             f"provider_configs/{config_name}": config_snapshot_path,
         },
     )
@@ -373,6 +377,21 @@ async def recognise_generation_zero(
     initial_by_query: dict[str, int] = {}
     async with AsyncJobStore(media_dir / "jobs.sqlite") as store:
         await store.ensure_budget(media_key, "shazam", max_requests=max_requests)
+        # Cross-generation content cache. Window ids carry the generation, so a later generation
+        # that happens to fingerprint byte-identical audio gets a *new* query id and would submit
+        # it again. Reuse the earlier generation's stored raw response instead: the plan's cache
+        # key is content-addressed, and one content must be submitted exactly once.
+        cached_by_content: dict[str, tuple[str, str]] = {}
+        for existing in await store.list_jobs():
+            if existing.provider != "shazam" or existing.state not in {"succeeded", "no_match"}:
+                continue
+            if not existing.result_path:
+                continue
+            stored = media_dir / existing.result_path
+            if cache_valid(stored, existing.state):
+                cached_by_content.setdefault(
+                    Path(existing.result_path).stem, (existing.result_path, existing.state)
+                )
         for query in queries:
             job = await store.ensure_job(media_key, query.id, "shazam")
             initial_physical += job.physical_attempts
@@ -388,6 +407,15 @@ async def recognise_generation_zero(
                 await store.reset_for_refresh(job.id)
             elif cached_raw_path is not None and cache_valid(cached_raw_path, job.state):
                 _write_immutable_bytes(raw_path, read_bytes(cached_raw_path))
+                cache_hits += 1
+            elif job.state == "pending" and query.cache_key in cached_by_content:
+                stored_path, stored_state = cached_by_content[query.cache_key]
+                _write_immutable_bytes(raw_path, read_bytes(media_dir / stored_path))
+                await store.finish(
+                    job.id,
+                    stored_state,
+                    result_path=raw_path.relative_to(media_dir).as_posix(),
+                )
                 cache_hits += 1
             elif job.state in {"succeeded", "no_match", "permanent_failure"}:
                 await store.reset_for_refresh(job.id)
@@ -475,7 +503,7 @@ async def recognise_generation_zero(
         {
             f"{queries_path.relative_to(media_dir).as_posix()}": queries_path,
             f"{raw_index_path.relative_to(media_dir).as_posix()}": raw_index_path,
-            "windows/windows.gen0.jsonl": windows.record_path,
+            windows.record_path.relative_to(media_dir).as_posix(): windows.record_path,
         },
     )
     return RecognitionResult(
@@ -490,3 +518,9 @@ async def recognise_generation_zero(
         failures=failures,
         cache_hits=cache_hits,
     )
+
+
+async def recognise_generation_zero(**kwargs: Any) -> RecognitionResult:
+    """Backwards-compatible alias for the generation-0 call used before Stage 4c."""
+
+    return await recognise_generation(generation=0, **kwargs)

@@ -14,6 +14,7 @@ from typing import Annotated
 
 import typer
 
+from id_detector.benchmark.ablations import engine_status_rows, run_ablations
 from id_detector.benchmark.controlled import render_controlled
 from id_detector.benchmark.corpus import run_corpus
 from id_detector.benchmark.hints import run_hint_gate
@@ -21,19 +22,21 @@ from id_detector.benchmark.scorer import score_corpus
 from id_detector.benchmark.shortlist import run_shortlist
 from id_detector.benchmark.transforms_schedule import run_transform_schedule_benchmark
 from id_detector.calibration import calibrate_shazam
-from id_detector.contracts import SourceRecord, Transform
+from id_detector.contracts import SourceRecord
 from id_detector.decode import decode
 from id_detector.doctor import run_doctor
-from id_detector.fuse.episodes import fuse_generation_zero
+from id_detector.fuse.episodes import fuse_generation_zero  # noqa: F401  (public re-export)
 from id_detector.hints.pipeline import run_hints
 from id_detector.ingest import ingest
 from id_detector.io import read_text, redact_text
 from id_detector.jobs import AsyncJobStore, ProcessLock
 from id_detector.journal import InvocationTimer, append_invocation
+from id_detector.orchestrate import run_generation_loop
 from id_detector.present import export_tracklist
 from id_detector.process import run_process
 from id_detector.providers.base import AppConfig
-from id_detector.recognise import recognise_generation_zero
+from id_detector.recognise import recognise_generation
+from id_detector.rescan import DEFAULT_MAX_GENERATIONS
 from id_detector.truth import (
     freeze_truth,
     resolve_truth,
@@ -82,6 +85,8 @@ async def _analyse(
     no_hints: bool,
     confirmed_mirrors: tuple[str, ...] = (),
     app_config: AppConfig | None = None,
+    max_generations: int = DEFAULT_MAX_GENERATIONS,
+    novelty: bool = True,
 ) -> int:
     app_config = app_config or AppConfig()
     run_id = uuid.uuid4().hex
@@ -134,15 +139,20 @@ async def _analyse(
         timer.finish_stage("windows_ms")
 
         timer.start_stage("recognise_ms")
-        recognised = await recognise_generation_zero(
-            media_key=ingested.record.media_key,
-            media_dir=media_dir,
-            windows=windows,
-            project_root=PROJECT_ROOT,
-            run_id=run_id,
-            refresh=refresh,
-            max_requests=max_requests,
-        )
+
+        async def recognise_windows(*, windows: object, generation: int) -> object:
+            return await recognise_generation(
+                media_key=ingested.record.media_key,
+                media_dir=media_dir,
+                windows=windows,  # type: ignore[arg-type]
+                project_root=PROJECT_ROOT,
+                run_id=run_id,
+                generation=generation,
+                refresh=refresh,
+                max_requests=max_requests,
+            )
+
+        recognised = await recognise_windows(windows=windows, generation=0)
         timer.finish_stage("recognise_ms")
         matches = sorted(
             (item for item in recognised.observations if item.status == "match"),
@@ -173,27 +183,31 @@ async def _analyse(
             timer.finish_stage("hints_ms")
             counts["hints"] = len(hint_result.hints)
         timer.start_stage("fuse_ms")
-        fused = fuse_generation_zero(
+        orchestrated = await run_generation_loop(
             media_key=ingested.record.media_key,
             media_dir=media_dir,
-            duration_ms=decoded.record.pcm.duration_ms,
+            decoded=decoded,
+            windows=windows,
             observations=recognised.observations,
             observations_path=recognised.observations_path,
-            windows=windows.records,
-            windows_path=windows.record_path,
-            pcm_path=decoded.record_path,
+            recognise=recognise_windows,
+            app_config=app_config,
             hints=hint_result.hints if hint_result is not None else (),
             hints_path=hint_result.hints_path if hint_result is not None else None,
-            rescan_transforms=(
-                [Transform(type="none", rate_e4=10_000, semitones=0)]
-                if app_config.transforms_policy == "off"
-                else list(
-                    TransformGrid(
-                        rates_e4=app_config.transform_rates_e4,
-                        semitones=app_config.transform_semitones,
-                    ).hypotheses()
-                )
-            ),
+            max_generations=max_generations,
+            request_budget=max_requests,
+            novelty_enabled=novelty,
+            gen0_requests=recognised.requests,
+            gen0_physical_attempts=recognised.physical_attempts,
+        )
+        fused = orchestrated.fusion
+        counts.update(
+            {
+                "requests": orchestrated.requests,
+                "physical_attempts": orchestrated.physical_attempts,
+                "generations": orchestrated.final_generation + 1,
+                "novelty_change_points": len(orchestrated.novelty_change_points_ms),
+            }
         )
         timer.finish_stage("fuse_ms")
         timer.start_stage("export_ms")
@@ -225,7 +239,9 @@ async def _analyse(
         else:
             typer.echo(
                 f"{len(matches)} matches; {recognised.failures} failures; "
-                f"{recognised.physical_attempts} physical attempts; "
+                f"{orchestrated.physical_attempts} physical attempts; "
+                f"{orchestrated.final_generation + 1} generations "
+                f"(stop={orchestrated.stop_reason}); "
                 f"{len(fused.episodes.episodes)} episodes; tracklist={exported.json_path}"
             )
         entry = timer.entry(
@@ -298,8 +314,22 @@ def analyse(
         "--confirm-mirror",
         help="Manually confirm and import an allow-listed mirror URL; repeatable.",
     ),
+    max_generations: int = typer.Option(
+        -1,
+        "--max-generations",
+        min=-1,
+        help=(
+            "Rescan generations after generation 0; 0 disables rescans. "
+            "-1 uses [rescan].max_generations from the config."
+        ),
+    ),
+    novelty: bool = typer.Option(
+        True,
+        "--novelty/--no-novelty",
+        help="Compute local spectral-novelty change points as rescan triggers.",
+    ),
 ) -> None:
-    """Run the full generation-zero pipeline and export a flattened tracklist."""
+    """Run the full multi-generation pipeline and export a flattened tracklist."""
     if no_hints and (tracklist is not None or confirm_mirror):
         typer.echo("--tracklist/--confirm-mirror cannot be combined with --no-hints", err=True)
         raise typer.Exit(2)
@@ -316,6 +346,12 @@ def analyse(
                 no_hints=no_hints,
                 confirmed_mirrors=tuple(confirm_mirror or ()),
                 app_config=loaded_config,
+                max_generations=(
+                    max_generations
+                    if max_generations >= 0
+                    else loaded_config.rescan_max_generations
+                ),
+                novelty=novelty,
             )
         )
     except KeyboardInterrupt:
@@ -605,10 +641,27 @@ def benchmark_render(
         Path | None,
         typer.Option("--audio-out", help="Local-only rendered audio directory."),
     ] = None,
+    cases: Annotated[
+        str,
+        typer.Option("--cases", help="Case set: base (Stage 2a) or events (Stage 4c replicates)."),
+    ] = "base",
+    corpus_version: Annotated[
+        str | None,
+        typer.Option("--corpus-version", help="Write this corpus_version into every truth file."),
+    ] = None,
 ) -> None:
     """Render the deterministic controlled-transform slice through FFmpeg."""
     try:
-        result = asyncio.run(render_controlled(sources, out, seed=seed, audio_dir=audio_out))
+        result = asyncio.run(
+            render_controlled(
+                sources,
+                out,
+                seed=seed,
+                audio_dir=audio_out,
+                case_set=cases,
+                corpus_version=corpus_version,
+            )
+        )
     except KeyboardInterrupt:
         raise typer.Exit(130) from None
     except (ValueError, RuntimeError, OSError) as exc:
@@ -695,6 +748,37 @@ def benchmark_transforms_schedule(
     typer.echo(
         f"benchmarked 18 schedules with off/global policies; rescan-policy="
         f"{schedule.window_ms}/{schedule.hop_ms}/{schedule.phase_ms}; report={result.path}"
+    )
+
+
+@benchmark_app.command("ablations")
+def benchmark_ablations(
+    corpus: Annotated[str, typer.Option("--corpus", help="Frozen controlled corpus version.")],
+    out: Annotated[Path, typer.Option("--out", help="Stage 4c ablation and gate report JSON.")],
+    work_root: Annotated[Path, typer.Option("--work-root")] = Path("data/local/work-ablations"),
+) -> None:
+    """Run the Stage 4c per-engine and per-feature ablations and evaluate its acceptance gates."""
+
+    try:
+        result = run_ablations(
+            corpus_version=corpus,
+            out_path=out,
+            project_root=PROJECT_ROOT,
+            work_root=work_root,
+            engine_statuses=engine_status_rows(PROJECT_ROOT),
+        )
+    except KeyboardInterrupt:
+        raise typer.Exit(130) from None
+    except (ValueError, RuntimeError, OSError, json.JSONDecodeError) as exc:
+        typer.echo(redact_text(str(exc)), err=True)
+        raise typer.Exit(1) from None
+    gates = "; ".join(
+        f"{gate['name']}={str(bool(gate['pass'])).lower()}" for gate in result.payload["gates"]
+    )
+    typer.echo(
+        f"ablated {len(result.payload['arms'])} arms on {corpus} "
+        f"({result.payload['n_sets']} sets, {result.payload['n_boundaries']} boundaries); "
+        f"{gates}; report={out}"
     )
 
 

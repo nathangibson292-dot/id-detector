@@ -7,6 +7,7 @@ import json
 import os
 import tempfile
 import wave
+from collections.abc import Sequence
 from dataclasses import dataclass
 from decimal import Decimal
 from hashlib import sha256
@@ -16,6 +17,7 @@ from typing import Literal
 from id_detector.contracts import (
     GENERATED_BY,
     SCHEMA_VERSION,
+    RescanRequestRecord,
     SampleMap,
     Transform,
     WindowRecord,
@@ -44,6 +46,7 @@ from id_detector.providers.base import (
     DEFAULT_WINDOW_MS,
     TransformPolicy,
 )
+from id_detector.rescan import request_sort_key, schedule_rescan_windows
 from id_detector.semantics import transform_spec
 
 WINDOW_MS = DEFAULT_WINDOW_MS
@@ -599,6 +602,246 @@ async def generate_windows_async(
     content = b"\n".join(canonical_json_bytes(record) for record in ordered) + b"\n"
     atomic_write_bytes(record_path, content)
     write_completion_sidecar(record_path, upstream)
+    return WindowsResult(ordered, record_path, False)
+
+
+@dataclass(frozen=True)
+class PlannedWindow:
+    """One rescan window before materialisation: geometry plus its owning request."""
+
+    start_ms: int
+    output_ms: int
+    rescan_request_id: str
+
+
+def plan_rescan_windows(
+    requests: Sequence[RescanRequestRecord],
+    *,
+    duration_ms: int,
+    existing_shapes: frozenset[tuple[int, int]] = frozenset(),
+) -> tuple[PlannedWindow, ...]:
+    """Turn accepted rescan requests into a deduplicated, deterministic window plan.
+
+    Requests are consumed in priority order, so when two regions overlap the window is attributed
+    to the higher-priority request.  A geometry that some earlier generation already scanned is
+    dropped: repeating it would spend a request without adding an independent support interval.
+    """
+
+    planned: dict[tuple[int, int], str] = {}
+    for request in sorted(requests, key=request_sort_key):
+        for window in schedule_rescan_windows(
+            start_ms=request.start_ms,
+            end_ms=request.end_ms,
+            policy=request.policy,
+            duration_ms=duration_ms,
+        ):
+            shape = (window.start_ms, window.output_ms)
+            if shape in existing_shapes or shape in planned:
+                continue
+            planned[shape] = request.id
+    return tuple(
+        PlannedWindow(start_ms=start, output_ms=output, rescan_request_id=planned[(start, output)])
+        for start, output in sorted(planned)
+    )
+
+
+def rescan_transform_hypotheses(
+    requests: Sequence[RescanRequestRecord], rescan_request_id: str
+) -> tuple[Transform, ...]:
+    for request in requests:
+        if request.id == rescan_request_id:
+            return tuple(request.policy.transforms)
+    return (Transform(type="none", rate_e4=10_000, semitones=0),)
+
+
+def _window_record(
+    media_key: str,
+    *,
+    generation: int,
+    start_ms: int,
+    output_ms: int,
+    transform: Transform,
+    none_id: str,
+    reason: str,
+    rescan_request_id: str | None,
+    wav_path: str,
+    wav_sha256: str,
+) -> WindowRecord:
+    support_end = start_ms + _support_span_ms(output_ms, transform)
+    return WindowRecord(
+        schema_version=SCHEMA_VERSION,
+        generated_by=GENERATED_BY,
+        id=_window_id(
+            media_key,
+            generation=generation,
+            start_ms=start_ms,
+            support_end_ms=support_end,
+            transform=transform,
+        ),
+        generation=generation,
+        start_ms=start_ms,
+        support_ms=(start_ms, support_end),
+        output_ms=output_ms,
+        transform=transform,
+        sample_map=sample_map_for_transform(
+            transform.type, rate_e4=transform.rate_e4, semitones=transform.semitones
+        ),
+        wav_path=wav_path,
+        wav_sha256=wav_sha256,
+        logical_trial_id=none_id,
+        reason=reason,
+        rescan_request_id=rescan_request_id,
+    )
+
+
+def plan_fixture_rescan_windows(
+    *,
+    media_key: str,
+    duration_ms: int,
+    requests: Sequence[RescanRequestRecord],
+    generation: int,
+    transform_policy: TransformPolicy,
+    transform_grid: TransformGrid = DEFAULT_TRANSFORM_GRID,
+    existing_shapes: frozenset[tuple[int, int]] = frozenset(),
+) -> tuple[WindowRecord, ...]:
+    """In-memory rescan windows for the controlled fixture benchmark (no FFmpeg, no WAVs)."""
+
+    total_samples = duration_ms * SAMPLES_PER_MS
+    records: list[WindowRecord] = []
+    for item in plan_rescan_windows(
+        requests, duration_ms=duration_ms, existing_shapes=existing_shapes
+    ):
+        none = Transform(type="none", rate_e4=10_000, semitones=0)
+        none_id = _window_id(
+            media_key,
+            generation=generation,
+            start_ms=item.start_ms,
+            support_end_ms=item.start_ms + item.output_ms,
+            transform=none,
+        )
+        hypotheses = (
+            rescan_transform_hypotheses(requests, item.rescan_request_id)
+            if transform_policy != "off"
+            else (none,)
+        )
+        for transform in hypotheses:
+            input_samples = transform_slice_sample_count(
+                item.output_ms,
+                transform.type,
+                rate_e4=transform.rate_e4,
+                semitones=transform.semitones,
+            )
+            if item.start_ms * SAMPLES_PER_MS + input_samples > total_samples:
+                continue
+            support_end = item.start_ms + _support_span_ms(item.output_ms, transform)
+            window_id = _window_id(
+                media_key,
+                generation=generation,
+                start_ms=item.start_ms,
+                support_end_ms=support_end,
+                transform=transform,
+            )
+            content_token = sha256(f"{media_key}:{window_id}".encode()).hexdigest()
+            records.append(
+                _window_record(
+                    media_key,
+                    generation=generation,
+                    start_ms=item.start_ms,
+                    output_ms=item.output_ms,
+                    transform=transform,
+                    none_id=none_id,
+                    reason="rescan",
+                    rescan_request_id=item.rescan_request_id,
+                    wav_path=f"local_fixture/window-token/{content_token}.wav",
+                    wav_sha256=content_token,
+                )
+            )
+    _ = transform_grid
+    return tuple(sort_records(records))
+
+
+async def generate_rescan_windows_async(
+    decoded: DecodeResult,
+    media_dir: Path,
+    *,
+    generation: int,
+    requests: Sequence[RescanRequestRecord],
+    transform_policy: TransformPolicy = "rescan_only",
+    existing_shapes: frozenset[tuple[int, int]] = frozenset(),
+    upstream: dict[str, Path] | None = None,
+) -> WindowsResult:
+    """Materialise generation ``N`` rescan windows and write ``windows/windows.gen<N>.jsonl``."""
+
+    record_path = media_dir / "windows" / f"windows.gen{generation}.jsonl"
+    total_bytes = path_size(decoded.pcm_path)
+    total_samples = total_bytes // BYTES_PER_SAMPLE
+    duration_ms = total_samples // SAMPLES_PER_MS
+    records: list[WindowRecord] = []
+    for item in plan_rescan_windows(
+        requests, duration_ms=duration_ms, existing_shapes=existing_shapes
+    ):
+        start_sample = item.start_ms * SAMPLES_PER_MS
+        none = Transform(type="none", rate_e4=10_000, semitones=0)
+        none_id = _window_id(
+            decoded.record.media_key,
+            generation=generation,
+            start_ms=item.start_ms,
+            support_end_ms=item.start_ms + item.output_ms,
+            transform=none,
+        )
+        hypotheses = (
+            rescan_transform_hypotheses(requests, item.rescan_request_id)
+            if transform_policy != "off"
+            else (none,)
+        )
+        for transform in hypotheses:
+            input_samples = transform_slice_sample_count(
+                item.output_ms,
+                transform.type,
+                rate_e4=transform.rate_e4,
+                semitones=transform.semitones,
+            )
+            if start_sample + input_samples > total_samples:
+                continue
+            wav_path = (
+                media_dir
+                / "windows"
+                / f"gen{generation}"
+                / f"{item.start_ms:010d}-{item.output_ms:06d}-{_variant_name(transform)}.wav"
+            )
+            await write_transformed_wav(
+                decoded.pcm_path,
+                wav_path,
+                start_sample=start_sample,
+                input_samples=input_samples,
+                output_samples=item.output_ms * SAMPLES_PER_MS,
+                transform=transform,
+            )
+            records.append(
+                _window_record(
+                    decoded.record.media_key,
+                    generation=generation,
+                    start_ms=item.start_ms,
+                    output_ms=item.output_ms,
+                    transform=transform,
+                    none_id=none_id,
+                    reason="rescan",
+                    rescan_request_id=item.rescan_request_id,
+                    wav_path=wav_path.relative_to(media_dir).as_posix(),
+                    wav_sha256=sha256_file(wav_path),
+                )
+            )
+    ordered = tuple(sort_records(records))
+    content = b"\n".join(canonical_json_bytes(record) for record in ordered)
+    atomic_write_bytes(record_path, content + (b"\n" if content else b""))
+    write_completion_sidecar(
+        record_path,
+        {
+            "decode/pcm.json": decoded.record_path,
+            decoded.record.pcm.path: decoded.pcm_path,
+            **(upstream or {}),
+        },
+    )
     return WindowsResult(ordered, record_path, False)
 
 

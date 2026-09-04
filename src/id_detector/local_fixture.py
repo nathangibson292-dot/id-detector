@@ -60,6 +60,11 @@ class FixtureHit:
     title: str
     recording_id: str
     ref_anchor_ms: int
+    # The mix time of the *first matched sample*, which is what a real provider's offset pairs
+    # with. For a window that begins before the track becomes audible this is the audible start,
+    # not the window start; anchoring at the window start instead would pair a moving mix time
+    # with a stationary reference time and manufacture a zero-slope segment.
+    mix_anchor_ms: int = 0
     frequencyskew_e6: int = 0
     timeskew_e6: int = 0
     is_decoy: bool = False
@@ -69,8 +74,51 @@ def _overlap(left: tuple[int, int], right: tuple[int, int]) -> int:
     return max(0, min(left[1], right[1]) - max(left[0], right[0]))
 
 
+# Stage 4c event replicates. Each renders exactly one discontinuity, so its reference behaviour
+# is a two- or three-piece function of the elapsed mix time inside the episode.
+EV_ONSET_MS = 10_000
+EV_LOOP_BACK_MS = 5_000
+EV_JUMP_MS = 40_000
+EV_DRIFT_RATE_E4 = 11_500
+
+
+def _event_case(set_id: str) -> str | None:
+    for name in ("ev-loop", "ev-jump", "ev-drift", "ev-replay"):
+        if f"-{name}-" in set_id:
+            return name
+    return None
+
+
+def _event_reference_progress(case: str, elapsed_ms: int) -> int:
+    if case == "ev-loop":
+        if elapsed_ms < EV_ONSET_MS:
+            return elapsed_ms
+        if elapsed_ms < EV_ONSET_MS + EV_LOOP_BACK_MS:
+            return EV_ONSET_MS - EV_LOOP_BACK_MS + (elapsed_ms - EV_ONSET_MS)
+        return elapsed_ms - EV_LOOP_BACK_MS
+    if case == "ev-jump":
+        return elapsed_ms if elapsed_ms < EV_ONSET_MS else elapsed_ms + EV_JUMP_MS
+    if case == "ev-drift":
+        if elapsed_ms < EV_ONSET_MS:
+            return elapsed_ms
+        return EV_ONSET_MS + (elapsed_ms - EV_ONSET_MS) * EV_DRIFT_RATE_E4 // 10_000
+    return elapsed_ms
+
+
+def _event_local_rate_e4(set_id: str, elapsed_ms: int) -> int:
+    """The playback rate the provider would report as time skew for this window."""
+
+    case = _event_case(set_id)
+    if case == "ev-drift" and elapsed_ms >= EV_ONSET_MS:
+        return EV_DRIFT_RATE_E4
+    return 10_000
+
+
 def _reference_progress(set_id: str, elapsed_ms: int) -> int:
     elapsed_ms = max(0, elapsed_ms)
+    case = _event_case(set_id)
+    if case is not None:
+        return _event_reference_progress(case, elapsed_ms)
     if "loop" in set_id:
         return elapsed_ms % 5_000
     if "cue-jump" in set_id:
@@ -186,6 +234,8 @@ def _hits_for_window(
         progress = _reference_progress(truth.set_id, elapsed)
         if "-tempo-" in truth.set_id or "-resample-" in truth.set_id:
             progress = progress * native_time_e4 // 10_000
+        local_rate_e4 = _event_local_rate_e4(truth.set_id, max(0, elapsed))
+        mix_anchor_ms = max(support[0], audible[0])
         hits.append(
             FixtureHit(
                 episode_index=index,
@@ -193,8 +243,9 @@ def _hits_for_window(
                 title=episode.work.title if matches_truth else DECOY_TITLE,
                 recording_id=recording_id if matches_truth else DECOY_RECORDING_ID,
                 ref_anchor_ms=source_offset_ms + progress,
+                mix_anchor_ms=mix_anchor_ms,
                 frequencyskew_e6=(residual_pitch - 10_000) * 100,
-                timeskew_e6=(residual_time - 10_000) * 100,
+                timeskew_e6=(residual_time * local_rate_e4 // 10_000 - 10_000) * 100,
                 is_decoy=not matches_truth,
             )
         )
@@ -231,7 +282,7 @@ def build_recorded_response_map(
     return recorded
 
 
-def _query(media_key: str, window: Any) -> QueryRecord:
+def _query(media_key: str, window: Any, generation: int = 0) -> QueryRecord:
     target = WindowQueryTarget(window_id=window.id)
     cache_key = clip_cache_key(window.wav_sha256, "local_fixture", PROVIDER_CONFIG_VERSION)
     natural = {
@@ -245,7 +296,7 @@ def _query(media_key: str, window: Any) -> QueryRecord:
         schema_version=SCHEMA_VERSION,
         generated_by=GENERATED_BY,
         id=make_id(media_key, "query", compose_natural_key("query", natural)),
-        generation=0,
+        generation=generation,
         provider="local_fixture",
         capability="clip_recognizer",
         target=target,
@@ -304,7 +355,7 @@ def _observation(
             "content_sha256": window.wav_sha256,
         }
         anchor = Anchor(
-            mix_anchor_ms=window.support_ms[0],
+            mix_anchor_ms=max(window.support_ms[0], hit.mix_anchor_ms),
             ref_anchor_ms=hit.ref_anchor_ms,
             uncertainty_ms=25,
             reliable=True,
@@ -318,7 +369,7 @@ def _observation(
         schema_version=SCHEMA_VERSION,
         generated_by=GENERATED_BY,
         id=make_id(media_key, "observation", compose_natural_key("observation", natural)),
-        generation=0,
+        generation=query.generation,
         query_id=query.id,
         provider="local_fixture",
         capability="clip_recognizer",
@@ -392,6 +443,7 @@ def recognise_controlled_fixture(
     media_dir: Path,
     windows: WindowsResult,
     recorded_responses: Mapping[str, tuple[FixtureHit, ...]],
+    generation: int = 0,
 ) -> RecognitionResult:
     """Materialise deterministic recorded responses keyed by each exact window WAV hash."""
 
@@ -403,15 +455,15 @@ def recognise_controlled_fixture(
 
     invocation_dir = media_dir / "recognise" / "invocations" / "local-fixture-v1"
     raw_dir = invocation_dir / "raw"
-    queries_path = invocation_dir / "queries.gen0.jsonl"
-    observations_path = invocation_dir / "observations.gen0.jsonl"
-    raw_index_path = invocation_dir / "raw_index.json"
+    queries_path = invocation_dir / f"queries.gen{generation}.jsonl"
+    observations_path = invocation_dir / f"observations.gen{generation}.jsonl"
+    raw_index_path = invocation_dir / f"raw_index.gen{generation}.json"
     queries: list[QueryRecord] = []
     observations: list[ObservationRecord] = []
     raw_index: list[RawIndexEntry] = []
     for content_hash in sorted(windows_by_hash):
         grouped_windows = windows_by_hash[content_hash]
-        query = _query(media_key, grouped_windows[0])
+        query = _query(media_key, grouped_windows[0], generation)
         queries.append(query)
         hits = recorded_responses.get(content_hash, ())
         raw_path = raw_dir / f"{query.cache_key}.json"
@@ -475,7 +527,8 @@ def recognise_controlled_fixture(
         b"\n".join(canonical_json_bytes(item) for item in ordered_observations) + b"\n"
     )
     atomic_write_bytes(queries_path, query_bytes)
-    write_completion_sidecar(queries_path, {"windows/windows.gen0.jsonl": windows.record_path})
+    windows_key = windows.record_path.name
+    write_completion_sidecar(queries_path, {f"windows/{windows_key}": windows.record_path})
     atomic_write_json(raw_index_path, list(ordered_index))
     write_completion_sidecar(
         raw_index_path, {item.path: media_dir / item.path for item in ordered_index}
@@ -486,7 +539,7 @@ def recognise_controlled_fixture(
         {
             queries_path.relative_to(media_dir).as_posix(): queries_path,
             raw_index_path.relative_to(media_dir).as_posix(): raw_index_path,
-            "windows/windows.gen0.jsonl": windows.record_path,
+            f"windows/{windows_key}": windows.record_path,
         },
     )
     return RecognitionResult(

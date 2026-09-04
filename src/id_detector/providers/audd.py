@@ -12,7 +12,7 @@ import os
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass, field
 from decimal import ROUND_HALF_UP, Decimal
-from hashlib import sha1, sha256
+from hashlib import sha256
 from pathlib import Path
 from typing import Any
 
@@ -31,6 +31,7 @@ from id_detector.contracts import (
     make_id,
     sort_records,
 )
+from id_detector.fuse.scanners import scanner_logical_trial_id
 from id_detector.io import (
     atomic_write_json,
     canonical_json_bytes,
@@ -170,7 +171,7 @@ def _empty_label() -> RawLabel:
 
 
 def _logical_trial_id(chunk_index: int) -> str:
-    return sha1(f"{PROVIDER}|{chunk_index}".encode(), usedforsecurity=False).hexdigest()
+    return scanner_logical_trial_id(PROVIDER, chunk_index)
 
 
 def parse_response(

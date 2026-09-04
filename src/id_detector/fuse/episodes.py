@@ -44,6 +44,13 @@ from id_detector.io import (
     sha256_file,
     write_completion_sidecar,
 )
+from id_detector.providers.base import AppConfig
+from id_detector.rescan import (
+    TRIGGER_PRIORITY,
+    policy_for_trigger,
+    priority_for_trigger,
+    schedule_rescan_windows,
+)
 from id_detector.semantics import (
     RECORDING_NAMESPACES,
     gap_intervals,
@@ -62,6 +69,7 @@ class FusionResult:
     generation_path: Path
     final_path: Path
     rescan_path: Path
+    requests: tuple[RescanRequestRecord, ...] = ()
 
 
 def _intersects(left: tuple[int, int], right: tuple[int, int]) -> bool:
@@ -80,29 +88,97 @@ def _interval_overlap_ms(
     return interval_length(intersections, duration_ms)
 
 
-def _independent_trials(votes: list[ObservationRecord]) -> int:
-    """Return ``T_ind`` (rev 5.2): the largest set of non-overlapping trial supports.
+#: Engines that sell the same commercial catalogue coverage. The plan's dependence prior says a
+#: *second* commercial engine's agreement is worth half a trial until dependence is measured.
+COMMERCIAL_PROVIDERS = frozenset({"audd", "acrcloud"})
+FULL_TRIAL_E4 = 10_000
+DISCOUNTED_TRIAL_E4 = 5_000
+
+
+def discounted_providers(votes: list[ObservationRecord]) -> frozenset[str]:
+    """Return the commercial engines whose trials carry the initial 0.5 dependence prior."""
+
+    counts: dict[str, int] = {}
+    for item in votes:
+        if item.provider in COMMERCIAL_PROVIDERS:
+            counts[item.provider] = counts.get(item.provider, 0) + 1
+    if len(counts) <= 1:
+        return frozenset()
+    ordered = sorted(counts, key=lambda name: (-counts[name], name))
+    return frozenset(ordered[1:])
+
+
+def _independent_trials_e4(votes: list[ObservationRecord]) -> int:
+    """Return ``T_ind`` in ten-thousandths (rev 5.2 + the Stage 4c dependence prior).
 
     Each logical trial contributes one interval — the hull of the supports of its selected
     observations — and greedy interval scheduling (earliest finishing interval first) yields the
     maximum pairwise non-overlapping subset.  Overlapping windows from a dense hop or a rescan
-    therefore cannot inflate the tier without new, disjoint evidence.
+    therefore cannot inflate the tier without new, disjoint evidence.  A selected trial owned by a
+    *second* commercial engine contributes ``0.5`` rather than ``1``.
     """
 
+    discounted = discounted_providers(votes)
     by_trial: dict[str, tuple[int, int]] = {}
+    provider_by_trial: dict[str, str] = {}
     for item in votes:
         start, end = item.support_ms
         current = by_trial.get(item.logical_trial_id)
         by_trial[item.logical_trial_id] = (
             (start, end) if current is None else (min(current[0], start), max(current[1], end))
         )
-    count = 0
+        previous = provider_by_trial.get(item.logical_trial_id)
+        if previous is None or item.provider < previous:
+            provider_by_trial[item.logical_trial_id] = item.provider
+    total = 0
     last_end: int | None = None
-    for start, end in sorted(by_trial.values(), key=lambda item: (item[1], item[0])):
+    for trial_id, (start, end) in sorted(
+        by_trial.items(), key=lambda item: (item[1][1], item[1][0], item[0])
+    ):
         if last_end is None or start >= last_end:
-            count += 1
+            total += (
+                DISCOUNTED_TRIAL_E4
+                if provider_by_trial.get(trial_id) in discounted
+                else FULL_TRIAL_E4
+            )
             last_end = end
-    return count
+    return total
+
+
+NOVELTY_REGION_PAD_MS = 10_000
+
+
+def region_request_key(trigger: str, start_ms: int, end_ms: int, policy: RescanPolicy) -> str:
+    """Generation-independent identity of a rescan region, used to stop re-requesting it."""
+
+    return compose_natural_key(
+        "rescan_request",
+        {
+            "generation": 0,
+            "trigger": trigger,
+            "start_ms": start_ms,
+            "end_ms": end_ms,
+            "policy": policy.model_dump(mode="json"),
+        },
+    )
+
+
+def _novelty_regions(
+    change_points_ms: tuple[int, ...] | list[int], duration_ms: int
+) -> list[tuple[int, int]]:
+    """Merge nearby spectral change points into padded, non-overlapping rescan regions."""
+
+    merged: list[tuple[int, int]] = []
+    for at_ms in sorted({int(value) for value in change_points_ms}):
+        start = max(0, at_ms - NOVELTY_REGION_PAD_MS)
+        end = min(duration_ms, at_ms + NOVELTY_REGION_PAD_MS)
+        if end <= start:
+            continue
+        if merged and start <= merged[-1][1]:
+            merged[-1] = (merged[-1][0], max(merged[-1][1], end))
+        else:
+            merged.append((start, end))
+    return merged
 
 
 def _tier_score(tier: str) -> int:
@@ -317,6 +393,10 @@ def build_episodes(
     generation: int = 0,
     profile: str = "free",
     rescan_transforms: tuple[Transform, ...] | list[Transform] | None = None,
+    novelty_change_points_ms: tuple[int, ...] | list[int] = (),
+    prior_request_keys: frozenset[str] | set[str] | None = None,
+    scanned_window_shapes: frozenset[tuple[int, int]] | None = None,
+    config: AppConfig | None = None,
 ) -> tuple[EpisodesFile, list[RescanRequestRecord]]:
     final = [item for item in observations if item.is_final]
     selection = select_logical_trial_points(final, identity.observation_candidates)
@@ -343,7 +423,7 @@ def build_episodes(
             if not supports:
                 continue
             start_bound, end_bound, start_censored, end_censored = proved_bounds(raw_supports)
-            independent_trials = _independent_trials(votes)
+            independent_trials_e4 = _independent_trials_e4(votes)
             candidate_work_id = candidate_by_id[candidate_id].work_id
             supporting_hints = [
                 hint
@@ -353,20 +433,32 @@ def build_episodes(
                 and hint.position_range_ms is not None
                 and any(_intersects(hint.position_range_ms, support) for support in supports)
             ]
-            hint_vote = int(bool({hint.provenance_group for hint in supporting_hints}))
+            hint_vote_e4 = FULL_TRIAL_E4 * int(
+                bool({hint.provenance_group for hint in supporting_hints})
+            )
             span = supports[-1][1] - supports[0][0]
             competing = _competition(supports, candidate_id, all_supports, duration_ms)
             has_global = alignment.has_global_alignment if alignment is not None else False
-            if independent_trials >= 4 and span >= 40_000 and not competing and has_global:
+            if (
+                independent_trials_e4 >= 4 * FULL_TRIAL_E4
+                and span >= 40_000
+                and not competing
+                and has_global
+            ):
                 audio_work_tier = "likely"
-            elif independent_trials >= 2 and span >= 20_000 and not competing:
+            elif independent_trials_e4 >= 2 * FULL_TRIAL_E4 and span >= 20_000 and not competing:
                 audio_work_tier = "possible"
             else:
                 audio_work_tier = "unclear"
-            effective_trials = independent_trials + hint_vote
-            if effective_trials >= 4 and span >= 40_000 and not competing and has_global:
+            effective_trials_e4 = independent_trials_e4 + hint_vote_e4
+            if (
+                effective_trials_e4 >= 4 * FULL_TRIAL_E4
+                and span >= 40_000
+                and not competing
+                and has_global
+            ):
                 work_tier = "likely"
-            elif effective_trials >= 2 and span >= 20_000 and not competing:
+            elif effective_trials_e4 >= 2 * FULL_TRIAL_E4 and span >= 20_000 and not competing:
                 work_tier = "possible"
             else:
                 work_tier = "unclear"
@@ -555,7 +647,9 @@ def build_episodes(
                         and _intersects(hint.position_range_ms, interval)
                         for hint in hints
                     ),
-                    n_novelty_events=0,
+                    n_novelty_events=sum(
+                        start <= at_ms <= end for at_ms in set(novelty_change_points_ms)
+                    ),
                 ),
                 reason="no_evidence",
                 truncated=start == 0 or end == duration_ms,
@@ -578,18 +672,29 @@ def build_episodes(
     )
     input_hashes: dict[str, str] = {}
     requests: list[RescanRequestRecord] = []
-    policy = RescanPolicy(
-        window_ms=8_000,
-        hop_ms=4_000,
-        phase_ms=2_000,
-        transforms=list(rescan_transforms)
+    transforms = (
+        list(rescan_transforms)
         if rescan_transforms is not None
-        else [Transform(type="none", rate_e4=10_000, semitones=0)],
+        else [Transform(type="none", rate_e4=10_000, semitones=0)]
     )
+    policies = {
+        trigger: policy_for_trigger(trigger, transforms=transforms, config=config)
+        for trigger in TRIGGER_PRIORITY
+    }
+    suppressed = frozenset(prior_request_keys or ())
+    scanned = frozenset(scanned_window_shapes or ())
+    emitted_keys: set[str] = set()
 
-    def add_request(trigger: str, start: int, end: int, priority: int) -> None:
+    def add_request(trigger: str, start: int, end: int) -> None:
         if end <= start:
             return
+        policy = policies[trigger]
+        key = region_request_key(trigger, start, end, policy)
+        if key in emitted_keys:
+            # Two episodes can nominate the same edge or gap region. The request is the region,
+            # so it is emitted once and its deterministic id stays unique within the plan.
+            return
+        emitted_keys.add(key)
         natural = {
             "generation": generation,
             "trigger": trigger,
@@ -597,6 +702,16 @@ def build_episodes(
             "end_ms": end,
             "policy": policy.model_dump(mode="json"),
         }
+        if region_request_key(trigger, start, end, policy) in suppressed:
+            return
+        # A region whose every planned window already exists cannot add an independent support
+        # interval, so re-requesting it would spend budget for no new evidence. This is what makes
+        # the generation loop converge instead of running to ``max_generations`` every time.
+        planned = schedule_rescan_windows(
+            start_ms=start, end_ms=end, policy=policy, duration_ms=duration_ms
+        )
+        if not planned or all((item.start_ms, item.output_ms) in scanned for item in planned):
+            return
         requests.append(
             RescanRequestRecord(
                 schema_version=SCHEMA_VERSION,
@@ -611,13 +726,13 @@ def build_episodes(
                 start_ms=start,
                 end_ms=end,
                 policy=policy,
-                priority=priority,
+                priority=priority_for_trigger(trigger),
                 input_hashes=input_hashes,
             )
         )
 
     for gap in gaps:
-        add_request("gap", gap.start_ms, gap.end_ms, 100)
+        add_request("gap", gap.start_ms, gap.end_ms)
     for episode in episode_records:
         candidate = candidate_by_id[episode.candidate_id]
         if candidate.contested:
@@ -625,24 +740,23 @@ def build_episodes(
                 "contested",
                 episode.evidence_support_ms[0][0],
                 episode.evidence_support_ms[-1][1],
-                90,
             )
         add_request(
             "edge",
             max(0, episode.best_start_ms - 20_000),
             min(duration_ms, episode.best_start_ms + 20_000),
-            70,
         )
         hull_start = episode.evidence_support_ms[0][0]
         hull_end = episode.evidence_support_ms[-1][1]
         if hull_end - hull_start > 12 * 60 * 1_000:
-            add_request("long_episode", hull_start, hull_end, 60)
+            add_request("long_episode", hull_start, hull_end)
         add_request(
             "edge",
             max(0, episode.best_end_ms - 20_000),
             min(duration_ms, episode.best_end_ms + 20_000),
-            70,
         )
+    for cluster_start, cluster_end in _novelty_regions(novelty_change_points_ms, duration_ms):
+        add_request("novelty", cluster_start, cluster_end)
     used_hint_ids = {hint.id for item in provisional for hint in item["supporting_hints"]}
     for hint in hints:
         if (
@@ -656,7 +770,6 @@ def build_episodes(
                 "hint_cluster",
                 hint.position_range_ms[0],
                 hint.position_range_ms[1],
-                80,
             )
 
     questions = sorted(
@@ -680,7 +793,6 @@ def build_episodes(
                 "question_cluster",
                 min(item.position_range_ms[0] for _, item in cluster if item.position_range_ms),
                 max(item.position_range_ms[1] for _, item in cluster if item.position_range_ms),
-                95,
             )
             index = end + 1
         else:
@@ -691,6 +803,97 @@ def build_episodes(
 def _jsonl_bytes(records: list[Any]) -> bytes:
     payload = b"\n".join(canonical_json_bytes(item) for item in records)
     return payload + (b"\n" if payload else b"")
+
+
+def fuse_generation(
+    *,
+    media_key: str,
+    media_dir: Path,
+    duration_ms: int,
+    observations: list[ObservationRecord] | tuple[ObservationRecord, ...],
+    observation_paths: list[Path] | tuple[Path, ...],
+    windows: list[WindowRecord] | tuple[WindowRecord, ...],
+    window_paths: list[Path] | tuple[Path, ...],
+    pcm_path: Path,
+    generation: int = 0,
+    hints: list[HintRecord] | tuple[HintRecord, ...] = (),
+    hints_path: Path | None = None,
+    profile: str = "free",
+    rescan_transforms: tuple[Transform, ...] | list[Transform] | None = None,
+    novelty_change_points_ms: tuple[int, ...] | list[int] = (),
+    prior_request_keys: frozenset[str] | set[str] | None = None,
+    scanned_window_shapes: frozenset[tuple[int, int]] | None = None,
+    config: AppConfig | None = None,
+    write_final: bool = True,
+) -> FusionResult:
+    """Fuse the union of every generation's evidence and publish generation ``N``'s artefacts.
+
+    ``observation_paths``/``window_paths`` list **every** input generation, so the completion
+    sidecar of ``fuse/episodes.gen<N>.json`` records the hash of each one, as the plan requires.
+    """
+
+    identity = build_identity_graph(media_key, observations, hints=hints)
+    identities_path = write_identity_graph(
+        media_dir,
+        generation,
+        identity,
+        observations_path=observation_paths[-1],
+        hints_path=hints_path,
+    )
+    episodes, requests = build_episodes(
+        media_key=media_key,
+        duration_ms=duration_ms,
+        observations=observations,
+        windows=windows,
+        identity=identity,
+        hints=hints,
+        generation=generation,
+        profile=profile,
+        rescan_transforms=rescan_transforms,
+        novelty_change_points_ms=novelty_change_points_ms,
+        prior_request_keys=prior_request_keys,
+        scanned_window_shapes=scanned_window_shapes,
+        config=config,
+    )
+    generation_path = media_dir / "fuse" / f"episodes.gen{generation}.json"
+    upstream = {
+        path.relative_to(media_dir).as_posix(): path for path in (*observation_paths, *window_paths)
+    }
+    upstream[pcm_path.relative_to(media_dir).as_posix()] = pcm_path
+    upstream[identities_path.relative_to(media_dir).as_posix()] = identities_path
+    if hints_path is not None:
+        upstream[hints_path.relative_to(media_dir).as_posix()] = hints_path
+    atomic_write_json(generation_path, episodes)
+    write_completion_sidecar(generation_path, upstream)
+    final_path = media_dir / "fuse" / "episodes.json"
+    if write_final:
+        atomic_write_bytes(final_path, canonical_json_bytes(episodes))
+        write_completion_sidecar(
+            final_path,
+            {generation_path.relative_to(media_dir).as_posix(): generation_path},
+        )
+    input_hashes = {
+        path.relative_to(media_dir).as_posix(): sha256_file(path)
+        for path in (
+            *observation_paths,
+            *window_paths,
+            identities_path,
+            *([hints_path] if hints_path is not None else []),
+        )
+    }
+    requests = [request.model_copy(update={"input_hashes": input_hashes}) for request in requests]
+    rescan_path = media_dir / "fuse" / f"rescan_plan.gen{generation}.jsonl"
+    atomic_write_bytes(rescan_path, _jsonl_bytes(requests))
+    write_completion_sidecar(rescan_path, upstream)
+    return FusionResult(
+        identities=identity,
+        episodes=episodes,
+        identities_path=identities_path,
+        generation_path=generation_path,
+        final_path=final_path,
+        rescan_path=rescan_path,
+        requests=tuple(requests),
+    )
 
 
 def fuse_generation_zero(
@@ -707,61 +910,27 @@ def fuse_generation_zero(
     hints_path: Path | None = None,
     profile: str = "free",
     rescan_transforms: tuple[Transform, ...] | list[Transform] | None = None,
+    novelty_change_points_ms: tuple[int, ...] | list[int] = (),
+    config: AppConfig | None = None,
+    write_final: bool = True,
 ) -> FusionResult:
-    identity = build_identity_graph(media_key, observations, hints=hints)
-    identities_path = write_identity_graph(
-        media_dir,
-        0,
-        identity,
-        observations_path=observations_path,
-        hints_path=hints_path,
-    )
-    episodes, requests = build_episodes(
+    """Generation-0 convenience wrapper used by the single-generation callers."""
+
+    return fuse_generation(
         media_key=media_key,
+        media_dir=media_dir,
         duration_ms=duration_ms,
         observations=observations,
+        observation_paths=(observations_path,),
         windows=windows,
-        identity=identity,
-        hints=hints,
+        window_paths=(windows_path,),
+        pcm_path=pcm_path,
         generation=0,
+        hints=hints,
+        hints_path=hints_path,
         profile=profile,
         rescan_transforms=rescan_transforms,
-    )
-    generation_path = media_dir / "fuse" / "episodes.gen0.json"
-    upstream = {
-        observations_path.relative_to(media_dir).as_posix(): observations_path,
-        windows_path.relative_to(media_dir).as_posix(): windows_path,
-        pcm_path.relative_to(media_dir).as_posix(): pcm_path,
-        identities_path.relative_to(media_dir).as_posix(): identities_path,
-    }
-    if hints_path is not None:
-        upstream[hints_path.relative_to(media_dir).as_posix()] = hints_path
-    atomic_write_json(generation_path, episodes)
-    write_completion_sidecar(generation_path, upstream)
-    final_path = media_dir / "fuse" / "episodes.json"
-    atomic_write_bytes(final_path, canonical_json_bytes(episodes))
-    write_completion_sidecar(
-        final_path,
-        {generation_path.relative_to(media_dir).as_posix(): generation_path},
-    )
-    input_hashes = {
-        path.relative_to(media_dir).as_posix(): sha256_file(path)
-        for path in (
-            observations_path,
-            windows_path,
-            identities_path,
-            *([hints_path] if hints_path is not None else []),
-        )
-    }
-    requests = [request.model_copy(update={"input_hashes": input_hashes}) for request in requests]
-    rescan_path = media_dir / "fuse" / "rescan_plan.gen0.jsonl"
-    atomic_write_bytes(rescan_path, _jsonl_bytes(requests))
-    write_completion_sidecar(rescan_path, upstream)
-    return FusionResult(
-        identities=identity,
-        episodes=episodes,
-        identities_path=identities_path,
-        generation_path=generation_path,
-        final_path=final_path,
-        rescan_path=rescan_path,
+        novelty_change_points_ms=novelty_change_points_ms,
+        config=config,
+        write_final=write_final,
     )

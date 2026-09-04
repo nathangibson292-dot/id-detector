@@ -202,6 +202,7 @@ def seed_truth(
         corpus_version=corpus_version,
         selection_basis=selection_basis,
         episodes=episodes,
+        events=[],
         regions=[],
     )
     atomic_write_json(out_path, truth)
@@ -251,9 +252,18 @@ def _episode_content(episode: Any) -> dict[str, Any]:
     return payload
 
 
+def _pass_content(payload: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "episodes": payload["episodes"],
+        "events": payload.get("events") or [],
+        "regions": payload["regions"],
+    }
+
+
 def _annotation_content(truth: GroundTruthRecord) -> dict[str, Any]:
     return {
         "episodes": [_episode_content(episode) for episode in truth.episodes],
+        "events": [event.model_dump(mode="json") for event in truth.events],
         "regions": [region.model_dump(mode="json") for region in truth.regions],
     }
 
@@ -288,7 +298,11 @@ def _read_annotation_pass(truth_path: Path, pass_name: str) -> dict[str, Any]:
     if not path_is_file(path):
         raise ValueError(f"missing {pass_name} annotation pass: {path.name}")
     payload = json.loads(read_text(path))
-    content = {"episodes": payload.get("episodes"), "regions": payload.get("regions")}
+    content = {
+        "episodes": payload.get("episodes"),
+        "events": payload.get("events") or [],
+        "regions": payload.get("regions"),
+    }
     digest = sha256(canonical_json_bytes(content)).hexdigest()
     if payload.get("pass") != pass_name or payload.get("content_sha256") != digest:
         raise ValueError(f"invalid {pass_name} annotation pass")
@@ -331,6 +345,7 @@ def _truth_with_content(
         {
             **base.model_dump(mode="json"),
             "episodes": episodes,
+            "events": content.get("events") or [],
             "regions": content["regions"],
         }
     )
@@ -504,7 +519,7 @@ def second_pass_truth(
         mode=mode,
         content=second_content,
     )
-    first_content = {"episodes": first["episodes"], "regions": first["regions"]}
+    first_content = _pass_content(first)
     agrees = canonical_json_bytes(first_content) == canonical_json_bytes(second_content)
     resolution = "agreed" if agrees else "unresolved:third-annotator-required"
     updated = _truth_with_content(
@@ -532,8 +547,8 @@ def resolve_truth(
         raise ValueError("first and second annotation passes must use distinct annotators")
     if resolver_ref in annotators:
         raise ValueError("resolver must be a third, distinct annotator")
-    first_content = {"episodes": first["episodes"], "regions": first["regions"]}
-    second_content = {"episodes": second["episodes"], "regions": second["regions"]}
+    first_content = _pass_content(first)
+    second_content = _pass_content(second)
     if canonical_json_bytes(first_content) == canonical_json_bytes(second_content):
         raise ValueError("matching passes do not need third-annotator resolution")
     resolved_content = _load_independent_annotation(annotation_path, truth)
@@ -590,8 +605,8 @@ def freeze_truth(truth_dir: Path, *, corpus_version: str, out_path: Path) -> dic
                     errors.append(f"{truth.set_id} annotation passes are not independent")
                 if second.get("mode") != "independent":
                     errors.append(f"{truth.set_id} second pass was not independently authored")
-                first_content = {"episodes": first["episodes"], "regions": first["regions"]}
-                second_content = {"episodes": second["episodes"], "regions": second["regions"]}
+                first_content = _pass_content(first)
+                second_content = _pass_content(second)
                 disagree = canonical_json_bytes(first_content) != canonical_json_bytes(
                     second_content
                 )
@@ -605,6 +620,7 @@ def freeze_truth(truth_dir: Path, *, corpus_version: str, out_path: Path) -> dic
                         errors.append(f"{truth.set_id} resolver is not a distinct third annotator")
                     expected = {
                         "episodes": resolution["episodes"],
+                        "events": resolution.get("events") or [],
                         "regions": resolution["regions"],
                     }
                     if any(

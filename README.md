@@ -1,8 +1,10 @@
 # id-detector
 
-Evidence-first track identification for DJ sets. Stage 4b adds corrected resample, tempo, and
-pitch hypotheses, configurable transform policy, and benchmark-selected schedules to the Stage 4a
-hint and recognition foundation.
+Evidence-first track identification for DJ sets. Stage 4c adds the orchestrator-owned generation
+loop (rescan plan -> windows -> recognise -> re-fuse the union of every generation), per-trigger
+rescan policies with local spectral-novelty change points, file-scanner fusion with the plan's
+second-commercial-engine dependence prior, an explicit event-truth contract, and the controlled
+ablations that Stage 4d will freeze profiles from.
 
 Recognition evidence is immutable per invocation under
 `work/<source_key>/<media_key>/recognise/invocations/<invocation_key>/`. The active packaged
@@ -18,12 +20,19 @@ uv run id-detector calibrate-shazam --track <released-file-or-url> --positions 1
 uv run id-detector analyse <mix-url> --raw
 uv run id-detector analyse <mix-url> --tracklist <tracklist.txt>
 uv run id-detector analyse <mix-url> --config id-detector.toml
+uv run id-detector analyse <mix-url> --max-generations 3 --novelty
 uv run id-detector hints <mix-url>
 uv run id-detector hints <mix-url> --confirm-mirror <ALLOWLISTED_MIRROR_URL>
 uv run id-detector benchmark hints --corpus dev-2 --out data/local/benchmark/dev-2/hints-gate.json
 uv run id-detector show <source-key>
 uv run id-detector benchmark run --corpus controlled-synth-1 --profile free --out data/corpus/controlled-synth-1/baseline-free.json
 uv run id-detector benchmark shortlist --corpus controlled-synth-1 --out data/corpus/controlled-synth-1/shortlist.json
+uv run id-detector benchmark ablations --corpus controlled-events-1 `
+  --out data/corpus/controlled-synth-1/ablations.json `
+  --work-root data/local/work-ablations
+uv run id-detector benchmark render --sources <local-audio-dir> --out data/corpus/controlled-events-1 `
+  --audio-out data/local/controlled/controlled-events-1 --seed 20260904 `
+  --cases events --corpus-version controlled-events-1
 uv run id-detector benchmark transforms-schedule --corpus controlled-synth-1 `
   --out data/corpus/controlled-synth-1/transforms-schedule.json `
   --work-root data/local/work-transforms-schedule
@@ -56,5 +65,11 @@ Third-party uploads are denied by default. To evaluate AudD or ACRCloud, copy
 `.env.example`, and pass `--i-own-this-audio-or-have-permission` to `benchmark shortlist`.
 The same config contains the Stage 4b schedules and transform grid. `[schedule]` is the
 generation-0 window (12,000 ms window / 9,000 ms hop, plan rev 5.2) and `[rescan]` is the denser
-12,000 / 5,000 policy Stage 4c consumes. `transforms.policy` accepts `off`, `rescan_only` (the
-default), or `global`; global applies all 13 hypotheses to generation 0.
+12,000 / 5,000 base policy the Stage 4c generation loop consumes, together with
+`max_generations`. `transforms.policy` accepts `off`, `rescan_only` (the default), or `global`;
+global applies all 13 hypotheses to generation 0, `rescan_only` keeps them for rescans.
+
+Rescan geometry is per trigger: `contested` and `long_episode` use the `[rescan]` table verbatim,
+while `edge`, `gap`, `novelty`, `hint_cluster` and `question_cluster` use the plan's shorter
+6-8 s windows with shifted phases, because only a shorter window can lower the proved start
+bound. Generations stop at the first of: no requests, `max_generations`, or an exhausted budget.

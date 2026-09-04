@@ -3,14 +3,15 @@
 from __future__ import annotations
 
 import argparse
-import re
 from hashlib import sha1, sha256
 from pathlib import Path
 
-from id_detector.benchmark.scorer import load_truth_directory, work_key
+from id_detector.benchmark.scorer import (
+    ScoringConfigSnapshot,
+    load_truth_directory,
+    work_key,
+)
 from id_detector.io import atomic_write_json, canonical_json_bytes
-
-_EVENT = re.compile(r"event:(jump|loop|reset|drift)@(\d+)")
 
 
 def main() -> None:
@@ -30,16 +31,18 @@ def main() -> None:
         nodes: dict[str, dict] = {}
         works: dict[str, dict] = {}
         candidates: dict[str, dict] = {}
-        for episode in truth.episodes:
+        for episode_index, episode in enumerate(truth.episodes):
             start = sum(episode.start_ms_range) // 2
             end = sum(episode.end_ms_range) // 2
             support_start = min(max(start, (start + end) // 2 - 1_000), max(start, end - 1))
             support_end = min(end, support_start + 2_000)
             if support_end <= support_start:
                 support_end = support_start + 1
+            # ``replay`` is expressed by the occurrence index, never as an alignment event.
             events = [
-                {"type": event, "at_ms": int(at_ms)}
-                for event, at_ms in _EVENT.findall(episode.note or "")
+                {"type": event.type, "at_ms": event.at_ms}
+                for event in truth.events
+                if event.episode_index == episode_index and event.type != "replay"
             ]
             text_node = f"text:{work_key(episode.work)}"
             nodes[text_node] = {
@@ -147,13 +150,14 @@ def main() -> None:
         "bootstrap_seed": args.seed,
         "certification_targets": [],
     }
+    snapshot = ScoringConfigSnapshot.model_validate(config_snapshot)
     atomic_write_json(
         args.out,
         {
             "corpus_version": versions.pop(),
             "profile": args.profile,
-            "config_hash": sha256(canonical_json_bytes(config_snapshot)).hexdigest(),
-            "config_snapshot": config_snapshot,
+            "config_hash": sha256(canonical_json_bytes(snapshot)).hexdigest(),
+            "config_snapshot": snapshot,
             "sets": sets,
             "cost": {
                 "requests": 0,
@@ -162,6 +166,8 @@ def main() -> None:
                 "usd_e2": 0,
                 "wall_ms": 0,
             },
+            # These fixtures are not a frozen corpus: the document must say so explicitly.
+            "unverified_seed_comparison": True,
         },
     )
     print(f"wrote truth-derived plumbing predictions for {len(sets)} sets to {args.out}")

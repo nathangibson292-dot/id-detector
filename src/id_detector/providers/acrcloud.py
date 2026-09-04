@@ -14,7 +14,7 @@ from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from decimal import ROUND_HALF_UP, Decimal
-from hashlib import sha1, sha256
+from hashlib import sha256
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit
@@ -34,6 +34,7 @@ from id_detector.contracts import (
     make_id,
     sort_records,
 )
+from id_detector.fuse.scanners import scanner_logical_trial_id
 from id_detector.io import (
     atomic_write_json,
     canonical_json_bytes,
@@ -224,9 +225,22 @@ def _album(result: Mapping[str, Any]) -> str | None:
     return str(album) if album is not None and not isinstance(album, Mapping) else None
 
 
-def _logical_trial_id(result_type: str, index: int) -> str:
-    value = f"{PROVIDER}|{result_type}|{index}"
-    return sha1(value.encode("utf-8"), usedforsecurity=False).hexdigest()
+def _chunk_indexes(results: Mapping[str, Any]) -> dict[int, int]:
+    """Map each distinct scan-chunk offset (seconds) to its ordinal chunk index.
+
+    The plan's scanner natural key is ``sha1(provider || chunk_index)``. ACRCloud reports one
+    entry per matched bucket inside a chunk, so music and own-bucket hits at the same offset are
+    *simultaneous sources of one logical trial*, distinguished by ``native.simultaneous_source``.
+    """
+
+    offsets: set[int] = set()
+    for result_type in ("music", "custom_files"):
+        entries = results.get(result_type) or []
+        if isinstance(entries, list):
+            for outer in entries:
+                if isinstance(outer, Mapping):
+                    offsets.add(max(0, _seconds_ms(outer.get("offset", 0))))
+    return {offset: index for index, offset in enumerate(sorted(offsets))}
 
 
 def parse_response(
@@ -245,6 +259,7 @@ def parse_response(
         raise ProviderProtocolError("ACRCloud results is not an object")
     observations: list[ObservationRecord] = []
     native_index = 0
+    chunk_indexes = _chunk_indexes(results)
     for result_type in ("music", "custom_files"):
         entries = results.get(result_type) or []
         if not isinstance(entries, list):
@@ -357,7 +372,7 @@ def parse_response(
                     mix_span_ms=(mix_start, mix_end),
                     support_ms=(mix_start, mix_end),
                     transform=None,
-                    logical_trial_id=_logical_trial_id(result_type, result_index),
+                    logical_trial_id=scanner_logical_trial_id(PROVIDER, chunk_indexes[offset_ms]),
                     raw_label=label,
                     provider_ids=_external_ids(result),
                     native=native,

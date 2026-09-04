@@ -14,8 +14,13 @@ window_ms = 12000
 hop_ms = 9000
 phase_ms = 0
 
-# Rescan policy (plan rev 5.2): the benchmark's denser schedule, consumed by Stage 4c.
+# Base rescan policy (plan rev 5.2): the Stage 4b benchmark's denser schedule, consumed by the
+# Stage 4c generation loop. It is used directly by the whole-episode triggers (contested,
+# long_episode) and clamps the shorter boundary policies the plan requires for edges, gaps and
+# spectral-novelty change points (6-8 s windows with shifted phases).
 [rescan]
 window_ms = 12000
 hop_ms = 5000
 phase_ms = 0
+# Generations after generation 0; 0 disables rescans. --max-generations overrides this.
+max_generations = 3

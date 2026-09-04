@@ -250,7 +250,44 @@ def _pad(filtergraph: str, episode_ms: int) -> str:
     )
 
 
-def _case_definitions() -> list[dict[str, Any]]:
+#: How many independent replicates of each Stage 4c event case the ``events`` set renders. The
+#: plan's corpus quota is "at least 30 cases per event type".
+EVENT_REPLICATES = 30
+EVENT_ONSET_MS = 11_000
+EVENT_LEAD_MS = 10_000
+EV_DRIFT_RATE_E4 = 11_500
+EV_JUMP_MS = 40_000
+EV_LOOP_BACK_MS = 5_000
+EV_REPLAY_GAP_MS = 35_000
+EV_REPLAY_EPISODE_MS = 15_000
+
+
+def event_case_definitions() -> list[dict[str, Any]]:
+    """One rendered discontinuity per set, so every event case has exact, unambiguous truth."""
+
+    cases: list[dict[str, Any]] = []
+    for kind, event in (
+        ("ev_loop", "loop"),
+        ("ev_jump", "jump"),
+        ("ev_drift", "drift"),
+        ("ev_replay", "replay"),
+    ):
+        cases.extend(
+            {
+                "name": f"{kind.replace('_', '-')}-{index + 1:02d}",
+                "kind": kind,
+                "episode_ms": EV_REPLAY_EPISODE_MS if kind == "ev_replay" else 25_000,
+                "event": event,
+                "replicate": index + 1,
+            }
+            for index in range(EVENT_REPLICATES)
+        )
+    return cases
+
+
+def _case_definitions(case_set: str = "base") -> list[dict[str, Any]]:
+    if case_set not in {"base", "events"}:
+        raise ValueError("case_set must be base or events")
     cases: list[dict[str, Any]] = [
         {"name": f"length-{length}s", "kind": "length", "episode_ms": length * 1000}
         for length in (3, 5, 10, 20, 30)
@@ -297,6 +334,8 @@ def _case_definitions() -> list[dict[str, Any]]:
         }
         for db in (0, -6, -12)
     )
+    if case_set == "events":
+        cases.extend(event_case_definitions())
     return cases
 
 
@@ -351,6 +390,42 @@ def _single_filter(case: dict[str, Any], source_offset_ms: int) -> str:
             f"[0:a]atrim=start={offset:g}:duration=5,asetpts=PTS-STARTPTS[a];"
             f"[0:a]atrim=start={offset + 15:g}:duration=5,asetpts=PTS-STARTPTS[b];"
             "[a]asplit=3[a0][a1][a2];[a0][b][a1][a2]concat=n=4:v=0:a=1",
+            duration_ms,
+        )
+    if kind == "ev_loop":
+        # 10 s straight, then the previous 5 s again, then on. Exactly one backwards reference
+        # step, at mix EVENT_ONSET_MS.
+        lead = EVENT_LEAD_MS / 1000
+        back = EV_LOOP_BACK_MS / 1000
+        tail = (duration_ms - EVENT_LEAD_MS - EV_LOOP_BACK_MS) / 1000
+        return _pad(
+            f"[0:a]atrim=start={offset:g}:duration={lead:g},asetpts=PTS-STARTPTS[a];"
+            f"[0:a]atrim=start={offset + lead - back:g}:duration={back:g},"
+            "asetpts=PTS-STARTPTS[b];"
+            f"[0:a]atrim=start={offset + lead:g}:duration={tail:g},asetpts=PTS-STARTPTS[c];"
+            "[a][b][c]concat=n=3:v=0:a=1",
+            duration_ms,
+        )
+    if kind == "ev_jump":
+        lead = EVENT_LEAD_MS / 1000
+        tail = (duration_ms - EVENT_LEAD_MS) / 1000
+        return _pad(
+            f"[0:a]atrim=start={offset:g}:duration={lead:g},asetpts=PTS-STARTPTS[a];"
+            f"[0:a]atrim=start={offset + lead + EV_JUMP_MS / 1000:g}:duration={tail:g},"
+            "asetpts=PTS-STARTPTS[b];"
+            "[a][b]concat=n=2:v=0:a=1",
+            duration_ms,
+        )
+    if kind == "ev_drift":
+        lead = EVENT_LEAD_MS / 1000
+        rate = Decimal(EV_DRIFT_RATE_E4) / Decimal(10_000)
+        tail_out = Decimal(duration_ms - EVENT_LEAD_MS) / Decimal(1000)
+        tail_in = tail_out * rate
+        return _pad(
+            f"[0:a]atrim=start={offset:g}:duration={lead:g},asetpts=PTS-STARTPTS[a];"
+            f"[0:a]atrim=start={offset + lead:g}:duration={tail_in},asetpts=PTS-STARTPTS,"
+            f"atempo={rate},atrim=duration={tail_out}[b];"
+            "[a][b]concat=n=2:v=0:a=1",
             duration_ms,
         )
     if kind == "drift":
@@ -414,6 +489,54 @@ async def _render_crossfade_case(
     )
 
 
+async def _render_replay_case(
+    case: dict[str, Any], source: Path, set_dir: Path, offset_ms: int
+) -> tuple[Path, list[RenderedStem], int]:
+    """Render one work twice, separated by a mix gap wider than the plan's 30 s replay rule."""
+
+    episode_ms = case["episode_ms"]
+    second_start_ms = 1_000 + episode_ms + EV_REPLAY_GAP_MS
+    total_ms = second_start_ms + episode_ms + 1_000
+    stems: list[RenderedStem] = []
+    paths: list[Path] = []
+    for index, delay_ms in enumerate((1_000, second_start_ms)):
+        stem = set_dir / f"stem-{index:02d}.wav"
+        await _ffmpeg_to_wav(
+            [source],
+            (
+                f"[0:a]atrim=start={offset_ms / 1000:g}:duration={episode_ms / 1000:g},"
+                f"asetpts=PTS-STARTPTS,aresample={SAMPLE_RATE},"
+                f"apad=whole_len={episode_ms * SAMPLE_RATE // 1000},"
+                f"adelay={delay_ms}:all=1,"
+                f"apad=whole_len={total_ms * SAMPLE_RATE // 1000}[out]"
+            ),
+            stem,
+        )
+        paths.append(stem)
+        stems.append(RenderedStem(stem, source, source.stem, occurrence_index=index))
+    mix = set_dir / "mix.wav"
+    await _ffmpeg_to_wav(paths, "[0:a][1:a]amix=inputs=2:normalize=0:duration=longest[out]", mix)
+    return mix, stems, total_ms
+
+
+def _truth_events(case: dict[str, Any], stems: list[RenderedStem]) -> list[dict[str, Any]]:
+    """Explicit event truth (rev 5.2 / Stage 4c) replacing the Stage 2a ``note`` convention."""
+
+    event = case.get("event")
+    if not event:
+        return []
+    if case["kind"] == "ev_replay":
+        return [
+            {
+                "type": "replay",
+                "at_ms": 1_000 + case["episode_ms"] + EV_REPLAY_GAP_MS,
+                "episode_index": len(stems) - 1,
+                "note": "second occurrence of the same rendered work",
+            }
+        ]
+    return [{"type": event, "at_ms": EVENT_ONSET_MS, "episode_index": 0, "note": None}]
+
+
 async def _truth_for_render(
     *,
     set_id: str,
@@ -424,12 +547,13 @@ async def _truth_for_render(
     corpus_version: str,
 ) -> GroundTruthRecord:
     ranges = await asyncio.gather(*(audible_truth(stem.path, mix, duration_ms) for stem in stems))
+    overlapping = len(stems) == 2 and case["kind"] != "ev_replay"
     episodes: list[dict[str, Any]] = []
     for index, (stem, (start_range, end_range)) in enumerate(zip(stems, ranges, strict=True)):
         start = sum(start_range) // 2
         end = sum(end_range) // 2
         roles: list[dict[str, Any]]
-        if len(stems) == 1:
+        if not overlapping:
             roles = [{"from_ms": start, "to_ms": end, "role": "dominant"}]
         elif index == 0:
             roles = [
@@ -442,9 +566,6 @@ async def _truth_for_render(
                 {"from_ms": 21_000, "to_ms": end, "role": "dominant"},
             ]
         roles = [item for item in roles if item["to_ms"] > item["from_ms"]]
-        event_note = None
-        if case.get("event") and index == 0:
-            event_note = f"event:{case['event']}@11000"
         episodes.append(
             {
                 "work": {"artist": "Synthetic Artist", "title": stem.work_title},
@@ -458,13 +579,13 @@ async def _truth_for_render(
                 "end_ms_range": end_range,
                 "audible_rule": AUDIBLE_RULE,
                 "role_segments": roles,
-                "overlaps_with": [1 - index] if len(stems) == 2 else [],
+                "overlaps_with": [1 - index] if overlapping else [],
                 "occurrence_index": stem.occurrence_index,
                 "in_reference_pool": True,
                 "annotator_ref": "controlled-generator",
                 "second_pass_ref": None,
                 "disagreement_resolution": None,
-                "note": event_note,
+                "note": None,
                 "draft": False,
             }
         )
@@ -486,6 +607,7 @@ async def _truth_for_render(
         corpus_version=corpus_version,
         selection_basis="scripted synthetic transforms fixed before recognition",
         episodes=episodes,
+        events=_truth_events(case, stems),
         regions=[],
     )
 
@@ -536,6 +658,8 @@ async def render_controlled(
     *,
     seed: int,
     audio_dir: Path | None = None,
+    case_set: str = "base",
+    corpus_version: str | None = None,
 ) -> RenderResult:
     sources_dir = sources_dir.resolve()
     sources = sorted(
@@ -546,7 +670,7 @@ async def render_controlled(
     if len(sources) < 3:
         raise ValueError("controlled rendering requires at least three local audio sources")
     out_dir = out_dir.resolve()
-    corpus_version = f"controlled-r5-seed-{seed}"
+    corpus_version = corpus_version or f"controlled-r5-seed-{seed}"
     audio_dir = (
         audio_dir.resolve()
         if audio_dir is not None
@@ -558,7 +682,7 @@ async def render_controlled(
     audio_staging: Path | None = _make_staging_directory(audio_dir)
     try:
         rng = random.Random(seed)
-        cases = _case_definitions()
+        cases = _case_definitions(case_set)
         manifest_sets: list[dict[str, Any]] = []
         boundary_count = 0
         for index, case in enumerate(cases):
@@ -566,8 +690,16 @@ async def render_controlled(
             set_dir = audio_staging / set_id
             os.makedirs(native_path(set_dir), exist_ok=True)
             source_index = rng.randrange(len(sources))
-            offset_ms = rng.randrange(5_000, 16_001, 100)
-            if case["kind"] == "crossfade":
+            # Event replicates start at least 8 s into the source so that a returning reference
+            # can never be confused with the plan's "ref within 5 s of 0" reset predicate.
+            offset_ms = rng.randrange(
+                8_000 if str(case["kind"]).startswith("ev_") else 5_000, 16_001, 100
+            )
+            if case["kind"] == "ev_replay":
+                mix, stems, duration_ms = await _render_replay_case(
+                    case, sources[source_index], set_dir, offset_ms
+                )
+            elif case["kind"] == "crossfade":
                 other_index = (source_index + 1 + rng.randrange(len(sources) - 1)) % len(sources)
                 mix, stems, duration_ms = await _render_crossfade_case(
                     case, (sources[source_index], sources[other_index]), set_dir, offset_ms
@@ -596,7 +728,7 @@ async def render_controlled(
                     "parameters": {
                         key: value
                         for key, value in case.items()
-                        if key not in {"name", "kind", "event"}
+                        if key not in {"name", "kind", "event", "replicate"}
                     },
                     "source_sha256": [sha256_file(stem.source) for stem in stems],
                     "stem_sha256": [sha256_file(stem.path) for stem in stems],
@@ -613,6 +745,7 @@ async def render_controlled(
             "corpus_version": corpus_version,
             "seed": seed,
             "audible_rule": AUDIBLE_RULE,
+            "case_set": case_set,
             "set_count": len(manifest_sets),
             "boundary_count": boundary_count,
             "sets": manifest_sets,

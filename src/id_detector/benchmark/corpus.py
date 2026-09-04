@@ -111,8 +111,12 @@ def _cached_link_source(work_root: Path, media_key: str, source_link: str | None
 
 
 def _source_offset(project_root: Path, set_id: str) -> int:
+    roots = (
+        project_root / "data" / "fixtures" / "controlled",
+        project_root / "data" / "corpus",
+    )
     for path in sorted(
-        (project_root / "data" / "fixtures" / "controlled").rglob("render_manifest.json")
+        item for root in roots if root.is_dir() for item in root.rglob("render_manifest.json")
     ):
         payload = json.loads(read_text(path))
         for item in payload.get("sets", []):

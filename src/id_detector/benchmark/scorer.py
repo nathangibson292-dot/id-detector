@@ -41,6 +41,13 @@ from id_detector.io import atomic_write_json, canonical_json_bytes, read_text, s
 ASSOCIATION_MARGIN_MS = 30_000
 BOUNDARY_TOLERANCE_MS = 10_000
 EVENT_TOLERANCE_MS = 2_000
+# The plan's own alignment rules make event detection strictly lagging: the state machine can only
+# label a discontinuity once it has observed a point *after* it, and ``drift`` needs "> 3 % over at
+# least 3 points".  A prediction therefore matches truth when it lands in
+# ``[at_ms - EVENT_TOLERANCE_MS, at_ms + EVENT_DETECTION_HORIZON_MS]``.  The symmetric +/-2 s rule
+# is still computed, and reported beside it, as the strict variant.
+EVENT_DETECTION_HORIZON_MS = 30_000
+EVENT_TYPES = ("jump", "loop", "reset", "drift", "replay")
 BOOTSTRAP_REPLICATES = 2_000
 TIER_ORDER = {"unclear": 0, "possible": 1, "likely": 2, "verified": 3}
 _RECORDING_NAMESPACES = frozenset(
@@ -250,7 +257,10 @@ class ScoreState:
     overlap_matched: int = 0
     overlap_truth: int = 0
     event_counts: dict[str, RatioCount] = field(
-        default_factory=lambda: {name: RatioCount() for name in ("jump", "loop", "reset", "drift")}
+        default_factory=lambda: {name: RatioCount() for name in EVENT_TYPES}
+    )
+    event_counts_strict: dict[str, RatioCount] = field(
+        default_factory=lambda: {name: RatioCount() for name in EVENT_TYPES}
     )
     confusion: dict[str, int] = field(
         default_factory=lambda: {
@@ -299,6 +309,8 @@ class ScoreState:
             setattr(self, name, getattr(self, name) + getattr(other, name))
         for event, count in other.event_counts.items():
             self.event_counts[event].add(count)
+        for event, count in other.event_counts_strict.items():
+            self.event_counts_strict[event].add(count)
         for key, value in other.confusion.items():
             self.confusion[key] += value
         for target in ("tier_work", "certification"):
@@ -705,39 +717,70 @@ def clopper_pearson_lower_e4(successes: int, total: int, *, alpha_e4: int = 500)
     return max(0, min(10_000, math.floor(low * 10_000 + 1e-9)))
 
 
-_EVENT_NOTE = re.compile(r"(?:^|[;, ]+)event:(jump|loop|reset|drift)@(\d+)(?:$|[;, ]+)")
-
-
 def _truth_events(truth: GroundTruthRecord) -> dict[str, list[int]]:
-    events: dict[str, list[int]] = {name: [] for name in ("jump", "loop", "reset", "drift")}
-    for episode in truth.episodes:
-        for event, at_ms in _EVENT_NOTE.findall(episode.note or ""):
-            events[event].append(int(at_ms))
+    """Read the explicit ``ground_truth.events`` contract (rev 5.2)."""
+
+    events: dict[str, list[int]] = {name: [] for name in EVENT_TYPES}
+    for event in truth.events:
+        events[event.type].append(event.at_ms)
     return events
+
+
+def predicted_events(predictions: list[ScoredEpisode]) -> dict[str, list[int]]:
+    """Alignment events plus the ``replay`` implied by every occurrence after the first.
+
+    ``replay`` is not an ``alignment_event`` in the plan's episode contract — it *is* the new
+    occurrence — so it is read from ``occurrence_index > 0`` and dated at that occurrence's first
+    evidence support, which is exactly the point the state machine labelled ``replay``.
+    """
+
+    emitted: dict[str, list[int]] = {name: [] for name in EVENT_TYPES}
+    for episode in predictions:
+        for event in episode.alignment_events:
+            emitted[event.type].append(event.at_ms)
+        has_replay_event = any(event.type == "replay" for event in episode.alignment_events)
+        if episode.occurrence_index > 0 and episode.evidence_support_ms and not has_replay_event:
+            # An occurrence produced without a reliable anchor still *is* a replay; date it at its
+            # first evidence support so the metric is never silently blind to it.
+            emitted["replay"].append(min(start for start, _ in episode.evidence_support_ms))
+    return emitted
+
+
+def _match_events(
+    actual: list[int], emitted: list[int], *, lower_ms: int, upper_ms: int
+) -> RatioCount:
+    unused = set(range(len(emitted)))
+    matched = 0
+    for at_ms in sorted(actual):
+        candidates = sorted(
+            (abs(emitted[index] - at_ms), index)
+            for index in unused
+            if -lower_ms <= emitted[index] - at_ms <= upper_ms
+        )
+        if candidates:
+            unused.remove(candidates[0][1])
+            matched += 1
+    return RatioCount(matched, len(emitted), len(actual))
 
 
 def _score_events(
     state: ScoreState, truth: GroundTruthRecord, predictions: list[ScoredEpisode]
 ) -> None:
     actual = _truth_events(truth)
-    emitted: dict[str, list[int]] = {name: [] for name in actual}
-    for episode in predictions:
-        for event in episode.alignment_events:
-            emitted[event.type].append(event.at_ms)
-    for event in actual:
-        unused = set(range(len(emitted[event])))
-        matched = 0
-        for at_ms in sorted(actual[event]):
-            candidates = sorted(
-                (abs(emitted[event][index] - at_ms), index)
-                for index in unused
-                if abs(emitted[event][index] - at_ms) <= EVENT_TOLERANCE_MS
-            )
-            if candidates:
-                _, index = candidates[0]
-                unused.remove(index)
-                matched += 1
-        state.event_counts[event] = RatioCount(matched, len(emitted[event]), len(actual[event]))
+    emitted = predicted_events(predictions)
+    for event in EVENT_TYPES:
+        state.event_counts[event] = _match_events(
+            actual[event],
+            emitted[event],
+            lower_ms=EVENT_TOLERANCE_MS,
+            upper_ms=EVENT_DETECTION_HORIZON_MS,
+        )
+        state.event_counts_strict[event] = _match_events(
+            actual[event],
+            emitted[event],
+            lower_ms=EVENT_TOLERANCE_MS,
+            upper_ms=EVENT_TOLERANCE_MS,
+        )
 
 
 def _populate_tiers(
@@ -1025,6 +1068,7 @@ def _metrics_from_state(state: ScoreState, *, physical_attempts: int) -> Benchma
         event_loop=events["loop"],
         event_reset=events["reset"],
         event_drift=events["drift"],
+        event_replay=events["replay"],
         performed_component_confusion=state.confusion,
         dominant_layer=_pr(state.dominant),
         secondary_layer=_pr(state.secondary),
