@@ -225,6 +225,13 @@ def test_identity_conflict_veto_and_late_conflict_contesting() -> None:
     assert vetoed.components == (("isrc:a",), ("shazam:a",))
     assert vetoed.refused == (("isrc:a", "shazam:a"),)
     contested = merge_recording_identities(nodes, [*recording, conflict])
+    assert contested.components == (("isrc:a",), ("shazam:a",))
+    assert not contested.contested
+    contested = merge_recording_identities(
+        nodes,
+        [conflict, *recording],
+        prior_components=(("isrc:a", "shazam:a"),),
+    )
     assert contested.components == (("isrc:a", "shazam:a"),)
     assert contested.contested == (("isrc:a", "shazam:a"),)
 
@@ -243,6 +250,13 @@ def test_privileged_identity_sources_merge_without_recording_ids_and_honor_confl
     assert vetoed.components == (("mb_work:a",), ("text:a",))
     assert vetoed.refused == (("mb_work:a", "text:a"),)
     contested = merge_recording_identities(nodes, [privileged, conflict])
+    assert contested.components == (("mb_work:a",), ("text:a",))
+    assert not contested.contested
+    contested = merge_recording_identities(
+        nodes,
+        [conflict, privileged],
+        prior_components=(("mb_work:a", "text:a"),),
+    )
     assert contested.components == (("mb_work:a", "text:a"),)
     assert contested.contested == (("mb_work:a", "text:a"),)
 

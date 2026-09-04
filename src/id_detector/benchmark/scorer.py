@@ -36,7 +36,7 @@ from id_detector.contracts import (
     TruthVersion,
     TruthWork,
 )
-from id_detector.io import atomic_write_json, canonical_json_bytes, read_text
+from id_detector.io import atomic_write_json, canonical_json_bytes, read_text, sha256_file
 
 ASSOCIATION_MARGIN_MS = 30_000
 BOUNDARY_TOLERANCE_MS = 10_000
@@ -74,6 +74,7 @@ class ScoringConfigSnapshot(ContractModel):
     profile: str = Field(min_length=1)
     bootstrap_seed: int = Field(ge=0)
     certification_targets: list[CertificationTarget]
+    run_config: dict[str, Any] | None = None
 
     @model_validator(mode="after")
     def _targets_are_unique(self) -> ScoringConfigSnapshot:
@@ -110,14 +111,32 @@ class ScoredEpisode(ContractModel):
         for start, end in self.evidence_support_ms:
             if end <= start:
                 raise ValueError("evidence support spans must have positive duration")
-        derived_start = min(end for _, end in self.evidence_support_ms)
-        derived_end = max(start for start, _ in self.evidence_support_ms)
-        if self.start_no_later_than_ms != derived_start:
+        # The artefact stores a union of supports, while the proved bounds use every raw final
+        # match. Nested raw supports can therefore put a proof point inside a union interval.
+        if not any(
+            start < self.start_no_later_than_ms <= end for start, end in self.evidence_support_ms
+        ):
             raise ValueError("start_no_later_than_ms must equal min evidence support end")
-        if self.end_no_earlier_than_ms != derived_end:
+        if not any(
+            start <= self.end_no_earlier_than_ms < end for start, end in self.evidence_support_ms
+        ):
             raise ValueError("end_no_earlier_than_ms must equal max evidence support start")
-        if self.best_end_ms < self.best_start_ms:
-            raise ValueError("best_end_ms must not precede best_start_ms")
+        # One-sided proofs can cross when all positive windows overlap.  They are bounds on
+        # different latent events, not the endpoints of a conventional closed interval.
+        expected_start = (
+            (self.start_pi.lo + self.start_pi.hi) // 2
+            if self.start_pi is not None and self.start_pi.calibrated
+            else self.start_no_later_than_ms
+        )
+        expected_end = (
+            (self.end_pi.lo + self.end_pi.hi) // 2
+            if self.end_pi is not None and self.end_pi.calibrated
+            else self.end_no_earlier_than_ms
+        )
+        if self.best_start_ms != expected_start:
+            raise ValueError("best_start_ms must equal the calibrated PI centre or proved bound")
+        if self.best_end_ms != expected_end:
+            raise ValueError("best_end_ms must equal the calibrated PI centre or proved bound")
         return self
 
 
@@ -135,8 +154,6 @@ class PredictionSet(ContractModel):
             candidate = candidates.get(episode.candidate_id)
             if candidate is None:
                 raise ValueError(f"unknown episode candidate_id: {episode.candidate_id}")
-            if candidate.conflicts and not candidate.contested:
-                raise ValueError("a candidate with conflicts must be marked contested")
             if candidate.contested and episode.tiers.version != "unclear":
                 raise ValueError("a contested candidate must have an unclear version tier")
         conflict_pairs = [
@@ -167,6 +184,7 @@ class PredictionDocument(ContractModel):
             wall_ms=0,
         )
     )
+    unverified_seed_comparison: bool
 
     @model_validator(mode="after")
     def _config_hash_matches_snapshot(self) -> PredictionDocument:
@@ -1121,6 +1139,43 @@ def load_truth_directory(path: Path) -> list[GroundTruthRecord]:
     return truths
 
 
+def truth_is_frozen_verified(path: Path, truths: list[GroundTruthRecord]) -> bool:
+    """Return verified state only for non-draft truth covered by a hash-checked freeze manifest."""
+
+    resolved = path.resolve()
+    directories = [resolved] if resolved.is_dir() else [resolved.parent, *resolved.parents[1:3]]
+    manifest_path = next(
+        (
+            directory / "corpus-version.json"
+            for directory in directories
+            if (directory / "corpus-version.json").is_file()
+        ),
+        None,
+    )
+    if manifest_path is None:
+        return False
+    manifest = json.loads(read_text(manifest_path))
+    if manifest.get("frozen") is not True:
+        return False
+    corpus_versions = {truth.corpus_version for truth in truths}
+    if corpus_versions != {manifest.get("corpus_version")}:
+        raise ValueError("freeze manifest corpus_version differs from loaded truth")
+    entries = {str(item.get("set_id")): item for item in manifest.get("sets", [])}
+    for truth in truths:
+        if any(
+            episode.draft or episode.verified_against is None or episode.annotator_ref is None
+            for episode in truth.episodes
+        ):
+            return False
+        entry = entries.get(truth.set_id)
+        if entry is None:
+            raise ValueError(f"freeze manifest does not cover truth set {truth.set_id}")
+        truth_file = manifest_path.parent / str(entry.get("path", ""))
+        if not truth_file.is_file() or sha256_file(truth_file) != entry.get("sha256"):
+            raise ValueError(f"freeze manifest hash mismatch for truth set {truth.set_id}")
+    return True
+
+
 def score_corpus(
     truth_path: Path,
     predictions_path: Path,
@@ -1130,6 +1185,12 @@ def score_corpus(
     truths = load_truth_directory(truth_path)
     raw_predictions = json.loads(read_text(predictions_path))
     document = PredictionDocument.model_validate(raw_predictions)
+    verified = truth_is_frozen_verified(truth_path, truths)
+    derived_unverified = not verified
+    if document.unverified_seed_comparison != derived_unverified:
+        raise ValueError(
+            "unverified_seed_comparison contradicts loaded truth and freeze manifest state"
+        )
     truth_by_id = {truth.set_id: truth for truth in truths}
     prediction_by_id = {item.set_id: item for item in document.sets}
     if set(truth_by_id) != set(prediction_by_id):
@@ -1198,7 +1259,8 @@ def score_corpus(
                     ),
                     "status": (
                         "certified"
-                        if target is not None
+                        if verified
+                        and target is not None
                         and cp_lower >= target
                         and cluster_lower >= target
                         and n_sets >= 10
@@ -1227,6 +1289,7 @@ def score_corpus(
         cost=document.cost,
         certification=certification,
         regression={"baseline_report_ref": None, "deltas": {}, "gates": []},
+        unverified_seed_comparison=derived_unverified,
     )
     if out_path is not None:
         atomic_write_json(out_path, report)

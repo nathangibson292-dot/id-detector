@@ -277,13 +277,15 @@ def text_equality_relation() -> Literal["same_work"]:
 
 
 def merge_recording_identities(
-    nodes: Mapping[str, str], assertions: Sequence[Mapping[str, Any]]
+    nodes: Mapping[str, str],
+    assertions: Sequence[Mapping[str, Any]],
+    *,
+    prior_components: Sequence[Sequence[str]] = (),
 ) -> IdentityMergeResult:
-    """Apply corroboration, conflict veto, and late-conflict contesting to recording unions."""
+    """Apply current conflict vetoes and contest only unions inherited from prior state."""
 
     parent = {node: node for node in nodes}
     contested_roots: set[str] = set()
-    conflicts_seen: list[tuple[str, str]] = []
     refused: list[tuple[str, str]] = []
 
     def find(item: str) -> str:
@@ -294,6 +296,35 @@ def merge_recording_identities(
 
     def members(root: str) -> set[str]:
         return {node for node in parent if find(node) == root}
+
+    def union(left: str, right: str) -> str:
+        left_root, right_root = find(left), find(right)
+        if left_root == right_root:
+            return left_root
+        keep, discard = sorted((left_root, right_root))
+        parent[discard] = keep
+        if left_root in contested_roots or right_root in contested_roots:
+            contested_roots.add(keep)
+        contested_roots.discard(discard)
+        return keep
+
+    for component in prior_components:
+        ordered = sorted(set(component))
+        if any(node not in parent for node in ordered):
+            raise ValueError("prior component references an unknown identity node")
+        for node in ordered[1:]:
+            union(ordered[0], node)
+
+    conflicts = [
+        tuple(sorted((str(assertion["a"]), str(assertion["b"]))))
+        for assertion in assertions
+        if assertion["relation"] == "conflicts"
+    ]
+    for a, b in conflicts:
+        if a not in parent or b not in parent:
+            raise ValueError("assertion references an unknown identity node")
+        if find(a) == find(b):
+            contested_roots.add(find(a))
 
     corroboration: dict[tuple[str, str], set[str]] = {}
     privileged: set[tuple[str, str]] = set()
@@ -311,12 +342,6 @@ def merge_recording_identities(
         relation = assertion["relation"]
         if a not in parent or b not in parent:
             raise ValueError("assertion references an unknown identity node")
-        if relation == "conflicts":
-            if find(a) == find(b):
-                contested_roots.add(find(a))
-            else:
-                conflicts_seen.append((a, b))
-            continue
         if relation != "same_recording":
             continue
         pair = tuple(sorted((a, b)))
@@ -327,17 +352,11 @@ def merge_recording_identities(
         if not eligible or find(a) == find(b):
             continue
         left, right = members(find(a)), members(find(b))
-        vetoed = any(
-            (x in left and y in right) or (x in right and y in left) for x, y in conflicts_seen
-        )
+        vetoed = any((x in left and y in right) or (x in right and y in left) for x, y in conflicts)
         if vetoed:
             refused.append(pair)
             continue
-        root_a, root_b = find(a), find(b)
-        parent[root_b] = root_a
-        if root_b in contested_roots:
-            contested_roots.add(root_a)
-        contested_roots.discard(root_b)
+        union(a, b)
 
     grouped: dict[str, list[str]] = {}
     for node in parent:

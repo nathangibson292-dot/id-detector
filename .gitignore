@@ -50,3 +50,7 @@ data/raw/
 # Local source URLs, uploader handles, and event links for pseudonymous truth refs.
 data/local/source_links.json
 data/local/controlled/
+
+# Local source media and provider/MixesDB response caches.
+data/local/
+data/corpus/**/media/

@@ -13,14 +13,17 @@ from typing import Annotated
 import typer
 
 from id_detector.benchmark.controlled import render_controlled
+from id_detector.benchmark.corpus import run_corpus
 from id_detector.benchmark.scorer import score_corpus
 from id_detector.calibration import calibrate_shazam
 from id_detector.contracts import SourceRecord
 from id_detector.decode import decode
 from id_detector.doctor import run_doctor
+from id_detector.fuse.episodes import fuse_generation_zero
 from id_detector.ingest import ingest
 from id_detector.jobs import AsyncJobStore, ProcessLock
 from id_detector.journal import InvocationTimer, append_invocation
+from id_detector.present import export_tracklist
 from id_detector.recognise import recognise_generation_zero
 from id_detector.truth import (
     freeze_truth,
@@ -28,6 +31,7 @@ from id_detector.truth import (
     second_pass_truth,
     seed_truth,
     verify_truth,
+    write_draft_manifest,
 )
 from id_detector.windows import generate_windows
 
@@ -126,6 +130,29 @@ async def _analyse(
                 "cache_hits": recognised.cache_hits,
             }
         )
+        timer.start_stage("fuse_ms")
+        fused = fuse_generation_zero(
+            media_key=ingested.record.media_key,
+            media_dir=media_dir,
+            duration_ms=decoded.record.pcm.duration_ms,
+            observations=recognised.observations,
+            observations_path=recognised.observations_path,
+            windows=windows.records,
+            windows_path=windows.record_path,
+            pcm_path=decoded.record_path,
+        )
+        timer.finish_stage("fuse_ms")
+        timer.start_stage("export_ms")
+        exported = export_tracklist(
+            media_dir=media_dir,
+            media_key=ingested.record.media_key,
+            duration_ms=decoded.record.pcm.duration_ms,
+            episodes=fused.episodes,
+            identities=fused.identities.record,
+            episodes_path=fused.final_path,
+            identities_path=fused.identities_path,
+        )
+        timer.finish_stage("export_ms")
         if print_raw:
             output = [
                 {
@@ -144,7 +171,8 @@ async def _analyse(
         else:
             typer.echo(
                 f"{len(matches)} matches; {recognised.failures} failures; "
-                f"{recognised.physical_attempts} physical attempts"
+                f"{recognised.physical_attempts} physical attempts; "
+                f"{len(fused.episodes.episodes)} episodes; tracklist={exported.json_path}"
             )
         entry = timer.entry(
             status="succeeded",
@@ -195,7 +223,7 @@ def analyse(
     work_root: Path = typer.Option(DEFAULT_WORK_ROOT, "--work-root"),  # noqa: B008
     max_requests: int = typer.Option(2_000, "--max-requests", min=1),
 ) -> None:
-    """Run Stage 1 ingest, decode, windows, and Shazam recognition."""
+    """Run the full generation-zero pipeline and export a flattened tracklist."""
     try:
         exit_code = asyncio.run(
             _analyse(
@@ -367,6 +395,51 @@ def benchmark_render(
     )
 
 
+@benchmark_app.command("run")
+def benchmark_run(
+    corpus: Annotated[str, typer.Option("--corpus", help="Corpus version under data/corpus.")],
+    profile: Annotated[str, typer.Option("--profile")] = "free",
+    out: Annotated[Path, typer.Option("--out", help="Output benchmark report JSON.")] = Path(
+        "benchmark-report.json"
+    ),
+    baseline: Annotated[
+        str | None,
+        typer.Option("--baseline", help="Baseline corpus name or report path."),
+    ] = None,
+    set_id: Annotated[
+        str | None,
+        typer.Option("--set-id", help="Run one corpus set (useful for live smoke tests)."),
+    ] = None,
+    work_root: Annotated[Path, typer.Option("--work-root")] = DEFAULT_WORK_ROOT,
+    max_requests: Annotated[int, typer.Option("--max-requests", min=1)] = 2_000,
+) -> None:
+    """Analyse every selected corpus set, score it, and compare a named baseline."""
+
+    try:
+        result = asyncio.run(
+            run_corpus(
+                corpus_version=corpus,
+                profile=profile,
+                out_path=out,
+                project_root=PROJECT_ROOT,
+                work_root=work_root,
+                baseline=baseline,
+                set_id=set_id,
+                max_requests=max_requests,
+            )
+        )
+    except KeyboardInterrupt:
+        raise typer.Exit(130) from None
+    except (ValueError, RuntimeError, OSError, json.JSONDecodeError) as exc:
+        typer.echo(str(exc), err=True)
+        raise typer.Exit(1) from None
+    typer.echo(
+        f"scored {len(result.report.sets)} sets; "
+        f"unverified_seed_comparison={str(result.report.unverified_seed_comparison).lower()}; "
+        f"report={out}"
+    )
+
+
 @truth_app.command("seed")
 def truth_seed(
     out: Annotated[Path, typer.Option("--out")],
@@ -378,6 +451,10 @@ def truth_seed(
     split: Annotated[str, typer.Option("--split")] = "dev-1",
     stratum: Annotated[str, typer.Option("--stratum")] = "catalogue-covered",
     corpus_version: Annotated[str, typer.Option("--corpus-version")] = "draft",
+    platform: Annotated[str, typer.Option("--platform")] = "local",
+    selection_basis: Annotated[
+        str, typer.Option("--selection-basis")
+    ] = "manual seed assembled before scoring",
     source_url: Annotated[str | None, typer.Option("--source-url")] = None,
     uploader: Annotated[str | None, typer.Option("--uploader")] = None,
     event: Annotated[str | None, typer.Option("--event")] = None,
@@ -394,6 +471,8 @@ def truth_seed(
             split=split,
             stratum=stratum,
             corpus_version=corpus_version,
+            platform=platform,
+            selection_basis=selection_basis,
             source_url=source_url,
             uploader=uploader,
             event=event,
@@ -478,6 +557,24 @@ def truth_freeze(
         typer.echo(str(exc), err=True)
         raise typer.Exit(1) from None
     typer.echo(f"froze {len(manifest['sets'])} sets as {corpus_version}; manifest={out}")
+
+
+@truth_app.command("manifest-draft")
+def truth_manifest_draft(
+    truth: Annotated[Path, typer.Option("--truth", help="Draft truth corpus directory.")],
+    corpus_version: Annotated[str, typer.Option("--corpus-version")],
+    out: Annotated[Path, typer.Option("--out", help="Draft inventory JSON.")],
+) -> None:
+    """Inventory unverified seeds without claiming that they are frozen truth."""
+
+    try:
+        manifest = write_draft_manifest(truth, corpus_version=corpus_version, out_path=out)
+    except (ValueError, OSError) as exc:
+        typer.echo(str(exc), err=True)
+        raise typer.Exit(1) from None
+    typer.echo(
+        f"recorded {len(manifest['sets'])} unverified draft sets; frozen=false; manifest={out}"
+    )
 
 
 if __name__ == "__main__":

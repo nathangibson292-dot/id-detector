@@ -462,6 +462,7 @@ class EpisodeRecord(Record):
     score_kind: Literal["heuristic", "calibrated"]
     tiers: EpisodeTiers
     badge: Literal["unclear", "possible", "likely", "verified"]
+    version_status: Literal["verified", "unverified", "contested"]
     evidence: list[str]
     flags: list[str]
     rescan_state: str
@@ -823,6 +824,7 @@ class BenchmarkReportRecord(Record):
     cost: BenchmarkCost
     certification: list[BenchmarkCertification]
     regression: BenchmarkRegression
+    unverified_seed_comparison: bool
 
 
 class InvocationJournalEntry(Record):

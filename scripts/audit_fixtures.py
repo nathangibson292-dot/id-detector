@@ -11,6 +11,7 @@ from typing import Any
 
 ROOT = Path(__file__).resolve().parents[1]
 SCAN_ROOTS = (
+    ROOT / "data" / "corpus",
     ROOT / "data" / "fixtures",
     ROOT / "docs",
     ROOT / "tests" / "fixtures",

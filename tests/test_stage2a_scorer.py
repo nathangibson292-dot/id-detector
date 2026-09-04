@@ -33,6 +33,7 @@ def _config(
         "profile": profile,
         "bootstrap_seed": seed,
         "certification_targets": targets or [],
+        "run_config": None,
     }
     return snapshot, sha256(canonical_json_bytes(snapshot)).hexdigest()
 
@@ -45,6 +46,30 @@ def _contains_float(value: object) -> bool:
     if isinstance(value, list):
         return any(_contains_float(item) for item in value)
     return False
+
+
+def _write_freeze_manifest(root: Path, truths: list[GroundTruthRecord]) -> None:
+    entries = []
+    for truth in truths:
+        path = root / truth.set_id / "ground_truth.json"
+        entries.append(
+            {
+                "set_id": truth.set_id,
+                "path": path.relative_to(root).as_posix(),
+                "sha256": sha256(path.read_bytes()).hexdigest(),
+                "annotation_passes": {"first": None, "second": None, "resolution": None},
+            }
+        )
+    atomic_write_json(
+        root / "corpus-version.json",
+        {
+            "schema_version": "1.0.0",
+            "generated_by": "test-vector",
+            "corpus_version": truths[0].corpus_version,
+            "frozen": True,
+            "sets": entries,
+        },
+    )
 
 
 def _truth_episode(
@@ -233,7 +258,7 @@ def _vector() -> tuple[GroundTruthRecord, PredictionSet]:
             10_000,
             310_000,
             supports=[(0, 5_000), (315_000, 320_000)],
-            start_pi=(0, 60_000),
+            start_pi=(0, 20_000),
             end_pi=(260_000, 360_000),
             event=("jump", 110_000),
         ),
@@ -280,19 +305,19 @@ def test_hand_computed_scorer_vector_covers_every_metric_family() -> None:
         assert metrics[f"{side}_bound_n"] == 5
         assert metrics[f"{side}_bound_violation_e4"] == 2_000  # one of five
 
-    # Four tight 2 s PIs and one wide PI on each side; all contain the exact truth point.
+    # Four tight 2 s PIs plus wider PIs on the long case; all centre on the best point.
     assert metrics["start_interval_coverage_e4"] == 10_000
     assert metrics["start_interval_median_width_ms"] == 2_000
-    assert metrics["start_interval_p90_width_ms"] == 60_000
-    assert metrics["start_interval_winkler_score"] == 13_600
+    assert metrics["start_interval_p90_width_ms"] == 20_000
+    assert metrics["start_interval_winkler_score"] == 5_600
     assert metrics["end_interval_coverage_e4"] == 10_000
     assert metrics["end_interval_median_width_ms"] == 2_000
     assert metrics["end_interval_p90_width_ms"] == 100_000
     assert metrics["end_interval_winkler_score"] == 21_600
     assert metrics["boundary_interval_coverage_e4"] == 10_000
     assert metrics["boundary_interval_median_width_ms"] == 2_000
-    assert metrics["boundary_interval_p90_width_ms"] == 60_000
-    assert metrics["boundary_winkler_score"] == 17_600
+    assert metrics["boundary_interval_p90_width_ms"] == 20_000
+    assert metrics["boundary_winkler_score"] == 13_600
 
     assert metrics["episode_iou_e4"] == 10_000
     assert metrics["repeated_occurrence_recall_e4"] == 10_000
@@ -334,7 +359,10 @@ def test_wide_vague_interval_has_worse_winkler_score_than_tight_interval() -> No
         (10_000, 10_000),
     )
     wide_episode = ScoredEpisode.model_validate(
-        _prediction("X", 10_000, 20_000, start_pi=(0, 40_000))
+        {
+            **_prediction("X", 10_000, 20_000, start_pi=(0, 40_000)),
+            "best_start_ms": 20_000,
+        }
     )
     wide = _interval_values(wide_episode.start_pi, (10_000, 10_000))
     assert tight == (1, 2_000, 2_000)
@@ -347,6 +375,23 @@ def test_proved_bounds_must_be_derived_from_evidence_support() -> None:
     forged["start_no_later_than_ms"] = 10_000
     with pytest.raises(ValidationError, match="min evidence support end"):
         ScoredEpisode.model_validate(forged)
+
+
+def test_best_points_follow_calibrated_and_uncalibrated_pi_rules() -> None:
+    calibrated = _prediction("X", 10_000, 20_000, start_pi=(1_000, 10_001))
+    calibrated["best_start_ms"] = 5_500
+    ScoredEpisode.model_validate(calibrated)
+    calibrated["best_start_ms"] = 5_501
+    with pytest.raises(ValidationError, match="calibrated PI centre"):
+        ScoredEpisode.model_validate(calibrated)
+
+    uncalibrated = _prediction("X", 10_000, 20_000)
+    uncalibrated["start_pi"]["calibrated"] = False
+    uncalibrated["best_start_ms"] = uncalibrated["start_no_later_than_ms"]
+    ScoredEpisode.model_validate(uncalibrated)
+    uncalibrated["best_start_ms"] += 1
+    with pytest.raises(ValidationError, match="proved bound"):
+        ScoredEpisode.model_validate(uncalibrated)
 
 
 def test_exact_equivalence_requires_consistent_recording_specific_ids() -> None:
@@ -382,6 +427,17 @@ def test_contested_recording_identity_cannot_claim_a_version_tier() -> None:
     candidate["conflicts"] = ["isrc:conflict"]
     with pytest.raises(ValidationError, match="unclear version tier"):
         PredictionSet.model_validate(payload)
+
+
+def test_separated_veto_candidate_can_retain_conflict_metadata() -> None:
+    _, prediction_set = _vector()
+    payload = prediction_set.model_dump(mode="json")
+    candidate_id = payload["episodes"][0]["candidate_id"]
+    candidate = next(
+        item for item in payload["identities"]["candidates"] if item["canonical_id"] == candidate_id
+    )
+    candidate["conflicts"] = ["isrc:separated-conflict"]
+    assert PredictionSet.model_validate(payload).identities.candidates
 
 
 def test_work_only_truth_is_excluded_from_exact_version_metrics() -> None:
@@ -468,6 +524,7 @@ def test_score_cli_plumbing_report_validates_schema_and_has_only_integers(tmp_pa
                 "usd_e2": 0,
                 "wall_ms": 10,
             },
+            "unverified_seed_comparison": True,
         },
     )
     report_path = tmp_path / "report.json"
@@ -488,6 +545,27 @@ def test_score_cli_plumbing_report_validates_schema_and_has_only_integers(tmp_pa
     assert all(isinstance(item.lower_bound_e4, int) for item in report.certification)
     assert all(item.status == "provisional" for item in report.certification)
     assert all(item.target_e4 is None for item in report.certification)
+    contradictory = json.loads(prediction_path.read_text(encoding="utf-8"))
+    contradictory["unverified_seed_comparison"] = False
+    contradictory_path = tmp_path / "contradictory-predictions.json"
+    atomic_write_json(contradictory_path, contradictory)
+    with pytest.raises(ValueError, match="contradicts loaded truth"):
+        score_corpus(tmp_path / "truth", contradictory_path)
+
+
+def test_prediction_document_requires_explicit_verification_marker() -> None:
+    _, predictions = _vector()
+    snapshot, config_hash = _config(7)
+    with pytest.raises(ValidationError, match="unverified_seed_comparison"):
+        PredictionDocument.model_validate(
+            {
+                "corpus_version": "vector-v1",
+                "profile": "vector",
+                "config_hash": config_hash,
+                "config_snapshot": snapshot,
+                "sets": [predictions],
+            }
+        )
 
 
 def test_prediction_document_rejects_a_forged_config_hash() -> None:
@@ -501,6 +579,7 @@ def test_prediction_document_rejects_a_forged_config_hash() -> None:
                 "config_hash": "0" * 64,
                 "config_snapshot": snapshot,
                 "sets": [predictions],
+                "unverified_seed_comparison": True,
             }
         )
 
@@ -528,6 +607,17 @@ def test_certification_uses_profile_dimension_tier_preregistration(tmp_path: Pat
                 episodes=predictions.episodes,
             )
         )
+    _write_freeze_manifest(
+        truth_root,
+        [
+            GroundTruthRecord.model_validate_json(
+                (truth_root / f"test-set-{index:02d}" / "ground_truth.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            for index in range(10)
+        ],
+    )
     targets = [
         {"profile": "vector", "dimension": "work", "tier": "possible", "target_e4": 9_000},
         {
@@ -548,6 +638,7 @@ def test_certification_uses_profile_dimension_tier_preregistration(tmp_path: Pat
             "config_hash": config_hash,
             "config_snapshot": snapshot,
             "sets": prediction_sets,
+            "unverified_seed_comparison": False,
         },
     )
     report = score_corpus(truth_root, predictions_path)

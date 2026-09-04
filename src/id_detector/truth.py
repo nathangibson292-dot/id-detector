@@ -123,6 +123,8 @@ def seed_truth(
     split: str = "dev-1",
     stratum: str = "catalogue-covered",
     corpus_version: str = "draft",
+    platform: str = "local",
+    selection_basis: str = "manual seed assembled before scoring",
     source_url: str | None = None,
     uploader: str | None = None,
     event: str | None = None,
@@ -190,7 +192,7 @@ def seed_truth(
             "url_ref": source_ref,
             "media_key": media_key,
             "duration_ms": duration_ms,
-            "platform": "local",
+            "platform": platform,
             "uploader_ref": uploader_ref,
             "event_ref": event_ref,
             "date": None,
@@ -198,7 +200,7 @@ def seed_truth(
         stratum=stratum,
         split=split,
         corpus_version=corpus_version,
-        selection_basis="manual seed assembled before scoring",
+        selection_basis=selection_basis,
         episodes=episodes,
         regions=[],
     )
@@ -636,6 +638,7 @@ def freeze_truth(truth_dir: Path, *, corpus_version: str, out_path: Path) -> dic
         "schema_version": "1.0.0",
         "generated_by": "id-detector/0.1.0",
         "corpus_version": corpus_version,
+        "frozen": True,
         "sets": [
             {
                 "set_id": truth.set_id,
@@ -652,6 +655,40 @@ def freeze_truth(truth_dir: Path, *, corpus_version: str, out_path: Path) -> dic
             }
             for path, truth in sorted(truths, key=lambda item: item[1].set_id)
         ],
+    }
+    atomic_write_json(out_path, manifest)
+    return manifest
+
+
+def write_draft_manifest(truth_dir: Path, *, corpus_version: str, out_path: Path) -> dict[str, Any]:
+    """Inventory draft truth without implying that human verification has happened."""
+
+    candidates = sorted(truth_dir.rglob("ground_truth.json"))
+    if not candidates:
+        raise ValueError("draft manifest found no ground_truth.json files")
+    base = truth_dir.resolve()
+    entries: list[dict[str, Any]] = []
+    for path in candidates:
+        truth = GroundTruthRecord.model_validate_json(read_text(path))
+        if truth.corpus_version != corpus_version:
+            raise ValueError(f"{truth.set_id} corpus_version differs from {corpus_version}")
+        entries.append(
+            {
+                "set_id": truth.set_id,
+                "path": path.resolve().relative_to(base).as_posix(),
+                "sha256": sha256_file(path),
+                "episode_count": len(truth.episodes),
+                "all_episodes_draft": all(episode.draft for episode in truth.episodes),
+            }
+        )
+    manifest = {
+        "schema_version": "1.0.0",
+        "generated_by": "id-detector/0.1.0",
+        "corpus_version": corpus_version,
+        "frozen": False,
+        "verification_status": "unverified_seed_drafts_not_truth",
+        "warning": "Do not use these seeds as verified benchmark truth.",
+        "sets": sorted(entries, key=lambda item: item["set_id"]),
     }
     atomic_write_json(out_path, manifest)
     return manifest
