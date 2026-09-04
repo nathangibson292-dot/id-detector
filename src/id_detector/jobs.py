@@ -45,7 +45,12 @@ class ProcessLock:
     """Non-blocking cross-process lock keyed by a resolved workspace path."""
 
     def __init__(self, path: Path) -> None:
-        self.path = path.resolve()
+        resolved = str(path.resolve())
+        if sys.platform == "win32" and resolved.startswith("\\\\?\\UNC\\"):
+            resolved = "\\\\" + resolved[8:]
+        elif sys.platform == "win32" and resolved.startswith("\\\\?\\"):
+            resolved = resolved[4:]
+        self.path = Path(resolved).resolve()
         self._handle: Any = None
         self._owns_windows_mutex = False
 
@@ -138,6 +143,34 @@ class Job:
 
     @classmethod
     def from_row(cls, row: sqlite3.Row) -> Job:
+        return cls(**dict(row))
+
+
+@dataclass(frozen=True)
+class ConnectorJob:
+    id: str
+    media_key: str
+    connector: str
+    target_url: str
+    cursor: str | None
+    page: int
+    page_cap: int
+    item_cap: int
+    items_fetched: int
+    state: str
+    lease_owner: str | None
+    lease_expires_at: str | None
+    heartbeat_at: str | None
+    attempts: int
+    next_retry_at: str | None
+    result_path: str | None
+    truncated: int
+    error: str | None
+    created_at: str
+    updated_at: str
+
+    @classmethod
+    def from_row(cls, row: sqlite3.Row) -> ConnectorJob:
         return cls(**dict(row))
 
 
@@ -274,6 +307,14 @@ class AsyncJobStore:
                     lease_expires_at=NULL, heartbeat_at=NULL, updated_at=?
                 WHERE state='submitted' AND remote_ref IS NULL
                   AND (heartbeat_at IS NULL OR heartbeat_at < ?)
+                """,
+                (now, cutoff_text),
+            )
+            connection.execute(
+                """
+                UPDATE connector_jobs SET state='pending', lease_owner=NULL,
+                    lease_expires_at=NULL, heartbeat_at=NULL, updated_at=?
+                WHERE state='leased' AND (heartbeat_at IS NULL OR heartbeat_at < ?)
                 """,
                 (now, cutoff_text),
             )
@@ -710,6 +751,14 @@ class AsyncJobStore:
                 """,
                 (now, owner),
             )
+            connection.execute(
+                """
+                UPDATE connector_jobs SET state='pending', lease_owner=NULL,
+                    lease_expires_at=NULL, heartbeat_at=NULL, updated_at=?
+                WHERE lease_owner=? AND state='leased'
+                """,
+                (now, owner),
+            )
             connection.commit()
 
         await self._call(operation)
@@ -814,6 +863,256 @@ class AsyncJobStore:
                 "SELECT * FROM budgets WHERE media_key=? AND provider=?", (media_key, provider)
             ).fetchone()
             return dict(row) if row else None
+
+        return await self._call(operation)
+
+    async def ensure_connector_job(
+        self,
+        media_key: str,
+        connector: str,
+        target_url: str,
+        *,
+        page_cap: int,
+        item_cap: int,
+        input_content_sha256: str | None = None,
+        configuration_sha256: str | None = None,
+    ) -> ConnectorJob:
+        if page_cap < 1 or item_cap < 1:
+            raise ValueError("connector caps must be positive")
+        target_sha256 = sha256(target_url.encode("utf-8")).hexdigest()
+        input_hash = input_content_sha256 or target_sha256
+        config_hash = configuration_sha256 or sha256(b"{}").hexdigest()
+        for name, value in (
+            ("input_content_sha256", input_hash),
+            ("configuration_sha256", config_hash),
+        ):
+            if len(value) != 64 or any(character not in "0123456789abcdef" for character in value):
+                raise ValueError(f"{name} must be a lowercase SHA-256")
+        identity = "\0".join(
+            (
+                "connector-cache-v2",
+                media_key,
+                connector,
+                target_sha256,
+                input_hash,
+                config_hash,
+                str(page_cap),
+                str(item_cap),
+            )
+        )
+        job_id = sha1(
+            identity.encode("utf-8"),
+            usedforsecurity=False,
+        ).hexdigest()
+        now = utc_now()
+
+        def operation(connection: sqlite3.Connection) -> ConnectorJob:
+            connection.execute(
+                """
+                INSERT OR IGNORE INTO connector_jobs
+                    (id, media_key, connector, target_url, cursor, page, page_cap, item_cap,
+                     items_fetched, state, lease_owner, lease_expires_at, heartbeat_at, attempts,
+                     next_retry_at, result_path, truncated, error, created_at, updated_at)
+                VALUES (?, ?, ?, ?, NULL, 0, ?, ?, 0, 'pending', NULL, NULL, NULL, 0,
+                        NULL, NULL, 0, NULL, ?, ?)
+                """,
+                (job_id, media_key, connector, target_url, page_cap, item_cap, now, now),
+            )
+            connection.commit()
+            row = connection.execute(
+                "SELECT * FROM connector_jobs WHERE id=?", (job_id,)
+            ).fetchone()
+            assert row is not None
+            return ConnectorJob.from_row(row)
+
+        return await self._call(operation)
+
+    async def lease_connector(self, job_id: str, owner: str) -> ConnectorJob | None:
+        now = datetime.now(UTC)
+        now_text = now.isoformat(timespec="milliseconds").replace("+00:00", "Z")
+        expires = (
+            (now + timedelta(seconds=self.lease_seconds))
+            .isoformat(timespec="milliseconds")
+            .replace("+00:00", "Z")
+        )
+
+        def operation(connection: sqlite3.Connection) -> ConnectorJob | None:
+            connection.execute("BEGIN IMMEDIATE")
+            cursor = connection.execute(
+                """
+                UPDATE connector_jobs SET state='leased', lease_owner=?, lease_expires_at=?,
+                    heartbeat_at=?, attempts=attempts+1, updated_at=?
+                WHERE id=? AND state IN ('pending', 'retryable_failure')
+                    AND (next_retry_at IS NULL OR next_retry_at <= ?)
+                """,
+                (owner, expires, now_text, now_text, job_id, now_text),
+            )
+            connection.commit()
+            if cursor.rowcount != 1:
+                return None
+            row = connection.execute(
+                "SELECT * FROM connector_jobs WHERE id=?", (job_id,)
+            ).fetchone()
+            assert row is not None
+            return ConnectorJob.from_row(row)
+
+        return await self._call(operation)
+
+    async def heartbeat_connector(self, job_id: str, owner: str) -> None:
+        now = datetime.now(UTC)
+        now_text = now.isoformat(timespec="milliseconds").replace("+00:00", "Z")
+        expires = (
+            (now + timedelta(seconds=self.lease_seconds))
+            .isoformat(timespec="milliseconds")
+            .replace("+00:00", "Z")
+        )
+
+        def operation(connection: sqlite3.Connection) -> None:
+            cursor = connection.execute(
+                """
+                UPDATE connector_jobs SET heartbeat_at=?, lease_expires_at=?, updated_at=?
+                WHERE id=? AND lease_owner=? AND state='leased'
+                """,
+                (now_text, expires, now_text, job_id, owner),
+            )
+            connection.commit()
+            if cursor.rowcount != 1:
+                raise RuntimeError("cannot heartbeat an unowned connector job")
+
+        await self._call(operation)
+
+    async def checkpoint_connector(
+        self,
+        job_id: str,
+        owner: str,
+        *,
+        cursor: str | None,
+        page: int,
+        items_fetched: int,
+        result_path: str | None,
+        truncated: bool,
+    ) -> ConnectorJob:
+        now = utc_now()
+
+        def operation(connection: sqlite3.Connection) -> ConnectorJob:
+            row = connection.execute(
+                "SELECT * FROM connector_jobs WHERE id=?", (job_id,)
+            ).fetchone()
+            if row is None or row["state"] != "leased" or row["lease_owner"] != owner:
+                raise RuntimeError("connector checkpoint requires the active lease")
+            if page < int(row["page"]) or items_fetched < int(row["items_fetched"]):
+                raise ValueError("connector checkpoint cannot move backwards")
+            if page > int(row["page_cap"]) or items_fetched > int(row["item_cap"]):
+                raise ValueError("connector checkpoint exceeds its cap")
+            connection.execute(
+                """
+                UPDATE connector_jobs SET cursor=?, page=?, items_fetched=?, result_path=?,
+                    truncated=?, updated_at=? WHERE id=?
+                """,
+                (cursor, page, items_fetched, result_path, int(truncated), now, job_id),
+            )
+            connection.commit()
+            final = connection.execute(
+                "SELECT * FROM connector_jobs WHERE id=?", (job_id,)
+            ).fetchone()
+            assert final is not None
+            return ConnectorJob.from_row(final)
+
+        return await self._call(operation)
+
+    async def finish_connector(
+        self,
+        job_id: str,
+        owner: str,
+        state: str,
+        *,
+        result_path: str | None,
+        error: str | None = None,
+        truncated: bool | None = None,
+    ) -> ConnectorJob:
+        if state not in {
+            "succeeded",
+            "no_match",
+            "retryable_failure",
+            "permanent_failure",
+            "cancelled",
+        }:
+            raise ValueError(f"invalid terminal connector state: {state}")
+        now = utc_now()
+
+        def operation(connection: sqlite3.Connection) -> ConnectorJob:
+            cursor = connection.execute(
+                """
+                UPDATE connector_jobs SET state=?, lease_owner=NULL, lease_expires_at=NULL,
+                    heartbeat_at=NULL, result_path=?, error=?,
+                    truncated=COALESCE(?, truncated), updated_at=?
+                WHERE id=? AND state='leased' AND lease_owner=?
+                """,
+                (
+                    state,
+                    result_path,
+                    error[:1000] if error else None,
+                    int(truncated) if truncated is not None else None,
+                    now,
+                    job_id,
+                    owner,
+                ),
+            )
+            connection.commit()
+            if cursor.rowcount != 1:
+                raise RuntimeError("connector finish requires the active lease")
+            row = connection.execute(
+                "SELECT * FROM connector_jobs WHERE id=?", (job_id,)
+            ).fetchone()
+            assert row is not None
+            return ConnectorJob.from_row(row)
+
+        return await self._call(operation)
+
+    async def reset_connector(self, job_id: str) -> ConnectorJob:
+        now = utc_now()
+
+        def operation(connection: sqlite3.Connection) -> ConnectorJob:
+            cursor = connection.execute(
+                """
+                UPDATE connector_jobs SET state='pending', cursor=NULL, page=0, items_fetched=0,
+                    lease_owner=NULL, lease_expires_at=NULL, heartbeat_at=NULL,
+                    next_retry_at=NULL, result_path=NULL, truncated=0, error=NULL, updated_at=?
+                WHERE id=? AND state IN
+                    ('succeeded', 'no_match', 'retryable_failure', 'permanent_failure', 'cancelled')
+                """,
+                (now, job_id),
+            )
+            connection.commit()
+            if cursor.rowcount != 1:
+                raise ValueError("connector job cannot be reset in its current state")
+            row = connection.execute(
+                "SELECT * FROM connector_jobs WHERE id=?", (job_id,)
+            ).fetchone()
+            assert row is not None
+            return ConnectorJob.from_row(row)
+
+        return await self._call(operation)
+
+    async def list_connector_jobs(self, media_key: str | None = None) -> list[ConnectorJob]:
+        def operation(connection: sqlite3.Connection) -> list[ConnectorJob]:
+            if media_key is None:
+                rows = connection.execute("SELECT * FROM connector_jobs ORDER BY created_at, id")
+            else:
+                rows = connection.execute(
+                    "SELECT * FROM connector_jobs WHERE media_key=? ORDER BY created_at, id",
+                    (media_key,),
+                )
+            return [ConnectorJob.from_row(row) for row in rows]
+
+        return await self._call(operation)
+
+    async def get_connector_job(self, job_id: str) -> ConnectorJob | None:
+        def operation(connection: sqlite3.Connection) -> ConnectorJob | None:
+            row = connection.execute(
+                "SELECT * FROM connector_jobs WHERE id=?", (job_id,)
+            ).fetchone()
+            return ConnectorJob.from_row(row) if row else None
 
         return await self._call(operation)
 

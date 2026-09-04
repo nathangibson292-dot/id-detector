@@ -6,6 +6,7 @@ import asyncio
 import json
 import sys
 import uuid
+from decimal import Decimal
 from hashlib import sha256
 from pathlib import Path
 from typing import Annotated
@@ -14,6 +15,7 @@ import typer
 
 from id_detector.benchmark.controlled import render_controlled
 from id_detector.benchmark.corpus import run_corpus
+from id_detector.benchmark.hints import run_hint_gate
 from id_detector.benchmark.scorer import score_corpus
 from id_detector.benchmark.shortlist import run_shortlist
 from id_detector.calibration import calibrate_shazam
@@ -21,11 +23,13 @@ from id_detector.contracts import SourceRecord
 from id_detector.decode import decode
 from id_detector.doctor import run_doctor
 from id_detector.fuse.episodes import fuse_generation_zero
+from id_detector.hints.pipeline import run_hints
 from id_detector.ingest import ingest
-from id_detector.io import redact_text
+from id_detector.io import read_text, redact_text
 from id_detector.jobs import AsyncJobStore, ProcessLock
 from id_detector.journal import InvocationTimer, append_invocation
 from id_detector.present import export_tracklist
+from id_detector.process import run_process
 from id_detector.providers.base import AppConfig
 from id_detector.recognise import recognise_generation_zero
 from id_detector.truth import (
@@ -72,6 +76,9 @@ async def _analyse(
     print_raw: bool,
     refresh: bool,
     max_requests: int,
+    tracklist: Path | None,
+    no_hints: bool,
+    confirmed_mirrors: tuple[str, ...] = (),
 ) -> int:
     run_id = uuid.uuid4().hex
     timer = InvocationTimer(run_id, ["analyse", url])
@@ -133,6 +140,21 @@ async def _analyse(
                 "cache_hits": recognised.cache_hits,
             }
         )
+        hint_result = None
+        if not no_hints:
+            timer.start_stage("hints_ms")
+            hint_result = await run_hints(
+                source=ingested.record,
+                duration_ms=decoded.record.pcm.duration_ms,
+                media_dir=media_dir,
+                source_path=ingested.source_path,
+                project_root=PROJECT_ROOT,
+                manual_tracklist=tracklist,
+                confirmed_mirrors=confirmed_mirrors,
+                refresh=refresh,
+            )
+            timer.finish_stage("hints_ms")
+            counts["hints"] = len(hint_result.hints)
         timer.start_stage("fuse_ms")
         fused = fuse_generation_zero(
             media_key=ingested.record.media_key,
@@ -143,6 +165,8 @@ async def _analyse(
             windows=windows.records,
             windows_path=windows.record_path,
             pcm_path=decoded.record_path,
+            hints=hint_result.hints if hint_result is not None else (),
+            hints_path=hint_result.hints_path if hint_result is not None else None,
         )
         timer.finish_stage("fuse_ms")
         timer.start_stage("export_ms")
@@ -225,8 +249,20 @@ def analyse(
     refresh: bool = typer.Option(False, "--refresh", help="Bypass positive/no-match TTLs."),
     work_root: Path = typer.Option(DEFAULT_WORK_ROOT, "--work-root"),  # noqa: B008
     max_requests: int = typer.Option(2_000, "--max-requests", min=1),
+    tracklist: Path | None = typer.Option(  # noqa: B008
+        None, "--tracklist", help="Manual UTF-8 tracklist."
+    ),
+    no_hints: bool = typer.Option(False, "--no-hints", help="Disable all hint connectors."),
+    confirm_mirror: list[str] | None = typer.Option(  # noqa: B008
+        None,
+        "--confirm-mirror",
+        help="Manually confirm and import an allow-listed mirror URL; repeatable.",
+    ),
 ) -> None:
     """Run the full generation-zero pipeline and export a flattened tracklist."""
+    if no_hints and (tracklist is not None or confirm_mirror):
+        typer.echo("--tracklist/--confirm-mirror cannot be combined with --no-hints", err=True)
+        raise typer.Exit(2)
     try:
         exit_code = asyncio.run(
             _analyse(
@@ -235,12 +271,156 @@ def analyse(
                 print_raw=raw,
                 refresh=refresh,
                 max_requests=max_requests,
+                tracklist=tracklist,
+                no_hints=no_hints,
+                confirmed_mirrors=tuple(confirm_mirror or ()),
             )
         )
     except KeyboardInterrupt:
         typer.echo("cancelled; safe job states were restored", err=True)
         raise typer.Exit(130) from None
     raise typer.Exit(exit_code)
+
+
+async def _original_duration_ms(path: Path) -> int:
+    result = await run_process(
+        [
+            "ffprobe",
+            "-v",
+            "error",
+            "-show_entries",
+            "format=duration",
+            "-of",
+            "default=noprint_wrappers=1:nokey=1",
+            str(path.resolve()),
+        ],
+        timeout=60,
+    )
+    if result.returncode:
+        raise RuntimeError(redact_text(result.stderr or "ffprobe failed"))
+    lines = result.stdout.strip().splitlines()
+    if not lines:
+        raise RuntimeError("ffprobe returned no duration")
+    value = lines[0]
+    return int((Decimal(value) * 1_000).to_integral_value())
+
+
+async def _hints(
+    url: str,
+    *,
+    tracklist: Path | None,
+    confirmed_mirrors: tuple[str, ...],
+    refresh: bool,
+    work_root: Path,
+) -> dict[str, object]:
+    source_lock: ProcessLock | None = None
+    media_lock: ProcessLock | None = None
+    try:
+        lock_key = sha256(url.encode("utf-8")).hexdigest()
+        source_lock = ProcessLock(work_root.resolve() / ".locks" / f"{lock_key}.lock")
+        source_lock.acquire()
+        ingested = await ingest(url, work_root)
+        media_lock = ProcessLock(ingested.media_dir / ".media.lock")
+        media_lock.acquire()
+        pcm_path = ingested.media_dir / "decode" / "pcm.json"
+        if pcm_path.is_file():
+            from id_detector.contracts import PcmRecord
+
+            pcm = PcmRecord.model_validate_json(read_text(pcm_path))
+            duration_ms = pcm.pcm.duration_ms
+        else:
+            duration_ms = await _original_duration_ms(ingested.original_path)
+        result = await run_hints(
+            source=ingested.record,
+            duration_ms=duration_ms,
+            media_dir=ingested.media_dir,
+            source_path=ingested.source_path,
+            project_root=PROJECT_ROOT,
+            manual_tracklist=tracklist,
+            confirmed_mirrors=confirmed_mirrors,
+            refresh=refresh,
+        )
+        by_connector: dict[str, int] = {}
+        by_kind: dict[str, int] = {}
+        for hint in result.hints:
+            by_connector[hint.connector] = by_connector.get(hint.connector, 0) + 1
+            by_kind[hint.kind] = by_kind.get(hint.kind, 0) + 1
+        block_lines: dict[tuple[str, bool], list[object]] = {}
+        for hint in result.hints:
+            if hint.kind != "tracklist_line":
+                continue
+            authority = bool(
+                hint.author.is_uploader or hint.is_pinned or hint.connector in {"mixesdb", "1001tl"}
+            )
+            block_lines.setdefault((hint.connector, authority), []).append(hint)
+        top_blocks = [
+            {
+                "connector": connector,
+                "authority": int(authority),
+                "line_count": len(lines),
+                "sample_lines": [
+                    {
+                        "position_range_ms": list(hint.position_range_ms)
+                        if hint.position_range_ms
+                        else None,
+                        "artist": hint.artist,
+                        "title": hint.title,
+                    }
+                    for hint in lines[:5]
+                ],
+            }
+            for (connector, authority), lines in sorted(
+                block_lines.items(), key=lambda item: (-int(item[0][1]), -len(item[1]), item[0][0])
+            )[:10]
+        ]
+        return {
+            "counts_by_connector": dict(sorted(by_connector.items())),
+            "counts_by_kind": dict(sorted(by_kind.items())),
+            "tracklist_blocks": result.tracklist_blocks,
+            "top_tracklist_blocks": top_blocks,
+            "quarantined_mirrors": list(result.quarantined_mirrors),
+            "hints_path": str(result.hints_path),
+            "connector_status_path": str(result.status_path),
+        }
+    finally:
+        if media_lock is not None:
+            media_lock.release()
+        if source_lock is not None:
+            source_lock.release()
+
+
+@app.command("hints")
+def hints_command(
+    url: str = typer.Argument(..., help="Public mix URL (or a local media file)."),
+    tracklist: Path | None = typer.Option(  # noqa: B008
+        None, "--tracklist", help="Manual UTF-8 tracklist."
+    ),
+    confirm_mirror: list[str] | None = typer.Option(  # noqa: B008
+        None,
+        "--confirm-mirror",
+        help="Manually confirm and import an allow-listed mirror URL; repeatable.",
+    ),
+    refresh: bool = typer.Option(False, "--refresh", help="Refresh connector caches."),
+    work_root: Path = typer.Option(DEFAULT_WORK_ROOT, "--work-root"),  # noqa: B008
+) -> None:
+    """Fetch and parse hints without decoding, recognition, fusion, or export."""
+
+    try:
+        summary = asyncio.run(
+            _hints(
+                url,
+                tracklist=tracklist,
+                confirmed_mirrors=tuple(confirm_mirror or ()),
+                refresh=refresh,
+                work_root=work_root,
+            )
+        )
+    except KeyboardInterrupt:
+        raise typer.Exit(130) from None
+    except (ValueError, RuntimeError, OSError, json.JSONDecodeError) as exc:
+        typer.echo(redact_text(str(exc)), err=True)
+        raise typer.Exit(1) from None
+    typer.echo(json.dumps(summary, ensure_ascii=False, separators=(",", ":"), sort_keys=True))
 
 
 def _parse_position(value: str) -> int:
@@ -415,6 +595,9 @@ def benchmark_run(
     ] = None,
     work_root: Annotated[Path, typer.Option("--work-root")] = DEFAULT_WORK_ROOT,
     max_requests: Annotated[int, typer.Option("--max-requests", min=1)] = 2_000,
+    include_hints: Annotated[
+        bool, typer.Option("--hints/--no-hints", help="Include Stage 4a hint evidence.")
+    ] = False,
 ) -> None:
     """Analyse every selected corpus set, score it, and compare a named baseline."""
 
@@ -429,6 +612,7 @@ def benchmark_run(
                 baseline=baseline,
                 set_id=set_id,
                 max_requests=max_requests,
+                include_hints=include_hints,
             )
         )
     except KeyboardInterrupt:
@@ -487,6 +671,37 @@ def benchmark_shortlist(
     typer.echo(
         f"shortlisted {len(result.report.engines)} engines on "
         f"{result.report.corpus_version}; {statuses}; report={out}"
+    )
+
+
+@benchmark_app.command("hints")
+def benchmark_hints(
+    corpus: Annotated[str, typer.Option("--corpus", help="Frozen held-out corpus version.")],
+    out: Annotated[Path, typer.Option("--out", help="Stage 4a gate report JSON.")],
+    work_root: Annotated[Path, typer.Option("--work-root")] = Path("data/local/work-hints-gate"),
+    max_requests: Annotated[int, typer.Option("--max-requests", min=1)] = 2_000,
+) -> None:
+    """Run the formal fused-vs-audio-only Stage 4a held-out gate."""
+
+    try:
+        result = asyncio.run(
+            run_hint_gate(
+                corpus_version=corpus,
+                out_path=out,
+                project_root=PROJECT_ROOT,
+                work_root=work_root,
+                max_requests=max_requests,
+            )
+        )
+    except KeyboardInterrupt:
+        raise typer.Exit(130) from None
+    except (ValueError, RuntimeError, OSError, json.JSONDecodeError) as exc:
+        typer.echo(redact_text(str(exc)), err=True)
+        raise typer.Exit(1) from None
+    typer.echo(
+        f"Stage 4a gate pass={str(result.passed).lower()}; "
+        f"coverage_delta_e4={result.coverage_delta_e4}; "
+        f"coverage_cluster_lower_e4={result.coverage_cluster_lower_e4}; report={out}"
     )
 
 

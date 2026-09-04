@@ -80,6 +80,7 @@ def flatten_tracklist(
                 "primary_role": primary_role,
                 "badge": episode.badge,
                 "version_status": episode.version_status,
+                "hint_supported": "hint_supported" in episode.flags,
                 "tiers": episode.tiers.model_dump(mode="json"),
             }
         )
@@ -148,6 +149,8 @@ def export_tracklist(
             lines.append(f"| {_format_time(entry['start_ms'])} | — | — | gap | {label} |")
         else:
             badge = str(entry["badge"]).upper()
+            if entry["hint_supported"]:
+                badge += " +HINT"
             version_status = str(entry["version_status"]).upper()
             label = f"{entry['artist']} — {entry['title']}"
             lines.append(

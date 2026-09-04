@@ -244,6 +244,7 @@ async def _run_real(
     truth: GroundTruthRecord,
     work_root: Path,
     max_requests: int,
+    include_hints: bool,
 ) -> tuple[Path, None, BenchmarkCost]:
     ingested = await ingest(source, work_root)
     decoded = await decode(ingested)
@@ -252,18 +253,21 @@ async def _run_real(
         media_key=ingested.record.media_key,
         duration_ms=decoded.record.pcm.duration_ms,
     )
+    command = [
+        sys.executable,
+        "-m",
+        "id_detector.cli",
+        "analyse",
+        source,
+        "--work-root",
+        str(work_root),
+        "--max-requests",
+        str(max_requests),
+    ]
+    if not include_hints:
+        command.append("--no-hints")
     result = await run_process(
-        [
-            sys.executable,
-            "-m",
-            "id_detector.cli",
-            "analyse",
-            source,
-            "--work-root",
-            str(work_root),
-            "--max-requests",
-            str(max_requests),
-        ],
+        command,
         timeout=28_800,
     )
     if result.returncode:
@@ -359,6 +363,7 @@ def _scoring_config(
     profile: str,
     max_requests: int,
     project_root: Path,
+    include_hints: bool = False,
 ) -> ScoringConfigSnapshot:
     controlled_run = any("controlled" in truth.stratum.casefold() for truth in truths)
     real_run = any("controlled" not in truth.stratum.casefold() for truth in truths)
@@ -403,6 +408,11 @@ def _scoring_config(
             "continuation_gap_ms": CONTINUATION_GAP_MS,
             "replay_gap_ms": REPLAY_GAP_MS,
             "badge_rule": "rev5.1",
+            **(
+                {"hint_policy": "stage4a-one-work-trial-no-version-question-rescans"}
+                if include_hints
+                else {}
+            ),
         },
         "budget": {"max_requests_per_set": max_requests if real_run else 0},
         "source_validation": {
@@ -430,6 +440,7 @@ async def run_corpus(
     baseline: str | None = None,
     set_id: str | None = None,
     max_requests: int = 2_000,
+    include_hints: bool = False,
 ) -> CorpusRunResult:
     if profile != "free":
         raise ValueError("Stage 2b corpus runs support only the free profile")
@@ -462,7 +473,11 @@ async def run_corpus(
                     f"no local media or source link for {truth.set_id} ({truth.source.url_ref})"
                 )
             media_dir, fusion, cost = await _run_real(
-                source, truth=truth, work_root=work_root, max_requests=max_requests
+                source,
+                truth=truth,
+                work_root=work_root,
+                max_requests=max_requests,
+                include_hints=include_hints,
             )
         prediction_sets.append(_prediction_set(truth.set_id, fusion, media_dir))
         costs.append(cost)
@@ -471,6 +486,7 @@ async def run_corpus(
         profile=profile,
         max_requests=max_requests,
         project_root=project_root,
+        include_hints=include_hints,
     )
     config_hash = sha256(canonical_json_bytes(config)).hexdigest()
     unverified = not truth_is_frozen_verified(corpus_dir, [truth for truth, _ in truths_with_paths])

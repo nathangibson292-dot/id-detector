@@ -17,6 +17,7 @@ from id_detector.contracts import (
     EpisodesFile,
     GapEvidence,
     GapRecord,
+    HintRecord,
     ObservationRecord,
     RescanPolicy,
     RescanRequestRecord,
@@ -94,6 +95,15 @@ def _candidate_recording_specific(identity: IdentityBuildResult, candidate_id: s
     return any(node.split(":", 1)[0] in RECORDING_NAMESPACES for node in candidate.member_nodes)
 
 
+def _eligible_tracklist_hint(hint: HintRecord) -> bool:
+    return (
+        hint.kind == "tracklist_line"
+        and hint.mirror_status == "verified"
+        and not hint.flags.id_unknown
+        and (hint.author.is_uploader or hint.is_pinned or hint.connector in {"mixesdb", "1001tl"})
+    )
+
+
 def _competition(
     supports: list[tuple[int, int]],
     candidate_id: str,
@@ -115,6 +125,7 @@ def _assign_observations(
     selected_ids: set[str],
     alignments: dict[str, tuple[AlignmentOccurrence, ...]],
     identity: IdentityBuildResult,
+    hints: list[HintRecord] | tuple[HintRecord, ...] = (),
 ) -> dict[
     str,
     list[tuple[list[ObservationRecord], list[ObservationRecord], AlignmentOccurrence | None]],
@@ -261,6 +272,7 @@ def build_episodes(
     observations: list[ObservationRecord] | tuple[ObservationRecord, ...],
     windows: list[WindowRecord] | tuple[WindowRecord, ...],
     identity: IdentityBuildResult,
+    hints: list[HintRecord] | tuple[HintRecord, ...] = (),
     generation: int = 0,
     profile: str = "free",
 ) -> tuple[EpisodesFile, list[RescanRequestRecord]]:
@@ -287,18 +299,35 @@ def build_episodes(
                 continue
             start_bound, end_bound, start_censored, end_censored = proved_bounds(raw_supports)
             trials = {item.logical_trial_id for item in votes}
+            candidate_work_id = candidate_by_id[candidate_id].work_id
+            supporting_hints = [
+                hint
+                for hint in hints
+                if _eligible_tracklist_hint(hint)
+                and identity.hint_work_ids.get(hint.id) == candidate_work_id
+                and hint.position_range_ms is not None
+                and any(_intersects(hint.position_range_ms, support) for support in supports)
+            ]
+            hint_vote = int(bool({hint.provenance_group for hint in supporting_hints}))
             span = supports[-1][1] - supports[0][0]
             competing = _competition(supports, candidate_id, all_supports, duration_ms)
             has_global = alignment.has_global_alignment if alignment is not None else False
             if len(trials) >= 4 and span >= 40_000 and not competing and has_global:
-                work_tier = "likely"
+                audio_work_tier = "likely"
             elif len(trials) >= 2 and span >= 20_000 and not competing:
+                audio_work_tier = "possible"
+            else:
+                audio_work_tier = "unclear"
+            effective_trials = len(trials) + hint_vote
+            if effective_trials >= 4 and span >= 40_000 and not competing and has_global:
+                work_tier = "likely"
+            elif effective_trials >= 2 and span >= 20_000 and not competing:
                 work_tier = "possible"
             else:
                 work_tier = "unclear"
             candidate = candidate_by_id[candidate_id]
             version_tier = (
-                work_tier
+                audio_work_tier
                 if candidate_id in identity.recording_supported and not candidate.contested
                 else "unclear"
             )
@@ -333,6 +362,8 @@ def build_episodes(
                 flags.append("hypothesis_rejected")
             if outliers:
                 flags.append("alignment_outlier")
+            if supporting_hints:
+                flags.append("hint_supported")
             provisional.append(
                 {
                     "id": episode_id,
@@ -355,6 +386,7 @@ def build_episodes(
                     "version_tier": version_tier,
                     "boundary_tier": boundary_tier,
                     "flags": flags,
+                    "supporting_hints": supporting_hints,
                 }
             )
     provisional.sort(key=lambda item: (item["outer_hull"][0], item["id"]))
@@ -418,7 +450,10 @@ def build_episodes(
                     if version_tier == "verified"
                     else "unverified"
                 ),
-                evidence=[observation.id for observation in item["evidence"]],
+                evidence=[
+                    *[observation.id for observation in item["evidence"]],
+                    *[hint.id for hint in item["supporting_hints"]],
+                ],
                 flags=item["flags"],
                 rescan_state="requested",
             )
@@ -468,7 +503,11 @@ def build_episodes(
                         )
                         for episode in episode_records
                     ),
-                    n_hint_events=0,
+                    n_hint_events=sum(
+                        hint.position_range_ms is not None
+                        and _intersects(hint.position_range_ms, interval)
+                        for hint in hints
+                    ),
                     n_novelty_events=0,
                 ),
                 reason="no_evidence",
@@ -555,6 +594,48 @@ def build_episodes(
             min(duration_ms, episode.best_end_ms + 20_000),
             70,
         )
+    used_hint_ids = {hint.id for item in provisional for hint in item["supporting_hints"]}
+    for hint in hints:
+        if (
+            hint.id not in used_hint_ids
+            and hint.kind in {"tracklist_line", "answer", "correction"}
+            and hint.mirror_status == "verified"
+            and hint.id in identity.hint_work_ids
+            and hint.position_range_ms is not None
+        ):
+            add_request(
+                "hint_cluster",
+                hint.position_range_ms[0],
+                hint.position_range_ms[1],
+                80,
+            )
+
+    questions = sorted(
+        (
+            ((hint.position_range_ms[0] + hint.position_range_ms[1]) // 2, hint)
+            for hint in hints
+            if hint.kind == "question"
+            and hint.mirror_status == "verified"
+            and hint.position_range_ms is not None
+        ),
+        key=lambda item: (item[0], item[1].id),
+    )
+    index = 0
+    while index < len(questions):
+        end = index
+        while end + 1 < len(questions) and questions[end + 1][0] - questions[index][0] <= 90_000:
+            end += 1
+        cluster = questions[index : end + 1]
+        if len(cluster) >= 3:
+            add_request(
+                "question_cluster",
+                min(item.position_range_ms[0] for _, item in cluster if item.position_range_ms),
+                max(item.position_range_ms[1] for _, item in cluster if item.position_range_ms),
+                95,
+            )
+            index = end + 1
+        else:
+            index += 1
     return episodes_file, sorted(requests, key=lambda item: (item.start_ms, item.id))
 
 
@@ -573,11 +654,17 @@ def fuse_generation_zero(
     windows: list[WindowRecord] | tuple[WindowRecord, ...],
     windows_path: Path,
     pcm_path: Path,
+    hints: list[HintRecord] | tuple[HintRecord, ...] = (),
+    hints_path: Path | None = None,
     profile: str = "free",
 ) -> FusionResult:
-    identity = build_identity_graph(media_key, observations)
+    identity = build_identity_graph(media_key, observations, hints=hints)
     identities_path = write_identity_graph(
-        media_dir, 0, identity, observations_path=observations_path
+        media_dir,
+        0,
+        identity,
+        observations_path=observations_path,
+        hints_path=hints_path,
     )
     episodes, requests = build_episodes(
         media_key=media_key,
@@ -585,6 +672,7 @@ def fuse_generation_zero(
         observations=observations,
         windows=windows,
         identity=identity,
+        hints=hints,
         generation=0,
         profile=profile,
     )
@@ -595,6 +683,8 @@ def fuse_generation_zero(
         pcm_path.relative_to(media_dir).as_posix(): pcm_path,
         identities_path.relative_to(media_dir).as_posix(): identities_path,
     }
+    if hints_path is not None:
+        upstream[hints_path.relative_to(media_dir).as_posix()] = hints_path
     atomic_write_json(generation_path, episodes)
     write_completion_sidecar(generation_path, upstream)
     final_path = media_dir / "fuse" / "episodes.json"
@@ -605,7 +695,12 @@ def fuse_generation_zero(
     )
     input_hashes = {
         path.relative_to(media_dir).as_posix(): sha256_file(path)
-        for path in (observations_path, windows_path, identities_path)
+        for path in (
+            observations_path,
+            windows_path,
+            identities_path,
+            *([hints_path] if hints_path is not None else []),
+        )
     }
     requests = [request.model_copy(update={"input_hashes": input_hashes}) for request in requests]
     rescan_path = media_dir / "fuse" / "rescan_plan.gen0.jsonl"

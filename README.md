@@ -1,8 +1,8 @@
 # id-detector
 
-Evidence-first track identification for DJ sets. Stage 3 adds independently evaluated AudD and
-ACRCloud file-scanner adapters, a disabled Panako capability skeleton, and reproducible engine
-shortlisting to the Stage 2b analysis and benchmarking foundation.
+Evidence-first track identification for DJ sets. Stage 4a adds non-blocking text-hint connectors,
+strict tracklist/comment parsing, provenance-aware work-tier evidence, and hint-driven rescan
+requests to the Stage 3 recognition foundation.
 
 Recognition evidence is immutable per invocation under
 `work/<source_key>/<media_key>/recognise/invocations/<invocation_key>/`. The active packaged
@@ -16,6 +16,10 @@ uv sync --dev
 uv run id-detector doctor
 uv run id-detector calibrate-shazam --track <released-file-or-url> --positions 10,40,70,100,140
 uv run id-detector analyse <mix-url> --raw
+uv run id-detector analyse <mix-url> --tracklist <tracklist.txt>
+uv run id-detector hints <mix-url>
+uv run id-detector hints <mix-url> --confirm-mirror <ALLOWLISTED_MIRROR_URL>
+uv run id-detector benchmark hints --corpus dev-2 --out data/local/benchmark/dev-2/hints-gate.json
 uv run id-detector show <source-key>
 uv run id-detector benchmark run --corpus controlled-synth-1 --profile free --out data/corpus/controlled-synth-1/baseline-free.json
 uv run id-detector benchmark shortlist --corpus controlled-synth-1 --out data/corpus/controlled-synth-1/shortlist.json

@@ -187,6 +187,7 @@ _PLAIN_SECRET = re.compile(
     r"authorization|cookie)(\s*[:=]\s*)"
     r"(?:Bearer\s+)?[^\s,;}]+"
 )
+_HTTP_URL = re.compile(r"https?://[^\s<>\"']+", re.IGNORECASE)
 
 _SENSITIVE_URL_QUERY_KEYS = frozenset(
     {
@@ -235,15 +236,13 @@ def url_has_credentials(value: str) -> bool:
     )
 
 
-def redact_command_argument(value: str) -> str:
-    """Remove URL userinfo and query credentials before journaling an argument."""
-
+def _redact_url_credentials(value: str) -> str:
     try:
         parts = urlsplit(value)
     except ValueError:
-        return redact_text(value)
+        return value
     if parts.scheme.casefold() not in {"http", "https"} or not parts.netloc:
-        return redact_text(value)
+        return value
     netloc = parts.netloc.rsplit("@", 1)[-1]
     query = urlencode(
         [
@@ -251,10 +250,17 @@ def redact_command_argument(value: str) -> str:
             for key, item in parse_qsl(parts.query, keep_blank_values=True)
         ]
     )
-    return redact_text(urlunsplit((parts.scheme, netloc, parts.path, query, parts.fragment)))
+    return urlunsplit((parts.scheme, netloc, parts.path, query, parts.fragment))
+
+
+def redact_command_argument(value: str) -> str:
+    """Remove URL userinfo and query credentials before journaling an argument."""
+
+    return redact_text(_redact_url_credentials(value))
 
 
 def redact_text(value: str) -> str:
+    value = _HTTP_URL.sub(lambda match: _redact_url_credentials(match.group(0)), value)
     value = _QUOTED_SECRET.sub(lambda match: f'{match.group(1)}"[REDACTED]"', value)
     return _PLAIN_SECRET.sub(lambda match: f"{match.group(1)}{match.group(2)}[REDACTED]", value)
 

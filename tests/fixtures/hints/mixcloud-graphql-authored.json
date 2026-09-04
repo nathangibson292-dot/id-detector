@@ -1,0 +1,1 @@
+{"data":{"cloudcastLookup":{"name":"Authored show","sections":[{"__typename":"TrackSection","artistName":"Artist One","songName":"Title One","startSeconds":0},{"__typename":"ChapterSection","chapter":"Talk","startSeconds":120},{"__typename":"TrackSection","artistName":"Artist Two","songName":"Title Two","startSeconds":300}]}}}

@@ -10,6 +10,7 @@ from pathlib import Path
 from id_detector.contracts import (
     GENERATED_BY,
     SCHEMA_VERSION,
+    HintRecord,
     IdentitiesRecord,
     IdentityAssertion,
     IdentityCandidate,
@@ -106,6 +107,8 @@ def _assertion(
 class IdentityBuildResult:
     record: IdentitiesRecord
     observation_candidates: dict[str, str]
+    hint_candidates: dict[str, str]
+    hint_work_ids: dict[str, str]
     candidate_labels: dict[str, tuple[str, str]]
     recording_supported: frozenset[str]
 
@@ -132,6 +135,7 @@ def build_identity_graph(
     media_key: str,
     observations: list[ObservationRecord] | tuple[ObservationRecord, ...],
     *,
+    hints: list[HintRecord] | tuple[HintRecord, ...] = (),
     extra_assertions: list[IdentityAssertion] | tuple[IdentityAssertion, ...] = (),
     prior_recording_components: tuple[tuple[str, ...], ...] = (),
 ) -> IdentityBuildResult:
@@ -150,6 +154,7 @@ def build_identity_graph(
     observation_nodes: dict[str, list[str]] = {}
     observation_text: dict[str, str] = {}
     recording_node_sources: dict[str, set[str]] = {}
+    hint_text: dict[str, str] = {}
 
     for observation in final_matches:
         label = display_label(observation)
@@ -204,6 +209,22 @@ def build_identity_graph(
                     confidence=10_000 if observation.provider == "local_fixture" else 9_000,
                 )
                 assertion_by_id[item.id] = item
+
+    for hint in sorted(hints, key=lambda item: item.id):
+        if (
+            hint.mirror_status != "verified"
+            or hint.flags.id_unknown
+            or not hint.artist
+            or not hint.title
+        ):
+            continue
+        artist = normalise_text(hint.artist)
+        title = normalise_text(hint.title)
+        if not artist or not title:
+            continue
+        text_node = f"text:{artist}|{title}"
+        node_labels.setdefault(text_node, f"{hint.artist} - {hint.title}")
+        hint_text[hint.id] = text_node
 
     assertions = sorted(assertion_by_id.values(), key=lambda item: item.id)
     # Reuse the Stage 0 helper; this call is intentionally not duplicated below.
@@ -298,6 +319,8 @@ def build_identity_graph(
         node: candidate.canonical_id for candidate in candidates for node in candidate.member_nodes
     }
     observation_candidates: dict[str, str] = {}
+    hint_candidates: dict[str, str] = {}
+    hint_work_ids: dict[str, str] = {}
     candidate_labels: dict[str, tuple[str, str]] = {}
     for observation in final_matches:
         provider_nodes = observation_nodes[observation.id]
@@ -317,6 +340,23 @@ def build_identity_graph(
                 observation.raw_label.title or "Unknown title",
             ),
         )
+    candidates_by_work = {
+        work_id: sorted(
+            candidate.canonical_id for candidate in candidates if candidate.work_id == work_id
+        )
+        for work_id in {candidate.work_id for candidate in candidates}
+    }
+    hint_by_id = {hint.id: hint for hint in hints}
+    for hint_id, text_node in sorted(hint_text.items()):
+        work_id = work_id_by_node[text_node]
+        hint_work_ids[hint_id] = work_id
+        work_candidates = candidates_by_work.get(work_id, [])
+        if work_candidates:
+            hint_candidates[hint_id] = work_candidates[0]
+            hint = hint_by_id[hint_id]
+            candidate_labels.setdefault(
+                work_candidates[0], (hint.artist or "Unknown artist", hint.title or "Unknown title")
+            )
 
     recording_supported = frozenset(
         candidate.canonical_id
@@ -356,6 +396,8 @@ def build_identity_graph(
     return IdentityBuildResult(
         record=record,
         observation_candidates=observation_candidates,
+        hint_candidates=hint_candidates,
+        hint_work_ids=hint_work_ids,
         candidate_labels=candidate_labels,
         recording_supported=recording_supported,
     )
@@ -367,10 +409,12 @@ def write_identity_graph(
     build: IdentityBuildResult,
     *,
     observations_path: Path,
+    hints_path: Path | None = None,
 ) -> Path:
     path = media_dir / "fuse" / f"identities.gen{generation}.json"
     atomic_write_json(path, build.record)
-    write_completion_sidecar(
-        path, {observations_path.relative_to(media_dir).as_posix(): observations_path}
-    )
+    upstream = {observations_path.relative_to(media_dir).as_posix(): observations_path}
+    if hints_path is not None:
+        upstream[hints_path.relative_to(media_dir).as_posix()] = hints_path
+    write_completion_sidecar(path, upstream)
     return path
