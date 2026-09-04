@@ -24,6 +24,7 @@ class ExportResult:
     json_path: Path
     markdown_path: Path
     entries: tuple[dict[str, Any], ...]
+    cue_path: Path | None = None
 
 
 def _format_time(milliseconds: int) -> str:
@@ -31,6 +32,25 @@ def _format_time(milliseconds: int) -> str:
     hours, remainder = divmod(seconds, 3600)
     minutes, seconds = divmod(remainder, 60)
     return f"{hours}:{minutes:02d}:{seconds:02d}" if hours else f"{minutes}:{seconds:02d}"
+
+
+def _cue_index(milliseconds: int) -> str:
+    """Format a millisecond position as CUE ``MM:SS:FF`` (75 frames per second).
+
+    Minutes are allowed to exceed two digits so a set longer than 99 minutes still flattens to a
+    monotonic sheet; every mainstream CUE reader we target tolerates a wider minute field.
+    """
+
+    frames_total = round(milliseconds * 75 / 1000)
+    minutes, remainder = divmod(frames_total, 60 * 75)
+    seconds, frames = divmod(remainder, 75)
+    return f"{minutes:02d}:{seconds:02d}:{frames:02d}"
+
+
+def _cue_quote(value: str) -> str:
+    """Quote a CUE string field, stripping the double quote CUE cannot escape."""
+
+    return '"' + value.replace('"', "'").replace("\n", " ").replace("\r", " ") + '"'
 
 
 def _candidate_label(identities: IdentitiesRecord, candidate_id: str) -> tuple[str, str]:
@@ -149,6 +169,7 @@ def export_tracklist(
     identities_path: Path,
     acquire: AcquireFile | None = None,
     acquire_path: Path | None = None,
+    title: str | None = None,
 ) -> ExportResult:
     entries = flatten_tracklist(episodes, identities, acquire)
     json_path = media_dir / "present" / "tracklist.json"
@@ -199,4 +220,36 @@ def export_tracklist(
             )
     atomic_write_bytes(markdown_path, ("\n".join(lines) + "\n").encode("utf-8"))
     write_completion_sidecar(markdown_path, upstream)
-    return ExportResult(json_path, markdown_path, entries)
+
+    cue_path = media_dir / "present" / "tracklist.cue"
+    atomic_write_bytes(cue_path, render_cue(entries, title=title).encode("utf-8"))
+    write_completion_sidecar(cue_path, upstream)
+
+    return ExportResult(json_path, markdown_path, entries, cue_path)
+
+
+def render_cue(entries: tuple[dict[str, Any], ...], *, title: str | None = None) -> str:
+    """Render a flattened CUE sheet.
+
+    The flattening rule is the plan's: entries already carry the primary-role start (an ``incoming``
+    role starts at ``best_start_ms``; the outgoing track therefore ends where the next one starts),
+    so a CUE ``INDEX 01`` at each entry's ``start_ms`` reproduces "outgoing ends there" implicitly —
+    the next track's index is the previous track's out point. ID gaps are emitted as their own
+    ``ID`` tracks so the sheet stays a monotonic partition with no silent, unexplained holes.
+    """
+
+    header = [
+        f"TITLE {_cue_quote(title)}" if title else 'TITLE "DJ set"',
+        'FILE "audio" WAVE',
+    ]
+    body: list[str] = []
+    for number, entry in enumerate(entries, 1):
+        if entry["kind"] == "id":
+            performer, track_title = "ID", "ID"
+        else:
+            performer, track_title = str(entry["artist"]), str(entry["title"])
+        body.append(f"  TRACK {number:02d} AUDIO")
+        body.append(f"    TITLE {_cue_quote(track_title)}")
+        body.append(f"    PERFORMER {_cue_quote(performer)}")
+        body.append(f"    INDEX 01 {_cue_index(int(entry['start_ms']))}")
+    return "\n".join(header + body) + "\n"

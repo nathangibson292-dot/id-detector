@@ -285,6 +285,11 @@ async def ingest(input_url: str, work_root: Path) -> IngestResult:
                 "write_info_json": True,
                 "write_comments": False,
                 "playlist": False,
+                # Carried through so the Stage 7 page can honour an embedding-disabled set.
+                # SoundCloud info.json exposes ``embeddable_by`` ∈ {"all","me","none"}.
+                "embeddable_by": str(info["embeddable_by"])
+                if info.get("embeddable_by") is not None
+                else None,
             },
         )
         source_path = ingest_dir / "source.json"

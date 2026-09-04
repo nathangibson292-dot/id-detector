@@ -37,7 +37,8 @@ from id_detector.io import read_text, redact_text
 from id_detector.jobs import AsyncJobStore, ProcessLock
 from id_detector.journal import InvocationTimer, append_invocation
 from id_detector.orchestrate import run_generation_loop
-from id_detector.present import export_tracklist
+from id_detector.present import export_tracklist, generate_page
+from id_detector.present.server import consume_rescan_queue, read_rescan_queue
 from id_detector.process import run_process
 from id_detector.profiles import (
     UnknownProfile,
@@ -230,6 +231,16 @@ async def _analyse(
             duration_ms=decoded.record.pcm.duration_ms,
             episodes=fused.episodes,
             identities=fused.identities.record,
+            episodes_path=fused.final_path,
+            identities_path=fused.identities_path,
+            title=ingested.record.title,
+        )
+        generate_page(
+            media_dir=media_dir,
+            source=ingested.record,
+            episodes=fused.episodes,
+            identities=fused.identities.record,
+            duration_ms=decoded.record.pcm.duration_ms,
             episodes_path=fused.final_path,
             identities_path=fused.identities_path,
         )
@@ -452,6 +463,18 @@ async def _acquire(
         identities_path=final_identities_path(media_dir),
         acquire=result.record,
         acquire_path=result.path,
+        title=cached.record.title,
+    )
+    generate_page(
+        media_dir=media_dir,
+        source=cached.record,
+        episodes=episodes,
+        identities=identities,
+        duration_ms=duration_ms,
+        episodes_path=media_dir / "fuse" / "episodes.json",
+        identities_path=final_identities_path(media_dir),
+        acquire=result.record,
+        acquire_path=result.path,
     )
     typer.echo(
         f"acquire: {result.counts['episodes']} identified episodes; "
@@ -487,6 +510,94 @@ def acquire(
             enable_soundcloud=soundcloud,
         )
     )
+    raise typer.Exit(exit_code)
+
+
+@app.command()
+def serve(
+    work_root: Path = typer.Option(DEFAULT_WORK_ROOT, "--work-root"),  # noqa: B008
+    port: int = typer.Option(8765, "--port", min=0, max=65535),
+    host: str = typer.Option(
+        "127.0.0.1", "--host", help="Loopback only; a routable interface is refused."
+    ),
+) -> None:
+    """Serve analysed sets' present/ pages read-only on 127.0.0.1 (POST /rescan queues a rescan)."""
+
+    from id_detector.present.server import make_server
+
+    try:
+        server = make_server(work_root, host=host, port=port)
+    except ValueError as exc:
+        typer.echo(str(exc), err=True)
+        raise typer.Exit(2) from None
+    bound_host, bound_port = server.server_address[0], server.server_address[1]
+    typer.echo(f"serving {work_root} at http://{bound_host}:{bound_port} (Ctrl-C to stop)")
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        typer.echo("stopping", err=True)
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+@app.command()
+def rescan(
+    url: str = typer.Argument(
+        ..., help="A URL (or local file) already analysed under --work-root."
+    ),
+    work_root: Path = typer.Option(DEFAULT_WORK_ROOT, "--work-root"),  # noqa: B008
+    config: Path = typer.Option(  # noqa: B008
+        Path("id-detector.toml"), "--config", help="Non-secret schedule/transform TOML config."
+    ),
+    max_generations: int = typer.Option(
+        1, "--max-generations", min=1, help="Rescan generations to run when consuming the queue."
+    ),
+    refresh: bool = typer.Option(False, "--refresh", help="Bypass positive/no-match TTLs."),
+    no_hints: bool = typer.Option(False, "--no-hints", help="Disable all hint connectors."),
+    novelty: bool = typer.Option(True, "--novelty/--no-novelty"),
+    dry_run: bool = typer.Option(
+        False, "--dry-run", help="Only report queued requests; do not run a generation."
+    ),
+) -> None:
+    """Consume present/rescan_queue.jsonl for a set and run another analysis generation."""
+
+    work_root = work_root.resolve()
+    cached = _load_cached(work_root, url)
+    if cached is None:
+        typer.echo(f"no cached analysis for {redact_text(url)} under {work_root}", err=True)
+        raise typer.Exit(2)
+    pending = read_rescan_queue(cached.media_dir)
+    if not pending:
+        typer.echo("no queued rescans")
+        raise typer.Exit(0)
+    if dry_run:
+        typer.echo(
+            f"{len(pending)} queued rescan request(s): "
+            + ", ".join(f"{item.trigger}[{item.start_ms}-{item.end_ms}]" for item in pending)
+        )
+        raise typer.Exit(0)
+    consumed = consume_rescan_queue(cached.media_dir)
+    typer.echo(f"consuming {len(consumed)} queued rescan request(s); running a new generation")
+    loaded_config = _load_app_config(config)
+    try:
+        exit_code = asyncio.run(
+            _analyse(
+                url,
+                work_root=work_root,
+                print_raw=False,
+                refresh=refresh,
+                max_requests=2_000,
+                tracklist=None,
+                no_hints=no_hints,
+                app_config=loaded_config,
+                max_generations=max_generations,
+                novelty=novelty,
+            )
+        )
+    except KeyboardInterrupt:
+        typer.echo("cancelled; safe job states were restored", err=True)
+        raise typer.Exit(130) from None
     raise typer.Exit(exit_code)
 
 
