@@ -81,6 +81,7 @@ def flatten_tracklist(
                 "badge": episode.badge,
                 "version_status": episode.version_status,
                 "hint_supported": "hint_supported" in episode.flags,
+                "n_rejected_hypotheses": len(episode.rejected_evidence),
                 "tiers": episode.tiers.model_dump(mode="json"),
             }
         )

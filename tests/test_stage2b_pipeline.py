@@ -14,7 +14,7 @@ from id_detector.ingest import ingest
 from id_detector.io import read_bytes
 from id_detector.local_fixture import build_recorded_response_map, recognise_controlled_fixture
 from id_detector.present import export_tracklist, flatten_tracklist
-from id_detector.windows import generate_windows
+from id_detector.windows import generate_windows_async
 
 
 def _noise_wav(path: Path, duration_ms: int, *, seed: int = 22) -> None:
@@ -79,7 +79,7 @@ def test_partition_and_byte_determinism_on_full_local_pipeline_sync(tmp_path: Pa
         _noise_wav(source, 75_000)
         ingested = await ingest(str(source), tmp_path / "work")
         decoded = await decode(ingested)
-        windows = generate_windows(decoded, ingested.media_dir)
+        windows = await generate_windows_async(decoded, ingested.media_dir)
         truth = _truth(ingested.record.media_key, decoded.record.pcm.duration_ms)
         recorded_responses = build_recorded_response_map(
             truth=truth, windows=windows, source_offset_ms=20_000
@@ -164,7 +164,7 @@ def test_recorded_responses_reject_unrelated_window_content(tmp_path: Path) -> N
 
         expected_ingest = await ingest(str(expected), tmp_path / "expected-work")
         expected_decode = await decode(expected_ingest)
-        expected_windows = generate_windows(expected_decode, expected_ingest.media_dir)
+        expected_windows = await generate_windows_async(expected_decode, expected_ingest.media_dir)
         truth = _truth(expected_ingest.record.media_key, expected_decode.record.pcm.duration_ms)
         recorded = build_recorded_response_map(
             truth=truth, windows=expected_windows, source_offset_ms=20_000
@@ -172,7 +172,9 @@ def test_recorded_responses_reject_unrelated_window_content(tmp_path: Path) -> N
 
         unrelated_ingest = await ingest(str(unrelated), tmp_path / "unrelated-work")
         unrelated_decode = await decode(unrelated_ingest)
-        unrelated_windows = generate_windows(unrelated_decode, unrelated_ingest.media_dir)
+        unrelated_windows = await generate_windows_async(
+            unrelated_decode, unrelated_ingest.media_dir
+        )
         recognised = recognise_controlled_fixture(
             media_key=unrelated_ingest.record.media_key,
             media_dir=unrelated_ingest.media_dir,

@@ -34,6 +34,7 @@ def _observation(provider: str) -> ObservationRecord:
         .sha256(json.dumps(label.model_dump(mode="json"), sort_keys=True).encode())
         .hexdigest(),
         "native_index": 0,
+        "transform": {"type": "none", "rate_e4": 10_000, "semitones": 0},
     }
     return ObservationRecord(
         schema_version=SCHEMA_VERSION,

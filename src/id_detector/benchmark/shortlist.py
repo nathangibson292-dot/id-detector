@@ -84,7 +84,7 @@ from id_detector.recognise import (
     recognise_generation_zero,
 )
 from id_detector.shazam import ShazamAdapter
-from id_detector.windows import generate_windows
+from id_detector.windows import generate_windows_async
 
 
 @dataclass(frozen=True)
@@ -271,7 +271,7 @@ async def _run_shazam(
             media_key=ingested.record.media_key,
             duration_ms=decoded.record.pcm.duration_ms,
         )
-        windows = generate_windows(decoded, ingested.media_dir)
+        windows = await generate_windows_async(decoded, ingested.media_dir)
         recognised = await recognise_generation_zero(
             media_key=ingested.record.media_key,
             media_dir=ingested.media_dir,
@@ -354,7 +354,7 @@ async def _run_scanner_set(
         media_key=ingested.record.media_key,
         duration_ms=decoded.record.pcm.duration_ms,
     )
-    windows = generate_windows(decoded, ingested.media_dir)
+    windows = await generate_windows_async(decoded, ingested.media_dir)
     asset_sha256 = ingested.record.original.sha256
     if provider == "audd":
         query = build_audd_query(

@@ -1,3 +1,21 @@
 # Third-party audio uploads require this local setting AND the CLI ownership confirmation.
 # Copy this file to id-detector.toml; that destination is ignored by Git.
 allow_third_party_upload = false
+
+# Stage 4b defaults, recorded in data/corpus/controlled-synth-1/transforms-schedule.json.
+[transforms]
+policy = "rescan_only"
+rate_e4 = [9200, 9600, 10400, 10800]
+semitones = [-2, -1, 1, 2]
+
+# Generation-0 schedule (plan rev 5.2): coverage-complete at the active measured L_min.
+[schedule]
+window_ms = 12000
+hop_ms = 9000
+phase_ms = 0
+
+# Rescan policy (plan rev 5.2): the benchmark's denser schedule, consumed by Stage 4c.
+[rescan]
+window_ms = 12000
+hop_ms = 5000
+phase_ms = 0

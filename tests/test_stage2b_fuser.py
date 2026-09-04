@@ -42,8 +42,10 @@ def _observation(
     provider_ids: dict[str, str],
     artist: str = "Artist",
     title: str = "Title",
+    transform: dict[str, int | str] | None = None,
 ) -> ObservationRecord:
     start = index * 9_000
+    transform = transform or {"type": "none", "rate_e4": 10_000, "semitones": 0}
     label = RawLabel(artist=artist, title=title, album=None, label=None, release_date=None)
     natural = {
         "query_id": f"{index + 1:040x}",
@@ -52,6 +54,7 @@ def _observation(
         .sha256(json.dumps(label.model_dump(mode="json"), sort_keys=True).encode())
         .hexdigest(),
         "native_index": 0,
+        "transform": transform,
     }
     return ObservationRecord(
         schema_version=SCHEMA_VERSION,
@@ -65,7 +68,7 @@ def _observation(
         is_final=True,
         mix_span_ms=(start, start + 12_000),
         support_ms=(start, start + 12_000),
-        transform={"type": "none", "rate_e4": 10_000, "semitones": 0},
+        transform=transform,
         logical_trial_id=f"{100 + index:040x}",
         raw_label=label,
         provider_ids=provider_ids,
@@ -201,13 +204,14 @@ def test_identity_graph_is_byte_deterministic_across_input_order() -> None:
     assert left == right
 
 
-def test_episode_proofs_and_evidence_use_all_final_hypotheses() -> None:
+def test_episode_proofs_use_only_the_selected_observation_of_each_logical_trial() -> None:
     selected = _observation(1, provider="shazam", provider_ids={"shazam": "s1"})
     rejected = selected.model_copy(
         update={
             "id": "e" * 40,
             "mix_span_ms": (0, 10_000),
             "support_ms": (0, 10_000),
+            "transform": {"type": "resample", "rate_e4": 10_800, "semitones": 0},
             "native": {
                 "matches": [{"offset_ms": 9_000, "frequencyskew_e6": 900, "timeskew_e6": 900}]
             },
@@ -226,12 +230,143 @@ def test_episode_proofs_and_evidence_use_all_final_hypotheses() -> None:
     candidate_id = identity.observation_candidates[selected.id]
     episode = next(item for item in episodes.episodes if item.candidate_id == candidate_id)
     other_episode = next(item for item in episodes.episodes if item.candidate_id != candidate_id)
-    assert episode.start_no_later_than_ms == 10_000
-    assert episode.end_no_earlier_than_ms == 9_000
-    assert episode.evidence_support_ms == [(0, 21_000)]
-    assert set(episode.evidence) == {selected.id, rejected.id}
+    # The rejected sibling's support (0, 10_000) must not move either proved bound or the
+    # evidence union: rev 5.2 reads both only from the per-trial selected observation.
+    assert episode.start_no_later_than_ms == selected.support_ms[1] == 21_000
+    assert episode.end_no_earlier_than_ms == selected.support_ms[0] == 9_000
+    assert episode.evidence_support_ms == [(9_000, 21_000)]
+    assert episode.evidence == [selected.id]
+    assert episode.rejected_evidence == [rejected.id]
     assert "hypothesis_rejected" in episode.flags
     assert "hypothesis_rejected" not in other_episode.flags
+    assert other_episode.rejected_evidence == []
+
+
+def test_rejected_minority_candidate_never_proves_the_winner_bound() -> None:
+    winner = _observation(1, provider="shazam", provider_ids={"shazam": "winner"})
+    same_candidate = winner.model_copy(
+        update={
+            "id": "a" * 40,
+            "transform": {"type": "tempo", "rate_e4": 9_600, "semitones": 0},
+            "native": {
+                "matches": [{"offset_ms": 9_000, "frequencyskew_e6": 700, "timeskew_e6": 700}]
+            },
+        }
+    )
+    minority = _observation(
+        2,
+        provider="shazam",
+        provider_ids={"shazam": "minority"},
+        title="Another track entirely",
+        transform={"type": "resample", "rate_e4": 10_800, "semitones": 0},
+    ).model_copy(
+        update={
+            "id": "c" * 40,
+            "logical_trial_id": winner.logical_trial_id,
+            "mix_span_ms": (9_000, 20_111),
+            "support_ms": (9_000, 20_111),
+            "anchor": winner.anchor,
+        }
+    )
+    identity = build_identity_graph(MEDIA_KEY, [winner, same_candidate, minority])
+    episodes, _ = build_episodes(
+        media_key=MEDIA_KEY,
+        duration_ms=30_000,
+        observations=[winner, same_candidate, minority],
+        windows=[],
+        identity=identity,
+    )
+    episode = next(iter(episodes.episodes))
+    assert episode.candidate_id == identity.observation_candidates[winner.id]
+    assert episode.start_no_later_than_ms == 21_000
+    assert episode.evidence == [winner.id]
+    assert sorted(episode.rejected_evidence) == sorted([same_candidate.id, minority.id])
+
+
+def test_conflicting_variants_belong_to_majority_episode_and_only_best_variant_votes() -> None:
+    best = _observation(1, provider="shazam", provider_ids={"shazam": "majority"})
+    same_candidate = best.model_copy(
+        update={
+            "id": "b" * 40,
+            "native": {
+                "matches": [{"offset_ms": 9_000, "frequencyskew_e6": 400, "timeskew_e6": 500}]
+            },
+        }
+    )
+    minority = _observation(
+        2,
+        provider="shazam",
+        provider_ids={"shazam": "minority"},
+        title="Conflicting hypothesis",
+    ).model_copy(
+        update={
+            "id": "c" * 40,
+            "logical_trial_id": best.logical_trial_id,
+            "mix_span_ms": best.mix_span_ms,
+            "support_ms": best.support_ms,
+            "anchor": best.anchor,
+        }
+    )
+    identity = build_identity_graph(MEDIA_KEY, [best, same_candidate, minority])
+    episodes, _ = build_episodes(
+        media_key=MEDIA_KEY,
+        duration_ms=30_000,
+        observations=[best, same_candidate, minority],
+        windows=[],
+        identity=identity,
+    )
+    assert len(episodes.episodes) == 1
+    episode = episodes.episodes[0]
+    assert episode.candidate_id == identity.observation_candidates[best.id]
+    assert episode.evidence == [best.id]
+    assert set(episode.rejected_evidence) == {same_candidate.id, minority.id}
+    assert episode.scores.work == 2_500
+    assert "hypothesis_rejected" in episode.flags
+
+
+def _trial_observation(index: int, start_ms: int, *, window_ms: int = 12_000) -> ObservationRecord:
+    base = _observation(index, provider="shazam", provider_ids={"shazam": "s1"})
+    return base.model_copy(
+        update={
+            "id": f"{index + 1:040x}",
+            "mix_span_ms": (start_ms, start_ms + window_ms),
+            "support_ms": (start_ms, start_ms + window_ms),
+            "anchor": base.anchor.model_copy(
+                update={"mix_anchor_ms": start_ms, "ref_anchor_ms": start_ms}
+            )
+            if base.anchor is not None
+            else None,
+            "native": {
+                "matches": [{"offset_ms": start_ms, "frequencyskew_e6": 0, "timeskew_e6": 0}]
+            },
+        }
+    )
+
+
+def _work_tier(starts: list[int], duration_ms: int = 200_000) -> str:
+    observations = [_trial_observation(index, start) for index, start in enumerate(starts)]
+    identity = build_identity_graph(MEDIA_KEY, observations)
+    episodes, _ = build_episodes(
+        media_key=MEDIA_KEY,
+        duration_ms=duration_ms,
+        observations=observations,
+        windows=[],
+        identity=identity,
+    )
+    return episodes.episodes[0].tiers.work
+
+
+def test_dense_overlapping_hops_do_not_inflate_the_work_tier() -> None:
+    # Four 12 s windows on a 9 s hop are pairwise non-overlapping only in pairs: T_ind = 3.
+    sparse = [0, 12_000, 24_000, 36_000, 48_000]
+    assert _work_tier(sparse) == "likely"
+    # Halving the hop doubles the number of trials over the same 48 s of audio without adding a
+    # single disjoint support, so rev 5.2's T_ind — and hence the tier — must not move.
+    dense = [value for start in sparse for value in (start, start + 6_000) if value <= 48_000]
+    assert len(dense) > len(sparse)
+    assert _work_tier(dense) == "likely"
+    # Three heavily overlapping windows cover < 40 s of span and yield T_ind = 1, not 3.
+    assert _work_tier([0, 1_000, 2_000]) == "unclear"
 
 
 def test_long_episode_emits_one_deterministic_rescan_request() -> None:

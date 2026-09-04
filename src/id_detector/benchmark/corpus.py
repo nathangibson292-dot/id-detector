@@ -43,7 +43,7 @@ from id_detector.present import export_tracklist
 from id_detector.process import run_process
 from id_detector.recognise import load_provider_config
 from id_detector.semantics import RECORDING_NAMESPACES
-from id_detector.windows import HOP_MS, WINDOW_MS, generate_windows
+from id_detector.windows import HOP_MS, WINDOW_MS, generate_windows_async
 
 SOURCE_DURATION_TOLERANCE_MS = 500
 
@@ -200,7 +200,7 @@ async def _run_controlled(
         media_key=ingested.record.media_key,
         duration_ms=decoded.record.pcm.duration_ms,
     )
-    windows = generate_windows(decoded, ingested.media_dir)
+    windows = await generate_windows_async(decoded, ingested.media_dir)
     recorded_responses = build_recorded_response_map(
         truth=truth,
         windows=windows,

@@ -1182,6 +1182,18 @@ def score_corpus(
     *,
     out_path: Path | None = None,
 ) -> BenchmarkReportRecord:
+    report, _ = score_corpus_detailed(truth_path, predictions_path, out_path=out_path)
+    return report
+
+
+def score_corpus_detailed(
+    truth_path: Path,
+    predictions_path: Path,
+    *,
+    out_path: Path | None = None,
+) -> tuple[BenchmarkReportRecord, list[SetScore]]:
+    """Score a corpus and also return the per-set states, which carry the raw numerators."""
+
     truths = load_truth_directory(truth_path)
     raw_predictions = json.loads(read_text(predictions_path))
     document = PredictionDocument.model_validate(raw_predictions)
@@ -1293,4 +1305,4 @@ def score_corpus(
     )
     if out_path is not None:
         atomic_write_json(out_path, report)
-    return report
+    return report, scores

@@ -17,6 +17,7 @@ from id_detector.contracts import (
     QueryRecord,
     RawIndexEntry,
     RawLabel,
+    Transform,
     WindowQueryTarget,
     clip_cache_key,
     compose_natural_key,
@@ -35,6 +36,22 @@ from id_detector.windows import WindowsResult
 
 PROVIDER_CONFIG_VERSION = "local_fixture-v1.json"
 
+# The fixture catalogue holds one *decoy* release next to the controlled truth: an unlicensed
+# rate edit of the same performance, pressed 12.5 % fast.  A hypothesis whose residual temporal
+# *and* frequency rate both land within tolerance of that ratio recognise the decoy instead of
+# the true recording, exactly as a rate-shifted bootleg would be matched by a real catalogue.
+# Without it the harness's false-match predicate is unsatisfiable (Stage 4b review, P1).
+#
+# 11_250 = 10_800 / 9_600 is chosen deliberately: no *untransformed* query of any corpus set can
+# reach it (the largest untransformed residual is 10_800), so the decoy is reachable only by a
+# wrong transform hypothesis and the ``off`` arm stays clean by construction, not by accident.
+DECOY_RESIDUAL_RATE_E4 = 11_250
+DECOY_ARTIST = "Decoy Bootlegs"
+DECOY_TITLE = "Unlicensed Rate Edit"
+DECOY_RECORDING_ID = "decoy:stage4b-rate-edit"
+DECOY_SOURCE_KEY = "stem-decoy"
+DECOY_SOURCE_ID = "controlled-decoy:rate-edit"
+
 
 @dataclass(frozen=True)
 class FixtureHit:
@@ -43,6 +60,9 @@ class FixtureHit:
     title: str
     recording_id: str
     ref_anchor_ms: int
+    frequencyskew_e6: int = 0
+    timeskew_e6: int = 0
+    is_decoy: bool = False
 
 
 def _overlap(left: tuple[int, int], right: tuple[int, int]) -> int:
@@ -75,11 +95,82 @@ def _reference_progress(set_id: str, elapsed_ms: int) -> int:
     return elapsed_ms
 
 
+def _encoded_behavior(set_id: str) -> tuple[str, int, int]:
+    """Return controlled behavior as (kind, temporal rate e4, pitch rate e4)."""
+
+    for kind in ("tempo", "resample"):
+        marker = f"-{kind}-"
+        if marker in set_id:
+            rate = int(set_id.rsplit(marker, 1)[1])
+            return kind, rate, rate if kind == "resample" else 10_000
+    marker = "-pitch-"
+    if marker in set_id:
+        semitones = int(set_id.rsplit(marker, 1)[1])
+        pitch_rate = round(10_000 * (2 ** (semitones / 12)))
+        return "pitch", 10_000, pitch_rate
+    return "none", 10_000, 10_000
+
+
+def _residual_rates_e4(set_id: str, transform: Transform) -> tuple[int, int]:
+    _, native_time, native_pitch = _encoded_behavior(set_id)
+    if transform.type == "none":
+        correction_time = correction_pitch = 10_000
+    elif transform.type == "resample":
+        correction_time = correction_pitch = transform.rate_e4
+    elif transform.type == "tempo":
+        correction_time, correction_pitch = transform.rate_e4, 10_000
+    else:
+        correction_time, correction_pitch = 10_000, transform.rate_e4
+    return (
+        round(native_time * 10_000 / correction_time),
+        round(native_pitch * 10_000 / correction_pitch),
+    )
+
+
+def transform_matches_fixture_rate(
+    set_id: str, transform: Transform, *, tolerance_e4: int = 300
+) -> bool:
+    """Emulate recognition only when temporal and frequency residuals are within ±3%."""
+
+    residual_time, residual_pitch = _residual_rates_e4(set_id, transform)
+    return (
+        abs(residual_time - 10_000) <= tolerance_e4 and abs(residual_pitch - 10_000) <= tolerance_e4
+    )
+
+
+def transform_matches_fixture_decoy(
+    set_id: str, transform: Transform, *, tolerance_e4: int = 300
+) -> bool:
+    """Return whether an undone window resembles the catalogue's rate-edit decoy release."""
+
+    residual_time, residual_pitch = _residual_rates_e4(set_id, transform)
+    return (
+        abs(residual_time - DECOY_RESIDUAL_RATE_E4) <= tolerance_e4
+        and abs(residual_pitch - DECOY_RESIDUAL_RATE_E4) <= tolerance_e4
+    )
+
+
 def _hits_for_window(
     truth: GroundTruthRecord,
     support: tuple[int, int],
     source_offset_ms: int,
+    *,
+    transform: Transform | None = None,
+    rate_tolerance_e4: int | None = None,
 ) -> list[FixtureHit]:
+    gated = rate_tolerance_e4 is not None and transform is not None
+    matches_truth = not gated or transform_matches_fixture_rate(
+        truth.set_id, transform, tolerance_e4=rate_tolerance_e4
+    )
+    matches_decoy = gated and transform_matches_fixture_decoy(
+        truth.set_id, transform, tolerance_e4=rate_tolerance_e4
+    )
+    if not matches_truth and not matches_decoy:
+        return []
+    residual_time, residual_pitch = (
+        _residual_rates_e4(truth.set_id, transform) if transform is not None else (10_000, 10_000)
+    )
+    _, native_time_e4, _ = _encoded_behavior(truth.set_id)
     hits: list[FixtureHit] = []
     for index, episode in enumerate(truth.episodes):
         audible = (
@@ -92,15 +183,25 @@ def _hits_for_window(
         if recording_id is None:
             recording_id = "synthetic:" + sha256(f"{truth.set_id}:{index}".encode()).hexdigest()
         elapsed = support[0] - audible[0]
+        progress = _reference_progress(truth.set_id, elapsed)
+        if "-tempo-" in truth.set_id or "-resample-" in truth.set_id:
+            progress = progress * native_time_e4 // 10_000
         hits.append(
             FixtureHit(
                 episode_index=index,
-                artist=episode.work.artist,
-                title=episode.work.title,
-                recording_id=recording_id,
-                ref_anchor_ms=source_offset_ms + _reference_progress(truth.set_id, elapsed),
+                artist=episode.work.artist if matches_truth else DECOY_ARTIST,
+                title=episode.work.title if matches_truth else DECOY_TITLE,
+                recording_id=recording_id if matches_truth else DECOY_RECORDING_ID,
+                ref_anchor_ms=source_offset_ms + progress,
+                frequencyskew_e6=(residual_pitch - 10_000) * 100,
+                timeskew_e6=(residual_time - 10_000) * 100,
+                is_decoy=not matches_truth,
             )
         )
+    if not matches_truth:
+        # One catalogue entry, one identity: a decoy answer collapses to a single hit even where
+        # several stems are audible, mirroring one wrong track name for the whole window.
+        hits = hits[:1]
     return hits
 
 
@@ -109,12 +210,21 @@ def build_recorded_response_map(
     truth: GroundTruthRecord,
     windows: WindowsResult,
     source_offset_ms: int,
+    rate_tolerance_e4: int | None = None,
 ) -> dict[str, tuple[FixtureHit, ...]]:
     """Build the immutable response map for an already validated controlled source."""
 
     recorded: dict[str, tuple[FixtureHit, ...]] = {}
     for window in windows.records:
-        hits = tuple(_hits_for_window(truth, window.support_ms, source_offset_ms))
+        hits = tuple(
+            _hits_for_window(
+                truth,
+                window.support_ms,
+                source_offset_ms,
+                transform=window.transform,
+                rate_tolerance_e4=rate_tolerance_e4,
+            )
+        )
         previous = recorded.setdefault(window.wav_sha256, hits)
         if previous != hits:
             raise ValueError("equal controlled window hashes map to different recorded responses")
@@ -167,6 +277,7 @@ def _observation(
         "mix_span_ms": list(window.support_ms),
         "raw_label_hash": label_hash,
         "native_index": native_index,
+        "transform": window.transform.model_dump(mode="json"),
     }
     provider_ids = {}
     native: dict[str, Any] = {"matches": []}
@@ -181,9 +292,15 @@ def _observation(
         }
         native = {
             "matches": [
-                {"offset_ms": hit.ref_anchor_ms, "frequencyskew_e6": 40, "timeskew_e6": 30}
+                {
+                    "offset_ms": hit.ref_anchor_ms,
+                    "frequencyskew_e6": hit.frequencyskew_e6,
+                    "timeskew_e6": hit.timeskew_e6,
+                }
             ],
-            "simultaneous_source": f"stem-{hit.episode_index:02d}",
+            "simultaneous_source": (
+                DECOY_SOURCE_KEY if hit.is_decoy else f"stem-{hit.episode_index:02d}"
+            ),
             "content_sha256": window.wav_sha256,
         }
         anchor = Anchor(
@@ -194,7 +311,9 @@ def _observation(
             method="local_fixture_content_hash",
             bias_applied_ms=0,
         )
-        source_ids.append(f"controlled-truth:{hit.episode_index}")
+        source_ids.append(
+            DECOY_SOURCE_ID if hit.is_decoy else f"controlled-truth:{hit.episode_index}"
+        )
     return ObservationRecord(
         schema_version=SCHEMA_VERSION,
         generated_by=GENERATED_BY,
@@ -218,6 +337,53 @@ def _observation(
         raw_response_ref=raw_response_ref,
         source_ids=source_ids,
     )
+
+
+def recognise_fixture_windows_in_memory(
+    *,
+    media_key: str,
+    truth: GroundTruthRecord,
+    windows: tuple[Any, ...] | list[Any],
+    source_offset_ms: int,
+    rate_tolerance_e4: int = 300,
+) -> tuple[ObservationRecord, ...]:
+    """Run the tolerance-based local fixture without publishing provider artifacts."""
+
+    observations: list[ObservationRecord] = []
+    for window in windows:
+        query = _query(media_key, window)
+        hits = _hits_for_window(
+            truth,
+            window.support_ms,
+            source_offset_ms,
+            transform=window.transform,
+            rate_tolerance_e4=rate_tolerance_e4,
+        )
+        raw_ref = f"local_fixture/in-memory/{query.cache_key}.json"
+        if hits:
+            observations.extend(
+                _observation(
+                    media_key=media_key,
+                    query=query,
+                    window=window,
+                    hit=hit,
+                    native_index=index,
+                    raw_response_ref=raw_ref,
+                )
+                for index, hit in enumerate(hits)
+            )
+        else:
+            observations.append(
+                _observation(
+                    media_key=media_key,
+                    query=query,
+                    window=window,
+                    hit=None,
+                    native_index=0,
+                    raw_response_ref=raw_ref,
+                )
+            )
+    return tuple(sort_records(observations))
 
 
 def recognise_controlled_fixture(

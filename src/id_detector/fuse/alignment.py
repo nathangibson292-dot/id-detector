@@ -97,7 +97,11 @@ def _native_skew_cost(observation: ObservationRecord) -> int:
 def _native_rate_e4(observation: ObservationRecord) -> int:
     """Combine the transform hypothesis with Shazam's measured residual time skew."""
 
-    base_rate = observation.transform.rate_e4 if observation.transform is not None else 10_000
+    base_rate = (
+        observation.transform.rate_e4
+        if observation.transform is not None and observation.transform.type in {"resample", "tempo"}
+        else 10_000
+    )
     matches = observation.native.get("matches", [])
     skews = [
         int(item.get("timeskew_e6", 0))

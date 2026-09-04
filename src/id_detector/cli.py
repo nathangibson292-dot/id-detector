@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import sys
+import tomllib
 import uuid
 from decimal import Decimal
 from hashlib import sha256
@@ -18,8 +19,9 @@ from id_detector.benchmark.corpus import run_corpus
 from id_detector.benchmark.hints import run_hint_gate
 from id_detector.benchmark.scorer import score_corpus
 from id_detector.benchmark.shortlist import run_shortlist
+from id_detector.benchmark.transforms_schedule import run_transform_schedule_benchmark
 from id_detector.calibration import calibrate_shazam
-from id_detector.contracts import SourceRecord
+from id_detector.contracts import SourceRecord, Transform
 from id_detector.decode import decode
 from id_detector.doctor import run_doctor
 from id_detector.fuse.episodes import fuse_generation_zero
@@ -40,7 +42,7 @@ from id_detector.truth import (
     verify_truth,
     write_draft_manifest,
 )
-from id_detector.windows import generate_windows
+from id_detector.windows import TransformGrid, WindowSchedule, generate_windows_async
 
 app = typer.Typer(no_args_is_help=True, pretty_exceptions_enable=False)
 benchmark_app = typer.Typer(no_args_is_help=True)
@@ -79,7 +81,9 @@ async def _analyse(
     tracklist: Path | None,
     no_hints: bool,
     confirmed_mirrors: tuple[str, ...] = (),
+    app_config: AppConfig | None = None,
 ) -> int:
+    app_config = app_config or AppConfig()
     run_id = uuid.uuid4().hex
     timer = InvocationTimer(run_id, ["analyse", url])
     media_dir: Path | None = None
@@ -113,7 +117,20 @@ async def _analyse(
         ffmpeg_version = decoded.record.decoder.ffmpeg_version
 
         timer.start_stage("windows_ms")
-        windows = generate_windows(decoded, media_dir)
+        windows = await generate_windows_async(
+            decoded,
+            media_dir,
+            schedule=WindowSchedule(
+                window_ms=app_config.window_ms,
+                hop_ms=app_config.hop_ms,
+                phase_ms=app_config.phase_ms,
+            ),
+            transform_policy=app_config.transforms_policy,
+            transform_grid=TransformGrid(
+                rates_e4=app_config.transform_rates_e4,
+                semitones=app_config.transform_semitones,
+            ),
+        )
         timer.finish_stage("windows_ms")
 
         timer.start_stage("recognise_ms")
@@ -167,6 +184,16 @@ async def _analyse(
             pcm_path=decoded.record_path,
             hints=hint_result.hints if hint_result is not None else (),
             hints_path=hint_result.hints_path if hint_result is not None else None,
+            rescan_transforms=(
+                [Transform(type="none", rate_e4=10_000, semitones=0)]
+                if app_config.transforms_policy == "off"
+                else list(
+                    TransformGrid(
+                        rates_e4=app_config.transform_rates_e4,
+                        semitones=app_config.transform_semitones,
+                    ).hypotheses()
+                )
+            ),
         )
         timer.finish_stage("fuse_ms")
         timer.start_stage("export_ms")
@@ -242,6 +269,16 @@ async def _analyse(
             source_lock.release()
 
 
+def _load_app_config(path: Path) -> AppConfig:
+    """Load the non-secret TOML config, reporting a bad file as a usage error, not a traceback."""
+
+    try:
+        return AppConfig.load(path)
+    except (ValueError, OSError, tomllib.TOMLDecodeError) as exc:
+        typer.echo(f"invalid config {path}: {redact_text(str(exc))}", err=True)
+        raise typer.Exit(2) from None
+
+
 @app.command()
 def analyse(
     url: str = typer.Argument(..., help="Public mix URL (or a local media file)."),
@@ -253,6 +290,9 @@ def analyse(
         None, "--tracklist", help="Manual UTF-8 tracklist."
     ),
     no_hints: bool = typer.Option(False, "--no-hints", help="Disable all hint connectors."),
+    config: Path = typer.Option(  # noqa: B008
+        Path("id-detector.toml"), "--config", help="Non-secret schedule/transform TOML config."
+    ),
     confirm_mirror: list[str] | None = typer.Option(  # noqa: B008
         None,
         "--confirm-mirror",
@@ -263,6 +303,7 @@ def analyse(
     if no_hints and (tracklist is not None or confirm_mirror):
         typer.echo("--tracklist/--confirm-mirror cannot be combined with --no-hints", err=True)
         raise typer.Exit(2)
+    loaded_config = _load_app_config(config)
     try:
         exit_code = asyncio.run(
             _analyse(
@@ -274,6 +315,7 @@ def analyse(
                 tracklist=tracklist,
                 no_hints=no_hints,
                 confirmed_mirrors=tuple(confirm_mirror or ()),
+                app_config=loaded_config,
             )
         )
     except KeyboardInterrupt:
@@ -627,6 +669,35 @@ def benchmark_run(
     )
 
 
+@benchmark_app.command("transforms-schedule")
+def benchmark_transforms_schedule(
+    corpus: Annotated[str, typer.Option("--corpus", help="Frozen controlled corpus version.")],
+    out: Annotated[Path, typer.Option("--out", help="Stage 4b decision report JSON.")],
+    work_root: Annotated[Path, typer.Option("--work-root")] = Path(
+        "data/local/work-transforms-schedule"
+    ),
+) -> None:
+    """Compare every Stage 4b schedule with transforms off and global."""
+
+    try:
+        result = run_transform_schedule_benchmark(
+            corpus_version=corpus,
+            out_path=out,
+            project_root=PROJECT_ROOT,
+            work_root=work_root,
+        )
+    except KeyboardInterrupt:
+        raise typer.Exit(130) from None
+    except (ValueError, RuntimeError, OSError, json.JSONDecodeError) as exc:
+        typer.echo(redact_text(str(exc)), err=True)
+        raise typer.Exit(1) from None
+    schedule = result.selected_schedule
+    typer.echo(
+        f"benchmarked 18 schedules with off/global policies; rescan-policy="
+        f"{schedule.window_ms}/{schedule.hop_ms}/{schedule.phase_ms}; report={result.path}"
+    )
+
+
 @benchmark_app.command("shortlist")
 def benchmark_shortlist(
     corpus: Annotated[str, typer.Option("--corpus", help="Controlled corpus version.")],
@@ -656,7 +727,7 @@ def benchmark_shortlist(
                 out_path=out,
                 project_root=PROJECT_ROOT,
                 work_root=work_root,
-                app_config=AppConfig.load(config),
+                app_config=_load_app_config(config),
                 cli_confirmation=i_own_this_audio_or_have_permission,
                 max_requests=max_requests,
                 refresh=refresh,

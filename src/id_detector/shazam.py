@@ -242,6 +242,7 @@ def response_to_observation(
         "mix_span_ms": list(window.support_ms),
         "raw_label_hash": raw_label_hash,
         "native_index": 0,
+        "transform": window.transform.model_dump(mode="json"),
     }
     observation_id = make_id(
         media_key, "observation", compose_natural_key("observation", natural_values)

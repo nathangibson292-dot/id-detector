@@ -91,24 +91,33 @@ def _unmeasured_config() -> ProviderConfigRecord:
     )
 
 
-def load_provider_config(project_root: Path) -> tuple[ProviderConfigRecord, str]:
+def load_provider_configs(project_root: Path) -> tuple[ProviderConfigRecord, ...]:
+    """Return every measured Shazam config found on disk or packaged, oldest version first.
+
+    The last entry is the *active* config; earlier entries are superseded and may be reported,
+    but rev 5.2 forbids using a superseded measurement as a gate.
+    """
+
     directory = project_root / "provider_configs"
-    measured: list[tuple[int, str]] = []
+    measured: dict[int, str] = {}
     for path in directory.glob("shazam-v*.json") if directory.is_dir() else []:
         suffix = path.stem.removeprefix("shazam-v")
         if suffix.isdigit():
-            measured.append((int(suffix), read_text(path)))
+            measured[int(suffix)] = read_text(path)
     packaged = files("id_detector.resources.provider_configs")
     for item in packaged.iterdir():
         suffix = item.name.removesuffix(".json").removeprefix("shazam-v")
         if item.name.endswith(".json") and suffix.isdigit():
-            measured.append((int(suffix), item.read_text(encoding="utf-8")))
-    if measured:
-        config = ProviderConfigRecord.model_validate_json(
-            max(measured, key=lambda item: item[0])[1]
-        )
-        return config, config.version
-    config = _unmeasured_config()
+            measured.setdefault(int(suffix), item.read_text(encoding="utf-8"))
+    if not measured:
+        return (_unmeasured_config(),)
+    return tuple(
+        ProviderConfigRecord.model_validate_json(measured[version]) for version in sorted(measured)
+    )
+
+
+def load_provider_config(project_root: Path) -> tuple[ProviderConfigRecord, str]:
+    config = load_provider_configs(project_root)[-1]
     return config, config.version
 
 
@@ -225,6 +234,7 @@ def _error_observation(
         "mix_span_ms": list(window.support_ms),
         "raw_label_hash": label_hash,
         "native_index": 0,
+        "transform": window.transform.model_dump(mode="json"),
     }
     return ObservationRecord(
         schema_version=SCHEMA_VERSION,

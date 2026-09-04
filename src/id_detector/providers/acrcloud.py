@@ -339,6 +339,7 @@ def parse_response(
                 "mix_span_ms": [mix_start, mix_end],
                 "raw_label_hash": label_hash,
                 "native_index": native_index,
+                "transform": None,
             }
             observations.append(
                 ObservationRecord(

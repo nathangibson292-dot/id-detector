@@ -22,7 +22,7 @@ from id_detector.recognise import (
     recognise_generation_zero,
 )
 from id_detector.shazam import CircuitBreaker, ShazamAdapter, TokenBucket, response_to_observation
-from id_detector.windows import generate_windows
+from id_detector.windows import generate_windows_async
 from tests.test_stage1_windows import _decoded
 
 ROOT = Path(__file__).parent
@@ -157,7 +157,7 @@ def test_raw_unicode_payload_is_utf8_serializable() -> None:
 def test_recognition_artifacts_cache_rerun_and_refresh(tmp_path: Path) -> None:
     async def scenario() -> tuple[int, ...]:
         decoded, _, media_dir = _decoded(tmp_path, 21_000)
-        windows = generate_windows(decoded, media_dir)
+        windows = await generate_windows_async(decoded, media_dir)
         config, _ = load_provider_config(tmp_path)
         calls = 0
 
@@ -245,7 +245,7 @@ def test_duplicate_wavs_submit_once_and_fan_out_timed_observations(tmp_path: Pat
     async def scenario() -> tuple[int, int, int, list[tuple[int, int]], int]:
         decoded, _, media_dir = _decoded(tmp_path, 21_000)
         decoded.pcm_path.write_bytes(bytes(21_000 * 16 * 2))
-        windows = generate_windows(decoded, media_dir)
+        windows = await generate_windows_async(decoded, media_dir)
         config, _ = load_provider_config(tmp_path)
         calls = 0
 
@@ -271,7 +271,9 @@ def test_duplicate_wavs_submit_once_and_fan_out_timed_observations(tmp_path: Pat
             calls,
             result.physical_attempts,
             len(result.queries),
-            [item.mix_span_ms for item in result.observations],
+            # Observations carry no ``start_ms`` and are therefore ordered by id; the property
+            # under test is that one cached response fans out to both duplicate windows.
+            sorted(item.mix_span_ms for item in result.observations),
             len(result.raw_index),
         )
 
@@ -324,7 +326,7 @@ def test_job_executor_owns_fake_server_retry(tmp_path: Path, monkeypatch: object
         server = await asyncio.start_server(handler, "127.0.0.1", 0)
         port = server.sockets[0].getsockname()[1]
         decoded, _, media_dir = _decoded(tmp_path, 12_000)
-        windows = generate_windows(decoded, media_dir)
+        windows = await generate_windows_async(decoded, media_dir)
         config, _ = load_provider_config(tmp_path)
         adapter = ShazamAdapter(
             config,
@@ -363,7 +365,7 @@ def test_job_executor_enforces_retry_limit(tmp_path: Path, monkeypatch: object) 
 
     async def scenario() -> tuple[int, int, str, int]:
         decoded, _, media_dir = _decoded(tmp_path, 12_000)
-        windows = generate_windows(decoded, media_dir)
+        windows = await generate_windows_async(decoded, media_dir)
         config, _ = load_provider_config(tmp_path)
         calls = 0
 

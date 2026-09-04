@@ -474,6 +474,7 @@ class EpisodeRecord(Record):
     badge: Literal["unclear", "possible", "likely", "verified"]
     version_status: Literal["verified", "unverified", "contested"]
     evidence: list[str]
+    rejected_evidence: list[str]
     flags: list[str]
     rescan_state: str
 
@@ -994,7 +995,10 @@ NATURAL_KEY_FIELDS: dict[str, tuple[str, ...]] = {
         "transform.semitones",
     ),
     "query": ("provider", "capability", "target", "provider_config_version", "scan_policy"),
-    "observation": ("query_id", "mix_span_ms", "raw_label_hash", "native_index"),
+    # ``transform`` (rev 5.2) separates sibling hypotheses of one window: byte-identical sibling
+    # WAVs share a cache key, so ``query_id`` fans out, and a ``pitch`` sibling has exactly the
+    # same ``mix_span_ms`` as its ``none`` parent.  Scanner observations carry ``transform: null``.
+    "observation": ("query_id", "mix_span_ms", "raw_label_hash", "native_index", "transform"),
     "hint": ("connector", "source_record_id"),
     "identity_node": ("id",),  # id is exactly ``ns:value``.
     "identity_assertion": ("a", "b", "relation", "source.record_id"),

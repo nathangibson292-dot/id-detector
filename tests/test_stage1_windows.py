@@ -26,6 +26,7 @@ from id_detector.recognise import load_provider_config, recognise_generation_zer
 from id_detector.shazam import ShazamAdapter, TokenBucket
 from id_detector.windows import (
     generate_windows,
+    generate_windows_async,
     generation_zero_schedule,
     sample_map_for_transform,
     transform_slice_sample_count,
@@ -145,7 +146,7 @@ def test_full_stage1_path_exceeds_max_path_and_cleans_up(tmp_path: Path) -> None
         ingested = await ingest(str(source), work_root)
         assert len(str(ingested.media_dir.resolve())) > 260
         decoded = await decode(ingested)
-        windows = generate_windows(decoded, ingested.media_dir)
+        windows = await generate_windows_async(decoded, ingested.media_dir)
         config, _ = load_provider_config(tmp_path)
 
         async def handler(request: object) -> object:

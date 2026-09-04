@@ -80,6 +80,31 @@ def _interval_overlap_ms(
     return interval_length(intersections, duration_ms)
 
 
+def _independent_trials(votes: list[ObservationRecord]) -> int:
+    """Return ``T_ind`` (rev 5.2): the largest set of non-overlapping trial supports.
+
+    Each logical trial contributes one interval — the hull of the supports of its selected
+    observations — and greedy interval scheduling (earliest finishing interval first) yields the
+    maximum pairwise non-overlapping subset.  Overlapping windows from a dense hop or a rescan
+    therefore cannot inflate the tier without new, disjoint evidence.
+    """
+
+    by_trial: dict[str, tuple[int, int]] = {}
+    for item in votes:
+        start, end = item.support_ms
+        current = by_trial.get(item.logical_trial_id)
+        by_trial[item.logical_trial_id] = (
+            (start, end) if current is None else (min(current[0], start), max(current[1], end))
+        )
+    count = 0
+    last_end: int | None = None
+    for start, end in sorted(by_trial.values(), key=lambda item: (item[1], item[0])):
+        if last_end is None or start >= last_end:
+            count += 1
+            last_end = end
+    return count
+
+
 def _tier_score(tier: str) -> int:
     return {"unclear": 2_500, "possible": 6_000, "likely": 8_000}[tier]
 
@@ -130,9 +155,25 @@ def _assign_observations(
     str,
     list[tuple[list[ObservationRecord], list[ObservationRecord], AlignmentOccurrence | None]],
 ]:
+    selected_owner: dict[tuple[str, str], str] = {}
+    for observation in final_matches:
+        if observation.id not in selected_ids:
+            continue
+        candidate = identity.observation_candidates.get(observation.id)
+        if candidate is None:
+            continue
+        source = observation.native.get("simultaneous_source")
+        source_key = str(source) if source is not None else "primary"
+        selected_owner[(observation.logical_trial_id, source_key)] = candidate
+
     by_candidate: dict[str, list[ObservationRecord]] = defaultdict(list)
     for observation in final_matches:
-        candidate = identity.observation_candidates.get(observation.id)
+        source = observation.native.get("simultaneous_source")
+        source_key = str(source) if source is not None else "primary"
+        candidate = selected_owner.get(
+            (observation.logical_trial_id, source_key),
+            identity.observation_candidates.get(observation.id),
+        )
         if candidate is not None:
             by_candidate[candidate].append(observation)
 
@@ -275,6 +316,7 @@ def build_episodes(
     hints: list[HintRecord] | tuple[HintRecord, ...] = (),
     generation: int = 0,
     profile: str = "free",
+    rescan_transforms: tuple[Transform, ...] | list[Transform] | None = None,
 ) -> tuple[EpisodesFile, list[RescanRequestRecord]]:
     final = [item for item in observations if item.is_final]
     selection = select_logical_trial_points(final, identity.observation_candidates)
@@ -284,21 +326,24 @@ def build_episodes(
     assigned = _assign_observations(final_matches, selected_ids, alignments, identity)
     candidate_by_id = {item.canonical_id: item for item in identity.record.candidates}
 
+    # rev 5.2: proved bounds, evidence support and competition are read only from the per-trial
+    # selected observations. A rejected hypothesis sibling — which may even name another track —
+    # never contributes support to the candidate that won its logical trial.
     all_supports = {
         candidate: normalise_intervals(
-            [item.support_ms for evidence, _, _ in groups for item in evidence], duration_ms
+            [item.support_ms for _, votes, _ in groups for item in votes], duration_ms
         )
         for candidate, groups in assigned.items()
     }
     provisional: list[dict[str, Any]] = []
     for candidate_id, groups in sorted(assigned.items()):
         for occurrence_index, (evidence, votes, alignment) in enumerate(groups):
-            raw_supports = [item.support_ms for item in evidence]
+            raw_supports = [item.support_ms for item in votes]
             supports = normalise_intervals(raw_supports, duration_ms)
             if not supports:
                 continue
             start_bound, end_bound, start_censored, end_censored = proved_bounds(raw_supports)
-            trials = {item.logical_trial_id for item in votes}
+            independent_trials = _independent_trials(votes)
             candidate_work_id = candidate_by_id[candidate_id].work_id
             supporting_hints = [
                 hint
@@ -312,13 +357,13 @@ def build_episodes(
             span = supports[-1][1] - supports[0][0]
             competing = _competition(supports, candidate_id, all_supports, duration_ms)
             has_global = alignment.has_global_alignment if alignment is not None else False
-            if len(trials) >= 4 and span >= 40_000 and not competing and has_global:
+            if independent_trials >= 4 and span >= 40_000 and not competing and has_global:
                 audio_work_tier = "likely"
-            elif len(trials) >= 2 and span >= 20_000 and not competing:
+            elif independent_trials >= 2 and span >= 20_000 and not competing:
                 audio_work_tier = "possible"
             else:
                 audio_work_tier = "unclear"
-            effective_trials = len(trials) + hint_vote
+            effective_trials = independent_trials + hint_vote
             if effective_trials >= 4 and span >= 40_000 and not competing and has_global:
                 work_tier = "likely"
             elif effective_trials >= 2 and span >= 20_000 and not competing:
@@ -343,7 +388,7 @@ def build_episodes(
                 "first_support_start_ms": supports[0][0],
             }
             episode_id = make_id(media_key, "episode", compose_natural_key("episode", natural))
-            rejected = set(selection.hypothesis_rejected) & {item.id for item in evidence}
+            rejected = sorted(set(selection.hypothesis_rejected) & {item.id for item in evidence})
             outliers = set(alignment.rejected_observation_ids) if alignment is not None else set()
 
             def trials_in(left: int, right: int, items: list[ObservationRecord] = votes) -> int:
@@ -371,6 +416,7 @@ def build_episodes(
                     "candidate": candidate,
                     "evidence": evidence,
                     "votes": votes,
+                    "rejected_evidence": rejected,
                     "supports": supports,
                     "outer_hull": (supports[0][0], supports[-1][1]),
                     "trials_in": trials_in,
@@ -451,9 +497,10 @@ def build_episodes(
                     else "unverified"
                 ),
                 evidence=[
-                    *[observation.id for observation in item["evidence"]],
+                    *[observation.id for observation in item["votes"]],
                     *[hint.id for hint in item["supporting_hints"]],
                 ],
+                rejected_evidence=item["rejected_evidence"],
                 flags=item["flags"],
                 rescan_state="requested",
             )
@@ -535,7 +582,9 @@ def build_episodes(
         window_ms=8_000,
         hop_ms=4_000,
         phase_ms=2_000,
-        transforms=[Transform(type="none", rate_e4=10_000, semitones=0)],
+        transforms=list(rescan_transforms)
+        if rescan_transforms is not None
+        else [Transform(type="none", rate_e4=10_000, semitones=0)],
     )
 
     def add_request(trigger: str, start: int, end: int, priority: int) -> None:
@@ -657,6 +706,7 @@ def fuse_generation_zero(
     hints: list[HintRecord] | tuple[HintRecord, ...] = (),
     hints_path: Path | None = None,
     profile: str = "free",
+    rescan_transforms: tuple[Transform, ...] | list[Transform] | None = None,
 ) -> FusionResult:
     identity = build_identity_graph(media_key, observations, hints=hints)
     identities_path = write_identity_graph(
@@ -675,6 +725,7 @@ def fuse_generation_zero(
         hints=hints,
         generation=0,
         profile=profile,
+        rescan_transforms=rescan_transforms,
     )
     generation_path = media_dir / "fuse" / "episodes.gen0.json"
     upstream = {
