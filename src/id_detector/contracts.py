@@ -393,11 +393,23 @@ class PredictionInterval(ContractModel):
     method: str
     calibrated: bool
 
+    @model_validator(mode="after")
+    def _ordered(self) -> PredictionInterval:
+        if self.hi < self.lo:
+            raise ValueError("prediction interval must be ordered")
+        return self
+
 
 class RoleSegment(ContractModel):
     from_ms: NonNegativeInt
     to_ms: NonNegativeInt
     role: Literal["incoming", "dominant", "outgoing", "layer", "component", "uncertain"]
+
+    @model_validator(mode="after")
+    def _ordered(self) -> RoleSegment:
+        if self.to_ms <= self.from_ms:
+            raise ValueError("role segment must have positive duration")
+        return self
 
 
 class AlignmentSegment(ContractModel):
@@ -551,12 +563,18 @@ class TruthRoleSegment(ContractModel):
     to_ms: NonNegativeInt
     role: Literal["incoming", "dominant", "outgoing", "layer", "component", "uncertain"]
 
+    @model_validator(mode="after")
+    def _ordered(self) -> TruthRoleSegment:
+        if self.to_ms <= self.from_ms:
+            raise ValueError("truth role segment must have positive duration")
+        return self
+
 
 class TruthEpisode(ContractModel):
     work: TruthWork
     version: TruthVersion
     version_verified: bool
-    verified_against: Literal["audio", "source_recording", "authoritative_metadata"]
+    verified_against: Literal["audio", "source_recording", "authoritative_metadata"] | None
     start_ms_range: SpanMs
     end_ms_range: SpanMs
     audible_rule: str
@@ -564,16 +582,39 @@ class TruthEpisode(ContractModel):
     overlaps_with: list[NonNegativeInt]
     occurrence_index: NonNegativeInt
     in_reference_pool: bool
-    annotator_ref: str
+    annotator_ref: str | None
     second_pass_ref: str | None
     disagreement_resolution: str | None
     note: str | None
+    draft: bool
+
+    @model_validator(mode="after")
+    def _verification_state(self) -> TruthEpisode:
+        if self.draft and (
+            self.verified_against is not None
+            or self.version_verified
+            or self.annotator_ref is not None
+            or self.second_pass_ref is not None
+        ):
+            raise ValueError("draft truth must not claim verification")
+        if self.version_verified and self.verified_against not in {
+            "source_recording",
+            "authoritative_metadata",
+        }:
+            raise ValueError("exact version truth needs source-recording or authoritative evidence")
+        return self
 
 
 class TruthRegion(ContractModel):
     start_ms: NonNegativeInt
     end_ms: NonNegativeInt
     type: Literal["silence_or_speech", "out_of_pool", "unresolved"]
+
+    @model_validator(mode="after")
+    def _ordered(self) -> TruthRegion:
+        if self.end_ms <= self.start_ms:
+            raise ValueError("truth region must have positive duration")
+        return self
 
 
 class GroundTruthRecord(Record):
@@ -585,6 +626,63 @@ class GroundTruthRecord(Record):
     selection_basis: str
     episodes: list[TruthEpisode]
     regions: list[TruthRegion]
+
+    @model_validator(mode="after")
+    def _timeline_is_coherent(self) -> GroundTruthRecord:
+        duration_ms = self.source.duration_ms
+        if duration_ms <= 0:
+            raise ValueError("truth source duration_ms must be positive")
+
+        occurrence_keys: set[tuple[str, str, int]] = set()
+        for index, episode in enumerate(self.episodes):
+            start_lo, start_hi = episode.start_ms_range
+            end_lo, end_hi = episode.end_ms_range
+            if start_hi < start_lo:
+                raise ValueError(f"episode {index} start_ms_range must be ordered")
+            if end_hi < end_lo:
+                raise ValueError(f"episode {index} end_ms_range must be ordered")
+            if start_hi > end_lo:
+                raise ValueError(f"episode {index} start range must not cross its end range")
+            if end_hi > duration_ms:
+                raise ValueError(f"episode {index} exceeds source duration_ms")
+            for role in episode.role_segments:
+                if role.from_ms < start_lo or role.to_ms > end_hi:
+                    raise ValueError(f"episode {index} role segment lies outside its audible span")
+            if len(set(episode.overlaps_with)) != len(episode.overlaps_with):
+                raise ValueError(f"episode {index} has duplicate overlap indexes")
+            for other in episode.overlaps_with:
+                if other == index or other >= len(self.episodes):
+                    raise ValueError(f"episode {index} has an invalid overlap index")
+            occurrence_key = (
+                episode.work.artist.casefold().strip(),
+                episode.work.title.casefold().strip(),
+                episode.occurrence_index,
+            )
+            if occurrence_key in occurrence_keys:
+                raise ValueError("occurrence_index must be unique within a work")
+            occurrence_keys.add(occurrence_key)
+
+        for index, episode in enumerate(self.episodes):
+            for other in episode.overlaps_with:
+                if index not in self.episodes[other].overlaps_with:
+                    raise ValueError(f"episode overlap {index}<->{other} must be symmetric")
+                other_episode = self.episodes[other]
+                if min(episode.end_ms_range[1], other_episode.end_ms_range[1]) <= max(
+                    episode.start_ms_range[0], other_episode.start_ms_range[0]
+                ):
+                    raise ValueError(
+                        f"episode overlap {index}<->{other} has no audible intersection"
+                    )
+
+        ordered_regions = sorted(
+            self.regions, key=lambda item: (item.start_ms, item.end_ms, item.type)
+        )
+        for index, region in enumerate(ordered_regions):
+            if region.end_ms > duration_ms:
+                raise ValueError(f"truth region {index} exceeds source duration_ms")
+            if index and region.start_ms < ordered_regions[index - 1].end_ms:
+                raise ValueError("truth regions must not overlap")
+        return self
 
 
 class PrecisionRecallF1(ContractModel):
@@ -619,6 +717,7 @@ class BenchmarkMetrics(ContractModel):
     selective_recall_e4: ConfidenceE4
     selective_coverage_e4: ConfidenceE4
     empirical_tier_precision_e4: dict[str, ConfidenceE4]
+    empirical_tier_lower_bound_e4: dict[str, ConfidenceE4]
     calibration_error_e4: NonNegativeInt
     false_discovery_rate_e4: ConfidenceE4
     start_median_absolute_error_ms: NonNegativeInt
@@ -626,11 +725,23 @@ class BenchmarkMetrics(ContractModel):
     start_within_5s_e4: ConfidenceE4
     start_within_10s_e4: ConfidenceE4
     start_within_30s_e4: ConfidenceE4
+    start_bound_violation_e4: ConfidenceE4
+    start_bound_n: NonNegativeInt
+    start_interval_coverage_e4: ConfidenceE4
+    start_interval_median_width_ms: NonNegativeInt
+    start_interval_p90_width_ms: NonNegativeInt
+    start_interval_winkler_score: NonNegativeInt
     end_median_absolute_error_ms: NonNegativeInt
     end_p90_error_ms: NonNegativeInt
     end_within_5s_e4: ConfidenceE4
     end_within_10s_e4: ConfidenceE4
     end_within_30s_e4: ConfidenceE4
+    end_bound_violation_e4: ConfidenceE4
+    end_bound_n: NonNegativeInt
+    end_interval_coverage_e4: ConfidenceE4
+    end_interval_median_width_ms: NonNegativeInt
+    end_interval_p90_width_ms: NonNegativeInt
+    end_interval_winkler_score: NonNegativeInt
     boundary_interval_coverage_e4: ConfidenceE4
     boundary_interval_median_width_ms: NonNegativeInt
     boundary_interval_p90_width_ms: NonNegativeInt
@@ -683,7 +794,10 @@ class BenchmarkCertification(ContractModel):
     n: NonNegativeInt
     errors: NonNegativeInt
     lower_bound_e4: ConfidenceE4
+    cluster_lower_bound_e4: ConfidenceE4
     n_sets: NonNegativeInt
+    target_e4: ConfidenceE4 | None
+    registration_version: str | None
     status: Literal["certified", "provisional"]
 
 

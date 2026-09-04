@@ -46,3 +46,7 @@ Thumbs.db
 # Raw research dumps (public comments with usernames) — local only, never committed.
 # Derived, minimised fixtures are produced by scripts/derive_fixtures.py.
 data/raw/
+
+# Local source URLs, uploader handles, and event links for pseudonymous truth refs.
+data/local/source_links.json
+data/local/controlled/

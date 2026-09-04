@@ -8,9 +8,12 @@ import sys
 import uuid
 from hashlib import sha256
 from pathlib import Path
+from typing import Annotated
 
 import typer
 
+from id_detector.benchmark.controlled import render_controlled
+from id_detector.benchmark.scorer import score_corpus
 from id_detector.calibration import calibrate_shazam
 from id_detector.contracts import SourceRecord
 from id_detector.decode import decode
@@ -19,9 +22,20 @@ from id_detector.ingest import ingest
 from id_detector.jobs import AsyncJobStore, ProcessLock
 from id_detector.journal import InvocationTimer, append_invocation
 from id_detector.recognise import recognise_generation_zero
+from id_detector.truth import (
+    freeze_truth,
+    resolve_truth,
+    second_pass_truth,
+    seed_truth,
+    verify_truth,
+)
 from id_detector.windows import generate_windows
 
 app = typer.Typer(no_args_is_help=True, pretty_exceptions_enable=False)
+benchmark_app = typer.Typer(no_args_is_help=True)
+truth_app = typer.Typer(no_args_is_help=True)
+app.add_typer(benchmark_app, name="benchmark")
+app.add_typer(truth_app, name="truth")
 PROJECT_ROOT = Path.cwd()
 DEFAULT_WORK_ROOT = Path("work")
 
@@ -307,6 +321,163 @@ def retry(
         typer.echo(f"outcome-unknown job not found: {job_id}", err=True)
         raise typer.Exit(1)
     typer.echo(f"job {job_id} returned to pending in {database}")
+
+
+@benchmark_app.command("score")
+def benchmark_score(
+    truth: Annotated[Path, typer.Option("--truth", help="Truth directory or ground_truth.json.")],
+    episodes: Annotated[
+        Path, typer.Option("--episodes", help="Identity-labelled prediction JSON.")
+    ],
+    out: Annotated[Path, typer.Option("--out", help="Output benchmark report JSON.")],
+) -> None:
+    """Score predictions using support-time occurrence association."""
+    try:
+        report = score_corpus(truth, episodes, out_path=out)
+    except (ValueError, OSError, json.JSONDecodeError) as exc:
+        typer.echo(str(exc), err=True)
+        raise typer.Exit(1) from None
+    typer.echo(
+        f"scored {len(report.sets)} sets; work precision="
+        f"{report.overall.identification_work.precision_e4}/10000; report={out}"
+    )
+
+
+@benchmark_app.command("render")
+def benchmark_render(
+    sources: Annotated[Path, typer.Option("--sources", help="Directory of legally held audio.")],
+    out: Annotated[Path, typer.Option("--out", help="Controlled corpus output directory.")],
+    seed: Annotated[int, typer.Option("--seed", min=0)],
+    audio_out: Annotated[
+        Path | None,
+        typer.Option("--audio-out", help="Local-only rendered audio directory."),
+    ] = None,
+) -> None:
+    """Render the deterministic controlled-transform slice through FFmpeg."""
+    try:
+        result = asyncio.run(render_controlled(sources, out, seed=seed, audio_dir=audio_out))
+    except KeyboardInterrupt:
+        raise typer.Exit(130) from None
+    except (ValueError, RuntimeError, OSError) as exc:
+        typer.echo(str(exc), err=True)
+        raise typer.Exit(1) from None
+    typer.echo(
+        f"rendered {result.set_count} sets and {result.boundary_count} boundaries; "
+        f"manifest={result.manifest_path}"
+    )
+
+
+@truth_app.command("seed")
+def truth_seed(
+    out: Annotated[Path, typer.Option("--out")],
+    set_id: Annotated[str, typer.Option("--set-id")],
+    duration_ms: Annotated[int, typer.Option("--duration-ms", min=1)],
+    media_key: Annotated[str, typer.Option("--media-key")],
+    hints: Annotated[Path | None, typer.Option("--hints")] = None,
+    tracklist: Annotated[Path | None, typer.Option("--tracklist")] = None,
+    split: Annotated[str, typer.Option("--split")] = "dev-1",
+    stratum: Annotated[str, typer.Option("--stratum")] = "catalogue-covered",
+    corpus_version: Annotated[str, typer.Option("--corpus-version")] = "draft",
+    source_url: Annotated[str | None, typer.Option("--source-url")] = None,
+    uploader: Annotated[str | None, typer.Option("--uploader")] = None,
+    event: Annotated[str | None, typer.Option("--event")] = None,
+) -> None:
+    """Seed draft truth from hints and/or a manual tracklist."""
+    try:
+        truth = seed_truth(
+            out_path=out,
+            set_id=set_id,
+            duration_ms=duration_ms,
+            media_key=media_key,
+            hints=hints,
+            tracklist=tracklist,
+            split=split,
+            stratum=stratum,
+            corpus_version=corpus_version,
+            source_url=source_url,
+            uploader=uploader,
+            event=event,
+            project_root=PROJECT_ROOT,
+        )
+    except (ValueError, OSError, json.JSONDecodeError) as exc:
+        typer.echo(str(exc), err=True)
+        raise typer.Exit(1) from None
+    typer.echo(f"seeded {len(truth.episodes)} draft episodes in {out}")
+
+
+@truth_app.command("verify")
+def truth_verify(
+    truth: Annotated[Path, typer.Option("--truth")],
+    annotator_ref: Annotated[str, typer.Option("--annotator-ref")],
+    audio: Annotated[Path | None, typer.Option("--audio")] = None,
+    annotation: Annotated[
+        Path | None,
+        typer.Option("--annotation", help="Complete independently authored ground-truth JSON."),
+    ] = None,
+) -> None:
+    """Run the first-pass terminal annotation loop (commands only; no GUI launch)."""
+    try:
+        updated = verify_truth(
+            truth, annotator_ref=annotator_ref, audio=audio, annotation_path=annotation
+        )
+    except (ValueError, OSError) as exc:
+        typer.echo(str(exc), err=True)
+        raise typer.Exit(1) from None
+    typer.echo(f"saved {len(updated.episodes)} episodes to {truth}")
+
+
+@truth_app.command("second-pass")
+def truth_second_pass(
+    truth: Annotated[Path, typer.Option("--truth")],
+    annotator_ref: Annotated[str, typer.Option("--annotator-ref")],
+    audio: Annotated[Path | None, typer.Option("--audio")] = None,
+    annotation: Annotated[
+        Path | None,
+        typer.Option("--annotation", help="Complete independently authored ground-truth JSON."),
+    ] = None,
+) -> None:
+    """Store a distinct second annotation without revealing the first-pass decisions."""
+    try:
+        updated = second_pass_truth(
+            truth, annotator_ref=annotator_ref, audio=audio, annotation_path=annotation
+        )
+    except (ValueError, OSError) as exc:
+        typer.echo(str(exc), err=True)
+        raise typer.Exit(1) from None
+    typer.echo(f"saved second pass for {len(updated.episodes)} episodes to {truth}")
+
+
+@truth_app.command("resolve")
+def truth_resolve(
+    truth: Annotated[Path, typer.Option("--truth")],
+    resolver_ref: Annotated[str, typer.Option("--resolver-ref")],
+    annotation: Annotated[
+        Path,
+        typer.Option("--annotation", help="Third annotator's complete resolved ground-truth JSON."),
+    ],
+) -> None:
+    """Resolve differing first/second passes with a distinct third annotation."""
+    try:
+        updated = resolve_truth(truth, resolver_ref=resolver_ref, annotation_path=annotation)
+    except (ValueError, OSError) as exc:
+        typer.echo(str(exc), err=True)
+        raise typer.Exit(1) from None
+    typer.echo(f"saved third-annotator resolution for {len(updated.episodes)} episodes to {truth}")
+
+
+@truth_app.command("freeze")
+def truth_freeze(
+    truth: Annotated[Path, typer.Option("--truth", help="Truth corpus directory.")],
+    corpus_version: Annotated[str, typer.Option("--corpus-version")],
+    out: Annotated[Path, typer.Option("--out", help="Corpus-version manifest JSON.")],
+) -> None:
+    """Validate complete verification and hash a frozen corpus manifest."""
+    try:
+        manifest = freeze_truth(truth, corpus_version=corpus_version, out_path=out)
+    except (ValueError, OSError) as exc:
+        typer.echo(str(exc), err=True)
+        raise typer.Exit(1) from None
+    typer.echo(f"froze {len(manifest['sets'])} sets as {corpus_version}; manifest={out}")
 
 
 if __name__ == "__main__":
