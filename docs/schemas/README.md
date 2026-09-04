@@ -32,6 +32,7 @@ canonical JSON array before being passed to `make_id(media_key, record_type, nat
 | invocation journal entry | invocation id supplied by the orchestrator |
 | raw-index entry | `cache_key` |
 | provider config | provider, immutable version filename |
+| profile | profile name, immutable version filename |
 
 `durations`, the identities aggregate, and the episodes aggregate have no standalone id: their
 identity is their immutable stage path and parent generation. Identity works and candidates retain

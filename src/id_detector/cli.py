@@ -34,6 +34,12 @@ from id_detector.journal import InvocationTimer, append_invocation
 from id_detector.orchestrate import run_generation_loop
 from id_detector.present import export_tracklist
 from id_detector.process import run_process
+from id_detector.profiles import (
+    UnknownProfile,
+    freeze_profiles,
+    load_profile,
+    profile_app_config,
+)
 from id_detector.providers.base import AppConfig
 from id_detector.recognise import recognise_generation
 from id_detector.rescan import DEFAULT_MAX_GENERATIONS
@@ -295,6 +301,16 @@ def _load_app_config(path: Path) -> AppConfig:
         raise typer.Exit(2) from None
 
 
+def _load_profile_or_exit(name: str):
+    """Resolve a frozen profile by name; a non-frozen or unknown name is a usage error."""
+
+    try:
+        return load_profile(PROJECT_ROOT, name)
+    except UnknownProfile as exc:
+        typer.echo(redact_text(str(exc)), err=True)
+        raise typer.Exit(2) from None
+
+
 @app.command()
 def analyse(
     url: str = typer.Argument(..., help="Public mix URL (or a local media file)."),
@@ -309,6 +325,15 @@ def analyse(
     config: Path = typer.Option(  # noqa: B008
         Path("id-detector.toml"), "--config", help="Non-secret schedule/transform TOML config."
     ),
+    profile: str | None = typer.Option(
+        None,
+        "--profile",
+        help=(
+            "Select a frozen profile ('free' or 'max_accuracy'). It fixes the engines, "
+            "transform/schedule/rescan geometry and the hint/novelty toggles; a name that is not "
+            "a frozen artefact is rejected. Overrides --config's schedule/transform tables."
+        ),
+    ),
     confirm_mirror: list[str] | None = typer.Option(  # noqa: B008
         None,
         "--confirm-mirror",
@@ -320,7 +345,7 @@ def analyse(
         min=-1,
         help=(
             "Rescan generations after generation 0; 0 disables rescans. "
-            "-1 uses [rescan].max_generations from the config."
+            "-1 uses the profile or [rescan].max_generations from the config."
         ),
     ),
     novelty: bool = typer.Option(
@@ -330,10 +355,17 @@ def analyse(
     ),
 ) -> None:
     """Run the full multi-generation pipeline and export a flattened tracklist."""
+    if profile is not None:
+        frozen = _load_profile_or_exit(profile)
+        loaded_config = profile_app_config(frozen)
+        # A frozen profile is the authority on its feature toggles.
+        novelty = frozen.novelty_enabled
+        no_hints = no_hints or not frozen.hints_enabled
+    else:
+        loaded_config = _load_app_config(config)
     if no_hints and (tracklist is not None or confirm_mirror):
         typer.echo("--tracklist/--confirm-mirror cannot be combined with --no-hints", err=True)
         raise typer.Exit(2)
-    loaded_config = _load_app_config(config)
     try:
         exit_code = asyncio.run(
             _analyse(
@@ -780,6 +812,36 @@ def benchmark_ablations(
         f"({result.payload['n_sets']} sets, {result.payload['n_boundaries']} boundaries); "
         f"{gates}; report={out}"
     )
+
+
+@benchmark_app.command("freeze-profiles")
+def benchmark_freeze_profiles(
+    ablations: Annotated[Path, typer.Option("--ablations", help="Stage 4c ablation report JSON.")],
+    shortlist: Annotated[Path, typer.Option("--shortlist", help="Stage 3 shortlist report JSON.")],
+    out: Annotated[
+        Path, typer.Option("--out", help="Directory to write frozen profiles into.")
+    ] = Path("profiles"),
+) -> None:
+    """Derive the frozen `free` and `max_accuracy` profiles mechanically from the two reports."""
+
+    try:
+        result = freeze_profiles(
+            ablations_path=ablations,
+            shortlist_path=shortlist,
+            out_dir=out,
+        )
+    except (ValueError, OSError, json.JSONDecodeError) as exc:
+        typer.echo(redact_text(str(exc)), err=True)
+        raise typer.Exit(1) from None
+    for name in sorted(result.profiles):
+        profile = result.profiles[name]
+        typer.echo(
+            f"froze {profile.version}: engines={','.join(profile.enabled_engines)} "
+            f"transforms={profile.transforms_policy} rescans={str(profile.rescan.enabled).lower()} "
+            f"novelty={str(profile.novelty_enabled).lower()} "
+            f"hints={str(profile.hints_enabled).lower()}(certified=false); "
+            f"-> {result.written[name]}"
+        )
 
 
 @benchmark_app.command("shortlist")

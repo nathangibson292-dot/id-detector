@@ -2,6 +2,18 @@
 # Copy this file to id-detector.toml; that destination is ignored by Git.
 allow_third_party_upload = false
 
+# Frozen profiles (Stage 4d).  Prefer `id-detector analyse <url> --profile free` (or
+# `--profile max_accuracy`) over hand-tuning the tables below: a profile is an immutable,
+# evidence-derived artefact under profiles/<name>-v<K>.json that fixes the engines, the
+# transform/schedule/rescan geometry and the hint/novelty toggles.  --profile overrides the
+# [transforms]/[schedule]/[rescan] tables in this file.  Re-freeze with:
+#   id-detector benchmark freeze-profiles \
+#     --ablations data/corpus/controlled-synth-1/ablations.json \
+#     --shortlist data/corpus/controlled-synth-1/shortlist.json --out profiles
+# In v1 both profiles enable only Shazam (the only available engine); AudD/ACRCloud need
+# credentials and Panako needs a JDK, so they are recorded as eligible-when-available, not enabled.
+# The tables below remain the defaults used when no --profile is passed.
+
 # Stage 4b defaults, recorded in data/corpus/controlled-synth-1/transforms-schedule.json.
 [transforms]
 policy = "rescan_only"

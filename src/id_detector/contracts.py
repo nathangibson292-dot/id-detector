@@ -987,6 +987,113 @@ class ProviderConfigRecord(Record):
         return self
 
 
+class ProfileEvidence(ContractModel):
+    """One report field cited by a profile decision, copied verbatim for traceability.
+
+    Every number a frozen profile states about the world comes from exactly one field of the
+    Stage 4c ablation report or the Stage 3 shortlist, named here as a dotted path with the
+    value read from it.  The freeze command reads these values from the reports rather than
+    hard-coding them, so the profile can be re-derived byte-for-byte from the evidence.
+    """
+
+    report: Literal["ablations", "shortlist"]
+    field: Annotated[str, Field(min_length=1)]
+    value: JsonValue
+
+
+class ProfileEngine(ContractModel):
+    provider: str
+    capability: Literal["clip_recognizer", "file_scanner", "local_index_query"]
+    cost_class: Literal["free", "paid", "self_hosted_free"]
+    enabled: bool
+    eligible_when_available: bool
+    eligibility_condition: str
+    status: str
+    reason: str
+    evidence: list[ProfileEvidence]
+
+
+class ProfileFeature(ContractModel):
+    name: Literal["rescans", "novelty", "transforms", "schedule", "hints"]
+    enabled: bool
+    certified: bool
+    setting: dict[str, JsonValue]
+    decision: str
+    evidence: list[ProfileEvidence]
+
+
+class ProfileSchedule(ContractModel):
+    window_ms: NonNegativeInt
+    hop_ms: NonNegativeInt
+    phase_ms: NonNegativeInt
+
+
+class ProfileRescan(ContractModel):
+    enabled: bool
+    window_ms: NonNegativeInt
+    hop_ms: NonNegativeInt
+    phase_ms: NonNegativeInt
+    max_generations: NonNegativeInt
+
+
+class ProfileBudget(ContractModel):
+    max_requests_per_media: NonNegativeInt
+    max_usd_e2: MoneyE2
+    allow_third_party_upload: bool
+    shazam_requests_per_minute: NonNegativeInt
+
+
+class ProfilePaidEstimate(ContractModel):
+    provider: str
+    status: str
+    expected_trial_cost_usd_e2: MoneyE2
+    corpus_version: str
+    evidence: list[ProfileEvidence]
+
+
+class ProfileCostReport(ContractModel):
+    enabled_engines_usd_e2: MoneyE2
+    ablation_corpus_sets: NonNegativeInt
+    windows_rescans_on: NonNegativeInt
+    windows_rescans_off: NonNegativeInt
+    paid_when_enabled: list[ProfilePaidEstimate]
+    evidence: list[ProfileEvidence]
+
+
+class ProfileProvenance(ContractModel):
+    ablations_report: str
+    ablations_report_ref: Sha256
+    ablations_corpus_version: str
+    shortlist_report: str
+    shortlist_report_ref: Sha256
+    shortlist_corpus_version: str
+
+
+class ProfileRecord(Record):
+    """A frozen, immutable, versioned recognition profile derived mechanically from evidence."""
+
+    id: Sha1
+    name: Literal["free", "max_accuracy"]
+    version: str
+    frozen: bool
+    engine_policy: Literal["free_only", "all_available"]
+    enabled_engines: list[str]
+    engines: list[ProfileEngine]
+    transforms_policy: Literal["off", "rescan_only", "global"]
+    transform_rates_e4: list[int]
+    transform_semitones: list[int]
+    schedule: ProfileSchedule
+    rescan: ProfileRescan
+    novelty_enabled: bool
+    hints_enabled: bool
+    hints_gate_status: str
+    features: list[ProfileFeature]
+    budget: ProfileBudget
+    cost_report: ProfileCostReport
+    frozen_from: ProfileProvenance
+    notes: list[str]
+
+
 SCHEMA_MODELS: dict[str, type[BaseModel]] = {
     "source": SourceRecord,
     "pcm": PcmRecord,
@@ -1010,6 +1117,7 @@ SCHEMA_MODELS: dict[str, type[BaseModel]] = {
     "invocation_journal_entry": InvocationJournalEntry,
     "raw_index_entry": RawIndexEntry,
     "provider_config": ProviderConfigRecord,
+    "profile": ProfileRecord,
 }
 
 
@@ -1043,6 +1151,7 @@ NATURAL_KEY_FIELDS: dict[str, tuple[str, ...]] = {
     "invocation_journal_entry": ("invocation_id",),
     "raw_index_entry": ("cache_key",),
     "provider_config": ("provider", "version"),
+    "profile": ("name", "version"),
 }
 
 
