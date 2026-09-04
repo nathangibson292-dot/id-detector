@@ -172,12 +172,15 @@ def flatten_tracklist(
     acquire: AcquireFile | None = None,
     *,
     collapse: bool = True,
+    same_track_bridge_ms: int | None = None,
 ) -> tuple[dict[str, Any], ...]:
     """Flatten episodes to tracklist rows using primary-role precedence and honest ID gaps.
 
     With ``collapse`` (the default), a contiguous run of competing near-duplicate matches of the
     same underlying track becomes ONE row: the closest match is shown and the others ride along as
-    ``alternatives``.  ``collapse=False`` restores the historical one-row-per-episode view.
+    ``alternatives``.  Two appearances of the SAME exact track up to ``same_track_bridge_ms`` apart
+    (``None`` → the grouping default) with no different confident track between them likewise stack
+    into one row.  ``collapse=False`` restores the historical one-row-per-episode view.
     """
 
     acquire_by_episode = (
@@ -189,14 +192,22 @@ def flatten_tracklist(
     }
     entries: list[dict[str, Any]] = []
     if collapse:
-        from id_detector.present.grouping import group_display_tracks
+        from id_detector.present.grouping import (
+            DEFAULT_SAME_TRACK_BRIDGE_MS,
+            group_display_tracks,
+        )
 
+        bridge_ms = (
+            DEFAULT_SAME_TRACK_BRIDGE_MS if same_track_bridge_ms is None else same_track_bridge_ms
+        )
         duration_ms = 0
         for episode in episodes.episodes:
             duration_ms = max(
                 duration_ms, episode.best_end_ms, *(s[1] for s in episode.evidence_support_ms)
             )
-        for track in group_display_tracks(list(episodes.episodes), identities, duration_ms):
+        for track in group_display_tracks(
+            list(episodes.episodes), identities, duration_ms, same_track_bridge_ms=bridge_ms
+        ):
             entry = _track_entry(track.primary, identities, acquire_by_episode, label_by_episode)
             entry["start_ms"] = track.start_ms
             entry["end_ms"] = track.end_ms
@@ -257,8 +268,11 @@ def export_tracklist(
     title: str | None = None,
     media_target: str | None = None,
     collapse: bool = True,
+    same_track_bridge_ms: int | None = None,
 ) -> ExportResult:
-    entries = flatten_tracklist(episodes, identities, acquire, collapse=collapse)
+    entries = flatten_tracklist(
+        episodes, identities, acquire, collapse=collapse, same_track_bridge_ms=same_track_bridge_ms
+    )
     json_path = media_dir / "present" / "tracklist.json"
     markdown_path = media_dir / "present" / "tracklist.md"
     atomic_write_json(

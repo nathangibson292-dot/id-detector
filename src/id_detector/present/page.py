@@ -534,26 +534,39 @@ def render_page(
     acquire: AcquireFile | None = None,
     lead_in_ms: int = DEFAULT_LEAD_IN_MS,
     collapse: bool = True,
+    same_track_bridge_ms: int | None = None,
 ) -> str:
     """Render the complete self-contained HTML page as a string.
 
     With ``collapse`` (the default), a contiguous run of competing near-duplicate matches of the
     same underlying track collapses to one display-track row (with a "▸ N other versions"
-    disclosure); the timeline lane, the current-row highlight and the seek all use that display
+    disclosure); two appearances of the SAME exact track up to ``same_track_bridge_ms`` apart
+    (``None`` → the grouping default) with no different confident track between them likewise stack
+    into one row.  The timeline lane, the current-row highlight and the seek all use that display
     track's primary.  ``collapse=False`` restores the one-lane-per-episode view.
     """
 
     embed = plan_embed(source)
-    entries = flatten_tracklist(episodes, identities, acquire, collapse=collapse)
+    entries = flatten_tracklist(
+        episodes, identities, acquire, collapse=collapse, same_track_bridge_ms=same_track_bridge_ms
+    )
     boundaries = _evidence_boundaries(list(episodes.episodes))
 
     # A display track is one collapsed row (primary + folded-in alternatives); ungrouped, it is one
     # episode.  Lanes, the highlight partition and the row all key off the primary's id so the
     # Stage 11 playhead lights the same row + lane as the tracklist.
     if collapse:
-        from id_detector.present.grouping import group_display_tracks
+        from id_detector.present.grouping import (
+            DEFAULT_SAME_TRACK_BRIDGE_MS,
+            group_display_tracks,
+        )
 
-        display_tracks = group_display_tracks(list(episodes.episodes), identities, duration_ms)
+        bridge_ms = (
+            DEFAULT_SAME_TRACK_BRIDGE_MS if same_track_bridge_ms is None else same_track_bridge_ms
+        )
+        display_tracks = group_display_tracks(
+            list(episodes.episodes), identities, duration_ms, same_track_bridge_ms=bridge_ms
+        )
         lane_episodes = [track.primary for track in display_tracks]
         span_items = [(track.primary.id, track.start_ms, track.end_ms) for track in display_tracks]
     else:
@@ -815,6 +828,7 @@ def generate_page(
     acquire_path: Path | None = None,
     lead_in_ms: int = DEFAULT_LEAD_IN_MS,
     collapse: bool = True,
+    same_track_bridge_ms: int | None = None,
 ) -> Path:
     """Render and atomically write ``present/index.html`` with a completion sidecar."""
 
@@ -826,6 +840,7 @@ def generate_page(
         acquire=acquire,
         lead_in_ms=lead_in_ms,
         collapse=collapse,
+        same_track_bridge_ms=same_track_bridge_ms,
     )
     index_path = media_dir / "present" / "index.html"
     atomic_write_bytes(index_path, html_text.encode("utf-8"))

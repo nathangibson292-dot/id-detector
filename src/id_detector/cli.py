@@ -484,6 +484,7 @@ async def _analyse(
             title=ingested.record.title,
             media_target=ingested.record.canonical_url,
             collapse=app_config.collapse,
+            same_track_bridge_ms=app_config.same_track_bridge_ms,
         )
         generate_page(
             media_dir=media_dir,
@@ -495,6 +496,7 @@ async def _analyse(
             identities_path=fused.identities_path,
             lead_in_ms=app_config.lead_in_ms,
             collapse=app_config.collapse,
+            same_track_bridge_ms=app_config.same_track_bridge_ms,
         )
         timer.finish_stage("export_ms")
         _report(progress, "present", 1, 1, "result page ready")
@@ -759,6 +761,7 @@ async def _acquire(
         title=cached.record.title,
         media_target=cached.record.canonical_url,
         collapse=acquire_config.collapse,
+        same_track_bridge_ms=acquire_config.same_track_bridge_ms,
     )
     generate_page(
         media_dir=media_dir,
@@ -772,6 +775,7 @@ async def _acquire(
         acquire_path=result.path,
         lead_in_ms=acquire_config.lead_in_ms,
         collapse=acquire_config.collapse,
+        same_track_bridge_ms=acquire_config.same_track_bridge_ms,
     )
     _report(progress, "present", 1, 1, "result page updated")
     typer.echo(

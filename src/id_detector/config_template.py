@@ -85,9 +85,12 @@ pointer_import = true
 # near-duplicate matches of the same underlying track (e.g. six "Work (X Remix)" rows) into ONE
 # tracklist / page row whose closest match is shown, with the other candidates listed as "could
 # also be" alternatives.  collapse = false (or --no-collapse) emits the old one-row-per-episode
-# view.
+# view.  same_track_bridge_ms additionally stacks two appearances of the SAME exact track this far
+# apart (default 180000 ms = 3 min) into one row, as long as no different confident track plays
+# between them; a genuine repeat later in the set stays its own row.
 [present]
 collapse = true
+same_track_bridge_ms = 180000
 """.replace("{connectors}", ", ".join(HINT_CONNECTORS))
 
 
@@ -134,5 +137,12 @@ def render_effective_config(config: AppConfig) -> str:
     ]
     for connector in HINT_CONNECTORS:
         lines.append(f"{connector} = {str(connector not in disabled).lower()}")
-    lines.extend(["", "[present]", f"collapse = {str(config.collapse).lower()}"])
+    lines.extend(
+        [
+            "",
+            "[present]",
+            f"collapse = {str(config.collapse).lower()}",
+            f"same_track_bridge_ms = {config.same_track_bridge_ms}",
+        ]
+    )
     return "\n".join(lines) + "\n"

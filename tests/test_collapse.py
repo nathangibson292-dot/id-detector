@@ -19,7 +19,7 @@ from id_detector.contracts import (
 )
 from id_detector.present.exports import flatten_tracklist
 from id_detector.present.grouping import (
-    DEFAULT_MERGE_GAP_MS,
+    DEFAULT_SAME_TRACK_BRIDGE_MS,
     group_display_tracks,
     normalise_title,
     work_key,
@@ -276,10 +276,12 @@ def test_real_repeat_later_in_set_is_not_merged() -> None:
     assert later.alternatives == ()  # occurrence 1 was not folded into occurrence 0
 
 
-def test_clean_gap_wider_than_threshold_prevents_merge() -> None:
+def test_clean_gap_wider_than_bridge_prevents_merge() -> None:
+    # A clean same-track gap wider than the same-track bridge (≈ a track length) is a genuine
+    # repeat, not one continuous play, so the two appearances stay separate display tracks.
     mapping = {_cid(0): ("Artist", "Track")}
     identities = _identities(mapping)
-    gap = DEFAULT_MERGE_GAP_MS + 8_000
+    gap = DEFAULT_SAME_TRACK_BRIDGE_MS + 8_000
     episodes = _episodes_file(
         [
             _episode(idx=0, candidate_id=_cid(0), best_start_ms=100_000, best_end_ms=112_000),
@@ -294,6 +296,102 @@ def test_clean_gap_wider_than_threshold_prevents_merge() -> None:
     )
     tracks = group_display_tracks(list(episodes.episodes), identities, duration_ms=800_000)
     assert len(tracks) == 2
+
+
+def test_same_track_across_short_gap_stacks_into_one_row() -> None:
+    # The motivating case: "Harry Mariani — E-Tales" detected at 29:45 and 31:03 (78 s apart, one
+    # continuous play with nothing between) is ONE display row after the same-track bridge.
+    mapping = {_cid(0): ("Harry Mariani", "E-Tales")}
+    identities = _identities(mapping)
+    first = 29 * 60_000 + 45_000  # 29:45
+    second = 31 * 60_000 + 3_000  # 31:03 — 78 s later, well past the 20 s adjacency gap
+    episodes = _episodes_file(
+        [
+            _episode(idx=0, candidate_id=_cid(0), best_start_ms=first, best_end_ms=first + 12_000),
+            _episode(
+                idx=1,
+                candidate_id=_cid(0),
+                best_start_ms=second,
+                best_end_ms=second + 12_000,
+            ),
+        ]
+    )
+    tracks = group_display_tracks(list(episodes.episodes), identities, duration_ms=2_400_000)
+    assert len(tracks) == 1
+    track = tracks[0]
+    assert track.start_ms == first
+    assert track.end_ms == second + 12_000  # the one row spans both appearances
+
+
+def test_same_track_with_confident_track_between_stays_two_rows() -> None:
+    # A different ≥ possible track between the two appearances means the first play ended, so the
+    # reappearance is a genuine repeat and must NOT bridge — the two same-track detections stay two
+    # separate rows (three rows in total with the intervening track).
+    mapping = {
+        _cid(0): ("Harry Mariani", "E-Tales"),
+        _cid(1): ("Other Artist", "Interlude"),
+    }
+    identities = _identities(mapping)
+    episodes = _episodes_file(
+        [
+            _episode(idx=0, candidate_id=_cid(0), best_start_ms=100_000, best_end_ms=112_000),
+            # A confident (possible) DIFFERENT track wedged strictly between the two appearances.
+            _episode(
+                idx=1,
+                candidate_id=_cid(1),
+                best_start_ms=140_000,
+                best_end_ms=152_000,
+                badge="possible",
+            ),
+            _episode(
+                idx=2,
+                candidate_id=_cid(0),
+                best_start_ms=180_000,
+                best_end_ms=192_000,
+                occurrence_index=1,
+            ),
+        ]
+    )
+    tracks = group_display_tracks(list(episodes.episodes), identities, duration_ms=800_000)
+    assert len(tracks) == 3
+    same_track_rows = [t for t in tracks if t.primary.candidate_id == _cid(0)]
+    assert len(same_track_rows) == 2  # the two appearances did NOT stack
+    assert all(row.alternatives == () for row in same_track_rows)
+
+
+def test_intervening_unclear_blip_does_not_prevent_bridging() -> None:
+    # An intervening UNCLEAR different-work blip is treated as noise: it does NOT separate the two
+    # same-track appearances, which still stack into one row (two rows in total with the blip).
+    mapping = {
+        _cid(0): ("Harry Mariani", "E-Tales"),
+        _cid(1): ("Noise Artist", "Blip"),
+    }
+    identities = _identities(mapping)
+    episodes = _episodes_file(
+        [
+            _episode(idx=0, candidate_id=_cid(0), best_start_ms=100_000, best_end_ms=112_000),
+            # A DIFFERENT work, but only UNCLEAR — noise, not a hard separator.
+            _episode(
+                idx=1,
+                candidate_id=_cid(1),
+                best_start_ms=140_000,
+                best_end_ms=152_000,
+                badge="unclear",
+            ),
+            _episode(
+                idx=2,
+                candidate_id=_cid(0),
+                best_start_ms=180_000,
+                best_end_ms=192_000,
+            ),
+        ]
+    )
+    tracks = group_display_tracks(list(episodes.episodes), identities, duration_ms=800_000)
+    assert len(tracks) == 2
+    same_track_rows = [t for t in tracks if t.primary.candidate_id == _cid(0)]
+    assert len(same_track_rows) == 1  # the two appearances stacked despite the UNCLEAR blip
+    assert same_track_rows[0].start_ms == 100_000
+    assert same_track_rows[0].end_ms == 192_000
 
 
 def test_work_key_normaliser_strips_qualifiers() -> None:

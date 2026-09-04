@@ -24,6 +24,9 @@ DEFAULT_RESCAN_PHASE_MS = 0
 DEFAULT_MAX_GENERATIONS = 3
 #: Seek lead-in applied by the web page and exports (jump this many ms before the proved start).
 DEFAULT_LEAD_IN_MS = 5_000
+#: Default same-exact-track display bridge: two appearances of one track (equal work key) up to this
+#: far apart, with no different confident track between them, stack into one collapsed row (~3 min).
+DEFAULT_SAME_TRACK_BRIDGE_MS = 180_000
 #: Default per-run Shazam request budget (a hard ceiling on billable/physical attempts).
 DEFAULT_MAX_REQUESTS = 2_000
 #: Cache TTLs (plan): a positive match is trusted for 180 days, a ``no_match`` for 30 days.
@@ -83,6 +86,7 @@ class AppConfig:
     max_requests: int = DEFAULT_MAX_REQUESTS
     lead_in_ms: int = DEFAULT_LEAD_IN_MS
     collapse: bool = True
+    same_track_bridge_ms: int = DEFAULT_SAME_TRACK_BRIDGE_MS
     cache_positive_max_age_days: int = DEFAULT_CACHE_POSITIVE_MAX_AGE_DAYS
     cache_no_match_max_age_days: int = DEFAULT_CACHE_NO_MATCH_MAX_AGE_DAYS
     hints_enabled: bool = True
@@ -171,6 +175,13 @@ class AppConfig:
         collapse = present.get("collapse", True)
         if not isinstance(collapse, bool):
             raise ValueError("present.collapse must be true or false")
+        same_track_bridge_ms = present.get("same_track_bridge_ms", DEFAULT_SAME_TRACK_BRIDGE_MS)
+        if (
+            isinstance(same_track_bridge_ms, bool)
+            or not isinstance(same_track_bridge_ms, int)
+            or same_track_bridge_ms < 0
+        ):
+            raise ValueError("present.same_track_bridge_ms must be a non-negative integer")
         positive_days = _positive_integer(
             cache.get("positive_max_age_days", DEFAULT_CACHE_POSITIVE_MAX_AGE_DAYS),
             "cache",
@@ -198,6 +209,7 @@ class AppConfig:
             max_requests=max_requests,
             lead_in_ms=lead_in_ms,
             collapse=collapse,
+            same_track_bridge_ms=same_track_bridge_ms,
             cache_positive_max_age_days=positive_days,
             cache_no_match_max_age_days=no_match_days,
             hints_enabled=hints_enabled,
