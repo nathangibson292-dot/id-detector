@@ -77,9 +77,7 @@ def manual_instructions(tool_dir: Path = DEFAULT_TOOL_DIR) -> str:
     )
 
 
-def download_jar(
-    dest: Path, *, url: str = PANAKO_DOWNLOAD_URL, timeout: float = 300
-) -> None:
+def download_jar(dest: Path, *, url: str = PANAKO_DOWNLOAD_URL, timeout: float = 300) -> None:
     """Download the pinned jar to ``dest`` (atomic via a temp file), then leave verification to
     the caller.  Raises :class:`PanakoSetupError` on any network failure."""
 
@@ -154,9 +152,7 @@ async def run_setup(
         runtime = PanakoRuntime(java=resolution.path, jar=jar, java_source=resolution.source)
         from id_detector.process import run_process
 
-        result = await run_process(
-            [*runtime.base_args(), "configuration"], timeout=60, check=False
-        )
+        result = await run_process([*runtime.base_args(), "configuration"], timeout=60, check=False)
         help_line = _first_meaningful_line(result.stdout + result.stderr)
 
     return SetupResult(

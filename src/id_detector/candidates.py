@@ -325,15 +325,11 @@ def derive_index_id(label: str) -> str:
 
 
 def derive_index_version(resources: Sequence[IndexedResource]) -> str:
-    payload = sorted(
-        (resource.resource_id, resource.fingerprint_count) for resource in resources
-    )
+    payload = sorted((resource.resource_id, resource.fingerprint_count) for resource in resources)
     return sha256(canonical_json_bytes(payload)).hexdigest()[:16]
 
 
-def build_manifest(
-    *, index_label: str, resources: Sequence[IndexedResource]
-) -> dict[str, object]:
+def build_manifest(*, index_label: str, resources: Sequence[IndexedResource]) -> dict[str, object]:
     """Build the (float-free) index manifest recording index_id/index_version for cache keys."""
 
     return {

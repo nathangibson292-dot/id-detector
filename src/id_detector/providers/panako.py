@@ -65,9 +65,7 @@ PANAKO_VERSION = "2.1"
 PANAKO_JAR_NAME = "Panako-2.1-all.jar"
 PANAKO_JAR_SIZE = 6_431_377
 PANAKO_JAR_SHA256 = "767cdd2cd0991658c4a25a0b8e887f9a2a38f69ae17781b02fe1652e1a7173d4"
-PANAKO_DOWNLOAD_URL = (
-    "https://github.com/JorenSix/Panako/releases/download/joss/Panako-2.1-all.jar"
-)
+PANAKO_DOWNLOAD_URL = "https://github.com/JorenSix/Panako/releases/download/joss/Panako-2.1-all.jar"
 
 #: Panako's OLAF strategy fingerprints at 16 kHz — the same rate as our decoded PCM.
 PANAKO_STRATEGY = "OLAF"
@@ -247,9 +245,7 @@ class PanakoRuntime:
     java_source: str = "install"
 
     @classmethod
-    def resolve(
-        cls, *, jar: Path, env: Mapping[str, str] | None = None
-    ) -> PanakoRuntime:
+    def resolve(cls, *, jar: Path, env: Mapping[str, str] | None = None) -> PanakoRuntime:
         if not jar.is_file():
             raise ProviderUnavailable(
                 f"Panako jar not found at {jar}; run `id-detector panako-setup` first"
@@ -586,8 +582,10 @@ def normalise_matches(
 
     if not matched:
         mix_start = window.start_ms
-        mix_end = min(duration_ms, window.start_ms + 1) if duration_ms > window.start_ms else (
-            window.start_ms + 1
+        mix_end = (
+            min(duration_ms, window.start_ms + 1)
+            if duration_ms > window.start_ms
+            else (window.start_ms + 1)
         )
         empty_label = RawLabel(artist=None, title=None, album=None, label=None, release_date=None)
         label_hash = sha256(canonical_json_bytes(empty_label)).hexdigest()
@@ -663,8 +661,7 @@ class PanakoProvider:
             resources = parse_store_output(result.stdout + result.stderr)
             if not resources:
                 raise PanakoError(
-                    "Panako store produced no fingerprints for "
-                    f"{audio}: {_diagnostic(result)}"
+                    f"Panako store produced no fingerprints for {audio}: {_diagnostic(result)}"
                 )
             stored.extend(resources)
         return stored

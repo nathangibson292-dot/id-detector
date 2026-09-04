@@ -195,6 +195,7 @@ As r4, plus event precision/recall per type, performed-vs-component confusion, d
 | **7. Web page** | Player; timeline with evidence support, PI shading, unresolved zones, gaps; badges; seek to `best_start_ms − lead_in` | Seek within 1 s of target |
 | **8. Panako full (conditional)** | Full provider; index from user-supplied/licensed files; discovery emits links | Stratum-2 recall +10 pp absolute on ≥ 20 episodes, paired |
 | **9. Polish** | CUE flattening, config, docs | Daily-usable |
+| **10. Web app** | Browser-driven `serve --analyse`: paste a URL → in-process background-thread job runner (one-at-a-time queue, cancellable, live progress via an optional pipeline progress hook) → home + progress pages, then the Stage 7 result page with click-to-seek; `id-detector.cmd` launcher | Job state machine + routes tested network-free (stubbed pipeline); `127.0.0.1`-only; no secrets in job state/logs; CLI `analyse` path unchanged |
 
 ## Committed-corpus policy
 Committed: synthetic fixtures, pseudonymous truth (no URLs/handles/platform IDs — refs resolve via local `data/local/source_links.json`), aggregate reports. Local only: raw dumps, raw provider/comment responses, source-link maps. `audit_fixtures.py` runs over **every** committed fixture, truth and report file. Uploading third-party mixes to AudD/ACRCloud requires `allow_third_party_upload = true` + CLI confirmation.

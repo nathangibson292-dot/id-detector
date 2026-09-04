@@ -12,29 +12,40 @@ The guiding rule is **accuracy over cost or speed**, and **honesty over complete
 
 ---
 
-## Quick start (for the owner)
+## Quick start (for the owner) — the browser way
 
-You need three things installed first: **[uv](https://docs.astral.sh/uv/)** (the Python runner) and
-**ffmpeg** (audio decoding). Everything else `uv` installs for you.
+You need two things installed first: **[uv](https://docs.astral.sh/uv/)** (the Python runner) and
+**ffmpeg** (audio decoding). Everything else `uv` installs for you. Run `uv sync` once to install.
+
+Then the whole tool is a **browser page** — no commands after the first setup:
+
+1. **Double-click `id-detector.cmd`** in this folder. A terminal opens the local server and your
+   **browser opens automatically** at `http://127.0.0.1:8765`.
+2. **Paste a mix URL** (SoundCloud / YouTube / Mixcloud) into the box, pick a profile, and click
+   **Analyse**.
+3. Watch the **live progress** (which phase, how many windows done, an estimated time). When it
+   finishes you get the **result page**: a player with a timeline where **clicking any track row
+   jumps the player to that moment**, plus "where to get it" links.
+
+Everything runs **only on your machine** (`127.0.0.1`); nothing is exposed to the network. The page
+also lists your recent and finished analyses, so you can leave it open and start more. Tick **also
+fetch acquire links** to add buy/download links, or **build reference index first** to fingerprint an
+uploader's own (possibly unreleased) tracks before analysing.
+
+### The command line (optional)
+
+The same steps are available as commands if you prefer them:
 
 ```powershell
-uv sync                                  # 1. install the tool and its dependencies
-uv run id-detector doctor                # 2. check your machine is ready (ffmpeg, Python, etc.)
-uv run id-detector analyse "<mix-url>"   # 3. analyse a set (paste a SoundCloud/YouTube/Mixcloud URL)
-uv run id-detector serve                 # 4. open the results in your browser
-```
-
-`serve` prints a `http://127.0.0.1:8765` address. Open it, pick your set, and you get a player with a
-timeline: **click any track row and the player jumps to that moment.**
-
-Two more everyday commands:
-
-```powershell
-uv run id-detector acquire "<mix-url>"   # add "where to buy / download" links to the results
+uv run id-detector doctor                # check your machine is ready (ffmpeg, Python, etc.)
+uv run id-detector serve                 # start the browser app yourself (what id-detector.cmd runs)
+uv run id-detector analyse "<mix-url>"   # analyse a set from the terminal instead
+uv run id-detector acquire "<mix-url>"   # add "where to buy / download" links to a result
 uv run id-detector config show           # see every setting and its current value
 ```
 
-That is the whole daily loop: **doctor → analyse → serve** (and `acquire` when you want buy links).
+`serve` opens the browser by default; add `--no-open` to skip that or `--no-analyse` for a
+read-only viewer of already-analysed sets.
 
 ### What each run produces
 

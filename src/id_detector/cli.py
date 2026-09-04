@@ -7,6 +7,7 @@ import json
 import sys
 import tomllib
 import uuid
+from collections.abc import Callable
 from dataclasses import replace
 from decimal import Decimal
 from hashlib import sha256
@@ -60,6 +61,18 @@ from id_detector.truth import (
     write_draft_manifest,
 )
 from id_detector.windows import TransformGrid, WindowSchedule, generate_windows_async
+
+#: A pipeline progress hook: ``(phase, done, total, message)``.  ``phase`` is one of ``ingest``,
+#: ``decode``, ``windows``, ``recognise``, ``hints``, ``fuse``, ``enrich`` or ``present``.  It is
+#: optional everywhere (default ``None``) so the CLI path stays byte-for-byte unchanged; only the
+#: web app supplies one.  A progress hook may raise ``asyncio.CancelledError`` to abort a run.
+ProgressFn = Callable[[str, int, int, str], None]
+
+
+def _report(progress: ProgressFn | None, phase: str, done: int, total: int, message: str) -> None:
+    if progress is not None:
+        progress(phase, done, total, message)
+
 
 app = typer.Typer(no_args_is_help=True, pretty_exceptions_enable=False)
 benchmark_app = typer.Typer(no_args_is_help=True)
@@ -316,6 +329,7 @@ async def _analyse(
     max_generations: int = DEFAULT_MAX_GENERATIONS,
     novelty: bool = True,
     calibrator: object | None = None,
+    progress: ProgressFn | None = None,
 ) -> int:
     app_config = app_config or AppConfig()
     run_id = uuid.uuid4().hex
@@ -336,6 +350,7 @@ async def _analyse(
         lock_key = sha256(url.encode("utf-8")).hexdigest()
         source_lock = ProcessLock(work_root.resolve() / ".locks" / f"{lock_key}.lock")
         source_lock.acquire()
+        _report(progress, "ingest", 0, 1, "resolving source")
         timer.start_stage("ingest_ms")
         ingested = await ingest(url, work_root)
         timer.finish_stage("ingest_ms")
@@ -344,12 +359,16 @@ async def _analyse(
         acquired_media_lock.acquire()
         media_lock = acquired_media_lock
         source_ids = [f"source:{ingested.record.source_key}"]
+        _report(progress, "ingest", 1, 1, ingested.record.title or "source ready")
 
+        _report(progress, "decode", 0, 1, "decoding audio")
         timer.start_stage("decode_ms")
         decoded = await decode(ingested)
         timer.finish_stage("decode_ms")
         ffmpeg_version = decoded.record.decoder.ffmpeg_version
+        _report(progress, "decode", 1, 1, "audio decoded")
 
+        _report(progress, "windows", 0, 1, "cutting windows")
         timer.start_stage("windows_ms")
         windows = await generate_windows_async(
             decoded,
@@ -366,8 +385,12 @@ async def _analyse(
             ),
         )
         timer.finish_stage("windows_ms")
+        _report(progress, "windows", 1, 1, f"{len(windows.records)} windows")
 
         timer.start_stage("recognise_ms")
+
+        def _on_recognise_window(done: int, total: int) -> None:
+            _report(progress, "recognise", done, total, "recognising windows")
 
         async def recognise_windows(*, windows: object, generation: int) -> object:
             return await recognise_generation(
@@ -381,6 +404,7 @@ async def _analyse(
                 max_requests=max_requests,
                 positive_max_age_seconds=app_config.cache_positive_max_age_seconds,
                 no_match_max_age_seconds=app_config.cache_no_match_max_age_seconds,
+                on_window=_on_recognise_window if progress is not None else None,
             )
 
         recognised = await recognise_windows(windows=windows, generation=0)
@@ -400,6 +424,7 @@ async def _analyse(
         )
         hint_result = None
         if not no_hints:
+            _report(progress, "hints", 0, 1, "reading tracklist hints")
             timer.start_stage("hints_ms")
             hint_result = await run_hints(
                 source=ingested.record,
@@ -414,6 +439,8 @@ async def _analyse(
             )
             timer.finish_stage("hints_ms")
             counts["hints"] = len(hint_result.hints)
+            _report(progress, "hints", 1, 1, f"{len(hint_result.hints)} hints")
+        _report(progress, "fuse", 0, 1, "fusing episodes")
         timer.start_stage("fuse_ms")
         orchestrated = await run_generation_loop(
             media_key=ingested.record.media_key,
@@ -443,6 +470,8 @@ async def _analyse(
             }
         )
         timer.finish_stage("fuse_ms")
+        _report(progress, "fuse", 1, 1, f"{len(fused.episodes.episodes)} episodes")
+        _report(progress, "present", 0, 1, "writing result page")
         timer.start_stage("export_ms")
         exported = export_tracklist(
             media_dir=media_dir,
@@ -466,6 +495,7 @@ async def _analyse(
             lead_in_ms=app_config.lead_in_ms,
         )
         timer.finish_stage("export_ms")
+        _report(progress, "present", 1, 1, "result page ready")
         if print_raw:
             output = [
                 {
@@ -668,6 +698,7 @@ async def _acquire(
     work_root: Path,
     refresh: bool,
     enable_soundcloud: bool,
+    progress: ProgressFn | None = None,
 ) -> int:
     from id_detector.contracts import PcmRecord
     from id_detector.enrich.run import final_identities_path, load_analysis
@@ -687,6 +718,7 @@ async def _acquire(
         )
         return 2
 
+    _report(progress, "enrich", 0, 1, "resolving acquire links")
     cache_root = PROJECT_ROOT / "data" / "local" / "enrich"
     result = await enrich_media_dir(
         source=cached.record,
@@ -695,6 +727,8 @@ async def _acquire(
         refresh=refresh,
         enable_soundcloud=enable_soundcloud,
     )
+    _report(progress, "enrich", 1, 1, "acquire links resolved")
+    _report(progress, "present", 0, 1, "updating result page")
     episodes, identities = load_analysis(media_dir)
     acquire_config = _load_app_config(Path("id-detector.toml"))
     duration_ms = PcmRecord.model_validate_json(
@@ -725,6 +759,7 @@ async def _acquire(
         acquire_path=result.path,
         lead_in_ms=acquire_config.lead_in_ms,
     )
+    _report(progress, "present", 1, 1, "result page updated")
     typer.echo(
         f"acquire: {result.counts['episodes']} identified episodes; "
         f"{result.counts['direct_links_total']} direct links "
@@ -769,18 +804,48 @@ def serve(
     host: str = typer.Option(
         "127.0.0.1", "--host", help="Loopback only; a routable interface is refused."
     ),
+    analyse: bool = typer.Option(
+        True,
+        "--analyse/--no-analyse",
+        help="Enable the browser analyse form and job runner (default). --no-analyse is read-only.",
+    ),
+    open_browser: bool = typer.Option(
+        True, "--open/--no-open", help="Open the home page in the default browser (default)."
+    ),
+    config: Path = typer.Option(  # noqa: B008
+        Path("id-detector.toml"), "--config", help="Non-secret schedule/transform TOML config."
+    ),
 ) -> None:
-    """Serve analysed sets' present/ pages read-only on 127.0.0.1 (POST /rescan queues a rescan)."""
+    """Serve analysed sets on 127.0.0.1; by default also run analyses started from the browser."""
+
+    import contextlib
+    import threading
+    import webbrowser
 
     from id_detector.present.server import make_server
+    from id_detector.webapp.jobs import JobManager
+    from id_detector.webapp.runner import make_pipeline_runner
 
+    def _open() -> None:
+        with contextlib.suppress(Exception):
+            webbrowser.open(url)
+
+    manager: JobManager | None = None
+    if analyse:
+        runner = make_pipeline_runner(work_root, project_root=PROJECT_ROOT, config_path=config)
+        manager = JobManager(work_root, runner)
     try:
-        server = make_server(work_root, host=host, port=port)
+        server = make_server(work_root, host=host, port=port, job_manager=manager)
     except ValueError as exc:
         typer.echo(str(exc), err=True)
         raise typer.Exit(2) from None
     bound_host, bound_port = server.server_address[0], server.server_address[1]
-    typer.echo(f"serving {work_root} at http://{bound_host}:{bound_port} (Ctrl-C to stop)")
+    url = f"http://{bound_host}:{bound_port}"
+    mode = "analyse + read-only" if analyse else "read-only"
+    typer.echo(f"serving {work_root} at {url} ({mode}; Ctrl-C to stop)")
+    if open_browser:
+        # Open after the server is listening; a browser failure must never stop the server.
+        threading.Timer(0.4, _open).start()
     try:
         server.serve_forever()
     except KeyboardInterrupt:
@@ -788,6 +853,8 @@ def serve(
     finally:
         server.shutdown()
         server.server_close()
+        if manager is not None:
+            manager.shutdown()
 
 
 @app.command()

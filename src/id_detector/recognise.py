@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import time
+from collections.abc import Callable
 from dataclasses import dataclass
 from hashlib import sha256
 from importlib.resources import files
@@ -357,6 +358,7 @@ async def recognise_generation(
     adapter: ShazamAdapter | None = None,
     positive_max_age_seconds: int = POSITIVE_MAX_AGE_SECONDS,
     no_match_max_age_seconds: int = NO_MATCH_MAX_AGE_SECONDS,
+    on_window: Callable[[int, int], None] | None = None,
 ) -> RecognitionResult:
     config, config_name = load_provider_config(project_root)
     queries = build_queries(media_key, windows, config, generation)
@@ -442,6 +444,13 @@ async def recognise_generation(
             elif job.state in {"succeeded", "no_match", "permanent_failure"}:
                 await store.reset_for_refresh(job.id)
 
+        # Optional, zero-overhead progress: the total is the number of unique query windows and the
+        # done count folds cache hits (resolved above) plus each leased job as it finishes. Purely a
+        # UI signal — it never touches artefacts, the budget, or the request accounting below.
+        window_total = len(queries)
+        window_done = cache_hits
+        if on_window is not None:
+            on_window(window_done, window_total)
         try:
             while True:
                 job = await store.lease_next(
@@ -465,6 +474,9 @@ async def recognise_generation(
                     raw_dir=raw_dir,
                     owner=run_id,
                 )
+                if on_window is not None:
+                    window_done = min(window_done + 1, window_total)
+                    on_window(window_done, window_total)
         except asyncio.CancelledError:
             await store.release_owner(run_id)
             raise
