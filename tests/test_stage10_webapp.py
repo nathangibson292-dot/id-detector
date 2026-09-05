@@ -448,3 +448,34 @@ def test_progress_logs_phase_completions_for_the_progress_page(tmp_path: Path) -
     for line in ("ingest: Fixture Live Set", "windows: 212 windows", "fuse: 41 episodes"):
         assert line in log
     assert log.count("recognise: recognising windows") == 1
+
+
+def test_eta_uses_the_observed_listening_rate_once_it_is_known() -> None:
+    """The ETA falls back to the historical 18/min only until a few windows have completed; after
+    that it follows the rate actually observed (concurrency, cache hits, an adaptive limiter)."""
+
+    job = Job(
+        id="b" * 32,
+        target=CLEAN_URL,
+        display=CLEAN_URL,
+        profile="free",
+        acquire=False,
+        build_index=False,
+        status="running",
+        phase="recognise",
+    )
+    job.windows_total = 72
+    # Cold start: too few windows to trust a measurement → the fallback constant.
+    job.windows_done = 1
+    job.recognise_started_at = 1_000.0
+    assert job.rate_per_minute(now=1_010.0) == 18.0
+    assert job.eta_seconds(now=1_010.0) == round(71 / 18 * 60)
+    # 36 windows in 60 s → 36/min observed, 36 left → 60 s.
+    job.windows_done = 36
+    assert job.rate_per_minute(now=1_060.0) == 36.0
+    assert job.eta_seconds(now=1_060.0) == 60
+    # The status snapshot measures against the real clock; only its presence/shape is pinned here.
+    assert isinstance(job.status_dict()["rate_per_minute"], float)
+    # Terminal jobs report no ETA.
+    job.status = "succeeded"
+    assert job.eta_seconds(now=1_060.0) == 0

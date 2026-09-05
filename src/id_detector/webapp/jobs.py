@@ -29,8 +29,13 @@ from id_detector.io import redact_text, url_has_credentials
 
 #: Ring-buffer size for a job's human-readable log tail.
 LOG_RING = 200
-#: The Shazam self-imposed ceiling used to estimate a windows-remaining ETA on the progress page.
+#: Cold-start fallback for the progress page's ETA (the historical Shazam ceiling).  Once a few
+#: windows have completed the ETA uses the *observed* rate instead, so concurrency, cache hits or an
+#: adaptive limiter in the recognise stage are reflected rather than assumed.
 SHAZAM_RATE_PER_MINUTE = 18
+#: Observed-rate ETA needs at least this many completed windows and this much listening time.
+_RATE_MIN_WINDOWS = 3
+_RATE_MIN_SECONDS = 5.0
 QUEUED = "queued"
 RUNNING = "running"
 SUCCEEDED = "succeeded"
@@ -101,14 +106,26 @@ class Job:
     created_at: float = field(default_factory=time.time)
     started_at: float | None = None
     finished_at: float | None = None
+    recognise_started_at: float | None = None
     log: deque[str] = field(default_factory=lambda: deque(maxlen=LOG_RING))
     cancel_event: threading.Event = field(default_factory=threading.Event)
 
-    def eta_seconds(self) -> int:
+    def rate_per_minute(self, now: float | None = None) -> float:
+        """Windows completed per minute — observed while recognising, else the fallback constant."""
+
+        started = self.recognise_started_at
+        if started is not None and self.windows_done >= _RATE_MIN_WINDOWS:
+            end = self.finished_at if self.finished_at is not None else (now or time.time())
+            elapsed = end - started
+            if elapsed >= _RATE_MIN_SECONDS:
+                return self.windows_done * 60.0 / elapsed
+        return float(SHAZAM_RATE_PER_MINUTE)
+
+    def eta_seconds(self, now: float | None = None) -> int:
         remaining = max(0, self.windows_total - self.windows_done)
         if not remaining or self.status in TERMINAL_STATES:
             return 0
-        return int(round(remaining / SHAZAM_RATE_PER_MINUTE * 60))
+        return int(round(remaining / self.rate_per_minute(now) * 60))
 
     def status_dict(self) -> dict[str, Any]:
         """A JSON-safe snapshot for ``GET /jobs/<id>/status`` — never contains a secret."""
@@ -126,6 +143,7 @@ class Job:
             "windows_done": self.windows_done,
             "windows_total": self.windows_total,
             "eta_seconds": self.eta_seconds(),
+            "rate_per_minute": round(self.rate_per_minute(), 1),
             "message": self.message,
             "error": self.error,
             "result_url": ("/" + self.result_path) if self.result_path else None,
@@ -183,6 +201,8 @@ class JobContext:
             if phase == "recognise":
                 self._job.windows_done = done
                 self._job.windows_total = total
+                if self._job.recognise_started_at is None:
+                    self._job.recognise_started_at = time.time()
             # Log a phase when it starts and again when it completes with a new message, so the
             # outcome of each phase ("ingest: <set title>", "windows: 212 windows",
             # "fuse: 41 episodes") reaches the progress page — not just "started".

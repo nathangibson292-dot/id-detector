@@ -58,7 +58,8 @@ contract, provider call or CLI behaviour changed.*
 - **New mix** (`/new`, also `/new?url=…` as the "try again" landing) — the same form plus a
   four-step "how it works".
 - **Progress** (`/jobs/<id>`): a big gradient percentage; the phase name + message; window / ETA
-  / elapsed / rate-limit tiles; the **scanner strip** — one cell per query window (capped at 240,
+  / elapsed / listening-speed tiles (the ETA and speed follow the *observed* windows-per-minute once
+  a few windows are done, falling back to 18/min only at cold start); the **scanner strip** — one cell per query window (capped at 240,
   proportionally mapped), lighting up left-to-right in the brand gradient with a pop on each newly
   finished cell and a pulsing "next" cell; rotating, honest flavour lines per phase; a step
   tracker (Index? → Fetch → Decode → Slice → Listen → Hints → Stitch → Links? → Page) with

@@ -693,6 +693,8 @@ function render(j){
   document.getElementById('t-windows').textContent = total ? (done + ' / ' + total) : '—';
   document.getElementById('t-eta').textContent = (j.eta_seconds && !j.terminal) ? '~' + fmt(
   j.eta_seconds) : (j.terminal ? '—' : '…');
+  document.getElementById('t-rate').textContent = (total && j.rate_per_minute) ?
+    (Math.round(j.rate_per_minute * 10) / 10) + '/min' : '…';
   var started = j.started_at, finished = j.finished_at;
   var elapsed = started ? ((finished || Date.now() / 1000) - started) : 0;
   document.getElementById('t-elapsed').textContent = started ? fmt(elapsed) : '—';
@@ -930,7 +932,7 @@ def _job_page_html(job: Job) -> bytes:
     tiles = (
         '<div class="tiles"><span><b id="t-windows">—</b>windows</span>'
         '<span><b id="t-eta">…</b>time left</span><span><b id="t-elapsed">—</b>elapsed</span>'
-        "<span><b>18/min</b>engine rate limit</span></div>"
+        '<span><b id="t-rate">…</b>windows / min</span></div>'
     )
     body = (
         topbar_html(back=True, new=True) + '<main><header class="job-head"><div class="titles">'
