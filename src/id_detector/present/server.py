@@ -386,8 +386,8 @@ margin:0 0 18px}
 .job-player .jp-label{display:flex;align-items:center;gap:9px;font-size:12.5px;color:var(--muted);
 margin:2px 2px 12px}
 .job-player iframe{display:block;width:100%;border:0;border-radius:12px;background:#00000022}
-.job-player .jp-yt{position:relative;width:100%;aspect-ratio:16/9;border-radius:12px;
-overflow:hidden}
+.job-player .jp-yt{position:relative;width:100%;max-width:560px;aspect-ratio:16/9;
+border-radius:12px;overflow:hidden}
 .job-player .jp-yt iframe{position:absolute;inset:0;width:100%;height:100%;border-radius:0}
 .scan{background:var(--card);border:1px solid var(--line);border-radius:18px;padding:22px 22px 18px;
 position:relative;overflow:hidden}
