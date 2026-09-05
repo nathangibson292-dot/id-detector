@@ -692,8 +692,66 @@ def build_episodes(
                 rejected_evidence=item["rejected_evidence"],
                 flags=item["flags"],
                 rescan_state="requested",
+                suppressed=None,
             )
         )
+
+    # Presentation suppression (free false-positive control): flag episodes that should not be
+    # LISTED as tracks, from three signals a confident, continuously-played match never trips.  The
+    # presentation layer honours EpisodeRecord.suppressed (hidden behind the "hidden matches"
+    # toggle — never deleted).  A likely/verified badge or a corroborating hint makes it immune.
+    confident_spans = [
+        (episode.evidence_support_ms[0][0], episode.evidence_support_ms[-1][1])
+        for episode in episode_records
+        if episode.badge in {"likely", "verified"} or "hint_supported" in episode.flags
+    ]
+    answer_positions = [
+        (hint.position_range_ms, identity.hint_work_ids.get(hint.id))
+        for hint in hints
+        if hint.kind in {"answer", "correction"}
+        and hint.mirror_status == "verified"
+        and hint.position_range_ms is not None
+    ]
+
+    def _covered_fraction(target: tuple[int, int], spans: list[tuple[int, int]]) -> float:
+        lo, hi = target
+        if hi <= lo:
+            return 0.0
+        clipped = normalise_intervals(
+            [(max(lo, a), min(hi, b)) for a, b in spans if b > lo and a < hi], duration_ms
+        )
+        return sum(b - a for a, b in clipped) / (hi - lo)
+
+    def _suppressed_reason(episode: EpisodeRecord) -> str | None:
+        if episode.badge in {"likely", "verified"} or "hint_supported" in episode.flags:
+            return None
+        span = (episode.evidence_support_ms[0][0], episode.evidence_support_ms[-1][1])
+        hull = span[1] - span[0]
+        merged = normalise_intervals(
+            [tuple(item) for item in episode.evidence_support_ms], duration_ms
+        )
+        summed = sum(b - a for a, b in merged)
+        # scatter: a few matches fused across a span far larger than the time actually matched — a
+        # real track plays continuously (hull ≈ summed); this is noise smeared over minutes.
+        if hull >= 120_000 and summed > 0 and hull >= 3 * summed:
+            return "scatter"
+        # contradicted: a trusted comment answer at this position names a DIFFERENT identity work.
+        episode_work = candidate_by_id[episode.candidate_id].work_id
+        for position, work in answer_positions:
+            if work is not None and work != episode_work and _intersects(position, span):
+                return "contradicted"
+        # buried: most of this span already sits under OTHER, more-confident/hint-backed tracks.
+        others = [item for item in confident_spans if item != span]
+        if hull > 0 and _covered_fraction(span, others) >= 0.6:
+            return "buried"
+        return None
+
+    episode_records = [
+        episode.model_copy(update={"suppressed": reason})
+        if (reason := _suppressed_reason(episode)) is not None
+        else episode
+        for episode in episode_records
+    ]
 
     scanned = normalise_intervals([item.support_ms for item in windows], duration_ms)
     duration_values, duration_intervals = partition_durations(duration_ms, episode_records, scanned)
@@ -792,6 +850,8 @@ def build_episodes(
     rescan_min_track_ms = config.present_min_track_ms if config is not None else 0
 
     def _episode_listed(episode: EpisodeRecord) -> bool:
+        if episode.suppressed:
+            return False
         if rescan_min_track_ms <= 0:
             return True
         if episode.badge == "likely" or episode.version_status == "verified":

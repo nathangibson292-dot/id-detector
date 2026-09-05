@@ -479,6 +479,12 @@ class EpisodeRecord(Record):
     rejected_evidence: list[str]
     flags: list[str]
     rescan_state: str
+    #: Why this episode should be hidden from the listed tracklist, or ``None`` to list it.  A short
+    #: reason token from a fixed vocabulary: ``"scatter"`` (a few matches fused across a long span —
+    #: not a real continuous play), ``"buried"`` (its span sits under a more-confident/hint-backed
+    #: track), ``"contradicted"`` (a trusted comment answer names a different track here).  The
+    #: presentation layer drops or tucks a suppressed episode behind the "hidden matches" toggle.
+    suppressed: str | None
 
 
 class GapEvidence(ContractModel):

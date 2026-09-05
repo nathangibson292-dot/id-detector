@@ -369,7 +369,10 @@ def test_dense_overlapping_hops_do_not_inflate_the_work_tier() -> None:
     assert _work_tier([0, 1_000, 2_000]) == "unclear"
 
 
-def test_long_episode_emits_one_deterministic_rescan_request() -> None:
+def test_scattered_long_episode_is_suppressed_not_rescanned() -> None:
+    # A 12-minute span "proved" by just two far-apart detections is scatter, not a real continuous
+    # play (this is the Airwave-matched-for-11-minutes pattern).  It is suppressed from the listed
+    # tracklist and, being unlisted, spends no rescan budget — deterministically in either order.
     observations = [
         _observation(0, provider="shazam", provider_ids={"shazam": "s1"}),
         _observation(81, provider="shazam", provider_ids={"shazam": "s1"}),
@@ -382,22 +385,19 @@ def test_long_episode_emits_one_deterministic_rescan_request() -> None:
         windows=[],
         identity=identity,
     )
-    _, second = build_episodes(
+    second_file, second = build_episodes(
         media_key=MEDIA_KEY,
         duration_ms=750_000,
         observations=list(reversed(observations)),
         windows=[],
         identity=identity,
     )
-    first_long = [item for item in first if item.trigger == "long_episode"]
-    second_long = [item for item in second if item.trigger == "long_episode"]
-    assert [(item.id, item.start_ms, item.end_ms) for item in first_long] == [
-        (item.id, item.start_ms, item.end_ms) for item in second_long
-    ]
-    assert len(first_long) == 1
-    assert (first_long[0].start_ms, first_long[0].end_ms) == (0, 741_000)
+    assert episode_file.episodes[0].suppressed == "scatter"
+    assert second_file.episodes[0].suppressed == "scatter"
+    assert [item for item in first if item.trigger == "long_episode"] == []
+    assert [item for item in second if item.trigger == "long_episode"] == []
+    # The classification itself is unchanged; only listing/rescan eligibility is.
     assert episode_file.episodes[0].tiers.work == "possible"
-    assert episode_file.episodes[0].tiers.version == "unclear"
     assert episode_file.episodes[0].badge == "possible"
     assert episode_file.episodes[0].version_status == "unverified"
 

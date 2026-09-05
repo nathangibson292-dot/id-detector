@@ -75,6 +75,7 @@ def _episode(
         "rejected_evidence": [],
         "flags": flags or [],
         "rescan_state": "not_requested",
+        "suppressed": None,
     }
 
 

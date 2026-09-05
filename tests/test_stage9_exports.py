@@ -114,6 +114,7 @@ def _episode(idx: int, start_ms: int, end_ms: int, overlaps: list[str], role: st
         "rejected_evidence": [],
         "flags": [],
         "rescan_state": "not_requested",
+        "suppressed": None,
     }
 
 
