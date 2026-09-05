@@ -197,11 +197,19 @@ def _candidate_recording_specific(identity: IdentityBuildResult, candidate_id: s
 
 
 def _eligible_tracklist_hint(hint: HintRecord) -> bool:
+    # A compiled tracklist line only counts from a trusted source (uploader/pinned/catalogue site).
+    # A position-anchored comment ANSWER/CORRECTION ("ID? -> Artist - Title") counts too: it is only
+    # ever used to CORROBORATE, and corroboration additionally requires the answer to resolve to the
+    # SAME identity work as the audio match, so an off-base answer simply never lines up and cannot
+    # confirm the wrong track.  This is what lets crowd-sourced IDs back up the recogniser.
+    trusted_tracklist_line = hint.kind == "tracklist_line" and (
+        hint.author.is_uploader or hint.is_pinned or hint.connector in {"mixesdb", "1001tl"}
+    )
+    positioned_answer = hint.kind in {"answer", "correction"}
     return (
-        hint.kind == "tracklist_line"
+        (trusted_tracklist_line or positioned_answer)
         and hint.mirror_status == "verified"
         and not hint.flags.id_unknown
-        and (hint.author.is_uploader or hint.is_pinned or hint.connector in {"mixesdb", "1001tl"})
     )
 
 

@@ -271,6 +271,41 @@ def build_identity_graph(
         node_labels.setdefault(text_node, f"{hint.artist} - {hint.title}")
         hint_text[hint.id] = text_node
 
+    # Casual "ID" answers in comments are frequently written "Title - Artist", the reverse of the
+    # provider label order ("Artist - Title").  That leaves the answer's text node (e.g.
+    # ``text:senses|bakey``) in an identity component of its own, unable to corroborate the audio
+    # match (``text:bakey|senses``).  Union a hint text node with an audio text node whenever their
+    # normalised token SETS are equal regardless of order, so the answer joins the right work.
+    audio_text_nodes = {node for node in observation_text.values() if node}
+
+    def _words(node: str) -> frozenset[str]:
+        return frozenset(re.findall(r"[a-z0-9]+", node.removeprefix("text:")))
+
+    # Match on the WORD set (not the two fields) so order AND extra collaborators don't block it:
+    # the answer "breaka breaka - bushbaby" must still corroborate the audio "Bushbaby & Eloq -
+    # Breaka Breaka".  Require one word set to fully contain the other (with ≥2 words) so a genuine
+    # ID lines up while an unrelated answer, whose words are not a subset, never does.
+    audio_words = [(node, _words(node)) for node in sorted(audio_text_nodes)]
+    for hint_id, text_node in sorted(hint_text.items()):
+        if text_node in audio_text_nodes:
+            continue
+        hint_words = _words(text_node)
+        for audio_node, words in audio_words:
+            if min(len(hint_words), len(words)) >= 2 and (
+                hint_words <= words or words <= hint_words
+            ):
+                item = _assertion(
+                    media_key,
+                    a=text_node,
+                    b=audio_node,
+                    relation="same_work",
+                    source_kind="hint_text_match",
+                    source_record_id=hint_id,
+                    independent_of="hint:comment_answer",
+                    confidence=7_000,
+                )
+                assertion_by_id[item.id] = item
+
     assertions = sorted(assertion_by_id.values(), key=lambda item: item.id)
     # Reuse the Stage 0 helper; this call is intentionally not duplicated below.
     merged = merge_recording_identities(
