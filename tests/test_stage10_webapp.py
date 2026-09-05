@@ -247,6 +247,37 @@ def _sample_job() -> Job:
     )
 
 
+def test_job_page_embeds_scrubbable_player_for_platform_url() -> None:
+    """While analysing, the progress page embeds the platform player so you can listen and scrub."""
+
+    sc = Job(
+        id="c" * 32,
+        target="https://soundcloud.com/artist/live-mix",
+        display="https://soundcloud.com/artist/live-mix",
+        profile="free",
+        acquire=False,
+        build_index=False,
+        status="running",
+        phase="recognise",
+    )
+    page = _job_page_html(sc).decode("utf-8")
+    assert 'class="job-player"' in page
+    assert "w.soundcloud.com/player/" in page
+
+    # A local-file analysis has nothing to stream — no player section.
+    local = Job(
+        id="d" * 32,
+        target=r"C:\mixes\set.wav",
+        display=r"C:\mixes\set.wav",
+        profile="free",
+        acquire=False,
+        build_index=False,
+        status="running",
+        phase="decode",
+    )
+    assert 'class="job-player"' not in _job_page_html(local).decode("utf-8")
+
+
 def test_home_and_job_pages_contain_no_usernames_or_identifier_fields() -> None:
     import re
 

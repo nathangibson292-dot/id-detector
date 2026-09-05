@@ -17,7 +17,7 @@ import json
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
-from urllib.parse import quote, urlsplit
+from urllib.parse import parse_qs, quote, urlsplit
 
 from id_detector.contracts import (
     AcquireFile,
@@ -170,6 +170,55 @@ def plan_embed(source: SourceRecord) -> EmbedPlan:
         feed = urlsplit(source.canonical_url).path or "/"
         return EmbedPlan("mixcloud", feed, link_url, "")
     return EmbedPlan("link", "", link_url, "platform not embeddable")
+
+
+def _youtube_id(parts: object) -> str:
+    """The video id from a parsed YouTube URL: ``watch?v=``, ``youtu.be/<id>`` or ``embed/<id>``."""
+
+    host = parts.netloc.casefold()  # type: ignore[attr-defined]
+    path = parts.path  # type: ignore[attr-defined]
+    if "youtu.be" in host:
+        segments = [segment for segment in path.split("/") if segment]
+        return segments[0] if segments else ""
+    query = parse_qs(parts.query)  # type: ignore[attr-defined]
+    if query.get("v"):
+        return query["v"][0]
+    segments = [segment for segment in path.split("/") if segment]
+    for marker in ("embed", "shorts", "live"):
+        if marker in segments:
+            index = segments.index(marker)
+            if index + 1 < len(segments):
+                return segments[index + 1]
+    return ""
+
+
+def plan_embed_from_url(url: str) -> EmbedPlan:
+    """Plan a player embed from a submitted URL alone — no ``SourceRecord`` needed.
+
+    The analysing (progress) page has only the target URL (ingest has not written ``source.json``
+    yet), so this mirrors :func:`plan_embed`'s per-platform choices but derives platform and
+    identifier from the URL: SoundCloud embeds by the URL itself, YouTube by its video id, Mixcloud
+    by its feed path.  A local file or an unrecognised non-web target becomes a plain ``link`` (no
+    embed).
+    """
+
+    text = (url or "").strip()
+    parts = urlsplit(text)
+    if parts.scheme.casefold() not in {"http", "https"} or not parts.netloc:
+        return EmbedPlan("link", "", "", "local or non-web target")
+    host = parts.netloc.casefold()
+    if "soundcloud.com" in host:
+        return EmbedPlan("soundcloud", text, text, "")
+    if "youtube.com" in host or "youtu.be" in host:
+        video_id = _youtube_id(parts)
+        return (
+            EmbedPlan("youtube", video_id, text, "")
+            if video_id
+            else EmbedPlan("link", "", text, "no video id")
+        )
+    if "mixcloud.com" in host:
+        return EmbedPlan("mixcloud", parts.path or "/", text, "")
+    return EmbedPlan("link", "", text, "platform not embeddable")
 
 
 def _pct(value_ms: int, duration_ms: int) -> float:

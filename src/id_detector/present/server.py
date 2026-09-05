@@ -19,7 +19,7 @@ from dataclasses import dataclass
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import parse_qs, urlsplit
+from urllib.parse import parse_qs, quote, urlsplit
 
 from id_detector.contracts import (
     GENERATED_BY,
@@ -39,6 +39,7 @@ from id_detector.io import (
     sha256_file,
 )
 from id_detector.present.exports import _format_time
+from id_detector.present.page import EmbedPlan, plan_embed_from_url
 from id_detector.present.refresh import ensure_fresh_page
 from id_detector.present.theme import head_html, platform_chip, topbar_html
 from id_detector.providers.base import AppConfig
@@ -380,6 +381,14 @@ background:var(--grad);color:#fff;font:800 12px/1 var(--display)}
 margin:6px 0 6px;overflow-wrap:anywhere}
 .job-url{color:var(--muted);font-size:13px;overflow-wrap:anywhere}
 .job-actions{display:flex;align-items:center;gap:10px;padding-top:6px}
+.job-player{background:var(--card);border:1px solid var(--line);border-radius:18px;padding:14px;
+margin:0 0 18px}
+.job-player .jp-label{display:flex;align-items:center;gap:9px;font-size:12.5px;color:var(--muted);
+margin:2px 2px 12px}
+.job-player iframe{display:block;width:100%;border:0;border-radius:12px;background:#00000022}
+.job-player .jp-yt{position:relative;width:100%;aspect-ratio:16/9;border-radius:12px;
+overflow:hidden}
+.job-player .jp-yt iframe{position:absolute;inset:0;width:100%;height:100%;border-radius:0}
 .scan{background:var(--card);border:1px solid var(--line);border-radius:18px;padding:22px 22px 18px;
 position:relative;overflow:hidden}
 .scan::after{content:"";position:absolute;inset:0;pointer-events:none;
@@ -921,8 +930,54 @@ def _job_steps(job: Job) -> list[tuple[str, str, str]]:
     return steps
 
 
+def _job_player_html(plan: EmbedPlan) -> str:
+    """A self-contained, scrubbable platform player for the analysing page — listen while it works.
+
+    Unlike the result page's embed this needs no page JavaScript: each player is a natively
+    interactive iframe (play / pause / seek on the platform's own waveform), so the owner can listen
+    and jump around the mix while the engines run.  A local file or a non-embeddable platform gets
+    no player (nothing to stream), and the section is simply omitted.
+    """
+
+    if plan.kind == "soundcloud":
+        src = (
+            "https://w.soundcloud.com/player/?url="
+            + quote(plan.identifier, safe="")
+            + "&show_comments=false&auto_play=false&hide_related=true&color=%23ff3d8a"
+        )
+        frame = (
+            f'<iframe title="SoundCloud player" height="166" scrolling="no" frameborder="no" '
+            f'allow="autoplay" src="{html.escape(src)}"></iframe>'
+        )
+    elif plan.kind == "youtube":
+        src = "https://www.youtube.com/embed/" + quote(plan.identifier, safe="")
+        frame = (
+            f'<div class="jp-yt"><iframe title="YouTube player" '
+            f'allow="autoplay; encrypted-media; picture-in-picture" allowfullscreen '
+            f'src="{html.escape(src)}"></iframe></div>'
+        )
+    elif plan.kind == "mixcloud":
+        src = "https://player-widget.mixcloud.com/widget/iframe/?feed=" + quote(
+            plan.identifier, safe=""
+        )
+        frame = (
+            f'<iframe title="Mixcloud player" height="120" frameborder="0" allow="autoplay" '
+            f'src="{html.escape(src)}"></iframe>'
+        )
+    else:
+        return ""
+    return (
+        '<section class="job-player" id="job-player">'
+        '<div class="jp-label"><span class="eq live"><i></i><i></i><i></i><i></i></span>'
+        "Listen while it works — scrub around to pass the time</div>"
+        f"{frame}</section>"
+    )
+
+
 def _job_page_html(job: Job) -> bytes:
     label = html.escape(job.display)
+    plan = plan_embed_from_url(job.target)
+    platform = plan.kind if plan.kind in ("soundcloud", "youtube", "mixcloud") else "file"
     steps = _job_steps(job)
     steps_html = "".join(
         f'<div class="step" data-step="{html.escape(key)}"><div class="k"><i>{n}</i>'
@@ -938,9 +993,11 @@ def _job_page_html(job: Job) -> bytes:
         topbar_html(back=True, new=True) + '<main><header class="job-head"><div class="titles">'
         '<p class="eyebrow" id="eyebrow">Analysing</p>'
         f'<h1 id="title">{label}</h1><p class="job-url" id="url" style="display:none">{label}</p>'
-        '</div><div class="job-actions"><span class="st" id="status">…</span>'
+        f"{platform_chip(platform)}</div>"
+        '<div class="job-actions"><span class="st" id="status">…</span>'
         '<button class="btn danger" id="cancel" type="button">Cancel</button></div></header>'
-        '<section class="scan" id="scan"><div class="scan-top">'
+        + _job_player_html(plan)
+        + '<section class="scan" id="scan"><div class="scan-top">'
         '<div class="pct" id="pct">0<small>%</small></div>'
         '<div class="phase-line"><div class="phase-name" id="phase-name">Starting</div>'
         '<div class="phase-msg" id="phase-msg"></div></div>' + tiles + "</div>"

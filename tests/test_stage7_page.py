@@ -20,6 +20,7 @@ from id_detector.present.page import (
     DEFAULT_LEAD_IN_MS,
     generate_page,
     plan_embed,
+    plan_embed_from_url,
     playhead_x,
     render_page,
     seek_argument,
@@ -326,6 +327,25 @@ def test_page_is_parseable_and_lists_every_episode_id() -> None:
         assert f'data-episode-id="{episode.id}"' in page
     for gap in episodes.gaps:
         assert f'data-gap-id="{gap.id}"' in page
+
+
+def test_plan_embed_from_url_detects_platform_without_a_source() -> None:
+    """The progress page plans an embed from the URL alone (no SourceRecord yet)."""
+
+    sc = plan_embed_from_url("https://soundcloud.com/artist/live-mix")
+    assert sc.kind == "soundcloud" and sc.identifier == "https://soundcloud.com/artist/live-mix"
+    assert plan_embed_from_url("https://www.youtube.com/watch?v=abcdEFGHijk").identifier == (
+        "abcdEFGHijk"
+    )
+    assert plan_embed_from_url("https://youtu.be/abcdEFGHijk").kind == "youtube"
+    assert plan_embed_from_url("https://youtu.be/abcdEFGHijk").identifier == "abcdEFGHijk"
+    assert plan_embed_from_url("https://www.mixcloud.com/artist/some-mix/").kind == "mixcloud"
+    assert plan_embed_from_url("https://www.mixcloud.com/artist/some-mix/").identifier == (
+        "/artist/some-mix/"
+    )
+    # A local file or unknown host is not embeddable — a plain link, no player.
+    assert plan_embed_from_url(r"C:\mixes\set.wav").kind == "link"
+    assert plan_embed_from_url("https://example.invalid/mix").kind == "link"
 
 
 def test_result_page_has_library_and_new_mix_nav() -> None:
