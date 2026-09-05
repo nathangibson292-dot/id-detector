@@ -19,7 +19,7 @@ from dataclasses import dataclass
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import parse_qs
+from urllib.parse import parse_qs, urlsplit
 
 from id_detector.contracts import (
     GENERATED_BY,
@@ -38,9 +38,12 @@ from id_detector.io import (
     read_text,
     sha256_file,
 )
+from id_detector.present.exports import _format_time
+from id_detector.present.refresh import ensure_fresh_page
+from id_detector.present.theme import head_html, platform_chip, topbar_html
 from id_detector.providers.base import AppConfig
 from id_detector.rescan import policy_for_trigger, priority_for_trigger
-from id_detector.webapp.jobs import Job, JobManager, TargetValidationError
+from id_detector.webapp.jobs import TERMINAL_STATES, Job, JobManager, TargetValidationError
 
 _SHA = re.compile(r"^[0-9a-f]{64}$")
 _JOB_ID = re.compile(r"^[0-9a-f]{32}$")
@@ -193,15 +196,69 @@ def _discover_sets(work_root: Path) -> list[AnalysedSet]:
     return sets
 
 
+def _human_duration(milliseconds: int) -> str:
+    """``1h 57m`` / ``58 min`` — the library's "music listened" figure."""
+
+    minutes = max(0, int(milliseconds)) // 60_000
+    hours, minutes = divmod(minutes, 60)
+    if hours:
+        return f"{hours}h {minutes:02d}m"
+    return f"{minutes} min"
+
+
+@dataclass(frozen=True)
+class _SetSummary:
+    """Per-mix figures for a library card, read from the flattened ``present/tracklist.json``."""
+
+    tracks: int
+    duration_ms: int
+    badges: dict[str, int]
+
+
+def _set_summary(item: AnalysedSet) -> _SetSummary | None:
+    path = item.media_dir / "present" / "tracklist.json"
+    if not path_is_file(path):
+        return None
+    try:
+        document = json.loads(read_text(path))
+        entries = [e for e in document.get("entries", ()) if e.get("kind") == "track"]
+        badges: dict[str, int] = {}
+        for entry in entries:
+            badge = str(entry.get("badge", "unclear"))
+            badges[badge] = badges.get(badge, 0) + 1
+        return _SetSummary(len(entries), int(document.get("duration_ms") or 0), badges)
+    except (ValueError, OSError, TypeError, AttributeError):
+        return None
+
+
+_BADGE_ORDER = ("verified", "likely", "possible", "unclear")
+
+
+def _conf_mini_html(badges: dict[str, int]) -> str:
+    total = sum(badges.get(key, 0) for key in _BADGE_ORDER)
+    if not total:
+        return ""
+    bars = "".join(
+        f'<i class="c-{key}" style="width:{badges[key] * 100.0 / total:.2f}%"></i>'
+        for key in _BADGE_ORDER
+        if badges.get(key)
+    )
+    title = " · ".join(f"{badges[key]} {key}" for key in _BADGE_ORDER if badges.get(key))
+    return f'<span class="conf-mini" title="{html.escape(title)}">{bars}</span>'
+
+
 def _index_html(sets: list[AnalysedSet]) -> bytes:
     """Read-only mode home: the mixes library with no analyse form (Stage 7 index)."""
 
     body = (
-        _topbar(show_back=False, show_new=False)
-        + "<h1>Analysed sets</h1>"
-        + '<p class="sub">Every mix analysed under this work root. Open one to explore its '
-        "tracklist.</p>"
-        + _mixes_block(sets)
+        topbar_html(back=False, new=False)
+        + '<main class="home"><header class="hero-home compact"><h1>Analysed sets</h1>'
+        '<p class="lede">Every mix analysed under this work root — open one to explore its '
+        "tracklist. This server is read-only.</p></header>"
+        + _library_stats_html(sets)
+        + _mixes_block(sets, allow_new=False)
+        + _footer_html()
+        + "</main>"
     )
     return _page_shell("id-detector — analysed sets", body)
 
@@ -209,214 +266,697 @@ def _index_html(sets: list[AnalysedSet]) -> bytes:
 # --------------------------------------------------------------------------------------------------
 # Web-app pages (self-contained inline HTML/CSS/JS; no usernames or comment text)
 # --------------------------------------------------------------------------------------------------
-_APP_CSS = (
-    "*{box-sizing:border-box}"
-    "body{font:14px/1.6 system-ui,-apple-system,Segoe UI,Roboto,sans-serif;max-width:860px;"
-    "margin:0 auto;padding:0 20px 56px;color:#1c1c1c;background:#faf9f7}"
-    "@media(prefers-color-scheme:dark){body{background:#16171a;color:#e9e9ea}}"
-    "a{color:#2b6cb0;text-decoration:none}a:hover{text-decoration:underline}"
-    ".topbar{display:flex;align-items:center;justify-content:space-between;gap:12px;"
-    "padding:16px 0 12px;margin-bottom:18px;border-bottom:1px solid #8883;position:sticky;top:0;"
-    "background:inherit;z-index:5}"
-    ".brand{font-size:16px;font-weight:700;letter-spacing:-.01em;color:inherit}"
-    ".brand:hover{text-decoration:none}.brand .dot{color:#2b6cb0}"
-    ".nav{display:flex;gap:8px;align-items:center}"
-    ".btn{font:inherit;font-size:13px;padding:8px 14px;border-radius:8px;border:1px solid #2b6cb0;"
-    "background:#2b6cb0;color:#fff;cursor:pointer;display:inline-flex;align-items:center;gap:6px;"
-    "white-space:nowrap;line-height:1}.btn:hover{background:#255d99;text-decoration:none}"
-    ".btn.ghost{background:transparent;color:#2b6cb0}.btn.ghost:hover{background:#2b6cb01a}"
-    "h1{font-size:22px;margin:6px 0 2px}"
-    "h2{font-size:12px;margin:26px 0 10px;color:#888;text-transform:uppercase;letter-spacing:.04em}"
-    ".sub{color:#888;font-size:13px;margin:0 0 18px}"
-    "form{background:#fff2;border:1px solid #8883;border-radius:12px;padding:18px;margin:8px 0}"
-    "@media(prefers-color-scheme:dark){form{background:#212228}}"
-    ".field{margin:16px 0}.field:first-child{margin-top:2px}"
-    ".field>label{display:block;font-size:11px;color:#888;text-transform:uppercase;"
-    "letter-spacing:.03em;margin-bottom:6px}"
-    "input[type=text]{width:100%;padding:10px 12px;border:1px solid #8886;border-radius:8px;"
-    "background:transparent;color:inherit;font:inherit}"
-    "select{padding:8px 10px;border:1px solid #8886;border-radius:8px;background:transparent;"
-    "color:inherit;font:inherit}"
-    ".opts{display:flex;flex-direction:column;gap:9px;margin-top:8px}"
-    ".opts label{display:flex;gap:8px;align-items:flex-start;font-size:13px;color:inherit}"
-    ".opts input{margin-top:3px}"
-    "button{font:inherit;padding:9px 18px;border:1px solid #2b6cb0;border-radius:8px;"
-    "background:#2b6cb0;color:#fff;cursor:pointer}button.ghost{background:transparent;color:#2b6cb0}"
-    ".mixes,.acts{list-style:none;padding:0;margin:0;display:flex;flex-direction:column;gap:8px}"
-    ".mix{border:1px solid #8883;border-radius:10px;background:#fff2;"
-    "transition:border-color .12s,box-shadow .12s}"
-    "@media(prefers-color-scheme:dark){.mix{background:#1d1e23}}"
-    ".mix:hover{border-color:#2b6cb0;box-shadow:0 1px 6px #2b6cb022}"
-    ".mix-link{display:flex;align-items:center;gap:12px;padding:14px 16px;color:inherit}"
-    ".mix-link:hover{text-decoration:none}"
-    ".tt{font-weight:600;font-size:15px;flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;"
-    "white-space:nowrap}"
-    ".pill{font-size:11px;color:#888;border:1px solid #8884;border-radius:20px;padding:2px 10px;"
-    "white-space:nowrap;text-transform:capitalize}"
-    ".go{color:#2b6cb0;font-size:18px;line-height:1}"
-    ".act{display:flex;align-items:center;gap:10px;padding:12px 16px;border:1px solid #8883;"
-    "border-radius:10px;background:#fff2}@media(prefers-color-scheme:dark){.act{background:#1d1e23}}"
-    ".act .tt{font-size:14px}.act .ph{margin:0;font-size:12px}"
-    ".empty{border:1px dashed #8885;border-radius:12px;padding:36px 20px;text-align:center;"
-    "color:#888}.empty p{margin:0 0 14px}"
-    ".st{font-weight:600;font-size:12px;text-transform:capitalize}"
-    ".st-succeeded{color:#1f7a4d}.st-failed{color:#b23b3b}.st-running{color:#2b6cb0}"
-    ".st-queued{color:#b8860b}.st-cancelled{color:#888}"
-    ".bar{height:12px;border-radius:6px;background:#8883;overflow:hidden;margin:6px 0}"
-    ".bar>span{display:block;height:100%;background:#2b6cb0;width:0;transition:width .3s}"
-    "pre{white-space:pre-wrap;word-break:break-word;background:#0000000a;border:1px solid #8883;"
-    "border-radius:8px;padding:10px;font-size:12px;max-height:240px;overflow:auto}"
-    "@media(prefers-color-scheme:dark){pre{background:#ffffff0a}}"
-    ".mono{font-variant-numeric:tabular-nums}"
-)
+_APP_CSS = """
+/* home hero + the drop-a-link form */
+.hero-home{padding:44px 0 26px;max-width:760px}
+.hero-home.compact{padding:26px 0 8px}
+.eyebrow{font:700 11px/1 var(--display);letter-spacing:.16em;text-transform:uppercase;
+color:var(--dim);margin:0 0 14px}
+.hero-home h1{font:800 clamp(34px,5.2vw,58px)/1.02 var(--display);letter-spacing:-.035em;
+margin:0 0 14px}
+.lede{color:var(--muted);font-size:15px;max-width:60ch;margin:0 0 22px}
+.dropform{margin:0}
+.urlbox{display:flex;align-items:center;gap:8px;padding:6px 6px 6px 10px;background:var(--card);
+border:1px solid var(--line2);border-radius:16px;
+box-shadow:0 30px 60px -40px rgba(139,92,246,.6);transition:border-color .15s,box-shadow .15s}
+.urlbox:focus-within{border-color:var(--accent);
+box-shadow:0 0 0 4px rgba(167,139,250,.18),0 30px 60px -40px rgba(139,92,246,.8)}
+.plat-ind{display:inline-flex;align-items:center;gap:7px;font:600 12px/1 var(--text);
+color:var(--muted);padding:8px 10px;border-radius:10px;background:#ffffff08;white-space:nowrap;
+transition:color .15s}
+.plat-ind.on{color:var(--fg)}
+.urlbox input{flex:1;min-width:0;padding:12px 8px;border:0;background:transparent;color:var(--fg);
+font:15px/1.3 var(--text);outline:none}
+.urlbox input::placeholder{color:var(--dim)}
+.opts{margin-top:12px}
+.opts>summary{list-style:none;cursor:pointer;display:inline-flex;align-items:center;gap:10px;
+font:600 13px/1 var(--text);color:var(--muted);padding:8px 12px;border-radius:9px;
+border:1px solid transparent}
+.opts>summary::-webkit-details-marker{display:none}
+.opts>summary::before{content:"▸";font-size:11px;transition:transform .15s}
+.opts[open]>summary::before{transform:rotate(90deg)}
+.opts>summary:hover,.opts[open]>summary{color:var(--fg);border-color:var(--line)}
+.opt-sum{font-weight:500;color:var(--dim)}
+.opt-grid{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-top:10px}
+.seg{grid-column:1/-1;display:grid;grid-template-columns:1fr 1fr;gap:8px}
+.segopt{position:relative;cursor:pointer}
+.segopt input{position:absolute;opacity:0;inset:0}
+.segopt span{display:block;padding:12px 14px;border:1px solid var(--line);border-radius:12px;
+background:var(--card);transition:border-color .12s,background .12s}
+.segopt input:checked+span{border-color:var(--accent);
+background:linear-gradient(135deg,rgba(139,92,246,.18),rgba(34,211,238,.08))}
+.segopt input:focus-visible+span{box-shadow:0 0 0 3px rgba(167,139,250,.3)}
+.segopt b{display:block;font-size:14px}.segopt small,.tog small{display:block;color:var(--muted);
+font-size:12px;margin-top:2px}
+.tog{display:flex;align-items:flex-start;gap:12px;padding:12px 14px;border:1px solid var(--line);
+border-radius:12px;background:var(--card);cursor:pointer}
+.tog input{position:absolute;opacity:0;width:0;height:0}
+.tog b{font-size:13px}
+.sw{flex:none;width:34px;height:20px;border-radius:999px;background:#ffffff1a;position:relative;
+margin-top:1px;transition:background .15s}
+.sw::after{content:"";position:absolute;top:3px;left:3px;width:14px;height:14px;border-radius:50%;
+background:#fff;transition:transform .15s}
+.tog input:checked~.sw{background:var(--violet)}
+.tog input:checked~.sw::after{transform:translateX(14px)}
+.tog input:focus-visible~.sw{box-shadow:0 0 0 3px rgba(167,139,250,.3)}
+/* library */
+.stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:12px;
+margin:8px 0 4px}
+.stat{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:14px 16px;
+min-height:78px;display:flex;align-items:center}
+.stat .big{font:800 30px/1 var(--display);letter-spacing:-.03em;font-variant-numeric:tabular-nums}
+.stat small{display:block;color:var(--muted);font-size:12px;margin-top:4px}
+.mixes{list-style:none;padding:0;margin:0;display:grid;
+grid-template-columns:repeat(auto-fill,minmax(280px,1fr));gap:12px}
+.mix{border:1px solid var(--line);border-radius:16px;background:var(--card);overflow:hidden;
+transition:transform .15s,border-color .15s,box-shadow .15s;position:relative}
+.mix::before{content:"";position:absolute;inset:0 0 auto 0;height:3px;background:var(--grad);
+opacity:0;transition:opacity .15s}
+.mix:hover{transform:translateY(-2px);border-color:var(--line2);
+box-shadow:0 20px 40px -24px rgba(139,92,246,.7)}
+.mix:hover::before{opacity:1}
+.mix-link{display:block;padding:16px 16px 14px;color:inherit}
+.mix-link:hover{text-decoration:none}
+.mix-top{display:flex;align-items:center;justify-content:space-between;gap:8px;margin-bottom:12px}
+.mono{font-family:var(--mono);font-variant-numeric:tabular-nums;color:var(--muted);font-size:12px}
+.mix-title{font:700 17px/1.25 var(--display);letter-spacing:-.01em;margin-bottom:10px;
+display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}
+.mix-meta{display:flex;align-items:center;gap:10px;color:var(--muted);font-size:12px}
+.mix-meta b{color:var(--fg)}
+.conf-mini{display:flex;flex:1;height:6px;border-radius:4px;overflow:hidden;background:#ffffff10;
+gap:1px}
+.conf-mini i{display:block;height:100%}
+.c-verified{background:var(--verified)}.c-likely{background:var(--likely)}
+.c-possible{background:var(--possible)}.c-unclear{background:var(--unclear)}
+.go{color:var(--dim);font-size:16px;transition:transform .15s,color .15s}
+.mix:hover .go{color:var(--fg);transform:translateX(3px)}
+.empty{border:1px dashed var(--line2);border-radius:16px;padding:40px 20px;text-align:center;
+color:var(--muted)}
+.empty b{display:block;color:var(--fg);font:700 18px/1.2 var(--display);margin-bottom:6px}
+.acts{list-style:none;padding:0;margin:0;display:flex;flex-direction:column;gap:8px}
+.act{border:1px solid var(--line);border-radius:14px;background:var(--card);overflow:hidden}
+.act-link{display:block;padding:12px 16px;color:inherit}.act-link:hover{text-decoration:none}
+.act-row{display:flex;align-items:center;gap:12px;min-width:0}
+.act-title{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;
+font-weight:600;font-size:14px}
+.act-phase{color:var(--muted);font-size:12px;margin-top:6px;
+font-variant-numeric:tabular-nums}
+.bar{height:6px;border-radius:4px;background:#ffffff10;overflow:hidden;margin-top:8px}
+.bar>span{display:block;height:100%;background:var(--grad);width:0;transition:width .6s;
+border-radius:4px}
+.act[data-status="failed"] .bar>span{background:var(--bad)}
+.act[data-status="cancelled"] .bar>span{background:var(--dim)}
+/* how it works (new-mix page) */
+.how{display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:12px;margin-top:8px}
+.how div{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:16px}
+.how b{display:block;font:700 14px/1.2 var(--display);margin:8px 0 4px}
+.how small{color:var(--muted);font-size:12px}
+.how .n{display:inline-grid;place-items:center;width:26px;height:26px;border-radius:8px;
+background:var(--grad);color:#fff;font:800 12px/1 var(--display)}
+/* progress page */
+.job-head{display:flex;align-items:flex-start;gap:16px;flex-wrap:wrap;padding:28px 0 18px}
+.job-head .titles{flex:1;min-width:0}
+.job-head h1{font:800 clamp(26px,3.6vw,38px)/1.1 var(--display);letter-spacing:-.03em;
+margin:6px 0 6px;overflow-wrap:anywhere}
+.job-url{color:var(--muted);font-size:13px;overflow-wrap:anywhere}
+.job-actions{display:flex;align-items:center;gap:10px;padding-top:6px}
+.scan{background:var(--card);border:1px solid var(--line);border-radius:18px;padding:22px 22px 18px;
+position:relative;overflow:hidden}
+.scan::after{content:"";position:absolute;inset:0;pointer-events:none;
+background:linear-gradient(180deg,#ffffff05,transparent)}
+.scan-top{display:flex;align-items:flex-end;gap:22px;flex-wrap:wrap;margin-bottom:16px}
+.pct{font:800 64px/1 var(--display);letter-spacing:-.04em;font-variant-numeric:tabular-nums;
+background:var(--grad);-webkit-background-clip:text;background-clip:text;color:transparent;
+min-width:3ch}
+.pct small{font-size:26px;letter-spacing:0}
+.phase-line{flex:1;min-width:220px}
+.phase-name{font:700 18px/1.2 var(--display);letter-spacing:-.01em}
+.phase-msg{color:var(--muted);font-size:13px;margin-top:3px;min-height:18px}
+.tiles{display:flex;gap:18px;flex-wrap:wrap;color:var(--muted);font-size:12px}
+.tiles b{display:block;color:var(--fg);font:700 18px/1.1 var(--display);
+font-variant-numeric:tabular-nums}
+.cells{display:grid;grid-auto-flow:column;grid-auto-columns:1fr;gap:2px;height:46px;padding:3px;
+background:#0c0c13;border:1px solid var(--line);border-radius:10px}
+.cells i{display:block;border-radius:2px;background:#1a1a26;transition:background .35s,
+box-shadow .35s}
+.cells i.on{background:var(--c);box-shadow:0 0 8px -2px var(--c)}
+.cells i.pop{animation:pop .5s ease-out}
+.cells i.next{animation:next 1s ease-in-out infinite}
+@keyframes pop{0%{background:#fff;box-shadow:0 0 14px #fff}}
+@keyframes next{50%{background:#2a2a3c}}
+.cells.idle{background-image:linear-gradient(90deg,transparent 0%,rgba(139,92,246,.18) 50%,
+transparent 100%);background-size:40% 100%;background-repeat:no-repeat;
+animation:shimmer 1.6s linear infinite}
+@keyframes shimmer{from{background-position:-40% 0}to{background-position:140% 0}}
+.flavour{margin:14px 2px 0;color:var(--muted);font-size:13px;min-height:20px;
+transition:opacity .35s}
+.flavour.fade{opacity:0}
+.steps{display:grid;grid-template-columns:repeat(auto-fit,minmax(110px,1fr));gap:8px;margin:14px 0}
+.step{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:12px 12px 10px;
+position:relative;transition:border-color .2s,opacity .2s;opacity:.55}
+.step .k{display:flex;align-items:center;gap:8px;font:700 12px/1 var(--display);
+letter-spacing:.02em}
+.step .k i{display:inline-grid;place-items:center;width:18px;height:18px;border-radius:50%;
+border:1.5px solid var(--dim);font:700 10px/1 var(--mono);color:var(--dim);font-style:normal}
+.step small{display:block;color:var(--dim);font-size:11px;margin-top:5px}
+.step.done{opacity:1}.step.done .k i{background:var(--ok);border-color:var(--ok);color:#0a0a0f}
+.step.active{opacity:1;border-color:var(--accent);
+background:linear-gradient(135deg,rgba(139,92,246,.16),rgba(34,211,238,.06))}
+.step.active .k i{border-color:var(--accent);color:var(--accent);
+animation:ringpulse 1.2s ease-out infinite}
+@keyframes ringpulse{0%{box-shadow:0 0 0 0 rgba(167,139,250,.55)}
+100%{box-shadow:0 0 0 8px rgba(167,139,250,0)}}
+.outcome{display:none;border-radius:18px;padding:26px;border:1px solid var(--line);
+background:var(--card);position:relative;overflow:hidden;margin:14px 0}
+.outcome.show{display:block;animation:rise .5s ease both}
+.outcome h2{font:800 30px/1.1 var(--display);letter-spacing:-.03em;margin:0 0 6px}
+.outcome p{color:var(--muted);margin:0 0 16px}
+.outcome.ok{border-color:rgba(52,211,153,.35);
+background:linear-gradient(135deg,rgba(52,211,153,.10),var(--card) 60%)}
+.outcome.bad{border-color:rgba(251,113,133,.4);
+background:linear-gradient(135deg,rgba(251,113,133,.10),var(--card) 60%)}
+.outcome .err{font-family:var(--mono);font-size:12px;color:var(--bad);background:#00000033;
+border-radius:8px;padding:10px 12px;margin:0 0 16px;white-space:pre-wrap;overflow-wrap:anywhere}
+.outcome .row{display:flex;gap:10px;align-items:center;flex-wrap:wrap}
+.countdown{color:var(--dim);font-size:12px}
+.confetti{position:absolute;inset:0;pointer-events:none;overflow:hidden}
+.confetti i{position:absolute;top:-10px;left:var(--x);width:7px;height:11px;background:var(--c);
+border-radius:2px;opacity:0;animation:fall var(--d) ease-in var(--delay) forwards}
+@keyframes fall{0%{opacity:1;transform:translateY(0) rotate(0)}
+100%{opacity:0;transform:translateY(340px) rotate(var(--r))}}
+details.log{margin-top:16px}
+details.log>summary{cursor:pointer;color:var(--dim);font-size:12px;list-style:none;
+display:inline-flex;align-items:center;gap:6px}
+details.log>summary::-webkit-details-marker{display:none}
+details.log>summary::before{content:"▸";font-size:10px}
+details.log[open]>summary::before{content:"▾"}
+pre{white-space:pre-wrap;word-break:break-word;background:#0c0c13;border:1px solid var(--line);
+border-radius:10px;padding:12px;font:12px/1.6 var(--mono);color:var(--muted);max-height:260px;
+overflow:auto;margin:8px 0 0}
+@media (max-width:720px){.hero-home{padding:24px 0 18px}.urlbox{flex-wrap:wrap;padding:8px}
+.urlbox input{flex-basis:100%;order:-1;padding:10px 6px}.urlbox .btn{margin-left:auto}
+.opt-grid,.seg{grid-template-columns:1fr}.pct{font-size:48px}.job-head{padding-top:16px}}
+"""
 
 
-def _topbar(*, show_back: bool, show_new: bool) -> str:
-    """The shared sticky header: an id-detector brand (home link) and optional nav actions."""
+_FORM_JS = """
+(function(){
+  var input = document.getElementById('url'); if(!input) return;
+  var ind = document.getElementById('plat'), name = document.getElementById('plat-name');
+  function detect(v){
+    v = (v || '').trim().toLowerCase();
+    if(!v) return ['', 'Paste a link'];
+    if(v.indexOf('soundcloud.com') >= 0) return ['soundcloud', 'SoundCloud'];
+    if(v.indexOf('youtube.com') >= 0 || v.indexOf('youtu.be') >= 0) return ['youtube', 'YouTube'];
+    if(v.indexOf('mixcloud.com') >= 0) return ['mixcloud', 'Mixcloud'];
+    if(/^https?:\\/\\//.test(v)) return ['', 'Web link'];
+    return ['file', 'Local file'];
+  }
+  function update(){
+    var d = detect(input.value);
+    ind.className = 'plat-ind' + (d[0] ? ' on plat-' + d[0] : (input.value.trim() ? ' on' : ''));
+    name.textContent = d[1];
+  }
+  input.addEventListener('input', update); update();
+  var sum = document.getElementById('opt-sum');
+  function summary(){
+    if(!sum) return;
+    var f = input.form, parts = [];
+    var prof = f.querySelector('input[name=profile]:checked');
+    parts.push(prof && prof.value === 'max_accuracy' ? 'Max accuracy' : 'Free · Shazam only');
+    if(f.querySelector('input[name=acquire]').checked) parts.push('where to get it');
+    if(f.querySelector('input[name=build_index]').checked) parts.push('reference index');
+    sum.textContent = parts.join(' · ');
+  }
+  Array.prototype.forEach.call(input.form.querySelectorAll(
+  'input[type=radio],input[type=checkbox]'),
+    function(el){ el.addEventListener('change', summary); });
+  summary();
+})();
+"""
 
-    nav = ""
-    if show_back:
-        nav += '<a class="btn ghost" href="/">← Your mixes</a>'
-    if show_new:
-        nav += '<a class="btn" href="/new">+ New mix</a>'
+
+_HOME_JS = """
+(function(){
+  var cards = document.querySelectorAll('.act[data-job]'); if(!cards.length) return;
+  function fmtPhase(j){
+    if(j.status === 'queued') return 'waiting in the queue';
+    var t = j.phase; if(j.message) t += ' — ' + j.message;
+    if(j.windows_total) t += '  ·  ' + j.windows_done + ' / ' + j.windows_total + ' windows';
+    return t;
+  }
+  function poll(card){
+    var id = card.getAttribute('data-job');
+    fetch('/jobs/' + id + '/status').then(function(r){ return r.json(); }).then(function(j){
+      var st = card.querySelector('.st'); st.textContent = j.status;
+  st.className = 'st st-' + j.status;
+      card.setAttribute('data-status', j.status);
+      card.querySelector('.act-phase').textContent = fmtPhase(j);
+      var total = j.windows_total || 0, done = j.windows_done || 0;
+      var pct = total ? Math.round(done * 100 / total) : (j.terminal ? 100 : 4);
+      card.querySelector('.bar>span').style.width = pct + '%';
+      if(j.status === 'succeeded' && j.result_url){ window.location.reload(); return; }
+      if(!j.terminal) setTimeout(function(){ poll(card); }, 2500);
+    }).catch(function(){ setTimeout(function(){ poll(card); }, 5000); });
+  }
+  Array.prototype.forEach.call(cards, function(card){
+    if(card.getAttribute('data-terminal') !== '1') poll(card); });
+})();
+"""
+
+
+_JOB_JS = """
+var STEP_INDEX = {}; STEPS.forEach(function(s, i){ STEP_INDEX[s[0]] = i; });
+var FLAVOUR = {
+  queued: ['Waiting in the queue — one analysis at a time keeps Shazam happy.'],
+  starting: ['Warming up…'],
+  build_index: ['Fingerprinting the uploader\\'s own tracks so unreleased ones match too.'],
+  ingest: ['Fetching the mix from the platform — a long set can take a minute.',
+    'Only the audio comes down; nothing about you goes up.'],
+  decode: ['Decoding to raw audio so every window sounds the same to the engines.'],
+  windows: ['Slicing the set into short, overlapping windows.'],
+  recognise: ['Every window is one question: what\\'s playing right now?',
+    'Shazam allows 18 asks a minute — we\\'re being polite, hence the wait.',
+    'A window that matches nothing stays honest: it becomes an ID, never a guess.',
+    'Overlapping windows are how a track start gets pinned — only as far as evidence proves.',
+    'The same track heard across several windows gets stitched into one episode later.',
+    'Nod along. The machine is listening so you don\\'t have to rewind.'],
+  hints: ['Reading the comments for tracklist clues — as hints, never as proof.'],
+  fuse: ['Stitching windows into track episodes with honest confidence tiers.',
+    'Where a boundary is not proved, the page will say so rather than guess.'],
+  enrich: ['Looking up where each track can be bought or downloaded.'],
+  present: ['Writing your click-to-jump tracklist page.'],
+  done: ['Done.'], failed: [''], cancelled: ['']
+};
+var cellCount = 0, lastDone = -1, flavourIx = 0, flavourPhase = '', redirectLeft = null;
+var LAST = null, celebrated = false;
+function fmt(s){ s = Math.max(0, Math.round(s)); var m = Math.floor(s / 60);
+  return m ? (m + 'm ' + (s % 60 < 10 ? '0' : '') + (s % 60) + 's') : (s + 's'); }
+function colour(t){
+  function mix(a, b, u){ return a.map(function(v, i){ return Math.round(v + (b[i] - v) * u); }); }
+  var P = [255, 61, 138], V = [139, 92, 246], C = [34, 211, 238];
+  var rgb = t < 0.55 ? mix(P, V, t / 0.55) : mix(V, C, (t - 0.55) / 0.45);
+  return 'rgb(' + rgb.join(',') + ')';
+}
+function buildCells(total){
+  var box = document.getElementById('cells'); box.innerHTML = ''; box.classList.remove('idle');
+  cellCount = Math.min(total, 240); lastDone = -1;
+  for(var i = 0; i < cellCount; i++){
+    var c = document.createElement('i'); c.style.setProperty('--c', colour(i / Math.max(1,
+  cellCount - 1)));
+    box.appendChild(c);
+  }
+}
+function lightCells(done, total){
+  var box = document.getElementById('cells'); if(!cellCount) return;
+  var lit = Math.round(done * cellCount / Math.max(1, total));
+  var cells = box.children;
+  for(var i = 0; i < cellCount; i++){
+    var on = i < lit; cells[i].classList.toggle('on', on);
+    cells[i].classList.toggle('next', i === lit && done < total);
+    if(on && i >= lastDone) cells[i].classList.add('pop');
+  }
+  lastDone = lit;
+}
+function overall(j){
+  var ix = STEP_INDEX[j.phase]; var rec = STEP_INDEX['recognise'];
+  if(j.status === 'succeeded') return 100;
+  if(j.status === 'queued' || ix === undefined) return 0;
+  if(ix < rec) return 2 + ix * 2;
+  if(ix === rec){ var t = j.windows_total || 0; return 8 + (t ? Math.round(
+  j.windows_done * 82 / t) : 0); }
+  return 90 + Math.min(9, (ix - rec) * 3);
+}
+function setSteps(j){
+  var ix = STEP_INDEX[j.phase]; var terminal = j.terminal;
+  Array.prototype.forEach.call(document.querySelectorAll('.step'), function(el, i){
+    el.classList.remove('done', 'active');
+    if(j.status === 'succeeded' || (
+  terminal === false && ix !== undefined && i < ix)) el.classList.add('done');
+    else if(!terminal && ix === i) el.classList.add('active');
+    else if(terminal && ix !== undefined && i < ix) el.classList.add('done');
+  });
+}
+function titleFromLog(j){
+  for(var i = 0; i < (j.log || []).length; i++){
+    var m = /ingest: (.+)$/.exec(j.log[i]);
+    var skip = {'resolving source': 1, 'started': 1, 'source ready': 1};
+    if(m && !skip[m[1]]) return m[1];
+  }
+  return null;
+}
+function fromLog(j, re){ for(var i = 0; i < (j.log || []).length; i++){ var m = re.exec(
+  j.log[i]); if(m) return m[1]; } return null; }
+function rotateFlavour(){
+  var j = LAST; if(!j) return;
+  var pool = FLAVOUR[j.status === 'queued' ? 'queued' : j.phase] || [];
+  if(!pool.length) return;
+  if(flavourPhase !== j.phase){ flavourPhase = j.phase; flavourIx = 0; } else { flavourIx = (
+  flavourIx + 1) % pool.length; }
+  var el = document.getElementById('flavour'); el.classList.add('fade');
+  setTimeout(function(){ el.textContent = pool[flavourIx]; el.classList.remove('fade'); }, 350);
+}
+function confetti(){
+  var box = document.getElementById('confetti'); if(!box || celebrated) return; celebrated = true;
+  var cols = ['#ff3d8a', '#8b5cf6', '#22d3ee', '#34d399', '#fbbf24', '#ffffff'];
+  for(var i = 0; i < 70; i++){
+    var p = document.createElement('i');
+    p.style.setProperty('--x', (Math.random() * 100) + '%'); p.style.setProperty('--c',
+  cols[i % cols.length]);
+    p.style.setProperty('--d', (1.6 + Math.random() * 1.4) + 's'); p.style.setProperty(
+  '--delay', (Math.random() * .6) + 's');
+    p.style.setProperty('--r', (Math.random() * 720 - 360) + 'deg');
+    box.appendChild(p);
+  }
+}
+function showOutcome(j){
+  var box = document.getElementById('outcome'); box.className = 'outcome show';
+  document.getElementById('scan').style.display = 'none';
+  var h = document.getElementById('o-title'), p = document.getElementById('o-sub'),
+  row = document.getElementById('o-row');
+  var err = document.getElementById('o-err'); err.style.display = 'none';
+  if(j.status === 'succeeded'){
+    box.classList.add('ok');
+    var eps = fromLog(j, /fuse: (\\d+) episodes/), wins = fromLog(j, /windows: (\\d+) windows/);
+    h.textContent = 'Tracklist ready';
+    p.textContent = (eps ? eps + ' track episodes found' : 'Analysis finished') + (
+  wins ? ' after listening to ' + wins + ' windows.' : '.');
+    var open = '<a class="btn primary big" id="open" href="' + j.result_url +
+      '">Open the tracklist →</a><span class="countdown" id="countdown"></span>';
+    row.innerHTML = j.result_url ? open : '';
+    confetti();
+    if(j.result_url && redirectLeft === null){ redirectLeft = 5; countdown(j.result_url); }
+  } else if(j.status === 'failed'){
+    box.classList.add('bad'); h.textContent = 'That one didn\\'t work';
+    p.textContent = 'The analysis stopped with an error. The log below has the details.';
+    if(j.error){ err.textContent = j.error; err.style.display = 'block'; }
+    row.innerHTML = '<a class="btn primary" href="/new?url=' + encodeURIComponent(
+  DISPLAY) + '">Try again</a>' +
+      '<a class="btn" href="/">Your mixes</a>';
+  } else {
+    h.textContent = 'Cancelled'; p.textContent = 'Stopped before it finished — nothing was saved.';
+    row.innerHTML = '<a class="btn primary" href="/new?url=' + encodeURIComponent(
+  DISPLAY) + '">Start again</a>' +
+      '<a class="btn" href="/">Your mixes</a>';
+  }
+}
+function countdown(url){
+  var el = document.getElementById('countdown'); if(!el) return;
+  if(redirectLeft <= 0){ window.location.href = url; return; }
+  el.innerHTML = 'opening in ' + redirectLeft + 's · <a href="#" id="stay">stay here</a>';
+  var stay = document.getElementById('stay');
+  if(stay) stay.addEventListener('click', function(e){ e.preventDefault(); redirectLeft = -1;
+  el.textContent = ''; });
+  redirectLeft -= 1;
+  setTimeout(function(){ if(redirectLeft >= 0) countdown(url); }, 1000);
+}
+function render(j){
+  LAST = j;
+  var st = document.getElementById('status'); st.textContent = j.status;
+  st.className = 'st st-' + j.status;
+  var t = titleFromLog(j); if(t){ document.getElementById('title').textContent = t;
+  document.getElementById('url').style.display = 'block'; }
+  var pct = overall(j);
+  document.getElementById('pct').innerHTML = pct + '<small>%</small>';
+  var stepIx = STEP_INDEX[j.phase];
+  var label = stepIx !== undefined ? STEPS[stepIx][1]
+    : (j.phase.charAt(0).toUpperCase() + j.phase.slice(1));
+  if(j.status === 'queued') label = 'In the queue';
+  document.getElementById('phase-name').textContent = label;
+  var msg = j.message || (stepIx !== undefined ? STEPS[stepIx][2] : '');
+  if(j.status === 'queued') msg = 'another analysis is running first';
+  document.getElementById('phase-msg').textContent = msg;
+  var total = j.windows_total || 0, done = j.windows_done || 0;
+  if(total && total !== cellCount && (cellCount === 0 || Math.min(total,
+  240) !== cellCount)) buildCells(total);
+  if(total) lightCells(done, total); else document.getElementById('cells').classList.add('idle');
+  document.getElementById('t-windows').textContent = total ? (done + ' / ' + total) : '—';
+  document.getElementById('t-eta').textContent = (j.eta_seconds && !j.terminal) ? '~' + fmt(
+  j.eta_seconds) : (j.terminal ? '—' : '…');
+  var started = j.started_at, finished = j.finished_at;
+  var elapsed = started ? ((finished || Date.now() / 1000) - started) : 0;
+  document.getElementById('t-elapsed').textContent = started ? fmt(elapsed) : '—';
+  setSteps(j);
+  document.title = (j.terminal ? (
+  j.status === 'succeeded' ? 'Done' : j.status) : pct + '%') + ' · ' + (
+  t || 'Analysing') + ' — id-detector';
+  document.getElementById('log').textContent = (j.log || []).join('\\n');
+  document.getElementById('cancel').style.display = j.terminal ? 'none' : '';
+  var eyebrow = {succeeded: 'Analysed', failed: 'Analysis failed', cancelled: 'Analysis cancelled'};
+  document.getElementById('eyebrow').textContent = eyebrow[j.status] || 'Analysing';
+  if(j.terminal) showOutcome(j); else if(flavourPhase !== j.phase) rotateFlavour();
+}
+function tick(){
+  fetch('/jobs/' + JOB_ID + '/status').then(function(r){ return r.json(); }).then(function(j){
+    render(j); if(!j.terminal) setTimeout(tick, 1500);
+  }).catch(function(){ setTimeout(tick, 4000); });
+}
+setInterval(function(){ if(LAST && !LAST.terminal && LAST.started_at){
+  document.getElementById('t-elapsed').textContent = fmt(Date.now() / 1000 - LAST.started_at);
+  } }, 1000);
+setInterval(rotateFlavour, 7000);
+document.getElementById('cancel').addEventListener('click', function(){
+  if(!confirm('Stop this analysis?')) return;
+  fetch('/jobs/' + JOB_ID + '/cancel', {method: 'POST'}).then(tick);
+});
+tick();
+"""
+
+
+def _page_shell(title: str, body: str, script: str = "") -> bytes:
+    tail = f"<script>{script}</script>" if script else ""
+    return (head_html(title, _APP_CSS) + f"<body>{body}{tail}</body></html>\n").encode("utf-8")
+
+
+def _footer_html() -> str:
     return (
-        '<nav class="topbar"><a class="brand" href="/">id<span class="dot">·</span>detector</a>'
-        f'<span class="nav">{nav}</span></nav>'
+        "<footer><span>🔒 everything runs on this machine — nothing leaves 127.0.0.1</span>"
+        "<span>id-detector</span></footer>"
     )
 
 
-def _page_shell(title: str, body: str) -> bytes:
+def _form_html(prefill: str = "") -> str:
+    """The drop-a-link form: a hero input with platform detection and a collapsible options tray."""
+
     return (
-        '<!doctype html><html lang="en"><head><meta charset="utf-8">'
-        '<meta name="viewport" content="width=device-width, initial-scale=1">'
-        f"<title>{html.escape(title)}</title><style>{_APP_CSS}</style></head><body>"
-        f"{body}</body></html>"
-    ).encode()
+        '<form method="post" action="/analyse" class="dropform" autocomplete="off">'
+        '<div class="urlbox">'
+        '<span class="plat-ind" id="plat"><span class="pd"></span>'
+        '<span id="plat-name">Paste a link</span></span>'
+        '<input id="url" name="url" type="text" required autofocus spellcheck="false" '
+        f'value="{html.escape(prefill)}" '
+        'placeholder="https://soundcloud.com/… — or a local audio file path">'
+        '<button class="btn primary big" type="submit">Analyse</button></div>'
+        '<details class="opts"><summary><span>Options</span>'
+        '<span class="opt-sum" id="opt-sum">Free · Shazam only</span></summary>'
+        '<div class="opt-grid"><div class="seg" role="radiogroup" aria-label="Profile">'
+        '<label class="segopt"><input type="radio" name="profile" value="free" checked>'
+        "<span><b>Free</b><small>Shazam only — no keys needed</small></span></label>"
+        '<label class="segopt"><input type="radio" name="profile" value="max_accuracy">'
+        "<span><b>Max accuracy</b><small>every engine you have configured</small></span></label>"
+        "</div>"
+        '<label class="tog"><input type="checkbox" name="acquire" value="1">'
+        '<span class="sw"></span>'
+        "<span><b>Find where to get each track</b>"
+        "<small>buy / free download / gate links on the result page</small></span></label>"
+        '<label class="tog"><input type="checkbox" name="build_index" value="1">'
+        '<span class="sw"></span><span><b>Build a reference index first</b>'
+        "<small>fingerprints the uploader's own tracks to catch unreleased ones</small></span>"
+        "</label></div></details></form>"
+    )
+
+
+def _library_stats_html(sets: list[AnalysedSet]) -> str:
+    """Three big numbers for the library: mixes, tracks identified, music listened to."""
+
+    if not sets:
+        return ""
+    summaries = [_set_summary(item) for item in sets]
+    tracks = sum(s.tracks for s in summaries if s)
+    listened = sum(s.duration_ms for s in summaries if s)
+    mixes = len(sets)
+    return (
+        '<div class="stats">'
+        f'<div class="stat"><div><span class="big">{mixes}</span>'
+        f"<small>mix{'es' if mixes != 1 else ''} analysed</small></div></div>"
+        f'<div class="stat"><div><span class="big">{tracks}</span>'
+        "<small>tracks identified</small></div></div>"
+        f'<div class="stat"><div><span class="big">{html.escape(_human_duration(listened))}</span>'
+        "<small>of music listened to</small></div></div>"
+        "</div>"
+    )
 
 
 def _mix_card_html(item: AnalysedSet) -> str:
     href = f"/{html.escape(item.source_key)}/{html.escape(item.media_key)}/present/index.html"
+    summary = _set_summary(item)
+    duration = (
+        f'<span class="mono">{html.escape(_format_time(summary.duration_ms))}</span>'
+        if summary and summary.duration_ms
+        else ""
+    )
+    meta = ""
+    if summary:
+        meta = (
+            f'<div class="mix-meta"><span><b>{summary.tracks}</b> '
+            f"track{'s' if summary.tracks != 1 else ''}</span>{_conf_mini_html(summary.badges)}"
+            '<span class="go" aria-hidden="true">→</span></div>'
+        )
+    else:
+        meta = '<div class="mix-meta"><span class="go" aria-hidden="true">→</span></div>'
     return (
         f'<li class="mix"><a class="mix-link" href="{href}">'
-        f'<span class="tt">{html.escape(item.title)}</span>'
-        f'<span class="pill">{html.escape(item.platform)}</span>'
-        '<span class="go" aria-hidden="true">→</span></a></li>'
+        f'<div class="mix-top">{platform_chip(item.platform)}{duration}</div>'
+        f'<div class="mix-title">{html.escape(item.title)}</div>{meta}</a></li>'
     )
 
 
-def _mixes_block(sets: list[AnalysedSet]) -> str:
-    """The library list of analysed mixes, or an empty state with a New-mix call to action."""
+def _mixes_block(sets: list[AnalysedSet], *, allow_new: bool = True) -> str:
+    """The library grid of analysed mixes, or a friendly empty state."""
 
     if sets:
         cards = "".join(_mix_card_html(item) for item in sets)
         return f'<ul class="mixes">{cards}</ul>'
-    return (
-        '<div class="empty"><p>No mixes analysed yet.</p>'
-        '<a class="btn" href="/new">+ Analyse your first mix</a></div>'
+    cta = (
+        "<p>Paste a link above and find out what is in it.</p>"
+        if allow_new
+        else "<p>Analyse a set from the command line and it will appear here.</p>"
     )
+    return f'<div class="empty"><b>No mixes yet</b>{cta}</div>'
 
 
 def _activity_item_html(job: Job) -> str:
     status = html.escape(job.status)
     label = html.escape(job.display)
-    phase = html.escape(job.message and f"{job.phase} — {job.message}" or job.phase)
+    phase = job.message and f"{job.phase} — {job.message}" or job.phase
+    if job.status == "queued":
+        phase = "waiting in the queue"
+    total, done = job.windows_total, job.windows_done
+    pct = round(done * 100 / total) if total else (100 if job.status == "succeeded" else 4)
+    terminal = "1" if job.status in TERMINAL_STATES else "0"
     return (
-        f'<li class="act"><a class="tt" href="/jobs/{html.escape(job.id)}">{label}</a>'
-        f'<span class="st st-{status}">{status}</span>'
-        f'<span class="sub ph">{phase}</span></li>'
+        f'<li class="act" data-job="{html.escape(job.id)}" data-terminal="{terminal}" '
+        f'data-status="{status}">'
+        f'<a class="act-link" href="/jobs/{html.escape(job.id)}">'
+        f'<div class="act-row"><span class="st st-{status}">{status}</span>'
+        f'<span class="act-title">{label}</span></div>'
+        f'<div class="act-phase">{html.escape(phase)}</div>'
+        f'<div class="bar"><span style="width:{pct}%"></span></div></a></li>'
     )
 
 
 def _home_html(sets: list[AnalysedSet], jobs: list[Job]) -> bytes:
-    """The library home: everything analysed so far, plus any in-flight analyses."""
+    """The home: a drop-a-link hero, anything in flight, and the library of analysed mixes."""
 
     active = [job for job in jobs if job.status != "succeeded"]
     activity = ""
     if active:
         items = "".join(_activity_item_html(job) for job in active)
-        activity = f'<h2>In progress</h2><ul class="acts">{items}</ul>'
+        activity = f'<h2 class="sec">In progress</h2><ul class="acts">{items}</ul>'
     body = (
-        _topbar(show_back=False, show_new=True)
-        + "<h1>Your mixes</h1>"
-        + '<p class="sub">Every mix you analyse is saved here — open one anytime, or start a new '
-        "analysis. Everything runs on this machine.</p>"
+        topbar_html(back=False, new=True) + '<main class="home"><header class="hero-home">'
+        '<p class="eyebrow">DJ-set track identifier · runs on this machine</p>'
+        '<h1>Drop a mix.<br><span class="grad">Get the tracklist.</span></h1>'
+        '<p class="lede">Paste a SoundCloud, YouTube or Mixcloud link. It listens to the set in '
+        "short windows, asks the recognition engines what is playing, and hands you a "
+        "click-to-jump tracklist with honest confidence for every track.</p>"
+        + _form_html()
+        + "</header>"
         + activity
-        + "<h2>Analysed mixes</h2>"
+        + '<h2 class="sec">Your mixes</h2>'
+        + _library_stats_html(sets)
         + _mixes_block(sets)
+        + _footer_html()
+        + "</main>"
     )
-    return _page_shell("id-detector — your mixes", body)
+    return _page_shell("id-detector — your mixes", body, _FORM_JS + _HOME_JS)
 
 
-def _new_html() -> bytes:
-    """The New-mix page: the analyse form on its own, reachable from the library and job pages."""
+def _new_html(prefill: str = "") -> bytes:
+    """The New-mix page: the analyse form on its own (also the "try again" landing)."""
 
-    profile_options = "".join(
-        f'<option value="{html.escape(name)}">{html.escape(name)}</option>' for name in _PROFILES
-    )
     body = (
-        _topbar(show_back=True, show_new=False)
-        + "<h1>New mix</h1>"
-        + '<p class="sub">Paste a mix link (or a local audio file path) and analyse it.</p>'
-        '<form method="post" action="/analyse">'
-        '<div class="field"><label for="url">Mix URL or file</label>'
-        '<input id="url" name="url" type="text" required autofocus '
-        'placeholder="https://soundcloud.com/... (or a local file path)"></div>'
-        '<div class="field"><label for="profile">Profile</label>'
-        f'<select id="profile" name="profile">{profile_options}</select></div>'
-        '<div class="field"><label>Options</label><div class="opts">'
-        '<label><input type="checkbox" name="acquire" value="1"> '
-        "Also fetch where-to-buy / download links</label>"
-        '<label><input type="checkbox" name="build_index" value="1"> '
-        "Build a reference index first (helps identify unreleased tracks)</label></div></div>"
-        '<div class="field"><button type="submit">Analyse</button></div>'
-        "</form>"
+        topbar_html(back=True, new=False) + '<main class="home"><header class="hero-home">'
+        '<p class="eyebrow">New mix</p>'
+        '<h1>What is in <span class="grad">this one</span>?</h1>'
+        '<p class="lede">Paste a mix link or a local audio file path, pick your options, and '
+        "hit Analyse. You can leave the page while it runs — it keeps going on this machine.</p>"
+        + _form_html(prefill)
+        + "</header>"
+        '<h2 class="sec">How it works</h2><div class="how">'
+        '<div><span class="n">1</span><b>Fetch &amp; slice</b>'
+        "<small>The audio is downloaded once and cut into short overlapping windows.</small></div>"
+        '<div><span class="n">2</span><b>Listen</b>'
+        "<small>Each window is sent to the recognition engines — politely, at their rate "
+        "limit.</small></div>"
+        '<div><span class="n">3</span><b>Stitch</b>'
+        "<small>Matches are fused into track episodes with honest confidence tiers; unknown "
+        "stretches stay marked ID.</small></div>"
+        '<div><span class="n">4</span><b>Play</b>'
+        "<small>You get a page where clicking any track jumps the player to that moment.</small>"
+        "</div></div>" + _footer_html() + "</main>"
     )
-    return _page_shell("id-detector — new mix", body)
+    return _page_shell("id-detector — new mix", body, _FORM_JS)
+
+
+def _job_steps(job: Job) -> list[tuple[str, str, str]]:
+    """The step tracker for this job — phase key, label, one-line sublabel — in pipeline order."""
+
+    steps: list[tuple[str, str, str]] = []
+    if job.build_index:
+        steps.append(("build_index", "Index", "fingerprint the uploader's tracks"))
+    steps += [
+        ("ingest", "Fetch", "download the mix"),
+        ("decode", "Decode", "to raw audio"),
+        ("windows", "Slice", "into short windows"),
+        ("recognise", "Listen", "ask the engines"),
+        ("hints", "Hints", "read the comments"),
+        ("fuse", "Stitch", "build track episodes"),
+    ]
+    if job.acquire:
+        steps.append(("enrich", "Links", "where to get each track"))
+    steps.append(("present", "Page", "write your tracklist"))
+    return steps
 
 
 def _job_page_html(job: Job) -> bytes:
     label = html.escape(job.display)
-    page = (
-        '<!doctype html><html lang="en"><head><meta charset="utf-8">'
-        '<meta name="viewport" content="width=device-width, initial-scale=1">'
-        "<title>id-detector — analysis</title><style>" + _APP_CSS + "</style></head><body>"
-        + _topbar(show_back=True, show_new=True)
-        + f'<h1>Analysing</h1><p class="sub">{label}</p>'
-        '<p>Status: <span class="st" id="status">…</span> '
-        '<button class="ghost" id="cancel" type="button">Cancel</button></p>'
-        '<p id="phase" class="sub"></p>'
-        '<div class="bar"><span id="fill"></span></div>'
-        '<p class="sub mono" id="windows"></p><p class="sub mono" id="eta"></p>'
-        '<p id="result"></p>'
-        '<h2>Log</h2><pre id="log"></pre>'
-        "<script>"
-        f"var JOB_ID={json.dumps(job.id)};"
-        "function fmt(s){s=Math.max(0,Math.round(s));var m=Math.floor(s/60);"
-        "return m?(m+'m '+(s%60)+'s'):(s+'s');}"
-        "function tick(){fetch('/jobs/'+JOB_ID+'/status').then(function(r){return r.json();})"
-        ".then(function(j){"
-        "var st=document.getElementById('status');st.textContent=j.status;"
-        "st.className='st st-'+j.status;"
-        "document.getElementById('phase').textContent=j.message?(j.phase+' — '+j.message):j.phase;"
-        "var total=j.windows_total||0,done=j.windows_done||0;"
-        "var pct=total?Math.round(done*100/total):(j.terminal?100:0);"
-        "document.getElementById('fill').style.width=pct+'%';"
-        "document.getElementById('windows').textContent="
-        "total?('windows '+done+' / '+total):'';"
-        "document.getElementById('eta').textContent="
-        "(j.eta_seconds&&!j.terminal)?('~'+fmt(j.eta_seconds)+' left at the rate limit'):'';"
-        "var res=document.getElementById('result');"
-        "if(j.status==='succeeded'&&j.result_url){res.innerHTML="
-        "'<a class=\"btn\" href=\"'+j.result_url+'\">Open the result page →</a>';}"
-        "else if(j.error){res.textContent='Error: '+j.error;}"
-        "document.getElementById('log').textContent=(j.log||[]).join('\\n');"
-        "if(!j.terminal){setTimeout(tick,2000);}});}"
-        "document.getElementById('cancel').addEventListener('click',function(){"
-        "fetch('/jobs/'+JOB_ID+'/cancel',{method:'POST'}).then(tick);});"
-        "tick();"
-        "</script></body></html>"
+    steps = _job_steps(job)
+    steps_html = "".join(
+        f'<div class="step" data-step="{html.escape(key)}"><div class="k"><i>{n}</i>'
+        f"{html.escape(name)}</div><small>{html.escape(sub)}</small></div>"
+        for n, (key, name, sub) in enumerate(steps, start=1)
     )
-    return page.encode("utf-8")
+    tiles = (
+        '<div class="tiles"><span><b id="t-windows">—</b>windows</span>'
+        '<span><b id="t-eta">…</b>time left</span><span><b id="t-elapsed">—</b>elapsed</span>'
+        "<span><b>18/min</b>engine rate limit</span></div>"
+    )
+    body = (
+        topbar_html(back=True, new=True) + '<main><header class="job-head"><div class="titles">'
+        '<p class="eyebrow" id="eyebrow">Analysing</p>'
+        f'<h1 id="title">{label}</h1><p class="job-url" id="url" style="display:none">{label}</p>'
+        '</div><div class="job-actions"><span class="st" id="status">…</span>'
+        '<button class="btn danger" id="cancel" type="button">Cancel</button></div></header>'
+        '<section class="scan" id="scan"><div class="scan-top">'
+        '<div class="pct" id="pct">0<small>%</small></div>'
+        '<div class="phase-line"><div class="phase-name" id="phase-name">Starting</div>'
+        '<div class="phase-msg" id="phase-msg"></div></div>' + tiles + "</div>"
+        '<div class="cells idle" id="cells" aria-hidden="true"></div>'
+        '<p class="flavour" id="flavour"></p></section>'
+        '<section class="outcome" id="outcome"><div class="confetti" id="confetti"></div>'
+        '<h2 id="o-title"></h2><p id="o-sub"></p><pre class="err" id="o-err"></pre>'
+        '<div class="row" id="o-row"></div></section>'
+        f'<div class="steps">{steps_html}</div>'
+        '<details class="log"><summary>Show the log</summary><pre id="log"></pre></details>'
+        + _footer_html()
+        + "</main>"
+    )
+    script = (
+        f"var JOB_ID={json.dumps(job.id)};var DISPLAY={json.dumps(job.display)};"
+        f"var STEPS={json.dumps(steps)};" + _JOB_JS
+    )
+    return _page_shell("Analysing — id-detector", body, script)
 
 
 class _Handler(BaseHTTPRequestHandler):
@@ -478,7 +1018,9 @@ class _Handler(BaseHTTPRequestHandler):
             self._send(HTTPStatus.OK, body, _CONTENT_TYPES[".html"])
             return
         if self._app_active() and route == "/new":
-            self._send(HTTPStatus.OK, _new_html(), _CONTENT_TYPES[".html"])
+            query = parse_qs(urlsplit(self.path).query)
+            prefill = (query.get("url") or [""])[0][:2048]
+            self._send(HTTPStatus.OK, _new_html(prefill), _CONTENT_TYPES[".html"])
             return
         if self._app_active() and route.startswith("/jobs/"):
             self._handle_job_get(route)
@@ -487,6 +1029,9 @@ class _Handler(BaseHTTPRequestHandler):
         if served is None:
             self._send(HTTPStatus.NOT_FOUND, b"not found", "text/plain; charset=utf-8")
             return
+        if served.name == "index.html" and served.parent.name == "present":
+            # A page written by an older build is re-rendered from its artefacts on open.
+            ensure_fresh_page(served.parent.parent, config=self.config)
         with open(native_path(served), "rb") as handle:
             body = handle.read()
         self._send(HTTPStatus.OK, body, _CONTENT_TYPES[served.suffix.lower()])

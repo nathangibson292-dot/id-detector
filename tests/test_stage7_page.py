@@ -433,3 +433,17 @@ def test_generate_page_writes_index_and_sidecar(tmp_path: Path) -> None:
     assert index.name == "index.html"
     assert (media_dir / "present" / "index.done.json").is_file()
     assert "iframe_api" in index.read_text("utf-8")  # youtube embed
+
+
+def test_page_carries_its_version_stamp() -> None:
+    """Every written page is stamped so an older page can be recognised and regenerated on open."""
+
+    from id_detector.present.page import PAGE_VERSION
+
+    page = render_page(
+        source=_source("soundcloud"),
+        episodes=_episodes_file(),
+        identities=_identities(),
+        duration_ms=DURATION_MS,
+    )
+    assert f'<meta name="id-detector-page" content="{PAGE_VERSION}">' in page

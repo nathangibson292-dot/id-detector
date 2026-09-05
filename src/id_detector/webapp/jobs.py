@@ -144,6 +144,7 @@ class JobContext:
         self._manager = manager
         self._job = job
         self._last_phase: str | None = None
+        self._last_logged: tuple[str, str] | None = None
 
     @property
     def target(self) -> str:
@@ -182,8 +183,13 @@ class JobContext:
             if phase == "recognise":
                 self._job.windows_done = done
                 self._job.windows_total = total
-            if phase != self._last_phase:
+            # Log a phase when it starts and again when it completes with a new message, so the
+            # outcome of each phase ("ingest: <set title>", "windows: 212 windows",
+            # "fuse: 41 episodes") reaches the progress page — not just "started".
+            completed = total > 0 and done >= total and bool(safe)
+            if (phase != self._last_phase or completed) and (phase, safe) != self._last_logged:
                 self._job.log.append(f"{_stamp()} {phase}: {safe or 'started'}")
+                self._last_logged = (phase, safe)
         self._last_phase = phase
 
     def log(self, message: str) -> None:

@@ -21,16 +21,22 @@ Then the whole tool is a **browser page** — no commands after the first setup:
 
 1. **Double-click `id-detector.cmd`** in this folder. A terminal opens the local server and your
    **browser opens automatically** at `http://127.0.0.1:8765`.
-2. **Paste a mix URL** (SoundCloud / YouTube / Mixcloud) into the box, pick a profile, and click
-   **Analyse**.
-3. Watch the **live progress** (which phase, how many windows done, an estimated time). When it
-   finishes you get the **result page**: a player with a timeline where **clicking any track row
-   jumps the player to that moment**, plus "where to get it" links.
+2. **Drop a mix link** (SoundCloud / YouTube / Mixcloud, or a local audio file path) into the big
+   box on the home page and click **Analyse**. Open **Options** to pick *Free* (Shazam only) or
+   *Max accuracy*, to also **find where to get each track**, or to **build a reference index
+   first** (fingerprints the uploader's own, possibly unreleased, tracks).
+3. Watch it work: a **scanner strip lights up window by window** as the set is listened to, with a
+   live percentage, time left, and a step tracker (Fetch → Decode → Slice → Listen → Hints →
+   Stitch → Page). You can leave the page — it keeps running on this machine.
+4. When it finishes you get the **result page**: how much of the set was identified, the
+   confidence mix, a player with a confidence-coloured timeline where **clicking any track row
+   jumps the player to that moment**, a *NOW playing* readout, "where to get it" links, and
+   **Copy tracklist** / CUE / M3U / Markdown / JSON exports.
 
-Everything runs **only on your machine** (`127.0.0.1`); nothing is exposed to the network. The page
-also lists your recent and finished analyses, so you can leave it open and start more. Tick **also
-fetch acquire links** to add buy/download links, or **build reference index first** to fingerprint an
-uploader's own (possibly unreleased) tracks before analysing.
+Everything runs **only on your machine** (`127.0.0.1`); nothing is exposed to the network. The home
+page is your library: every analysed mix (with its track count and confidence bar) plus anything in
+progress, so you can leave it open and queue more. Result pages written by an older version of the
+tool are refreshed to the current look the first time you open them — no re-analysis needed.
 
 ### The command line (optional)
 

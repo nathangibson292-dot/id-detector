@@ -283,7 +283,9 @@ def test_home_renders_library_when_analyse_enabled(tmp_path: Path) -> None:
         # Home is the mixes library with a "New mix" button — not the analyse form itself.
         assert "Your mixes" in page.text
         assert 'href="/new"' in page.text
-        assert 'action="/analyse"' not in page.text
+        # The home carries the drop-a-link form too (paste → Analyse is the first thing you see);
+        # /new is the same form on its own page.
+        assert 'action="/analyse"' in page.text
     finally:
         running.shutdown()
         manager.shutdown()
@@ -419,3 +421,30 @@ def test_cancel_route(tmp_path: Path) -> None:
         running.shutdown()
         manager.shutdown()
     assert _wait_until(_no_worker_thread_alive)
+
+
+def test_progress_logs_phase_completions_for_the_progress_page(tmp_path: Path) -> None:
+    """A phase is logged when it starts AND when it completes with a new message, so the outcome of
+    each phase (the set title, the window count, the episode count) reaches the progress page."""
+
+    def runner(ctx: JobContext) -> None:
+        ctx.progress("ingest", 0, 1, "resolving source")
+        ctx.progress("ingest", 1, 1, "Fixture Live Set")
+        ctx.progress("windows", 0, 1, "cutting windows")
+        ctx.progress("windows", 1, 1, "212 windows")
+        for done in range(1, 4):  # the same message throughout: logged once, not per tick
+            ctx.progress("recognise", done, 3, "recognising windows")
+        ctx.progress("fuse", 0, 1, "fusing episodes")
+        ctx.progress("fuse", 1, 1, "41 episodes")
+
+    manager = JobManager(tmp_path, runner)
+    try:
+        job_id = manager.submit(CLEAN_URL, "free")
+        assert _wait_until(lambda: manager.get(job_id).status == "succeeded")
+        log = "\n".join(manager.get(job_id).log)
+    finally:
+        manager.shutdown()
+    assert _wait_until(_no_worker_thread_alive)
+    for line in ("ingest: Fixture Live Set", "windows: 212 windows", "fuse: 41 episodes"):
+        assert line in log
+    assert log.count("recognise: recognising windows") == 1

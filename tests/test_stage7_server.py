@@ -173,3 +173,44 @@ def test_build_rescan_request_hashes_episodes_when_present(tmp_path: Path) -> No
     assert request.generation == episodes.generation
     # The record is schema-valid and its id is deterministic.
     assert json.loads(request.model_dump_json())["trigger"] == "gap"
+
+
+def test_stale_result_page_is_regenerated_on_open(tmp_path: Path) -> None:
+    """A page written by an older build (no version stamp) is re-rendered from the artefacts the
+    first time the server serves it — no re-analysis, and the artefacts themselves are untouched."""
+
+    from id_detector.present.page import PAGE_VERSION
+    from id_detector.present.refresh import ensure_fresh_page, page_version
+
+    source = _source("soundcloud")
+    media_dir = _seed_work_root(tmp_path, source)
+    (media_dir / "decode").mkdir()
+    golden_pcm = Path(__file__).resolve().parents[1] / "tests" / "golden" / "pcm.json"
+    (media_dir / "decode" / "pcm.json").write_bytes(golden_pcm.read_bytes())
+    index_html = media_dir / "present" / "index.html"
+    episodes_before = (media_dir / "fuse" / "episodes.json").read_bytes()
+
+    # A fresh page is left alone.
+    assert page_version(index_html) == PAGE_VERSION
+    assert ensure_fresh_page(media_dir) is False
+
+    # An old page (pre-stamp) is rewritten when served.
+    index_html.write_bytes(b"<!doctype html><title>old page</title><p>Fixture Live Set</p>")
+    assert page_version(index_html) == 0
+    running = serve_in_background(tmp_path, port=0)
+    try:
+        page_url = f"{running.base_url}/{source.source_key}/{source.media_key}/present/index.html"
+        page = httpx.get(page_url, timeout=TIMEOUT)
+        assert page.status_code == 200
+        assert f'<meta name="id-detector-page" content="{PAGE_VERSION}">' in page.text
+        assert '<tr class="track"' in page.text
+    finally:
+        running.shutdown()
+    assert page_version(index_html) == PAGE_VERSION
+    assert (media_dir / "fuse" / "episodes.json").read_bytes() == episodes_before
+
+    # A page that cannot be regenerated (artefact missing) is served as-is, never an error.
+    index_html.write_bytes(b"<!doctype html><title>old page</title>")
+    (media_dir / "decode" / "pcm.json").unlink()
+    assert ensure_fresh_page(media_dir) is False
+    assert index_html.read_bytes().startswith(b"<!doctype html><title>old page</title>")
