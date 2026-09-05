@@ -46,7 +46,7 @@ contract, provider call or CLI behaviour changed.*
   so pre-field episodes still load) wins, then `short_track()`.  Suppressed rows get the same
   treatment as short ones, with a friendly label tag; the note reads
   "N matches (K short, M suppressed) hidden".
-- `<meta name="id-detector-page" content="N">` version stamp (`PAGE_VERSION = 4`).
+- `<meta name="id-detector-page" content="N">` version stamp (`PAGE_VERSION = 5`).
 - Everything the Stage 7/11/12 tests pin is intact: byte-identical seek + playhead JS, the
   `EPISODE_SPANS` partition, `.current` row/lane highlight, per-platform position hooks, the
   `closest('a,button,details,summary')` guard, valid nesting, no handles / identifier fields.
