@@ -194,123 +194,184 @@ def _discover_sets(work_root: Path) -> list[AnalysedSet]:
 
 
 def _index_html(sets: list[AnalysedSet]) -> bytes:
-    rows = "".join(
-        f'<li><a href="/{html.escape(item.source_key)}/{html.escape(item.media_key)}'
-        f'/present/index.html">{html.escape(item.title)}</a> '
-        f'<span class="p">{html.escape(item.platform)}</span></li>'
-        for item in sets
+    """Read-only mode home: the mixes library with no analyse form (Stage 7 index)."""
+
+    body = (
+        _topbar(show_back=False, show_new=False)
+        + "<h1>Analysed sets</h1>"
+        + '<p class="sub">Every mix analysed under this work root. Open one to explore its '
+        "tracklist.</p>"
+        + _mixes_block(sets)
     )
-    if not rows:
-        rows = "<li>No analysed sets found under this work root.</li>"
-    page = (
-        '<!doctype html><html lang="en"><head><meta charset="utf-8">'
-        '<meta name="viewport" content="width=device-width, initial-scale=1">'
-        "<title>id-detector — analysed sets</title><style>"
-        "body{font:14px/1.5 system-ui,sans-serif;max-width:720px;margin:40px auto;padding:0 16px;"
-        "color:#1c1c1c}@media(prefers-color-scheme:dark){body{background:#16171a;color:#e9e9ea}}"
-        "h1{font-size:19px}ul{list-style:none;padding:0}li{padding:8px 0;border-bottom:1px solid "
-        "#8883}a{color:#2b6cb0;text-decoration:none}.p{color:#888;font-size:12px}"
-        "</style></head><body><h1>Analysed sets</h1><ul>" + rows + "</ul></body></html>"
-    )
-    return page.encode("utf-8")
+    return _page_shell("id-detector — analysed sets", body)
 
 
 # --------------------------------------------------------------------------------------------------
 # Web-app pages (self-contained inline HTML/CSS/JS; no usernames or comment text)
 # --------------------------------------------------------------------------------------------------
 _APP_CSS = (
-    "body{font:14px/1.5 system-ui,-apple-system,Segoe UI,Roboto,sans-serif;max-width:820px;"
-    "margin:32px auto;padding:0 16px;color:#1c1c1c;background:#faf9f7}"
+    "*{box-sizing:border-box}"
+    "body{font:14px/1.6 system-ui,-apple-system,Segoe UI,Roboto,sans-serif;max-width:860px;"
+    "margin:0 auto;padding:0 20px 56px;color:#1c1c1c;background:#faf9f7}"
     "@media(prefers-color-scheme:dark){body{background:#16171a;color:#e9e9ea}}"
-    "h1{font-size:20px;margin:0 0 4px}h2{font-size:15px;margin:24px 0 8px}"
+    "a{color:#2b6cb0;text-decoration:none}a:hover{text-decoration:underline}"
+    ".topbar{display:flex;align-items:center;justify-content:space-between;gap:12px;"
+    "padding:16px 0 12px;margin-bottom:18px;border-bottom:1px solid #8883;position:sticky;top:0;"
+    "background:inherit;z-index:5}"
+    ".brand{font-size:16px;font-weight:700;letter-spacing:-.01em;color:inherit}"
+    ".brand:hover{text-decoration:none}.brand .dot{color:#2b6cb0}"
+    ".nav{display:flex;gap:8px;align-items:center}"
+    ".btn{font:inherit;font-size:13px;padding:8px 14px;border-radius:8px;border:1px solid #2b6cb0;"
+    "background:#2b6cb0;color:#fff;cursor:pointer;display:inline-flex;align-items:center;gap:6px;"
+    "white-space:nowrap;line-height:1}.btn:hover{background:#255d99;text-decoration:none}"
+    ".btn.ghost{background:transparent;color:#2b6cb0}.btn.ghost:hover{background:#2b6cb01a}"
+    "h1{font-size:22px;margin:6px 0 2px}"
+    "h2{font-size:12px;margin:26px 0 10px;color:#888;text-transform:uppercase;letter-spacing:.04em}"
     ".sub{color:#888;font-size:13px;margin:0 0 18px}"
-    "form{background:#fff2;border:1px solid #8883;border-radius:10px;padding:16px;margin:0 0 8px}"
+    "form{background:#fff2;border:1px solid #8883;border-radius:12px;padding:18px;margin:8px 0}"
     "@media(prefers-color-scheme:dark){form{background:#212228}}"
-    ".row{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin:8px 0}"
-    "label{font-size:13px}input[type=text]{flex:1;min-width:260px;padding:7px 9px;border:1px solid "
-    "#8886;border-radius:6px;background:transparent;color:inherit}"
-    "select{padding:6px;border:1px solid #8886;border-radius:6px;background:transparent;"
-    "color:inherit}"
-    "button{font:inherit;padding:8px 16px;border:1px solid #2b6cb0;border-radius:7px;"
+    ".field{margin:16px 0}.field:first-child{margin-top:2px}"
+    ".field>label{display:block;font-size:11px;color:#888;text-transform:uppercase;"
+    "letter-spacing:.03em;margin-bottom:6px}"
+    "input[type=text]{width:100%;padding:10px 12px;border:1px solid #8886;border-radius:8px;"
+    "background:transparent;color:inherit;font:inherit}"
+    "select{padding:8px 10px;border:1px solid #8886;border-radius:8px;background:transparent;"
+    "color:inherit;font:inherit}"
+    ".opts{display:flex;flex-direction:column;gap:9px;margin-top:8px}"
+    ".opts label{display:flex;gap:8px;align-items:flex-start;font-size:13px;color:inherit}"
+    ".opts input{margin-top:3px}"
+    "button{font:inherit;padding:9px 18px;border:1px solid #2b6cb0;border-radius:8px;"
     "background:#2b6cb0;color:#fff;cursor:pointer}button.ghost{background:transparent;color:#2b6cb0}"
-    "table{width:100%;border-collapse:collapse}td,th{padding:6px 8px;text-align:left;"
-    "border-bottom:1px solid #8883;font-size:13px;vertical-align:top}"
-    "th{color:#888;text-transform:uppercase;font-size:11px;letter-spacing:.03em}"
-    "a{color:#2b6cb0;text-decoration:none}.st{font-weight:600}"
+    ".mixes,.acts{list-style:none;padding:0;margin:0;display:flex;flex-direction:column;gap:8px}"
+    ".mix{border:1px solid #8883;border-radius:10px;background:#fff2;"
+    "transition:border-color .12s,box-shadow .12s}"
+    "@media(prefers-color-scheme:dark){.mix{background:#1d1e23}}"
+    ".mix:hover{border-color:#2b6cb0;box-shadow:0 1px 6px #2b6cb022}"
+    ".mix-link{display:flex;align-items:center;gap:12px;padding:14px 16px;color:inherit}"
+    ".mix-link:hover{text-decoration:none}"
+    ".tt{font-weight:600;font-size:15px;flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;"
+    "white-space:nowrap}"
+    ".pill{font-size:11px;color:#888;border:1px solid #8884;border-radius:20px;padding:2px 10px;"
+    "white-space:nowrap;text-transform:capitalize}"
+    ".go{color:#2b6cb0;font-size:18px;line-height:1}"
+    ".act{display:flex;align-items:center;gap:10px;padding:12px 16px;border:1px solid #8883;"
+    "border-radius:10px;background:#fff2}@media(prefers-color-scheme:dark){.act{background:#1d1e23}}"
+    ".act .tt{font-size:14px}.act .ph{margin:0;font-size:12px}"
+    ".empty{border:1px dashed #8885;border-radius:12px;padding:36px 20px;text-align:center;"
+    "color:#888}.empty p{margin:0 0 14px}"
+    ".st{font-weight:600;font-size:12px;text-transform:capitalize}"
     ".st-succeeded{color:#1f7a4d}.st-failed{color:#b23b3b}.st-running{color:#2b6cb0}"
-    ".st-queued{color:#b8860b}.st-cancelled{color:#888}ul{list-style:none;padding:0}"
-    "li{padding:6px 0;border-bottom:1px solid #8883}.bar{height:12px;border-radius:6px;"
-    "background:#8883;overflow:hidden;margin:6px 0}.bar>span{display:block;height:100%;"
-    "background:#2b6cb0;width:0}pre{white-space:pre-wrap;word-break:break-word;background:#0000000a;"
-    "border:1px solid #8883;border-radius:8px;padding:10px;font-size:12px;max-height:240px;"
-    "overflow:auto}@media(prefers-color-scheme:dark){pre{background:#ffffff0a}}.mono{font-variant-"
-    "numeric:tabular-nums}"
+    ".st-queued{color:#b8860b}.st-cancelled{color:#888}"
+    ".bar{height:12px;border-radius:6px;background:#8883;overflow:hidden;margin:6px 0}"
+    ".bar>span{display:block;height:100%;background:#2b6cb0;width:0;transition:width .3s}"
+    "pre{white-space:pre-wrap;word-break:break-word;background:#0000000a;border:1px solid #8883;"
+    "border-radius:8px;padding:10px;font-size:12px;max-height:240px;overflow:auto}"
+    "@media(prefers-color-scheme:dark){pre{background:#ffffff0a}}"
+    ".mono{font-variant-numeric:tabular-nums}"
 )
 
 
-def _job_row_html(job: Job) -> str:
+def _topbar(*, show_back: bool, show_new: bool) -> str:
+    """The shared sticky header: an id-detector brand (home link) and optional nav actions."""
+
+    nav = ""
+    if show_back:
+        nav += '<a class="btn ghost" href="/">← Your mixes</a>'
+    if show_new:
+        nav += '<a class="btn" href="/new">+ New mix</a>'
+    return (
+        '<nav class="topbar"><a class="brand" href="/">id<span class="dot">·</span>detector</a>'
+        f'<span class="nav">{nav}</span></nav>'
+    )
+
+
+def _page_shell(title: str, body: str) -> bytes:
+    return (
+        '<!doctype html><html lang="en"><head><meta charset="utf-8">'
+        '<meta name="viewport" content="width=device-width, initial-scale=1">'
+        f"<title>{html.escape(title)}</title><style>{_APP_CSS}</style></head><body>"
+        f"{body}</body></html>"
+    ).encode()
+
+
+def _mix_card_html(item: AnalysedSet) -> str:
+    href = f"/{html.escape(item.source_key)}/{html.escape(item.media_key)}/present/index.html"
+    return (
+        f'<li class="mix"><a class="mix-link" href="{href}">'
+        f'<span class="tt">{html.escape(item.title)}</span>'
+        f'<span class="pill">{html.escape(item.platform)}</span>'
+        '<span class="go" aria-hidden="true">→</span></a></li>'
+    )
+
+
+def _mixes_block(sets: list[AnalysedSet]) -> str:
+    """The library list of analysed mixes, or an empty state with a New-mix call to action."""
+
+    if sets:
+        cards = "".join(_mix_card_html(item) for item in sets)
+        return f'<ul class="mixes">{cards}</ul>'
+    return (
+        '<div class="empty"><p>No mixes analysed yet.</p>'
+        '<a class="btn" href="/new">+ Analyse your first mix</a></div>'
+    )
+
+
+def _activity_item_html(job: Job) -> str:
     status = html.escape(job.status)
     label = html.escape(job.display)
-    phase = html.escape(job.phase)
-    extras = []
-    if job.acquire:
-        extras.append("acquire")
-    if job.build_index:
-        extras.append("index")
-    tags = f' <span class="sub">({html.escape(", ".join(extras))})</span>' if extras else ""
-    result = ""
-    if job.status == "succeeded" and job.result_path:
-        result = f' · <a href="/{html.escape(job.result_path)}">result</a>'
+    phase = html.escape(job.message and f"{job.phase} — {job.message}" or job.phase)
     return (
-        f'<tr><td><a href="/jobs/{html.escape(job.id)}">{label}</a>{tags}</td>'
-        f'<td><span class="st st-{status}">{status}</span></td>'
-        f'<td class="sub">{phase}{result}</td></tr>'
+        f'<li class="act"><a class="tt" href="/jobs/{html.escape(job.id)}">{label}</a>'
+        f'<span class="st st-{status}">{status}</span>'
+        f'<span class="sub ph">{phase}</span></li>'
     )
 
 
 def _home_html(sets: list[AnalysedSet], jobs: list[Job]) -> bytes:
+    """The library home: everything analysed so far, plus any in-flight analyses."""
+
+    active = [job for job in jobs if job.status != "succeeded"]
+    activity = ""
+    if active:
+        items = "".join(_activity_item_html(job) for job in active)
+        activity = f'<h2>In progress</h2><ul class="acts">{items}</ul>'
+    body = (
+        _topbar(show_back=False, show_new=True)
+        + "<h1>Your mixes</h1>"
+        + '<p class="sub">Every mix you analyse is saved here — open one anytime, or start a new '
+        "analysis. Everything runs on this machine.</p>"
+        + activity
+        + "<h2>Analysed mixes</h2>"
+        + _mixes_block(sets)
+    )
+    return _page_shell("id-detector — your mixes", body)
+
+
+def _new_html() -> bytes:
+    """The New-mix page: the analyse form on its own, reachable from the library and job pages."""
+
     profile_options = "".join(
         f'<option value="{html.escape(name)}">{html.escape(name)}</option>' for name in _PROFILES
     )
-    if jobs:
-        job_rows = "".join(_job_row_html(job) for job in jobs)
-        jobs_table = (
-            "<table><thead><tr><th>Mix</th><th>Status</th><th>Phase</th></tr></thead>"
-            f"<tbody>{job_rows}</tbody></table>"
-        )
-    else:
-        jobs_table = '<p class="sub">No analyses yet — paste a mix URL above and click Analyse.</p>'
-    set_rows = "".join(
-        f'<li><a href="/{html.escape(item.source_key)}/{html.escape(item.media_key)}'
-        f'/present/index.html">{html.escape(item.title)}</a> '
-        f'<span class="sub">{html.escape(item.platform)}</span></li>'
-        for item in sets
-    )
-    sets_block = f"<ul>{set_rows}</ul>" if set_rows else '<p class="sub">None yet.</p>'
-    page = (
-        '<!doctype html><html lang="en"><head><meta charset="utf-8">'
-        '<meta name="viewport" content="width=device-width, initial-scale=1">'
-        "<title>id-detector</title><style>" + _APP_CSS + "</style></head><body>"
-        "<h1>id-detector</h1>"
-        '<p class="sub">Paste a mix link and analyse it — everything runs on this machine.</p>'
+    body = (
+        _topbar(show_back=True, show_new=False)
+        + "<h1>New mix</h1>"
+        + '<p class="sub">Paste a mix link (or a local audio file path) and analyse it.</p>'
         '<form method="post" action="/analyse">'
-        '<div class="row"><label for="url">Mix URL</label>'
-        '<input id="url" name="url" type="text" required '
+        '<div class="field"><label for="url">Mix URL or file</label>'
+        '<input id="url" name="url" type="text" required autofocus '
         'placeholder="https://soundcloud.com/... (or a local file path)"></div>'
-        '<div class="row"><label for="profile">Profile</label>'
-        f'<select id="profile" name="profile">{profile_options}</select>'
-        '<label><input type="checkbox" name="acquire" value="1"> also fetch acquire links</label>'
+        '<div class="field"><label for="profile">Profile</label>'
+        f'<select id="profile" name="profile">{profile_options}</select></div>'
+        '<div class="field"><label>Options</label><div class="opts">'
+        '<label><input type="checkbox" name="acquire" value="1"> '
+        "Also fetch where-to-buy / download links</label>"
         '<label><input type="checkbox" name="build_index" value="1"> '
-        "build reference index first (unreleased tracks)</label></div>"
-        '<div class="row"><button type="submit">Analyse</button></div>'
+        "Build a reference index first (helps identify unreleased tracks)</label></div></div>"
+        '<div class="field"><button type="submit">Analyse</button></div>'
         "</form>"
-        "<h2>Recent analyses</h2>"
-        + jobs_table
-        + "<h2>Finished result pages</h2>"
-        + sets_block
-        + "</body></html>"
     )
-    return page.encode("utf-8")
+    return _page_shell("id-detector — new mix", body)
 
 
 def _job_page_html(job: Job) -> bytes:
@@ -319,8 +380,8 @@ def _job_page_html(job: Job) -> bytes:
         '<!doctype html><html lang="en"><head><meta charset="utf-8">'
         '<meta name="viewport" content="width=device-width, initial-scale=1">'
         "<title>id-detector — analysis</title><style>" + _APP_CSS + "</style></head><body>"
-        '<p class="sub"><a href="/">← all analyses</a></p>'
-        f'<h1>Analysing</h1><p class="sub">{label}</p>'
+        + _topbar(show_back=True, show_new=True)
+        + f'<h1>Analysing</h1><p class="sub">{label}</p>'
         '<p>Status: <span class="st" id="status">…</span> '
         '<button class="ghost" id="cancel" type="button">Cancel</button></p>'
         '<p id="phase" class="sub"></p>'
@@ -346,7 +407,7 @@ def _job_page_html(job: Job) -> bytes:
         "(j.eta_seconds&&!j.terminal)?('~'+fmt(j.eta_seconds)+' left at the rate limit'):'';"
         "var res=document.getElementById('result');"
         "if(j.status==='succeeded'&&j.result_url){res.innerHTML="
-        "'<a href=\"'+j.result_url+'\">Open the result page →</a>';}"
+        "'<a class=\"btn\" href=\"'+j.result_url+'\">Open the result page →</a>';}"
         "else if(j.error){res.textContent='Error: '+j.error;}"
         "document.getElementById('log').textContent=(j.log||[]).join('\\n');"
         "if(!j.terminal){setTimeout(tick,2000);}});}"
@@ -415,6 +476,9 @@ class _Handler(BaseHTTPRequestHandler):
             else:
                 body = _index_html(_discover_sets(self.work_root))
             self._send(HTTPStatus.OK, body, _CONTENT_TYPES[".html"])
+            return
+        if self._app_active() and route == "/new":
+            self._send(HTTPStatus.OK, _new_html(), _CONTENT_TYPES[".html"])
             return
         if self._app_active() and route.startswith("/jobs/"):
             self._handle_job_get(route)

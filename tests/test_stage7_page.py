@@ -328,6 +328,23 @@ def test_page_is_parseable_and_lists_every_episode_id() -> None:
         assert f'data-gap-id="{gap.id}"' in page
 
 
+def test_result_page_has_library_and_new_mix_nav() -> None:
+    """The result page can navigate back to the library and start a new mix (multi-mix flow)."""
+
+    page = render_page(
+        source=_source("soundcloud"),
+        episodes=_episodes_file(),
+        identities=_identities(),
+        duration_ms=DURATION_MS,
+    )
+    assert '<nav class="topbar">' in page
+    assert 'href="/"' in page  # ← Your mixes (back to the library home)
+    assert 'href="/new"' in page  # + New mix
+    validator = _Validator()
+    validator.feed(page)
+    assert validator.errors == []
+
+
 def test_page_contains_no_usernames_or_comment_text() -> None:
     """Reuse the fixture-audit handle/identifier patterns (style block excluded — CSS ``@media``
     at-rules are not usernames)."""

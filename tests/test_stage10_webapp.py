@@ -19,6 +19,7 @@ import pytest
 from id_detector.present.server import (
     _home_html,
     _job_page_html,
+    _new_html,
     make_server,
     serve_in_background,
 )
@@ -250,12 +251,15 @@ def test_home_and_job_pages_contain_no_usernames_or_identifier_fields() -> None:
     import re
 
     home = _home_html([], [_sample_job()]).decode("utf-8")
+    new = _new_html().decode("utf-8")
     job = _job_page_html(_sample_job()).decode("utf-8")
-    for page in (home, job):
+    for page in (home, new, job):
         without_style = re.sub(r"<style>.*?</style>", "", page, flags=re.DOTALL)
         assert _HANDLE.search(without_style) is None
         assert _ID_FIELD.search(page) is None
-    assert "Analyse" in home and "Recent analyses" in home
+    # The home page is the library ("Your mixes"); the analyse form lives on the New-mix page.
+    assert "Your mixes" in home and 'href="/new"' in home
+    assert 'action="/analyse"' in new
 
 
 # --------------------------------------------------------------------------------------------------
@@ -270,14 +274,16 @@ def test_make_server_only_binds_loopback(tmp_path: Path) -> None:
         manager.shutdown()
 
 
-def test_home_renders_form_when_analyse_enabled(tmp_path: Path) -> None:
+def test_home_renders_library_when_analyse_enabled(tmp_path: Path) -> None:
     manager = JobManager(tmp_path, _fast_runner_factory(tmp_path))
     running = serve_in_background(tmp_path, port=0, job_manager=manager)
     try:
         page = httpx.get(running.base_url + "/", timeout=TIMEOUT)
         assert page.status_code == 200
-        assert 'action="/analyse"' in page.text
-        assert "max_accuracy" in page.text
+        # Home is the mixes library with a "New mix" button — not the analyse form itself.
+        assert "Your mixes" in page.text
+        assert 'href="/new"' in page.text
+        assert 'action="/analyse"' not in page.text
     finally:
         running.shutdown()
         manager.shutdown()
@@ -285,8 +291,22 @@ def test_home_renders_form_when_analyse_enabled(tmp_path: Path) -> None:
     assert _wait_until(_no_worker_thread_alive)
 
 
+def test_new_page_renders_form_when_analyse_enabled(tmp_path: Path) -> None:
+    manager = JobManager(tmp_path, _fast_runner_factory(tmp_path))
+    running = serve_in_background(tmp_path, port=0, job_manager=manager)
+    try:
+        page = httpx.get(running.base_url + "/new", timeout=TIMEOUT)
+        assert page.status_code == 200
+        assert 'action="/analyse"' in page.text
+        assert "max_accuracy" in page.text
+    finally:
+        running.shutdown()
+        manager.shutdown()
+    assert _wait_until(_no_worker_thread_alive)
+
+
 def test_read_only_server_has_no_analyse_routes(tmp_path: Path) -> None:
-    # No job manager => the Stage 7 read-only index and a 404 for /analyse.
+    # No job manager => the Stage 7 read-only index and a 404 for /analyse and /new.
     running = serve_in_background(tmp_path, port=0)
     try:
         home = httpx.get(running.base_url + "/", timeout=TIMEOUT)
@@ -295,6 +315,8 @@ def test_read_only_server_has_no_analyse_routes(tmp_path: Path) -> None:
             running.base_url + "/analyse", json={"url": CLEAN_URL}, timeout=TIMEOUT
         )
         assert rejected.status_code == 404
+        no_new = httpx.get(running.base_url + "/new", timeout=TIMEOUT)
+        assert no_new.status_code == 404
     finally:
         running.shutdown()
 

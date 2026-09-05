@@ -458,7 +458,16 @@ _CSS = """
 --accent:#6aa9e9;}}
 *{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--fg);
 font:14px/1.5 system-ui,-apple-system,Segoe UI,Roboto,sans-serif}
-main{max-width:1040px;margin:0 auto;padding:20px}
+.topbar{max-width:1040px;margin:0 auto;padding:16px 20px 0;display:flex;align-items:center;
+justify-content:space-between;gap:12px}
+.topbar .brand{font-size:15px;font-weight:700;color:var(--fg);text-decoration:none}
+.topbar .brand .dot{color:var(--accent)}
+.topbar .nav{display:flex;gap:8px;align-items:center}
+.topbar .tb{font-size:13px;padding:7px 13px;border-radius:8px;border:1px solid var(--accent);
+text-decoration:none;white-space:nowrap;line-height:1;display:inline-flex;align-items:center}
+.topbar .tb.ghost{color:var(--accent);background:transparent}
+.topbar .tb.solid{color:#fff;background:var(--accent)}
+main{max-width:1040px;margin:0 auto;padding:16px 20px 20px}
 h1{font-size:20px;margin:0 0 2px}.sub{color:var(--muted);margin:0 0 16px;font-size:13px}
 .player{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:12px;
 margin-bottom:16px}.yt{aspect-ratio:16/9;width:100%}.yt iframe{width:100%;height:100%}
@@ -626,7 +635,14 @@ def render_page(
     )
     episode_spans_js = json.dumps(episode_spans)
 
-    body = f"""<main>
+    body = f"""<nav class="topbar">
+<a class="brand" href="/">id<span class="dot">·</span>detector</a>
+<span class="nav">
+<a class="tb ghost" href="/">← Your mixes</a>
+<a class="tb solid" href="/new">+ New mix</a>
+</span>
+</nav>
+<main>
 <h1>{_esc(title)}</h1>
 <p class="sub">{_esc(summary)}</p>
 <section class="player">{_embed_html(embed)}</section>
