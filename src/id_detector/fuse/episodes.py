@@ -754,15 +754,20 @@ def build_episodes(
     ]
 
     scanned = normalise_intervals([item.support_ms for item in windows], duration_ms)
-    duration_values, duration_intervals = partition_durations(duration_ms, episode_records, scanned)
+    # A suppressed episode is hidden from the tracklist, so its span is effectively unidentified:
+    # count it as an ID gap, not as coverage, so the coverage stat and the ID gaps match what the
+    # timeline actually shows (otherwise a suppressed phantom leaves a visible hole that still reads
+    # as "covered, 0 gaps").
+    listed_episodes = [episode for episode in episode_records if not episode.suppressed]
+    duration_values, duration_intervals = partition_durations(duration_ms, listed_episodes, scanned)
     gaps: list[GapRecord] = []
     for start, end in gap_intervals(duration_intervals["no_evidence_ms"]):
         interval = (start, end)
         prior = [
-            episode for episode in episode_records if episode.evidence_support_ms[-1][1] <= start
+            episode for episode in listed_episodes if episode.evidence_support_ms[-1][1] <= start
         ]
         following = [
-            episode for episode in episode_records if episode.evidence_support_ms[0][0] >= end
+            episode for episode in listed_episodes if episode.evidence_support_ms[0][0] >= end
         ]
         bounded = []
         if prior:
