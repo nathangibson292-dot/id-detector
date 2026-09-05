@@ -158,8 +158,11 @@ async def fetch_comments(
     if track_id is None:
         raise ConnectorError("SoundCloud resolve response has no track id")
     uploader_user_id = str(resolved.get("user_id")) if resolved.get("user_id") is not None else None
+    # threaded=1 returns the flat collection PLUS reply comments; the ID answers on a mix live in
+    # replies to the "ID?" questions (threaded=0 omits them entirely), and a reply carries the same
+    # waveform timestamp as the comment it answers, so the answer lands at the right position.
     cursor = context.job.cursor or (
-        f"https://api-v2.soundcloud.com/tracks/{track_id}/comments?threaded=0&limit=200"
+        f"https://api-v2.soundcloud.com/tracks/{track_id}/comments?threaded=1&limit=200"
     )
     page = context.job.page
     count = context.job.items_fetched
