@@ -37,6 +37,85 @@ def test_partial_overlap_bias_is_relative_to_first_fingerprinted_sample() -> Non
     )
 
 
+def test_token_bucket_backs_off_on_throttle_and_recovers_toward_ceiling() -> None:
+    # Ceiling 60/min (1.0 tok/s), floor 12/min (0.2 tok/s); cooldown off so every signal applies.
+    bucket = TokenBucket(
+        rate_per_minute=60, capacity=4, min_rate_per_minute=12, penalty_cooldown_s=0.0
+    )
+    assert bucket.rate_per_second == 1.0
+    bucket.penalize()
+    assert bucket.rate_per_second == 0.5  # halved -> 30/min
+    bucket.penalize()
+    assert bucket.rate_per_second == 0.25  # -> 15/min
+    bucket.penalize()
+    assert bucket.rate_per_second == 0.2  # would be 7.5/min but clamped to the 12/min floor
+    # Sustained success climbs back to the ceiling and never overshoots it.
+    for _ in range(1_000):
+        bucket.recover()
+    assert bucket.rate_per_second == 1.0
+
+
+def test_token_bucket_penalty_cooldown_collapses_a_concurrent_burst() -> None:
+    # N in-flight workers all seeing 429 at once must not slam the rate to the floor in one step.
+    bucket = TokenBucket(rate_per_minute=60, min_rate_per_minute=6, penalty_cooldown_s=30.0)
+    bucket.penalize()
+    after_first = bucket.rate_per_second
+    assert after_first == 0.5
+    bucket.penalize()  # within the cooldown window -> ignored
+    assert bucket.rate_per_second == after_first
+
+
+def test_concurrent_workers_match_serial_results_and_overlap(tmp_path: Path) -> None:
+    async def scenario() -> None:
+        in_flight = 0
+        max_in_flight = 0
+
+        async def handler(request: object) -> object:
+            nonlocal in_flight, max_in_flight
+            in_flight += 1
+            max_in_flight = max(max_in_flight, in_flight)
+            try:
+                await asyncio.sleep(0.03)  # simulate network latency so a pool can overlap
+                return __import__("httpx").Response(200, json=_fixture("response-match.json"))
+            finally:
+                in_flight -= 1
+
+        async def run(root: Path, concurrency: int) -> bytes:
+            decoded, _, media_dir = _decoded(root, 120_000)
+            windows = await generate_windows_async(decoded, media_dir)
+            config, _ = load_provider_config(tmp_path)
+            adapter = ShazamAdapter(
+                config,
+                limiter=TokenBucket(rate_per_minute=1_000_000, capacity=max(1, concurrency)),
+                transport=__import__("httpx").MockTransport(handler),
+            )
+            result = await recognise_generation_zero(
+                media_key="a" * 64,
+                media_dir=media_dir,
+                windows=windows,
+                project_root=tmp_path,
+                # Same run_id for both runs: the invocation dir (and thus raw_response_ref) is keyed
+                # on run_id, so equal ids let us assert order-independence of the *recognition*.
+                run_id="equiv",
+                max_requests=1_000,
+                concurrency=concurrency,
+                adapter=adapter,
+            )
+            return read_bytes(result.observations_path)
+
+        serial = await run(tmp_path / "serial", 1)
+        assert max_in_flight == 1  # a single worker never overlaps
+        in_flight = 0
+        max_in_flight = 0
+        concurrent = await run(tmp_path / "concurrent", 6)
+        # Same windows + responses -> byte-identical observations, whatever the finish order.
+        assert concurrent == serial
+        # ...and the pool genuinely ran requests in parallel.
+        assert max_in_flight > 1
+
+    asyncio.run(scenario())
+
+
 def test_latency_estimator_uses_position_rates_and_censored_failures() -> None:
     cases = [
         {

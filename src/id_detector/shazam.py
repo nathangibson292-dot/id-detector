@@ -42,13 +42,41 @@ class ShazamHTTPError(RuntimeError):
 
 
 class TokenBucket:
-    """A monotonic, lock-protected token bucket; defaults to one non-bursting token."""
+    """A monotonic, lock-protected token bucket that adapts to server throttling (AIMD).
 
-    def __init__(self, rate_per_minute: int = 18, capacity: int = 1) -> None:
-        self.rate_per_second = rate_per_minute / 60
+    The bucket admits requests at ``rate_per_minute`` (the *ceiling*).  Shazam's free endpoint
+    throttles sustained load unpredictably, so the rate is not fixed: a throttle signal
+    (:meth:`penalize`) multiplicatively cuts the admission rate toward a floor, and sustained
+    success (:meth:`recover`) additively climbs it back to the ceiling.  This lets a run go as
+    fast as Shazam currently tolerates without a hand-tuned guess, and self-heals after a 429
+    burst instead of failing windows.  ``capacity`` is how many tokens may accumulate, i.e. how
+    many requests may be in flight at once (set it to the worker-pool size).  Callers that pass a
+    very high ``rate_per_minute`` (the test transports) simply never leave the ceiling.
+    """
+
+    def __init__(
+        self,
+        rate_per_minute: int = 18,
+        capacity: int = 1,
+        *,
+        min_rate_per_minute: int | None = None,
+        backoff_factor: float = 0.5,
+        recover_fraction: float = 0.02,
+        penalty_cooldown_s: float = 2.0,
+    ) -> None:
+        self.max_rate_per_second = rate_per_minute / 60
+        floor = min_rate_per_minute if min_rate_per_minute is not None else min(rate_per_minute, 12)
+        # Never let the floor reach 0: a 0 admission rate makes acquire()'s delay math divide by
+        # zero.  Clamp to at least 1/min, and never above the ceiling.
+        self.min_rate_per_second = min(self.max_rate_per_second, max(1, floor) / 60)
+        self.rate_per_second = self.max_rate_per_second
         self.capacity = capacity
         self.tokens = float(capacity)
         self.updated = time.monotonic()
+        self.backoff_factor = backoff_factor
+        self.recover_step = self.max_rate_per_second * recover_fraction
+        self.penalty_cooldown_s = penalty_cooldown_s
+        self._last_penalty = float("-inf")
         self._lock = asyncio.Lock()
 
     async def acquire(self) -> None:
@@ -64,6 +92,29 @@ class TokenBucket:
                     return
                 delay = (1 - self.tokens) / self.rate_per_second
             await asyncio.sleep(delay)
+
+    def penalize(self) -> None:
+        """React to a throttle (HTTP 429/503) by halving the admission rate toward the floor.
+
+        A cooldown collapses a burst of concurrent throttles into a single cut, so N in-flight
+        workers all seeing 429 at once do not slam the rate to the floor in one step.
+        """
+
+        now = time.monotonic()
+        if now - self._last_penalty < self.penalty_cooldown_s:
+            return
+        self._last_penalty = now
+        self.rate_per_second = max(
+            self.min_rate_per_second, self.rate_per_second * self.backoff_factor
+        )
+
+    def recover(self) -> None:
+        """React to a success by nudging the admission rate back up toward the ceiling."""
+
+        if self.rate_per_second < self.max_rate_per_second:
+            self.rate_per_second = min(
+                self.max_rate_per_second, self.rate_per_second + self.recover_step
+            )
 
 
 @dataclass
@@ -129,6 +180,9 @@ class InjectedHTTPClient(HTTPClientInterface):
             raise ShazamHTTPError(0, f"{type(exc).__name__}: {exc}") from exc
         if response.status_code >= 400:
             self.breaker.failure()
+            if response.status_code in {429, 503}:
+                # Shazam is throttling: slow the shared admission rate for the rest of the run.
+                self.limiter.penalize()
             retry_after_value = response.headers.get("Retry-After")
             try:
                 retry_after = float(retry_after_value) if retry_after_value else None
@@ -149,6 +203,8 @@ class InjectedHTTPClient(HTTPClientInterface):
             self.breaker.failure()
             raise ShazamHTTPError(response.status_code, "Shazam response was not JSON") from exc
         self.breaker.success()
+        # A clean response earns a little rate back toward the ceiling.
+        self.limiter.recover()
         return payload
 
 

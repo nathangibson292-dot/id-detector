@@ -29,6 +29,13 @@ DEFAULT_LEAD_IN_MS = 5_000
 DEFAULT_SAME_TRACK_BRIDGE_MS = 180_000
 #: Default per-run Shazam request budget (a hard ceiling on billable/physical attempts).
 DEFAULT_MAX_REQUESTS = 2_000
+#: Recognition pacing (runtime performance knobs; they change speed only, never results, which are
+#: content-addressed).  ``requests_per_minute`` is the *ceiling* admission rate — the adaptive
+#: limiter starts here and backs off automatically when Shazam's free endpoint returns 429s, so a
+#: higher ceiling is safe.  ``concurrency`` is how many recognitions may be in flight at once.
+#: Historic behaviour was 18/min, strictly serial; these defaults are a safe ~2-3x speed-up.
+DEFAULT_SHAZAM_REQUESTS_PER_MINUTE = 45
+DEFAULT_RECOGNISE_CONCURRENCY = 3
 #: Cache TTLs (plan): a positive match is trusted for 180 days, a ``no_match`` for 30 days.
 DEFAULT_CACHE_POSITIVE_MAX_AGE_DAYS = 180
 DEFAULT_CACHE_NO_MATCH_MAX_AGE_DAYS = 30
@@ -84,6 +91,8 @@ class AppConfig:
     rescan_max_generations: int = DEFAULT_MAX_GENERATIONS
     default_profile: str | None = None
     max_requests: int = DEFAULT_MAX_REQUESTS
+    shazam_requests_per_minute: int = DEFAULT_SHAZAM_REQUESTS_PER_MINUTE
+    recognise_concurrency: int = DEFAULT_RECOGNISE_CONCURRENCY
     lead_in_ms: int = DEFAULT_LEAD_IN_MS
     collapse: bool = True
     same_track_bridge_ms: int = DEFAULT_SAME_TRACK_BRIDGE_MS
@@ -115,8 +124,11 @@ class AppConfig:
         cache = payload.get("cache", {})
         hints = payload.get("hints", {})
         present = payload.get("present", {})
+        recognise = payload.get("recognise", {})
         if not isinstance(transforms, dict):
             raise ValueError("transforms must be a TOML table")
+        if not isinstance(recognise, dict):
+            raise ValueError("recognise must be a TOML table")
         if not isinstance(schedule, dict):
             raise ValueError("schedule must be a TOML table")
         if not isinstance(rescan, dict):
@@ -169,6 +181,16 @@ class AppConfig:
         max_requests = _positive_integer(
             payload.get("max_requests", DEFAULT_MAX_REQUESTS), "config", "max_requests"
         )
+        requests_per_minute = _positive_integer(
+            recognise.get("requests_per_minute", DEFAULT_SHAZAM_REQUESTS_PER_MINUTE),
+            "recognise",
+            "requests_per_minute",
+        )
+        recognise_concurrency = _positive_integer(
+            recognise.get("concurrency", DEFAULT_RECOGNISE_CONCURRENCY),
+            "recognise",
+            "concurrency",
+        )
         lead_in_ms = payload.get("lead_in_ms", DEFAULT_LEAD_IN_MS)
         if isinstance(lead_in_ms, bool) or not isinstance(lead_in_ms, int) or lead_in_ms < 0:
             raise ValueError("lead_in_ms must be a non-negative integer")
@@ -207,6 +229,8 @@ class AppConfig:
             rescan_max_generations=max_generations,
             default_profile=default_profile,
             max_requests=max_requests,
+            shazam_requests_per_minute=requests_per_minute,
+            recognise_concurrency=recognise_concurrency,
             lead_in_ms=lead_in_ms,
             collapse=collapse,
             same_track_bridge_ms=same_track_bridge_ms,

@@ -48,6 +48,7 @@ from id_detector.jobs import (
 from id_detector.shazam import (
     ShazamAdapter,
     ShazamHTTPError,
+    TokenBucket,
     canonicalize_provider_json,
     response_to_observation,
     retry_delay,
@@ -57,6 +58,10 @@ from id_detector.windows import WindowsResult
 POSITIVE_MAX_AGE_SECONDS = 180 * 24 * 60 * 60
 NO_MATCH_MAX_AGE_SECONDS = 30 * 24 * 60 * 60
 MAX_RETRIES = 5
+#: Legacy per-generation defaults kept for direct/library callers and tests that do not pass the
+#: runtime knobs.  The CLI/web app override these from ``AppConfig`` (see providers.base).
+DEFAULT_REQUESTS_PER_MINUTE = 18
+DEFAULT_CONCURRENCY = 1
 
 
 @dataclass(frozen=True)
@@ -356,6 +361,8 @@ async def recognise_generation(
     refresh: bool = False,
     max_requests: int = DEFAULT_SHAZAM_MAX_REQUESTS,
     adapter: ShazamAdapter | None = None,
+    requests_per_minute: int = DEFAULT_REQUESTS_PER_MINUTE,
+    concurrency: int = DEFAULT_CONCURRENCY,
     positive_max_age_seconds: int = POSITIVE_MAX_AGE_SECONDS,
     no_match_max_age_seconds: int = NO_MATCH_MAX_AGE_SECONDS,
     on_window: Callable[[int, int], None] | None = None,
@@ -385,7 +392,11 @@ async def recognise_generation(
     for window in windows.records:
         cache_key = clip_cache_key(window.wav_sha256, "shazam", config.version)
         windows_by_cache.setdefault(cache_key, []).append(window)
-    adapter = adapter or ShazamAdapter(config)
+    worker_count = max(1, concurrency)
+    adapter = adapter or ShazamAdapter(
+        config,
+        limiter=TokenBucket(rate_per_minute=requests_per_minute, capacity=worker_count),
+    )
     cache_hits = 0
     initial_physical = 0
     initial_by_query: dict[str, int] = {}
@@ -451,7 +462,14 @@ async def recognise_generation(
         window_done = cache_hits
         if on_window is not None:
             on_window(window_done, window_total)
-        try:
+        # Bounded worker pool: each worker leases and runs one window at a time; the shared
+        # ``store`` serialises every lease through its single writer, so two workers can never
+        # grab the same window, and the shared ``adapter`` limiter paces the whole pool. Windows
+        # complete out of order, but observations are content-addressed and sorted before writing,
+        # so results are identical to the old serial loop — only faster. ``window_done`` is only
+        # ever mutated synchronously between awaits (single event loop), so no lock is needed.
+        async def _drain() -> None:
+            nonlocal window_done
             while True:
                 job = await store.lease_next(
                     run_id,
@@ -460,7 +478,7 @@ async def recognise_generation(
                     query_ids=frozenset(query_by_id),
                 )
                 if job is None:
-                    break
+                    return
                 query = query_by_id[job.query_id]
                 target = query.target
                 window = window_by_id[target.window_id]
@@ -477,7 +495,17 @@ async def recognise_generation(
                 if on_window is not None:
                     window_done = min(window_done + 1, window_total)
                     on_window(window_done, window_total)
-        except asyncio.CancelledError:
+
+        workers = [asyncio.create_task(_drain()) for _ in range(worker_count)]
+        try:
+            await asyncio.gather(*workers)
+        except BaseException:
+            # Ctrl-C (CancelledError) or an unexpected worker error: cancel the siblings, let them
+            # unwind, release every lease this run holds, then re-raise. Prevents an orphaned worker
+            # from racing the store's shutdown and leaves no leaked leases behind.
+            for worker in workers:
+                worker.cancel()
+            await asyncio.gather(*workers, return_exceptions=True)
             await store.release_owner(run_id)
             raise
 

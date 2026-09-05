@@ -43,6 +43,17 @@ max_requests = 2000
 # mix-in is audible.  The page also exposes a live control seeded from this value.
 lead_in_ms = 5000
 
+# Recognition pacing (speed only; never changes results, which are content-addressed).
+# requests_per_minute is the CEILING rate for Shazam clip queries: the limiter starts here and
+# automatically backs off when Shazam's free endpoint returns 429s, then climbs back when it calms
+# down -- so a higher ceiling is safe, it self-tunes to whatever Shazam currently tolerates.
+# concurrency is how many recognitions run at once.  Old behaviour was 18 / 1 (serial); the
+# defaults below are a safe ~2-3x speed-up on a cold analysis.  Lower them if you see heavy
+# throttling; the free Shazam endpoint is the hard ceiling, not this tool.
+[recognise]
+requests_per_minute = 45
+concurrency = 3
+
 # Stage 4b transform hypotheses.  policy = "off" | "rescan_only" (default) | "global".
 [transforms]
 policy = "rescan_only"
@@ -111,6 +122,10 @@ def render_effective_config(config: AppConfig) -> str:
         else "# default_profile = (unset)",
         f"max_requests = {config.max_requests}",
         f"lead_in_ms = {config.lead_in_ms}",
+        "",
+        "[recognise]",
+        f"requests_per_minute = {config.shazam_requests_per_minute}",
+        f"concurrency = {config.recognise_concurrency}",
         "",
         "[transforms]",
         f'policy = "{config.transforms_policy}"',

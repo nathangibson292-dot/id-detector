@@ -402,6 +402,8 @@ async def _analyse(
                 generation=generation,
                 refresh=refresh,
                 max_requests=max_requests,
+                requests_per_minute=app_config.shazam_requests_per_minute,
+                concurrency=app_config.recognise_concurrency,
                 positive_max_age_seconds=app_config.cache_positive_max_age_seconds,
                 no_match_max_age_seconds=app_config.cache_no_match_max_age_seconds,
                 on_window=_on_recognise_window if progress is not None else None,
