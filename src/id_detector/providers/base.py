@@ -27,6 +27,11 @@ DEFAULT_LEAD_IN_MS = 5_000
 #: Default same-exact-track display bridge: two appearances of one track (equal work key) up to this
 #: far apart, with no different confident track between them, stack into one collapsed row (~3 min).
 DEFAULT_SAME_TRACK_BRIDGE_MS = 180_000
+#: Minimum proved on-air duration for a low/medium-confidence track to be LISTED in the tracklist.
+#: A real track in a DJ set plays for minutes; most false positives are a single ~12 s window.
+#: Empirically (Nathan's benchmark set) a 30 s floor cuts false positives ~5x while keeping recall.
+#: A ``likely``/``verified`` badge or a corroborating text hint bypasses this floor.  0 disables it.
+DEFAULT_PRESENT_MIN_TRACK_MS = 30_000
 #: Default per-run Shazam request budget (a hard ceiling on billable/physical attempts).
 DEFAULT_MAX_REQUESTS = 2_000
 #: Recognition pacing (runtime performance knobs; they change speed only, never results, which are
@@ -96,6 +101,7 @@ class AppConfig:
     lead_in_ms: int = DEFAULT_LEAD_IN_MS
     collapse: bool = True
     same_track_bridge_ms: int = DEFAULT_SAME_TRACK_BRIDGE_MS
+    present_min_track_ms: int = DEFAULT_PRESENT_MIN_TRACK_MS
     cache_positive_max_age_days: int = DEFAULT_CACHE_POSITIVE_MAX_AGE_DAYS
     cache_no_match_max_age_days: int = DEFAULT_CACHE_NO_MATCH_MAX_AGE_DAYS
     hints_enabled: bool = True
@@ -204,6 +210,13 @@ class AppConfig:
             or same_track_bridge_ms < 0
         ):
             raise ValueError("present.same_track_bridge_ms must be a non-negative integer")
+        present_min_track_ms = present.get("min_track_ms", DEFAULT_PRESENT_MIN_TRACK_MS)
+        if (
+            isinstance(present_min_track_ms, bool)
+            or not isinstance(present_min_track_ms, int)
+            or present_min_track_ms < 0
+        ):
+            raise ValueError("present.min_track_ms must be a non-negative integer")
         positive_days = _positive_integer(
             cache.get("positive_max_age_days", DEFAULT_CACHE_POSITIVE_MAX_AGE_DAYS),
             "cache",
@@ -234,6 +247,7 @@ class AppConfig:
             lead_in_ms=lead_in_ms,
             collapse=collapse,
             same_track_bridge_ms=same_track_bridge_ms,
+            present_min_track_ms=present_min_track_ms,
             cache_positive_max_age_days=positive_days,
             cache_no_match_max_age_days=no_match_days,
             hints_enabled=hints_enabled,

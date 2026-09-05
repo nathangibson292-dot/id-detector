@@ -102,6 +102,11 @@ pointer_import = true
 [present]
 collapse = true
 same_track_bridge_ms = 180000
+# min_track_ms: the shortest a low/medium-confidence match may play and still be LISTED as a track.
+# Real tracks in a set run for minutes; most false positives are one fleeting ~12 s window.  A
+# 30 s (30000) floor removes the bulk of false positives while keeping the real tracks; a strong
+# (likely/verified) badge or a corroborating tracklist hint bypasses it.  Set 0 to list everything.
+min_track_ms = 30000
 """.replace("{connectors}", ", ".join(HINT_CONNECTORS))
 
 
@@ -158,6 +163,7 @@ def render_effective_config(config: AppConfig) -> str:
             "[present]",
             f"collapse = {str(config.collapse).lower()}",
             f"same_track_bridge_ms = {config.same_track_bridge_ms}",
+            f"min_track_ms = {config.present_min_track_ms}",
         ]
     )
     return "\n".join(lines) + "\n"
