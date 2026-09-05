@@ -753,6 +753,78 @@ def build_episodes(
         for episode in episode_records
     ]
 
+    # Hint-only tracks: a confident, position-anchored comment answer whose work no engine matched —
+    # and that no listed track already covers — still names the track.  Surface it as a low-
+    # confidence "from comments" episode so a crowd ID (e.g. an opener Shazam can't fingerprint that
+    # a listener named in the comments) appears on the tracklist instead of an empty gap.
+    known_work_ids = {
+        candidate_by_id[episode.candidate_id].work_id
+        for episode in episode_records
+        if episode.candidate_id in candidate_by_id
+    }
+    listed_spans = [
+        (episode.evidence_support_ms[0][0], episode.evidence_support_ms[-1][1])
+        for episode in episode_records
+        if not episode.suppressed
+    ]
+    hint_only_episodes: list[EpisodeRecord] = []
+    for hint in sorted(hints, key=lambda item: item.id):
+        if hint.kind not in {"answer", "correction"} or hint.mirror_status != "verified":
+            continue
+        if hint.flags.id_unknown or hint.position_range_ms is None:
+            continue
+        work_id = identity.hint_work_ids.get(hint.id)
+        candidate_id = identity.hint_candidates.get(hint.id)
+        if work_id is None or candidate_id is None or work_id in known_work_ids:
+            continue
+        lo, hi = hint.position_range_ms
+        if hi <= lo or any(_intersects((lo, hi), span) for span in listed_spans):
+            continue
+        known_work_ids.add(work_id)
+        natural = {
+            "candidate_id": candidate_id,
+            "occurrence_index": 0,
+            "first_support_start_ms": lo,
+        }
+        hint_only_episodes.append(
+            EpisodeRecord(
+                schema_version=SCHEMA_VERSION,
+                generated_by=GENERATED_BY,
+                id=make_id(media_key, "episode", compose_natural_key("episode", natural)),
+                candidate_id=candidate_id,
+                alternatives=[],
+                claim="component_evidence",
+                start_no_later_than_ms=lo,
+                end_no_earlier_than_ms=hi,
+                evidence_support_ms=[(lo, hi)],
+                start_no_earlier_than_ms=None,
+                end_no_later_than_ms=None,
+                start_pi=None,
+                end_pi=None,
+                best_start_ms=lo,
+                best_end_ms=hi,
+                role_segments=[RoleSegment(from_ms=lo, to_ms=hi, role="dominant")],
+                occurrence_index=0,
+                overlaps=[],
+                alignment_segments=[],
+                alignment_events=[],
+                has_global_alignment=False,
+                scores={"work": 2500, "version": 0, "boundary": 0},
+                score_kind="heuristic",
+                tiers={"work": "possible", "version": "unclear", "boundary": "unclear"},
+                badge="possible",
+                version_status="unverified",
+                evidence=[hint.id],
+                rejected_evidence=[],
+                # "hint_supported" keeps it listed (it is not a short phantom) and immune to
+                # suppression; "hint_only" marks that it has NO audio match — a pure crowd ID.
+                flags=["hint_only", "hint_supported"],
+                rescan_state="not_requested",
+                suppressed=None,
+            )
+        )
+    episode_records = list(episode_records) + hint_only_episodes
+
     scanned = normalise_intervals([item.support_ms for item in windows], duration_ms)
     # A suppressed episode is hidden from the tracklist, so its span is effectively unidentified:
     # count it as an ID gap, not as coverage, so the coverage stat and the ID gaps match what the
