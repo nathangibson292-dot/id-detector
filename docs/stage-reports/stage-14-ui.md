@@ -39,9 +39,14 @@ contract, provider call or CLI behaviour changed.*
   12 s window), so a track whose proved on-air span is under the floor — unless it is
   likely/verified or hint-supported — is **dropped from the exports** and, on the page, **kept but
   hidden** behind a "N short matches (under 30 s) hidden · show" toggle, and left out of the
-  stat tiles, the timeline and the playhead partition.  `exports.short_track()` is the single
-  predicate; `on_air_ms` (evidence hull) is now on every flattened track entry.
-- `<meta name="id-detector-page" content="N">` version stamp (`PAGE_VERSION = 3`).
+  stat tiles, the timeline and the playhead partition.  `on_air_ms` is the **summed proved
+  support** (union of evidence intervals — never the unproven time between detections) on
+  every flattened track entry.  `exports.hidden_reason()` is the single predicate: a fusion-side
+  `EpisodeRecord.suppressed` reason token (`buried` / `contradicted` / `scatter`, read leniently
+  so pre-field episodes still load) wins, then `short_track()`.  Suppressed rows get the same
+  treatment as short ones, with a friendly label tag; the note reads
+  "N matches (K short, M suppressed) hidden".
+- `<meta name="id-detector-page" content="N">` version stamp (`PAGE_VERSION = 4`).
 - Everything the Stage 7/11/12 tests pin is intact: byte-identical seek + playhead JS, the
   `EPISODE_SPANS` partition, `.current` row/lane highlight, per-platform position hooks, the
   `closest('a,button,details,summary')` guard, valid nesting, no handles / identifier fields.

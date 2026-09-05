@@ -523,3 +523,22 @@ def test_short_low_confidence_matches_drop_from_exports_and_hide_on_the_page() -
         collapse=False,
     )
     assert 'class="track short"' not in plain and 'id="short-note"' not in plain
+
+
+def test_hidden_reason_covers_suppressed_and_short_rows() -> None:
+    """``hidden_reason`` is the single predicate the exports drop by and the page tucks away by:
+    a fusion-side ``suppressed`` token wins, then the on-air floor; gaps are never hidden."""
+
+    from id_detector.present.exports import _support_ms, hidden_reason
+
+    base = {"kind": "track", "badge": "unclear", "hint_supported": False, "on_air_ms": 12_000}
+    assert hidden_reason(base, 30_000) == "short"
+    assert hidden_reason(base, 0) is None
+    assert hidden_reason({**base, "suppressed": "buried"}, 0) == "buried"
+    assert hidden_reason({**base, "badge": "likely"}, 30_000) is None
+    assert hidden_reason({**base, "hint_supported": True}, 30_000) is None
+    assert hidden_reason({"kind": "id", "suppressed": "buried"}, 30_000) is None
+    # Summed support merges overlapping windows and ignores the unproven time between detections.
+    assert _support_ms([[0, 12_000], [6_000, 18_000]]) == 18_000
+    assert _support_ms([[0, 12_000], [60_000, 72_000]]) == 24_000
+    assert _support_ms([]) == 0

@@ -90,18 +90,33 @@ def _display_start(episode: EpisodeRecord) -> int:
     return primary.from_ms
 
 
-def _on_air_ms(episode: EpisodeRecord) -> int:
-    """Proved on-air span: the hull of the evidence support and the best bounds.
+def _support_ms(intervals: list[tuple[int, int]] | list[list[int]]) -> int:
+    """Summed proved support: the union length of evidence intervals (overlaps merged).
 
-    A single-window episode carries inverted ``best_start_ms``/``best_end_ms`` (each names a proved
-    one-sided bound), so the hull — not ``best_end - best_start`` — is the robust measure of how
-    long the track was actually heard.
+    This counts only the seconds an engine actually matched — never the unproven time between two
+    detections — so it is the honest "how long was this heard" figure.  Adjacent windows that
+    overlap are merged rather than double-counted.
     """
 
-    support = episode.evidence_support_ms
-    lo = min(episode.best_start_ms, episode.best_end_ms, *(span[0] for span in support))
-    hi = max(episode.best_start_ms, episode.best_end_ms, *(span[1] for span in support))
-    return max(0, hi - lo)
+    total = 0
+    current_lo: int | None = None
+    current_hi = 0
+    for lo, hi in sorted((int(span[0]), int(span[1])) for span in intervals):
+        if current_lo is None or lo > current_hi:
+            if current_lo is not None:
+                total += max(0, current_hi - current_lo)
+            current_lo, current_hi = lo, hi
+        else:
+            current_hi = max(current_hi, hi)
+    if current_lo is not None:
+        total += max(0, current_hi - current_lo)
+    return total
+
+
+def _on_air_ms(episode: EpisodeRecord) -> int:
+    """Proved on-air time of one episode: its summed evidence support (see ``_support_ms``)."""
+
+    return _support_ms(list(episode.evidence_support_ms))
 
 
 #: Badges that keep a short match listed regardless of how briefly it played.
@@ -112,7 +127,7 @@ def short_track(entry: dict[str, Any], min_track_ms: int) -> bool:
     """Whether a flattened track row played too briefly to be listed as a track.
 
     On-air duration cleanly separates real tracks from false positives (most false positives are a
-    single 12 s window), so a ``kind == "track"`` row whose proved on-air span is under
+    single 12 s window), so a ``kind == "track"`` row whose summed proved support is under
     ``min_track_ms`` is treated as short — UNLESS its badge is ``likely``/``verified`` or a text
     hint supports it.  ``0`` disables the rule; ID gaps are never short.
     """
@@ -122,6 +137,24 @@ def short_track(entry: dict[str, Any], min_track_ms: int) -> bool:
     if entry.get("badge") in _KEEP_SHORT_BADGES or entry.get("hint_supported"):
         return False
     return int(entry.get("on_air_ms") or 0) < min_track_ms
+
+
+def hidden_reason(entry: dict[str, Any], min_track_ms: int) -> str | None:
+    """Why a flattened track row is left out of the exports and tucked away on the page, or
+    ``None`` when it is listed normally.
+
+    Two sources: a fusion-side ``suppressed`` reason on the episode (a short lowercase token such as
+    ``buried`` — set when a more confident or hint-supported track covers the same time, a trusted
+    comment contradicts it, or its detections are scattered) and the on-air floor (``"short"``,
+    see :func:`short_track`).  ID gaps are never hidden.
+    """
+
+    if entry.get("kind") != "track":
+        return None
+    suppressed = entry.get("suppressed")
+    if suppressed:
+        return str(suppressed)
+    return "short" if short_track(entry, min_track_ms) else None
 
 
 def _acquire_summary(episode: AcquireEpisode) -> dict[str, Any]:
@@ -179,6 +212,9 @@ def _track_entry(
         "version_status": episode.version_status,
         "hint_supported": "hint_supported" in episode.flags,
         "on_air_ms": _on_air_ms(episode),
+        # Fusion may mark an episode as suppressed (a short reason token); read leniently so
+        # the page/exports work with episodes written before the field existed.
+        "suppressed": getattr(episode, "suppressed", None) or None,
         "n_rejected_hypotheses": len(episode.rejected_evidence),
         "tiers": episode.tiers.model_dump(mode="json"),
         "acquire": _acquire_summary(acquire_episode) if acquire_episode is not None else None,
@@ -219,7 +255,8 @@ def flatten_tracklist(
     into one row.  ``collapse=False`` restores the historical one-row-per-episode view.
 
     ``min_track_ms`` (default ``0`` = off) drops track rows that played too briefly to be a real
-    track — see :func:`short_track` — while leaving every ID gap in place.
+    track, and any row fusion marked ``suppressed`` — see :func:`hidden_reason` — while leaving
+    every ID gap in place.
     """
 
     acquire_by_episode = (
@@ -250,7 +287,13 @@ def flatten_tracklist(
             entry = _track_entry(track.primary, identities, acquire_by_episode, label_by_episode)
             entry["start_ms"] = track.start_ms
             entry["end_ms"] = track.end_ms
-            entry["on_air_ms"] = max(entry["on_air_ms"], track.end_ms - track.start_ms)
+            entry["on_air_ms"] = _support_ms(
+                [
+                    span
+                    for member in (track.primary, *track.alternatives)
+                    for span in member.evidence_support_ms
+                ]
+            )
             alternatives = [_alternative_summary(alt, identities) for alt in track.alternatives]
             entry["alternatives"] = alternatives
             entry["also_count"] = len(alternatives)
@@ -275,7 +318,7 @@ def flatten_tracklist(
         }
         for gap in episodes.gaps
     )
-    entries = [entry for entry in entries if not short_track(entry, min_track_ms)]
+    entries = [entry for entry in entries if hidden_reason(entry, min_track_ms) is None]
     return tuple(
         sorted(
             entries,
