@@ -575,3 +575,70 @@ def test_suppressed_episodes_drop_from_exports_and_tuck_on_the_page() -> None:
     assert "buried under a surer track" in page
     assert "<b>1</b> suppressed match hidden" in page
     assert f'"id": "{buried["id"]}"' not in page  # out of the playhead partition
+
+
+def test_hint_only_crowd_ids_render_distinctly_and_are_never_proved_evidence() -> None:
+    """A fusion ``hint_only`` episode (a comment answer no engine matched) is listed — the hint
+    keeps it past the on-air floor — but the page marks it as a crowd ID everywhere: row, chip,
+    lane, stat tile; the JSON entry carries ``hint_only``."""
+
+    from id_detector.present.exports import flatten_tracklist
+
+    document = _episodes_file().model_dump(mode="json")
+    crowd = _episode(
+        idx=9, best_start_ms=40_000, best_end_ms=50_000, flags=["hint_only", "hint_supported"]
+    )
+    crowd["badge"] = "possible"
+    document["episodes"].append(crowd)
+    episodes = EpisodesFile.model_validate(document)
+    identities = _identities()
+
+    entries = flatten_tracklist(episodes, identities, collapse=False, min_track_ms=30_000)
+    entry = next(e for e in entries if e.get("episode_id") == crowd["id"])  # not hidden (hint)
+    assert entry["hint_only"] is True and entry["on_air_ms"] == 10_000
+
+    page = render_page(
+        source=_source("soundcloud"),
+        episodes=episodes,
+        identities=identities,
+        duration_ms=DURATION_MS,
+        collapse=False,
+        min_track_ms=30_000,
+    )
+    assert f'<tr class="track crowd" data-episode-id="{crowd["id"]}" data-crowd="1"' in page
+    assert ">from comments</span>" in page
+    assert f'data-episode-id="{crowd["id"]}" data-badge="possible" data-crowd="1"' in page
+    assert "found · 1 from comments</small>" in page
+    assert 'class="lg-crowd"' in page
+    validator = _Validator()
+    validator.feed(page)
+    assert validator.errors == []
+
+
+def test_hint_only_marker_reaches_the_markdown_export(tmp_path: Path) -> None:
+    from id_detector.present.exports import export_tracklist
+
+    document = _episodes_file().model_dump(mode="json")
+    crowd = _episode(
+        idx=9, best_start_ms=40_000, best_end_ms=50_000, flags=["hint_only", "hint_supported"]
+    )
+    document["episodes"].append(crowd)
+    episodes = EpisodesFile.model_validate(document)
+    media_dir = tmp_path / "media"
+    (media_dir / "fuse").mkdir(parents=True)
+    episodes_path = media_dir / "fuse" / "episodes.json"
+    identities_path = media_dir / "fuse" / "identities.gen0.json"
+    episodes_path.write_bytes(episodes.model_dump_json().encode("utf-8"))
+    identities_path.write_bytes(_identities().model_dump_json().encode("utf-8"))
+    result = export_tracklist(
+        media_dir=media_dir,
+        media_key="a" * 64,
+        duration_ms=DURATION_MS,
+        episodes=episodes,
+        identities=_identities(),
+        episodes_path=episodes_path,
+        identities_path=identities_path,
+        collapse=False,
+    )
+    assert "FROM COMMENTS" in result.markdown_path.read_text("utf-8")
+    assert any(e.get("hint_only") for e in result.entries)

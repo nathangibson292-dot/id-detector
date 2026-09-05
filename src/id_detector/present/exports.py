@@ -211,6 +211,8 @@ def _track_entry(
         "badge": episode.badge,
         "version_status": episode.version_status,
         "hint_supported": "hint_supported" in episode.flags,
+        # A crowd ID: named by a confident comment answer, but no engine matched the audio.
+        "hint_only": "hint_only" in episode.flags,
         "on_air_ms": _on_air_ms(episode),
         # Fusion may mark an episode as suppressed (a short reason token); read leniently so
         # the page/exports work with episodes written before the field existed.
@@ -401,7 +403,9 @@ def export_tracklist(
             )
         else:
             badge = str(entry["badge"]).upper()
-            if entry["hint_supported"]:
+            if entry.get("hint_only"):
+                badge += " FROM COMMENTS"
+            elif entry["hint_supported"]:
                 badge += " +HINT"
             version_status = str(entry["version_status"]).upper()
             label = f"{entry['artist']} — {entry['title']}"

@@ -46,7 +46,12 @@ contract, provider call or CLI behaviour changed.*
   so pre-field episodes still load) wins, then `short_track()`.  Suppressed rows get the same
   treatment as short ones, with a friendly label tag; the note reads
   "N matches (K short, M suppressed) hidden".
-- `<meta name="id-detector-page" content="N">` version stamp (`PAGE_VERSION = 5`).
+- **Crowd IDs** (fusion's `hint_only` flag — a confident comment answer no engine matched):
+  listed, but never drawn as proved evidence — a dashed timeline lane, a dashed row edge, a
+  "from comments" chip instead of HINT, "· K from comments" on the tracks tile, "(from comments)"
+  in the copied tracklist and "FROM COMMENTS" in the Markdown export; `hint_only` is on every
+  flattened track entry.
+- `<meta name="id-detector-page" content="N">` version stamp (`PAGE_VERSION = 6`).
 - Everything the Stage 7/11/12 tests pin is intact: byte-identical seek + playhead JS, the
   `EPISODE_SPANS` partition, `.current` row/lane highlight, per-platform position hooks, the
   `closest('a,button,details,summary')` guard, valid nesting, no handles / identifier fields.

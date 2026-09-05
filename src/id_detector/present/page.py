@@ -45,7 +45,7 @@ UNRESOLVED_CAP_MS = 120_000
 #: Bump when the page's look or behaviour changes: ``present.refresh.ensure_fresh_page`` re-renders
 #: any written page whose ``<meta name="id-detector-page">`` stamp is older, so already-analysed
 #: mixes pick up the new page the next time they are opened (no re-analysis).
-PAGE_VERSION = 5
+PAGE_VERSION = 6
 
 
 # --------------------------------------------------------------------------------------------------
@@ -391,7 +391,12 @@ def _tags_html(entry: dict[str, Any], hidden: str | None = None) -> str:
     version = str(entry["version_status"])
     if version in {"verified", "contested"}:
         tags.append(f'<span class="tag ver-{_esc(version)}">{_esc(version)}</span>')
-    if entry["hint_supported"]:
+    if entry.get("hint_only"):
+        tags.append(
+            '<span class="hint crowd" title="named in the comments — no engine matched the '
+            'audio here">from comments</span>'
+        )
+    elif entry["hint_supported"]:
         tags.append('<span class="hint" title="supported by a text hint">hint</span>')
     if hidden == "short":
         seconds = round(int(entry.get("on_air_ms") or 0) / 1000)
@@ -414,11 +419,15 @@ def _track_row_html(
     alternatives = _alternatives_html(entry)
     # ``short`` is the CSS hook for every hidden-by-default row, whatever the reason.
     row_class = "track short" if hidden else "track"
+    crowd_attr = ""
+    if entry.get("hint_only"):
+        row_class += " crowd"
+        crowd_attr = 'data-crowd="1" '
     # ``--i`` staggers the row entrance animation; the hidden ``ver``/``role`` cells keep the
     # export-identical columns available to CSS/tests while the visible row stays uncluttered.
     return (
         f'<tr class="{row_class}" data-episode-id="{_esc(entry["episode_id"])}" '
-        f'style="--i:{index}" '
+        f'{crowd_attr}style="--i:{index}" '
         f'data-best-start-ms="{best_start}" tabindex="0" role="button" '
         f'aria-label="Seek to {_esc(_format_time(best_start))} — {label}">'
         f'<td class="time"><span class="eqi"><i></i><i></i><i></i></span>'
@@ -471,9 +480,14 @@ def _timeline_html(lanes: list[dict[str, Any]], gaps: list[dict[str, Any]]) -> s
     for lane in lanes:
         ext = lane["extent"]
         # ``data-badge`` colours the lane by confidence, so the strip reads as a confidence map.
+        flags = ""
+        if lane.get("short"):
+            flags += ' data-short="1"'
+        if lane.get("crowd"):
+            flags += ' data-crowd="1"'
         parts.append(
             f'<div class="tl-lane" data-episode-id="{_esc(lane["episode_id"])}" '
-            f'data-badge="{_esc(lane["badge"])}"{' data-short="1"' if lane.get("short") else ""} '
+            f'data-badge="{_esc(lane["badge"])}"{flags} '
             f'title="{_esc(lane["label"])}">'
         )
         parts.append(
@@ -552,6 +566,8 @@ def _stats_html(
         key = str(entry["badge"])
         counts[key] = counts.get(key, 0) + 1
     n = len(tracks)
+    crowd = sum(1 for entry in tracks if entry.get("hint_only"))
+    crowd_note = f" · {crowd} from comments" if crowd else ""
     covered = episodes.durations.evidence_supported_ms + episodes.durations.predicted_episode_ms
     pct = int(round(max(0.0, min(100.0, covered * 100.0 / duration_ms)))) if duration_ms else 0
     bars = "".join(
@@ -568,7 +584,7 @@ def _stats_html(
     return (
         '<div class="stats">'
         f'<div class="stat"><div><span class="big">{n}</span>'
-        f"<small>track{'s' if n != 1 else ''} found</small></div></div>"
+        f"<small>track{'s' if n != 1 else ''} found{crowd_note}</small></div></div>"
         f'<div class="stat"><div class="ring" style="--p:{pct}">'
         '<svg viewBox="0 0 36 36" aria-hidden="true"><defs><linearGradient id="ringgrad" '
         'x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#ff3d8a"></stop>'
@@ -817,6 +833,14 @@ body.show-short tr.track.short td{opacity:.72}
 .linkish{background:none;border:0;padding:0;color:var(--accent);cursor:pointer;font:inherit;
 font-size:12px}
 .linkish:hover{text-decoration:underline}
+/* crowd IDs (named in the comments, no audio match): dashed, never drawn as proved evidence */
+.hint.crowd{background:none;border:1px dashed var(--accent);color:var(--accent)}
+tr.track.crowd td:first-child{box-shadow:inset 3px 0 0 transparent;
+border-left:3px dashed rgba(167,139,250,.6)}
+.tl-lane[data-crowd="1"] .tl-extent{display:none}
+.tl-lane[data-crowd="1"] .tl-solid{background:transparent;border:1.5px dashed var(--lc);
+box-shadow:none}
+.lg-crowd::before{background:transparent;border:1.5px dashed var(--accent);height:6px}
 /* the NOW pill in the top bar */
 .now{flex:1;min-width:0;display:flex;align-items:center;gap:10px;justify-content:center;
 font-size:13px;cursor:pointer}
@@ -956,7 +980,8 @@ function tracklistText(){
     if(row.classList.contains('short') && !showingShort) return;
     const t = row.querySelector('.time').textContent.trim();
     if(row.classList.contains('gap')){ lines.push(t + '  ID'); return; }
-    lines.push(t + '  ' + (ROW_LABELS[row.getAttribute('data-episode-id')] || ''));
+    lines.push(t + '  ' + (ROW_LABELS[row.getAttribute('data-episode-id')] || '') +
+      (row.getAttribute('data-crowd') ? ' (from comments)' : ''));
   });
   return lines.join('\\n');
 }
@@ -1128,8 +1153,10 @@ def render_page(
         )
         for episode in lane_episodes
     ]
+    crowd_ids = {episode.id for episode in lane_episodes if "hint_only" in episode.flags}
     for lane in lanes:
         lane["short"] = lane["episode_id"] in short_ids
+        lane["crowd"] = lane["episode_id"] in crowd_ids
     span_items = [item for item in span_items if item[0] not in short_ids]
     gap_markers = [_gap_marker(gap, duration_ms) for gap in episodes.gaps]
 
@@ -1228,6 +1255,7 @@ class="pd"></span>{_esc(platform_name)}</span>
   <span class="lg-pi">prediction interval</span>
   <span class="lg-unresolved">unresolved boundary</span>
   <span class="lg-gap">ID gap</span>
+  <span class="lg-crowd">from comments (no audio match)</span>
 </div>
 </section>
 <div class="list-head"><h2>Tracklist</h2>{short_note}
