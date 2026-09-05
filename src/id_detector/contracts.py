@@ -486,6 +486,17 @@ class EpisodeRecord(Record):
     #: presentation layer drops or tucks a suppressed episode behind the "hidden matches" toggle.
     suppressed: str | None
 
+    @model_validator(mode="before")
+    @classmethod
+    def _tolerate_missing_suppressed(cls, value: Any) -> Any:
+        # Backward compatibility: episodes.json written before this field omits the key.  Inject an
+        # explicit null on READ so historical analyses keep loading (present/refresh, acquire, show,
+        # rescan, benchmark, calibrate).  New writes still carry it explicitly and the schema keeps
+        # it required, so the emit side and the explicit-null convention are unchanged.
+        if isinstance(value, dict) and "suppressed" not in value:
+            return {**value, "suppressed": None}
+        return value
+
 
 class GapEvidence(ContractModel):
     n_windows: NonNegativeInt

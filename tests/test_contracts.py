@@ -91,6 +91,15 @@ def test_all_nullable_contract_fields_require_explicit_nulls() -> None:
         _assert_nullable_properties_are_required(schema_for(model))
 
 
+def test_episode_without_suppressed_key_still_loads_as_null() -> None:
+    # episodes.json written before EpisodeRecord.suppressed omit the key; historical analyses must
+    # keep loading (with an explicit null) instead of failing validation.
+    legacy = _golden("episode")
+    del legacy["suppressed"]
+    parsed = SCHEMA_MODELS["episode"].model_validate(legacy)
+    assert parsed.suppressed is None
+
+
 def test_nested_float_is_rejected_by_model_and_schema() -> None:
     source = _golden("source")
     source["config_snapshot"]["bad_rate"] = 1.25
