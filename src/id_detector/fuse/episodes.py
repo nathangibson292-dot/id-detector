@@ -774,6 +774,25 @@ def build_episodes(
     scanned = frozenset(scanned_window_shapes or ())
     emitted_keys: set[str] = set()
 
+    # Skip the boundary/verification rescans for episodes the presentation floor will drop anyway:
+    # a below-floor, low-confidence match never reaches the tracklist, so refining its edges spends
+    # rescan budget for a row nobody sees — and per-episode "edge" requests are the bulk of the
+    # gen>=1 window blow-up.  Gap/novelty/hint/question scans stay unconditional: those FIND new
+    # tracks, so they protect recall.  A strong badge, a verified version, or a supporting hint
+    # keeps an episode eligible regardless of length.  min_track_ms == 0 disables the filter (and
+    # therefore this skip), preserving the historical behaviour exactly.
+    rescan_min_track_ms = config.present_min_track_ms if config is not None else 0
+
+    def _episode_listed(episode: EpisodeRecord) -> bool:
+        if rescan_min_track_ms <= 0:
+            return True
+        if episode.badge == "likely" or episode.version_status == "verified":
+            return True
+        if "hint_supported" in episode.flags:
+            return True
+        hull = episode.evidence_support_ms
+        return hull[-1][1] - hull[0][0] >= rescan_min_track_ms
+
     def add_request(trigger: str, start: int, end: int) -> None:
         if end <= start:
             return
@@ -823,6 +842,9 @@ def build_episodes(
     for gap in gaps:
         add_request("gap", gap.start_ms, gap.end_ms)
     for episode in episode_records:
+        if not _episode_listed(episode):
+            # Below the presentation floor and low-confidence → it won't be listed; don't rescan it.
+            continue
         candidate = candidate_by_id[episode.candidate_id]
         if candidate.contested:
             add_request(
