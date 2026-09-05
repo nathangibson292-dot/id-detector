@@ -34,7 +34,14 @@ contract, provider call or CLI behaviour changed.*
   `body.playing` state that animates the brand mark.
 - **Export row**: *Copy tracklist* (plain text `time  artist — title`, `ID` for gaps, via the
   clipboard API with a textarea fallback) plus CUE / M3U / Markdown / JSON download links.
-- `<meta name="id-detector-page" content="N">` version stamp (`PAGE_VERSION = 2`).
+- **Short matches** (`min_track_ms`, wired from `[present] min_track_ms`, default 30 s): on-air
+  duration cleanly separates real tracks from false positives (most false positives are a single
+  12 s window), so a track whose proved on-air span is under the floor — unless it is
+  likely/verified or hint-supported — is **dropped from the exports** and, on the page, **kept but
+  hidden** behind a "N short matches (under 30 s) hidden · show" toggle, and left out of the
+  stat tiles, the timeline and the playhead partition.  `exports.short_track()` is the single
+  predicate; `on_air_ms` (evidence hull) is now on every flattened track entry.
+- `<meta name="id-detector-page" content="N">` version stamp (`PAGE_VERSION = 3`).
 - Everything the Stage 7/11/12 tests pin is intact: byte-identical seek + playhead JS, the
   `EPISODE_SPANS` partition, `.current` row/lane highlight, per-platform position hooks, the
   `closest('a,button,details,summary')` guard, valid nesting, no handles / identifier fields.

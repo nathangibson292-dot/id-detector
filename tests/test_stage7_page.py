@@ -467,3 +467,59 @@ def test_page_carries_its_version_stamp() -> None:
         duration_ms=DURATION_MS,
     )
     assert f'<meta name="id-detector-page" content="{PAGE_VERSION}">' in page
+
+
+def test_short_low_confidence_matches_drop_from_exports_and_hide_on_the_page() -> None:
+    """On-air duration separates real tracks from false positives: with ``min_track_ms`` a brief
+    low-confidence match is dropped from the exports and hidden (but kept, behind a toggle) on the
+    page — unless it is likely/verified or hint-supported.  ``0`` (the default) changes nothing."""
+
+    from id_detector.present.exports import flatten_tracklist, short_track
+
+    document = _episodes_file().model_dump(mode="json")
+    short_unclear = _episode(idx=5, best_start_ms=2_000_000, best_end_ms=2_012_000)
+    short_unclear["badge"] = "unclear"
+    short_likely = _episode(idx=6, best_start_ms=2_500_000, best_end_ms=2_512_000)  # likely
+    short_hinted = _episode(
+        idx=7, best_start_ms=3_000_000, best_end_ms=3_012_000, flags=["hint_supported"]
+    )
+    short_hinted["badge"] = "unclear"
+    document["episodes"] += [short_unclear, short_likely, short_hinted]
+    episodes = EpisodesFile.model_validate(document)
+    identities = _identities()
+
+    everything = flatten_tracklist(episodes, identities, collapse=False)
+    kept = flatten_tracklist(episodes, identities, collapse=False, min_track_ms=30_000)
+    dropped = {e.get("episode_id") for e in everything} - {e.get("episode_id") for e in kept}
+    assert dropped == {short_unclear["id"]}
+    assert [e for e in kept if e["kind"] == "id"] == [e for e in everything if e["kind"] == "id"]
+    unclear_entry = next(e for e in everything if e.get("episode_id") == short_unclear["id"])
+    assert unclear_entry["on_air_ms"] == 12_000 and short_track(unclear_entry, 30_000)
+    assert not short_track(unclear_entry, 0)
+
+    page = render_page(
+        source=_source("soundcloud"),
+        episodes=episodes,
+        identities=identities,
+        duration_ms=DURATION_MS,
+        collapse=False,
+        min_track_ms=30_000,
+    )
+    assert page.count('<tr class="track short"') == 1
+    assert f'<tr class="track short" data-episode-id="{short_unclear["id"]}"' in page
+    assert 'id="short-note"' in page and 'id="show-short"' in page
+    assert f'data-episode-id="{short_unclear["id"]}" data-badge="unclear" data-short="1"' in page
+    assert f'"id": "{short_unclear["id"]}"' not in page  # not in the playhead partition
+    assert f'"id": "{short_likely["id"]}"' in page
+    validator = _Validator()
+    validator.feed(page)
+    assert validator.errors == []
+
+    plain = render_page(
+        source=_source("soundcloud"),
+        episodes=episodes,
+        identities=identities,
+        duration_ms=DURATION_MS,
+        collapse=False,
+    )
+    assert 'class="track short"' not in plain and 'id="short-note"' not in plain

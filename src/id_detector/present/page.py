@@ -31,6 +31,7 @@ from id_detector.present.exports import (
     _candidate_label,
     _format_time,
     flatten_tracklist,
+    short_track,
 )
 from id_detector.present.theme import PLATFORM_NAMES, head_html, topbar_html
 
@@ -44,7 +45,7 @@ UNRESOLVED_CAP_MS = 120_000
 #: Bump when the page's look or behaviour changes: ``present.refresh.ensure_fresh_page`` re-renders
 #: any written page whose ``<meta name="id-detector-page">`` stamp is older, so already-analysed
 #: mixes pick up the new page the next time they are opened (no re-analysis).
-PAGE_VERSION = 2
+PAGE_VERSION = 3
 
 
 # --------------------------------------------------------------------------------------------------
@@ -376,7 +377,7 @@ def _alternatives_html(entry: dict[str, Any]) -> str:
     )
 
 
-def _tags_html(entry: dict[str, Any]) -> str:
+def _tags_html(entry: dict[str, Any], short: bool = False) -> str:
     """Small inline tags after the track name: an interesting role, a decided version, a hint.
 
     ``incoming``/``dominant`` are the normal case for a DJ mix, so only ``layer``/``outgoing``/
@@ -392,10 +393,15 @@ def _tags_html(entry: dict[str, Any]) -> str:
         tags.append(f'<span class="tag ver-{_esc(version)}">{_esc(version)}</span>')
     if entry["hint_supported"]:
         tags.append('<span class="hint" title="supported by a text hint">hint</span>')
+    if short:
+        seconds = round(int(entry.get("on_air_ms") or 0) / 1000)
+        tags.append(f'<span class="tag short-tag">short · {seconds}s</span>')
     return f'<span class="tags">{"".join(tags)}</span>' if tags else ""
 
 
-def _track_row_html(entry: dict[str, Any], platform: str, index: int = 0) -> str:
+def _track_row_html(
+    entry: dict[str, Any], platform: str, index: int = 0, *, short: bool = False
+) -> str:
     badge = _esc(entry["badge"])
     version_status = _esc(entry["version_status"])
     role = _esc(entry["primary_role"])
@@ -403,10 +409,12 @@ def _track_row_html(entry: dict[str, Any], platform: str, index: int = 0) -> str
     acquire = _acquire_links_html(entry.get("acquire"))
     best_start = int(entry["start_ms"])
     alternatives = _alternatives_html(entry)
+    row_class = "track short" if short else "track"
     # ``--i`` staggers the row entrance animation; the hidden ``ver``/``role`` cells keep the
     # export-identical columns available to CSS/tests while the visible row stays uncluttered.
     return (
-        f'<tr class="track" data-episode-id="{_esc(entry["episode_id"])}" style="--i:{index}" '
+        f'<tr class="{row_class}" data-episode-id="{_esc(entry["episode_id"])}" '
+        f'style="--i:{index}" '
         f'data-best-start-ms="{best_start}" tabindex="0" role="button" '
         f'aria-label="Seek to {_esc(_format_time(best_start))} — {label}">'
         f'<td class="time"><span class="eqi"><i></i><i></i><i></i></span>'
@@ -416,7 +424,7 @@ def _track_row_html(entry: dict[str, Any], platform: str, index: int = 0) -> str
         f'<td class="role">{role}</td>'
         f'<td class="label"><span class="ar">{_esc(entry["artist"])}</span>'
         f'<span class="sep">—</span><span class="tt">{_esc(entry["title"])}</span>'
-        f"{_tags_html(entry)}{alternatives}</td>"
+        f"{_tags_html(entry, short)}{alternatives}</td>"
         f'<td class="acquire">{acquire}</td>'
         f'<td class="ops"><button type="button" class="rescan" '
         f'title="Ask for a rescan around here" data-trigger="edge" '
@@ -461,7 +469,8 @@ def _timeline_html(lanes: list[dict[str, Any]], gaps: list[dict[str, Any]]) -> s
         # ``data-badge`` colours the lane by confidence, so the strip reads as a confidence map.
         parts.append(
             f'<div class="tl-lane" data-episode-id="{_esc(lane["episode_id"])}" '
-            f'data-badge="{_esc(lane["badge"])}" title="{_esc(lane["label"])}">'
+            f'data-badge="{_esc(lane["badge"])}"{' data-short="1"' if lane.get("short") else ""} '
+            f'title="{_esc(lane["label"])}">'
         )
         parts.append(
             f'<div class="tl-extent" '
@@ -787,6 +796,16 @@ tr.gap td{background:repeating-linear-gradient(135deg,rgba(251,113,133,.05) 0 8p
 transparent 8px 16px)}
 tr.gap .label{color:var(--muted)}
 tr.gap .tt{color:var(--gap)}
+/* short matches (under the configured on-air floor): hidden until asked for */
+tr.track.short{display:none}body.show-short tr.track.short{display:table-row}
+body.show-short tr.track.short td{opacity:.72}
+.tl-lane[data-short="1"]{display:none}body.show-short .tl-lane[data-short="1"]{display:block}
+.tag.short-tag{color:var(--gap);border-color:rgba(251,113,133,.35)}
+.short-note{color:var(--muted);font-size:12px;display:inline-flex;gap:5px;align-items:center}
+.short-note b{color:var(--fg)}
+.linkish{background:none;border:0;padding:0;color:var(--accent);cursor:pointer;font:inherit;
+font-size:12px}
+.linkish:hover{text-decoration:underline}
 /* the NOW pill in the top bar */
 .now{flex:1;min-width:0;display:flex;align-items:center;gap:10px;justify-content:center;
 font-size:13px;cursor:pointer}
@@ -921,7 +940,9 @@ function seekToPositionMs(positionMs){ return seekPlayerArg(seekArgument(positio
 // Copy the tracklist as plain text (time, artist — title; ID for a gap) ------
 function tracklistText(){
   const lines = [];
+  const showingShort = document.body.classList.contains('show-short');
   document.querySelectorAll('tr.track, tr.gap').forEach(function(row){
+    if(row.classList.contains('short') && !showingShort) return;
     const t = row.querySelector('.time').textContent.trim();
     if(row.classList.contains('gap')){ lines.push(t + '  ID'); return; }
     lines.push(t + '  ' + (ROW_LABELS[row.getAttribute('data-episode-id')] || ''));
@@ -993,6 +1014,12 @@ ready(function(){
   });
   const copy = document.getElementById('copy');
   if(copy) copy.addEventListener('click', copyTracklist);
+  const showShort = document.getElementById('show-short');
+  if(showShort) showShort.addEventListener('click', function(){
+    const on = document.body.classList.toggle('show-short');
+    showShort.textContent = on ? 'hide' : 'show';
+    if(CURRENT_POSITION_MS !== null) updatePlayhead(CURRENT_POSITION_MS);
+  });
   const now = document.getElementById('now');
   if(now) now.addEventListener('click', function(){
     const row = document.querySelector('tr.track.current');
@@ -1020,6 +1047,7 @@ def render_page(
     lead_in_ms: int = DEFAULT_LEAD_IN_MS,
     collapse: bool = True,
     same_track_bridge_ms: int | None = None,
+    min_track_ms: int = 0,
 ) -> str:
     """Render the complete self-contained HTML page as a string.
 
@@ -1029,6 +1057,11 @@ def render_page(
     (``None`` → the grouping default) with no different confident track between them likewise stack
     into one row.  The timeline lane, the current-row highlight and the seek all use that display
     track's primary.  ``collapse=False`` restores the one-lane-per-episode view.
+
+    ``min_track_ms`` (default ``0`` = off) marks track rows that played too briefly to be a real
+    track (see :func:`~id_detector.present.exports.short_track`): they stay in the page but are
+    hidden behind a "N short matches hidden · show" toggle and are left out of the stats, the
+    timeline and the playhead partition.  The exports drop them outright.
     """
 
     embed = plan_embed(source)
@@ -1036,6 +1069,8 @@ def render_page(
         episodes, identities, acquire, collapse=collapse, same_track_bridge_ms=same_track_bridge_ms
     )
     boundaries = _evidence_boundaries(list(episodes.episodes))
+    short_ids = {e["episode_id"] for e in entries if short_track(e, min_track_ms)}
+    visible = tuple(e for e in entries if e.get("episode_id") not in short_ids)
 
     # A display track is one collapsed row (primary + folded-in alternatives); ungrouped, it is one
     # episode.  Lanes, the highlight partition and the row all key off the primary's id so the
@@ -1070,6 +1105,9 @@ def render_page(
         )
         for episode in lane_episodes
     ]
+    for lane in lanes:
+        lane["short"] = lane["episode_id"] in short_ids
+    span_items = [item for item in span_items if item[0] not in short_ids]
     gap_markers = [_gap_marker(gap, duration_ms) for gap in episodes.gaps]
 
     # Playhead → current-track partition: each display track owns time from its start up to the
@@ -1088,7 +1126,8 @@ def render_page(
     rows: list[str] = []
     for index, entry in enumerate(entries):
         if entry["kind"] == "track":
-            rows.append(_track_row_html(entry, source.platform, index))
+            short = entry["episode_id"] in short_ids
+            rows.append(_track_row_html(entry, source.platform, index, short=short))
         else:
             rows.append(_gap_row_html(entry))
 
@@ -1107,6 +1146,15 @@ def render_page(
     episode_spans_js = json.dumps(episode_spans)
     # The control shows whole seconds; the page converts back to milliseconds on change.
     lead_in_s = f"{lead_in_ms / 1000:g}"
+    short_note = ""
+    if short_ids:
+        n = len(short_ids)
+        seconds = f"{min_track_ms / 1000:g}"
+        short_note = (
+            f'<span class="short-note" id="short-note"><b>{n}</b> short match'
+            f"{'es' if n != 1 else ''} (under {seconds} s) hidden · "
+            '<button type="button" class="linkish" id="show-short">show</button></span>'
+        )
     now_pill = (
         '<div class="now" id="now" hidden title="Jump to the current track">'
         '<span class="now-k">NOW</span><span class="now-t" id="now-time"></span>'
@@ -1124,7 +1172,7 @@ class="pd"></span>{_esc(platform_name)}</span>
   <span class="chip">generation <b>{episodes.generation}</b></span>
 </div>
 <h1>{_esc(title)}</h1>
-{_stats_html(entries, episodes, duration_ms)}
+{_stats_html(visible, episodes, duration_ms)}
 </header>
 <section class="player">{_embed_html(embed)}</section>
 <div class="exports">
@@ -1152,7 +1200,7 @@ class="pd"></span>{_esc(platform_name)}</span>
   <span class="lg-gap">ID gap</span>
 </div>
 </section>
-<div class="list-head"><h2>Tracklist</h2>
+<div class="list-head"><h2>Tracklist</h2>{short_note}
 <span class="hint-k">click a row to jump there · <kbd>↑</kbd><kbd>↓</kbd> move · <kbd>↵</kbd>
 play</span></div>
 <div class="tablewrap"><table>
@@ -1193,6 +1241,7 @@ def generate_page(
     lead_in_ms: int = DEFAULT_LEAD_IN_MS,
     collapse: bool = True,
     same_track_bridge_ms: int | None = None,
+    min_track_ms: int = 0,
 ) -> Path:
     """Render and atomically write ``present/index.html`` with a completion sidecar."""
 
@@ -1205,6 +1254,7 @@ def generate_page(
         lead_in_ms=lead_in_ms,
         collapse=collapse,
         same_track_bridge_ms=same_track_bridge_ms,
+        min_track_ms=min_track_ms,
     )
     index_path = media_dir / "present" / "index.html"
     atomic_write_bytes(index_path, html_text.encode("utf-8"))

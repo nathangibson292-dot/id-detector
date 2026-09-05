@@ -73,6 +73,7 @@ def regenerate_page(media_dir: Path, *, config: AppConfig | None = None) -> Path
         lead_in_ms=app_config.lead_in_ms,
         collapse=app_config.collapse,
         same_track_bridge_ms=app_config.same_track_bridge_ms,
+        min_track_ms=getattr(app_config, "present_min_track_ms", 0),
     )
 
 

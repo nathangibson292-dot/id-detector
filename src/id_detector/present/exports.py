@@ -90,6 +90,40 @@ def _display_start(episode: EpisodeRecord) -> int:
     return primary.from_ms
 
 
+def _on_air_ms(episode: EpisodeRecord) -> int:
+    """Proved on-air span: the hull of the evidence support and the best bounds.
+
+    A single-window episode carries inverted ``best_start_ms``/``best_end_ms`` (each names a proved
+    one-sided bound), so the hull — not ``best_end - best_start`` — is the robust measure of how
+    long the track was actually heard.
+    """
+
+    support = episode.evidence_support_ms
+    lo = min(episode.best_start_ms, episode.best_end_ms, *(span[0] for span in support))
+    hi = max(episode.best_start_ms, episode.best_end_ms, *(span[1] for span in support))
+    return max(0, hi - lo)
+
+
+#: Badges that keep a short match listed regardless of how briefly it played.
+_KEEP_SHORT_BADGES = frozenset({"likely", "verified"})
+
+
+def short_track(entry: dict[str, Any], min_track_ms: int) -> bool:
+    """Whether a flattened track row played too briefly to be listed as a track.
+
+    On-air duration cleanly separates real tracks from false positives (most false positives are a
+    single 12 s window), so a ``kind == "track"`` row whose proved on-air span is under
+    ``min_track_ms`` is treated as short — UNLESS its badge is ``likely``/``verified`` or a text
+    hint supports it.  ``0`` disables the rule; ID gaps are never short.
+    """
+
+    if min_track_ms <= 0 or entry.get("kind") != "track":
+        return False
+    if entry.get("badge") in _KEEP_SHORT_BADGES or entry.get("hint_supported"):
+        return False
+    return int(entry.get("on_air_ms") or 0) < min_track_ms
+
+
 def _acquire_summary(episode: AcquireEpisode) -> dict[str, Any]:
     classification = episode.soundcloud.classification if episode.soundcloud else "none"
     free_download = classification == "free_download_native"
@@ -144,6 +178,7 @@ def _track_entry(
         "badge": episode.badge,
         "version_status": episode.version_status,
         "hint_supported": "hint_supported" in episode.flags,
+        "on_air_ms": _on_air_ms(episode),
         "n_rejected_hypotheses": len(episode.rejected_evidence),
         "tiers": episode.tiers.model_dump(mode="json"),
         "acquire": _acquire_summary(acquire_episode) if acquire_episode is not None else None,
@@ -173,6 +208,7 @@ def flatten_tracklist(
     *,
     collapse: bool = True,
     same_track_bridge_ms: int | None = None,
+    min_track_ms: int = 0,
 ) -> tuple[dict[str, Any], ...]:
     """Flatten episodes to tracklist rows using primary-role precedence and honest ID gaps.
 
@@ -181,6 +217,9 @@ def flatten_tracklist(
     ``alternatives``.  Two appearances of the SAME exact track up to ``same_track_bridge_ms`` apart
     (``None`` → the grouping default) with no different confident track between them likewise stack
     into one row.  ``collapse=False`` restores the historical one-row-per-episode view.
+
+    ``min_track_ms`` (default ``0`` = off) drops track rows that played too briefly to be a real
+    track — see :func:`short_track` — while leaving every ID gap in place.
     """
 
     acquire_by_episode = (
@@ -211,6 +250,7 @@ def flatten_tracklist(
             entry = _track_entry(track.primary, identities, acquire_by_episode, label_by_episode)
             entry["start_ms"] = track.start_ms
             entry["end_ms"] = track.end_ms
+            entry["on_air_ms"] = max(entry["on_air_ms"], track.end_ms - track.start_ms)
             alternatives = [_alternative_summary(alt, identities) for alt in track.alternatives]
             entry["alternatives"] = alternatives
             entry["also_count"] = len(alternatives)
@@ -235,6 +275,7 @@ def flatten_tracklist(
         }
         for gap in episodes.gaps
     )
+    entries = [entry for entry in entries if not short_track(entry, min_track_ms)]
     return tuple(
         sorted(
             entries,
@@ -269,9 +310,15 @@ def export_tracklist(
     media_target: str | None = None,
     collapse: bool = True,
     same_track_bridge_ms: int | None = None,
+    min_track_ms: int = 0,
 ) -> ExportResult:
     entries = flatten_tracklist(
-        episodes, identities, acquire, collapse=collapse, same_track_bridge_ms=same_track_bridge_ms
+        episodes,
+        identities,
+        acquire,
+        collapse=collapse,
+        same_track_bridge_ms=same_track_bridge_ms,
+        min_track_ms=min_track_ms,
     )
     json_path = media_dir / "present" / "tracklist.json"
     markdown_path = media_dir / "present" / "tracklist.md"
