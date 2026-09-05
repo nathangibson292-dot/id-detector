@@ -543,3 +543,35 @@ def test_hidden_reason_covers_suppressed_and_short_rows() -> None:
     assert _support_ms([[0, 12_000], [6_000, 18_000]]) == 18_000
     assert _support_ms([[0, 12_000], [60_000, 72_000]]) == 24_000
     assert _support_ms([]) == 0
+
+
+def test_suppressed_episodes_drop_from_exports_and_tuck_on_the_page() -> None:
+    """A fusion-side ``suppressed`` reason is honoured like a short match: gone from the exports,
+    kept on the page behind the toggle with a friendly reason tag and counted in the note."""
+
+    from id_detector.present.exports import flatten_tracklist
+
+    document = _episodes_file().model_dump(mode="json")
+    buried = _episode(idx=8, best_start_ms=2_000_000, best_end_ms=2_090_000)
+    buried["badge"] = "possible"
+    buried["suppressed"] = "buried"
+    document["episodes"].append(buried)
+    episodes = EpisodesFile.model_validate(document)
+    identities = _identities()
+
+    listed = flatten_tracklist(episodes, identities, collapse=False)
+    assert buried["id"] not in {e.get("episode_id") for e in listed}  # even with the floor off
+    everything = flatten_tracklist(episodes, identities, collapse=False, include_hidden=True)
+    assert buried["id"] in {e.get("episode_id") for e in everything}
+
+    page = render_page(
+        source=_source("soundcloud"),
+        episodes=episodes,
+        identities=identities,
+        duration_ms=DURATION_MS,
+        collapse=False,
+    )
+    assert f'<tr class="track short" data-episode-id="{buried["id"]}"' in page
+    assert "buried under a surer track" in page
+    assert "<b>1</b> suppressed match hidden" in page
+    assert f'"id": "{buried["id"]}"' not in page  # out of the playhead partition

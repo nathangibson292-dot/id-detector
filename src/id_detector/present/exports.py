@@ -245,6 +245,7 @@ def flatten_tracklist(
     collapse: bool = True,
     same_track_bridge_ms: int | None = None,
     min_track_ms: int = 0,
+    include_hidden: bool = False,
 ) -> tuple[dict[str, Any], ...]:
     """Flatten episodes to tracklist rows using primary-role precedence and honest ID gaps.
 
@@ -256,7 +257,8 @@ def flatten_tracklist(
 
     ``min_track_ms`` (default ``0`` = off) drops track rows that played too briefly to be a real
     track, and any row fusion marked ``suppressed`` — see :func:`hidden_reason` — while leaving
-    every ID gap in place.
+    every ID gap in place.  ``include_hidden=True`` keeps those rows (the page uses it to tuck
+    them behind a toggle instead of losing them).
     """
 
     acquire_by_episode = (
@@ -318,7 +320,8 @@ def flatten_tracklist(
         }
         for gap in episodes.gaps
     )
-    entries = [entry for entry in entries if hidden_reason(entry, min_track_ms) is None]
+    if not include_hidden:
+        entries = [entry for entry in entries if hidden_reason(entry, min_track_ms) is None]
     return tuple(
         sorted(
             entries,

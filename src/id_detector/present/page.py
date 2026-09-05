@@ -1077,8 +1077,14 @@ def render_page(
     """
 
     embed = plan_embed(source)
+    # Every row, including short/suppressed ones: the page hides them itself (see hidden_by_id).
     entries = flatten_tracklist(
-        episodes, identities, acquire, collapse=collapse, same_track_bridge_ms=same_track_bridge_ms
+        episodes,
+        identities,
+        acquire,
+        collapse=collapse,
+        same_track_bridge_ms=same_track_bridge_ms,
+        include_hidden=True,
     )
     boundaries = _evidence_boundaries(list(episodes.episodes))
     hidden_by_id = {
