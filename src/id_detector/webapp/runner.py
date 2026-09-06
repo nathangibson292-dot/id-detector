@@ -15,8 +15,10 @@ from hashlib import sha256
 from pathlib import Path
 
 from id_detector.providers.base import AppConfig
-from id_detector.scan import PAID_FILE_SCANNERS
 from id_detector.webapp.jobs import JobContext
+
+#: The single paid engine the browser's max-accuracy tier uses (see the runner note below).
+WEB_PAID_ENGINE = "audd"
 
 
 @dataclass(frozen=True)
@@ -127,12 +129,14 @@ def make_pipeline_runner(
 
         settings = _resolve_settings(project, config_file, ctx.profile)
         tracklist_path = _materialise_tracklist(root, ctx.known_tracklist)
-        # The browser's paid tier: choosing max_accuracy AND ticking upload consent activates the
-        # paid scanners on top of the profile's engines.  Each still self-gates on its credentials
-        # and on the config's allow_third_party_upload, so a missing key simply skips that engine.
+        # The browser's paid tier: choosing max_accuracy AND ticking upload consent activates ONE
+        # paid scanner (AudD — the broadest single catalogue; running both engines is mostly
+        # redundant spend).  It still self-gates on its credentials and on the config's
+        # allow_third_party_upload, so a missing key simply skips it.  ACRCloud stays available for
+        # a deliberate comparison via the CLI's --engine flag.
         engines = settings.enabled_engines
         if ctx.upload_consent and ctx.profile == "max_accuracy":
-            engines = tuple(dict.fromkeys([*engines, *PAID_FILE_SCANNERS]))
+            engines = tuple(dict.fromkeys([*engines, WEB_PAID_ENGINE]))
 
         def progress(phase: str, done: int, total: int, message: str = "") -> None:
             ctx.progress(phase, done, total, message)
