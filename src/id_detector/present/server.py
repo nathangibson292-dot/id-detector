@@ -1327,20 +1327,34 @@ class _Handler(BaseHTTPRequestHandler):
                 profile = str(profile) if profile is not None else None
                 acquire = bool(payload.get("acquire"))
                 build_index = bool(payload.get("build_index"))
+                known_tracklist = payload.get("known_tracklist")
             else:
                 form = parse_qs(raw.decode("utf-8"), keep_blank_values=True)
                 url = (form.get("url") or [""])[0]
                 profile = (form.get("profile") or [None])[0]
                 acquire = bool(form.get("acquire"))
                 build_index = bool(form.get("build_index"))
+                known_tracklist = (form.get("known_tracklist") or [""])[0]
         except (ValueError, UnicodeDecodeError):
             self._send_json(HTTPStatus.BAD_REQUEST, {"error": "bad request"})
             return
         if profile is not None and profile not in _PROFILES:
             self._send_json(HTTPStatus.BAD_REQUEST, {"error": "unknown profile"})
             return
+        # A pasted tracklist is an optional hint seed; blank/whitespace means "audio only".  Cap it
+        # so an oversized paste can never balloon a job (a real tracklist is a few KB at most).
+        if not isinstance(known_tracklist, str) or not known_tracklist.strip():
+            known_tracklist = None
+        elif len(known_tracklist) > 64_000:
+            known_tracklist = known_tracklist[:64_000]
         try:
-            job_id = self.job_manager.submit(url, profile, acquire=acquire, build_index=build_index)
+            job_id = self.job_manager.submit(
+                url,
+                profile,
+                acquire=acquire,
+                build_index=build_index,
+                known_tracklist=known_tracklist,
+            )
         except TargetValidationError as exc:
             self._send_json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
             return

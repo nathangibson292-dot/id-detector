@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass, replace
+from hashlib import sha256
 from pathlib import Path
 
 from id_detector.providers.base import AppConfig
@@ -77,6 +78,27 @@ def _resolve_settings(project_root: Path, config_path: Path, profile: str | None
     )
 
 
+def _materialise_tracklist(work_root: Path, pasted: str | None) -> Path | None:
+    """Write a pasted known tracklist to a stable UTF-8 file for the manual-tracklist hint path.
+
+    The file is content-addressed under ``<work_root>/.tracklists`` so repeated submissions of the
+    same text reuse one file, and blank/whitespace-only input means "audio only" (no file).
+    """
+
+    if pasted is None:
+        return None
+    text = pasted.strip()
+    if not text:
+        return None
+    body = text.encode("utf-8")
+    digest = sha256(body).hexdigest()[:16]
+    path = Path(work_root) / ".tracklists" / f"{digest}.txt"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if not path.is_file():
+        path.write_bytes(body)
+    return path
+
+
 def make_pipeline_runner(
     work_root: Path,
     *,
@@ -100,6 +122,7 @@ def make_pipeline_runner(
             ctx.check_cancel()
 
         settings = _resolve_settings(project, config_file, ctx.profile)
+        tracklist_path = _materialise_tracklist(root, ctx.known_tracklist)
 
         def progress(phase: str, done: int, total: int, message: str = "") -> None:
             ctx.progress(phase, done, total, message)
@@ -111,7 +134,7 @@ def make_pipeline_runner(
                 print_raw=False,
                 refresh=False,
                 max_requests=settings.max_requests,
-                tracklist=None,
+                tracklist=tracklist_path,
                 no_hints=settings.no_hints,
                 app_config=settings.config,
                 max_generations=settings.max_generations,

@@ -94,6 +94,9 @@ class Job:
     profile: str | None
     acquire: bool
     build_index: bool
+    #: An optional tracklist the user pasted (e.g. from 1001tracklists / a YouTube description) to
+    #: seed positioned hints — the same corroboration/recovery path as the CLI's ``--tracklist``.
+    known_tracklist: str | None = None
     status: str = QUEUED
     phase: str = QUEUED
     phase_done: int = 0
@@ -185,6 +188,10 @@ class JobContext:
         return self._job.build_index
 
     @property
+    def known_tracklist(self) -> str | None:
+        return self._job.known_tracklist
+
+    @property
     def work_root(self) -> Path:
         return self._manager.work_root
 
@@ -260,6 +267,7 @@ class JobManager:
         *,
         acquire: bool = False,
         build_index: bool = False,
+        known_tracklist: str | None = None,
     ) -> str:
         validated = validate_target(target)
         job = Job(
@@ -269,6 +277,7 @@ class JobManager:
             profile=profile,
             acquire=acquire,
             build_index=build_index,
+            known_tracklist=known_tracklist,
         )
         with self.lock:
             self._jobs[job.id] = job

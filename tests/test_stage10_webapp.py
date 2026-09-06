@@ -609,3 +609,44 @@ def test_audio_route_streams_the_fetched_original_with_range_support(tmp_path: P
         running.shutdown()
         manager.shutdown()
     assert _wait_until(_no_worker_thread_alive)
+
+
+# --------------------------------------------------------------------------------------------------
+# Paste-a-tracklist (known_tracklist) plumbing
+# --------------------------------------------------------------------------------------------------
+def test_materialise_tracklist_writes_dedupes_and_ignores_blank(tmp_path: Path) -> None:
+    from id_detector.webapp.runner import _materialise_tracklist
+
+    assert _materialise_tracklist(tmp_path, None) is None
+    assert _materialise_tracklist(tmp_path, "   \n\t ") is None
+
+    text = "12:34 Artist - Title\n45:00 Other - Song"
+    first = _materialise_tracklist(tmp_path, text)
+    assert first is not None and first.is_file()
+    assert first.read_text(encoding="utf-8") == text
+    # Leading/trailing whitespace is stripped but the same content maps to the same file.
+    second = _materialise_tracklist(tmp_path, f"\n {text}  ")
+    assert second == first
+    # Different content is a different file.
+    third = _materialise_tracklist(tmp_path, text + "\n59:00 Third - Cut")
+    assert third is not None and third != first
+
+
+def test_submit_threads_known_tracklist_to_the_runner(tmp_path: Path) -> None:
+    seen: dict[str, object] = {}
+
+    def capture(ctx: JobContext) -> None:
+        seen["known"] = ctx.known_tracklist
+
+    manager = JobManager(tmp_path, capture)
+    try:
+        job_id = manager.submit(CLEAN_URL, "free", known_tracklist="00:00 A - B")
+        assert _wait_until(lambda: manager.get(job_id).status in {"succeeded", "failed"})
+        assert seen["known"] == "00:00 A - B"
+        # And a job submitted without one leaves the field None.
+        other = manager.submit(CLEAN_URL, "free")
+        assert _wait_until(lambda: manager.get(other).status in {"succeeded", "failed"})
+        assert seen["known"] is None
+    finally:
+        manager.shutdown()
+    assert _wait_until(_no_worker_thread_alive)
