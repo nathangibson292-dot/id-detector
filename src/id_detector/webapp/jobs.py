@@ -97,6 +97,10 @@ class Job:
     #: An optional tracklist the user pasted (e.g. from 1001tracklists / a YouTube description) to
     #: seed positioned hints — the same corroboration/recovery path as the CLI's ``--tracklist``.
     known_tracklist: str | None = None
+    #: Per-run consent to upload this audio to a paid engine (the browser mirror of the CLI's
+    #: ``--i-own-this-audio-or-have-permission``).  Paid file_scanners run only when this is true
+    #: AND the config's ``allow_third_party_upload`` is set AND the profile enables them.
+    upload_consent: bool = False
     status: str = QUEUED
     phase: str = QUEUED
     phase_done: int = 0
@@ -192,6 +196,10 @@ class JobContext:
         return self._job.known_tracklist
 
     @property
+    def upload_consent(self) -> bool:
+        return self._job.upload_consent
+
+    @property
     def work_root(self) -> Path:
         return self._manager.work_root
 
@@ -268,6 +276,7 @@ class JobManager:
         acquire: bool = False,
         build_index: bool = False,
         known_tracklist: str | None = None,
+        upload_consent: bool = False,
     ) -> str:
         validated = validate_target(target)
         job = Job(
@@ -278,6 +287,7 @@ class JobManager:
             acquire=acquire,
             build_index=build_index,
             known_tracklist=known_tracklist,
+            upload_consent=upload_consent,
         )
         with self.lock:
             self._jobs[job.id] = job

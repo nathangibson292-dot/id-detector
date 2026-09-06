@@ -127,6 +127,8 @@ async def run_generation_loop(
     observations_path: Path,
     recognise: RecogniseGeneration,
     app_config: AppConfig,
+    extra_observations: tuple[ObservationRecord, ...] | list[ObservationRecord] = (),
+    extra_observation_paths: tuple[Path, ...] | list[Path] = (),
     hints: tuple[HintRecord, ...] | list[HintRecord] = (),
     hints_path: Path | None = None,
     profile: str = "free",
@@ -144,9 +146,12 @@ async def run_generation_loop(
     transforms = rescan_transform_grid(app_config)
 
     all_windows: list[WindowRecord] = list(windows.records)
-    all_observations: list[ObservationRecord] = list(observations)
+    # Paid whole-file scanner observations (AudD/ACRCloud) join generation 0 as a static set: they
+    # are never re-run per rescan generation, so they simply persist through the loop and fuse
+    # alongside every generation's clip observations.  Empty on the free path.
+    all_observations: list[ObservationRecord] = list(observations) + list(extra_observations)
     window_paths: list[Path] = [windows.record_path]
-    observation_paths: list[Path] = [observations_path]
+    observation_paths: list[Path] = [observations_path, *extra_observation_paths]
     prior_keys: set[str] = set()
     spent_windows = len(all_windows)
     budget = max(request_budget, len(all_windows))

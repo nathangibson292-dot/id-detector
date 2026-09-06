@@ -1328,6 +1328,7 @@ class _Handler(BaseHTTPRequestHandler):
                 acquire = bool(payload.get("acquire"))
                 build_index = bool(payload.get("build_index"))
                 known_tracklist = payload.get("known_tracklist")
+                upload_consent = bool(payload.get("upload_consent"))
             else:
                 form = parse_qs(raw.decode("utf-8"), keep_blank_values=True)
                 url = (form.get("url") or [""])[0]
@@ -1335,6 +1336,7 @@ class _Handler(BaseHTTPRequestHandler):
                 acquire = bool(form.get("acquire"))
                 build_index = bool(form.get("build_index"))
                 known_tracklist = (form.get("known_tracklist") or [""])[0]
+                upload_consent = bool(form.get("upload_consent"))
         except (ValueError, UnicodeDecodeError):
             self._send_json(HTTPStatus.BAD_REQUEST, {"error": "bad request"})
             return
@@ -1354,6 +1356,7 @@ class _Handler(BaseHTTPRequestHandler):
                 acquire=acquire,
                 build_index=build_index,
                 known_tracklist=known_tracklist,
+                upload_consent=upload_consent,
             )
         except TargetValidationError as exc:
             self._send_json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})

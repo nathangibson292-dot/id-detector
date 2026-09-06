@@ -7,7 +7,7 @@ import json
 import sys
 import tomllib
 import uuid
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import replace
 from decimal import Decimal
 from hashlib import sha256
@@ -52,6 +52,7 @@ from id_detector.profiles import (
 from id_detector.providers.base import AppConfig
 from id_detector.recognise import recognise_generation
 from id_detector.rescan import DEFAULT_MAX_GENERATIONS
+from id_detector.scan import PAID_FILE_SCANNERS, PaidScanResult, run_paid_scanners
 from id_detector.truth import (
     freeze_truth,
     resolve_truth,
@@ -329,6 +330,9 @@ async def _analyse(
     max_generations: int = DEFAULT_MAX_GENERATIONS,
     novelty: bool = True,
     calibrator: object | None = None,
+    enabled_engines: tuple[str, ...] = (),
+    cli_confirmation: bool = False,
+    paid_scan_adapters: Mapping[str, object] | None = None,
     progress: ProgressFn | None = None,
 ) -> int:
     app_config = app_config or AppConfig()
@@ -424,6 +428,43 @@ async def _analyse(
                 "cache_hits": recognised.cache_hits,
             }
         )
+
+        # Paid whole-file scanners (AudD/ACRCloud) run once here when the active profile enables
+        # them AND credentials + upload consent are present; otherwise this is a no-op and the free
+        # path is untouched.  Their observations join generation 0 as a static evidence set.
+        paid_scan = PaidScanResult()
+        if enabled_engines:
+            _report(progress, "scan", 0, 1, "cross-checking with paid engines")
+            timer.start_stage("scan_ms")
+            paid_scan = await run_paid_scanners(
+                media_key=ingested.record.media_key,
+                media_dir=media_dir,
+                asset_path=ingested.original_path,
+                asset_sha256=ingested.record.original.sha256,
+                asset_kind="original",
+                duration_ms=decoded.record.pcm.duration_ms,
+                source_path=ingested.source_path,
+                app_config=app_config,
+                enabled_engines=enabled_engines,
+                cli_confirmation=cli_confirmation,
+                refresh=refresh,
+                adapters=paid_scan_adapters,
+                log=lambda message: _report(progress, "scan", 0, 1, message),
+            )
+            timer.finish_stage("scan_ms")
+            counts["paid_matches"] = sum(
+                item.status == "match" for item in paid_scan.observations
+            )
+            for provider, reason in paid_scan.skipped:
+                _report(progress, "scan", 1, 1, f"{provider} skipped: {reason}")
+            summary = (
+                f"{len(paid_scan.engines_run)} engine(s), "
+                f"{len(paid_scan.observations)} observations"
+                if paid_scan.ran
+                else "no paid engine ran"
+            )
+            _report(progress, "scan", 1, 1, summary)
+
         hint_result = None
         if not no_hints:
             _report(progress, "hints", 0, 1, "reading tracklist hints")
@@ -453,6 +494,8 @@ async def _analyse(
             observations_path=recognised.observations_path,
             recognise=recognise_windows,
             app_config=app_config,
+            extra_observations=paid_scan.observations,
+            extra_observation_paths=paid_scan.observation_paths,
             hints=hint_result.hints if hint_result is not None else (),
             hints_path=hint_result.hints_path if hint_result is not None else None,
             max_generations=max_generations,
@@ -643,9 +686,29 @@ def analyse(
             "track into one row with 'could also be' alternatives (default: present.collapse, on)."
         ),
     ),
+    i_own_this_audio_or_have_permission: bool = typer.Option(
+        False,
+        "--i-own-this-audio-or-have-permission",
+        help=(
+            "Per-run consent to upload this audio to a paid engine (AudD/ACRCloud). Required, "
+            "together with allow_third_party_upload = true in config, before a profile's paid "
+            "file_scanner engines run; otherwise they are skipped and only the free engine is used."
+        ),
+    ),
+    engine: list[str] | None = typer.Option(  # noqa: B008
+        None,
+        "--engine",
+        help=(
+            "Add a paid file_scanner engine ('audd' or 'acrcloud') for this run, on top of the "
+            "profile's engines; repeatable.  The engine still runs only with its credentials set "
+            "and upload consent given.  Use this to try a paid cross-check without re-freezing a "
+            "profile (a frozen profile lists paid engines only once benchmarked with credentials)."
+        ),
+    ),
 ) -> None:
     """Run the full multi-generation pipeline and export a flattened tracklist."""
     calibrator = None
+    enabled_engines: tuple[str, ...] = ()
     # The file config is always the source of non-schedule preferences (lead-in, budget, cache TTLs,
     # per-connector hint switches).  A --profile (or the file's default_profile) is the authority on
     # engines and the transform/schedule/rescan geometry, so it overrides those tables while the
@@ -667,7 +730,9 @@ def analyse(
             hints_enabled=file_config.hints_enabled,
             disabled_hint_connectors=file_config.disabled_hint_connectors,
         )
-        # A frozen profile is the authority on its feature toggles.
+        # A frozen profile is the authority on its feature toggles and its engine set (only
+        # max_accuracy lists paid file_scanner engines).
+        enabled_engines = tuple(frozen.enabled_engines)
         novelty = frozen.novelty_enabled
         no_hints = no_hints or not frozen.hints_enabled
         # Use calibrated scores/tiers only if a frozen calibration artefact exists for the profile;
@@ -676,6 +741,18 @@ def analyse(
         calibrator = load_calibration(PROJECT_ROOT, frozen.name)
     else:
         loaded_config = file_config
+    # An explicit --engine adds a paid scanner on top of whatever the profile fixes (deduped, order
+    # preserved).  It still runs only with credentials + consent, so this is a convenience opt-in,
+    # not a bypass of the safety gates.
+    if engine:
+        requested = [name.strip().lower() for name in engine if name.strip()]
+        unknown = [name for name in requested if name not in PAID_FILE_SCANNERS]
+        if unknown:
+            typer.echo(
+                f"unknown --engine: {', '.join(unknown)} (choose audd or acrcloud)", err=True
+            )
+            raise typer.Exit(2)
+        enabled_engines = tuple(dict.fromkeys([*enabled_engines, *requested]))
     if collapse is not None:
         loaded_config = replace(loaded_config, collapse=collapse)
     if max_requests < 0:
@@ -702,6 +779,8 @@ def analyse(
                 ),
                 novelty=novelty,
                 calibrator=calibrator,
+                enabled_engines=enabled_engines,
+                cli_confirmation=i_own_this_audio_or_have_permission,
             )
         )
     except KeyboardInterrupt:
