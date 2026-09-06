@@ -57,10 +57,12 @@ main{max-width:1120px;margin:0 auto;padding:12px 24px 64px;animation:rise .5s ea
 border-bottom:1px solid var(--line)}
 .topbar-in{max-width:1120px;margin:0 auto;padding:10px 24px;display:flex;align-items:center;
 gap:16px;min-height:56px}
-.brand{display:inline-flex;align-items:center;gap:10px;font:700 16px/1 var(--display);
-letter-spacing:-.02em;color:var(--fg);white-space:nowrap}.brand:hover{text-decoration:none}
-.brand .dot{background:var(--grad);-webkit-background-clip:text;background-clip:text;
-color:transparent;font-weight:900}
+.brand{display:inline-flex;align-items:center;gap:9px;color:var(--fg);white-space:nowrap}
+.brand:hover{text-decoration:none}
+.logo{display:inline-flex;align-items:center;justify-content:center;width:30px;height:30px;
+border-radius:9px;background:var(--grad);box-shadow:0 6px 18px -7px rgba(139,92,246,.85)}
+.logo .eq{height:15px;width:17px}.logo .eq i{background:#fff}
+.wm{font:800 19px/1 var(--display);letter-spacing:-.03em;color:var(--fg)}.wm span{font-weight:500}
 .eq{display:inline-flex;align-items:flex-end;gap:2px;height:14px;width:16px}
 .eq i{display:block;width:3px;height:4px;border-radius:2px;background:var(--grad);
 transform-origin:bottom;transition:height .3s}
@@ -141,8 +143,9 @@ def topbar_html(*, back: bool = False, new: bool = True, middle: str = "") -> st
         nav += '<a class="btn primary" href="/new">+ New mix</a>'
     return (
         '<nav class="topbar"><div class="topbar-in">'
-        '<a class="brand" href="/"><span class="eq"><i></i><i></i><i></i><i></i></span>'
-        '<span class="dot">ID</span>ea</a>'
+        '<a class="brand" href="/">'
+        '<span class="logo"><span class="eq"><i></i><i></i><i></i><i></i></span></span>'
+        '<span class="wm"><b>ID</b><span>ea</span></span></a>'
         f'{middle}<span class="nav">{nav}</span></div></nav>'
     )
 
