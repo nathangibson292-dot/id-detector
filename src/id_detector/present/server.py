@@ -308,8 +308,8 @@ background:var(--card);transition:border-color .12s,background .12s}
 .segopt input:checked+span{border-color:var(--accent);
 background:linear-gradient(135deg,rgba(139,92,246,.18),rgba(34,211,238,.08))}
 .segopt input:focus-visible+span{box-shadow:0 0 0 3px rgba(167,139,250,.3)}
-.segopt b{display:block;font-size:14px}.segopt small,.tog small{display:block;color:var(--muted);
-font-size:12px;margin-top:2px}
+.segopt b{display:block;font-size:14px}.segopt small,.tog small,.tlbox-h small{display:block;
+color:var(--muted);font-size:12px;margin-top:2px}
 .tog{display:flex;align-items:flex-start;gap:12px;padding:12px 14px;border:1px solid var(--line);
 border-radius:12px;background:var(--card);cursor:pointer}
 .tog input{position:absolute;opacity:0;width:0;height:0}
@@ -321,6 +321,14 @@ background:#fff;transition:transform .15s}
 .tog input:checked~.sw{background:var(--violet)}
 .tog input:checked~.sw::after{transform:translateX(14px)}
 .tog input:focus-visible~.sw{box-shadow:0 0 0 3px rgba(167,139,250,.3)}
+.tlbox{grid-column:1/-1;padding:12px 14px;border:1px solid var(--line);border-radius:12px;
+background:var(--card)}
+.tlbox-h{display:block;margin-bottom:8px}.tlbox-h b{font-size:13px}
+.tlbox textarea{display:block;width:100%;resize:vertical;min-height:66px;padding:10px 12px;
+border:1px solid var(--line);border-radius:9px;background:#ffffff08;color:var(--fg);
+font:12px/1.55 var(--mono);outline:none;transition:border-color .12s,box-shadow .12s}
+.tlbox textarea:focus{border-color:var(--accent);box-shadow:0 0 0 3px rgba(167,139,250,.18)}
+.tlbox textarea::placeholder{color:var(--dim)}
 /* library */
 .stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:12px;
 margin:8px 0 4px}
@@ -801,7 +809,14 @@ def _form_html(prefill: str = "") -> str:
         '<label class="tog"><input type="checkbox" name="build_index" value="1">'
         '<span class="sw"></span><span><b>Build a reference index first</b>'
         "<small>fingerprints the uploader's own tracks to catch unreleased ones</small></span>"
-        "</label></div></details></form>"
+        "</label>"
+        '<label class="tlbox"><span class="tlbox-h"><b>Know the tracklist?</b>'
+        "<small>Paste what you can already see — from 1001tracklists, a YouTube "
+        "description, a comment — to guide the analysis. One track per line, ideally "
+        '"12:34 Artist - Title". Leave blank to analyse from the audio only.</small></span>'
+        '<textarea name="known_tracklist" rows="4" spellcheck="false" '
+        'placeholder="12:34 Artist - Title&#10;19:20 Another Artist - Another Title">'
+        "</textarea></label></div></details></form>"
     )
 
 
