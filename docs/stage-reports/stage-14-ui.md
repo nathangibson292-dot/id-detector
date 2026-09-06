@@ -85,6 +85,12 @@ contract, provider call or CLI behaviour changed.*
   tracklist* button with a 5-second auto-open (and *stay here*).  On failure: the error, *Try
   again* (prefilled) and the log.  Cancel asks for confirmation and disappears once terminal;
   the log is collapsed under *Show the log*.
+- **Listen while it works**: the analysing page plays the fetched mix itself — an HTML5
+  `<audio>` over `GET /jobs/<id>/audio`, which streams `ingest/original.*` with HTTP Range
+  support (206) so seeking works, resolved via `ingest._load_cached` (sidecar + media-key
+  verified, so a partial download is never served) and handed to the page as `audio_url` in the
+  status JSON once ingest is done.  No platform widget: SoundCloud's Cloudflare challenge had
+  put a raw browser error inside the card that read as a failed analysis.
 - `webapp/jobs.py`: a phase is now logged when it **completes with a new message** as well as
   when it starts (`ingest: <set title>`, `windows: 212 windows`, `fuse: 41 episodes`), which is
   what the progress page uses for the set title and the done card.  Status JSON shape unchanged.

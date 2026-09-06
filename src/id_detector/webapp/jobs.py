@@ -107,6 +107,9 @@ class Job:
     started_at: float | None = None
     finished_at: float | None = None
     recognise_started_at: float | None = None
+    #: The fetched mix on disk (``ingest/original.*``) once ingest has completed and the
+    #: server has resolved it — what the analysing page plays while the engines run.
+    audio_path: str | None = None
     log: deque[str] = field(default_factory=lambda: deque(maxlen=LOG_RING))
     cancel_event: threading.Event = field(default_factory=threading.Event)
 
@@ -147,6 +150,7 @@ class Job:
             "message": self.message,
             "error": self.error,
             "result_url": ("/" + self.result_path) if self.result_path else None,
+            "audio_url": f"/jobs/{self.id}/audio" if self.audio_path else None,
             "created_at": self.created_at,
             "started_at": self.started_at,
             "finished_at": self.finished_at,

@@ -247,35 +247,36 @@ def _sample_job() -> Job:
     )
 
 
-def test_job_page_embeds_scrubbable_player_for_platform_url() -> None:
-    """While analysing, the progress page embeds the platform player so you can listen and scrub."""
+def test_job_page_player_plays_the_fetched_audio_from_disk() -> None:
+    """While analysing, the progress page plays the fetched mix itself (HTML5 audio over the local
+    Range-capable route) — no platform widget, so nothing third-party can break it or look like a
+    failed analysis.  A local-file target gets the same player."""
 
-    sc = Job(
+    job = Job(
         id="c" * 32,
-        target="https://soundcloud.com/artist/live-mix",
-        display="https://soundcloud.com/artist/live-mix",
+        target=CLEAN_URL,
+        display=CLEAN_URL,
         profile="free",
         acquire=False,
         build_index=False,
-        status="running",
-        phase="recognise",
     )
-    page = _job_page_html(sc).decode("utf-8")
+    page = _job_page_html(job).decode("utf-8")
     assert 'class="job-player"' in page
-    assert "w.soundcloud.com/player/" in page
-
-    # A local-file analysis has nothing to stream — no player section.
+    assert '<audio id="jp-audio" controls preload="metadata"></audio>' in page
+    assert "Getting the audio…" in page
+    assert "The analysis below is still running." in page and "Open on SoundCloud" in page
+    assert "w.soundcloud.com" not in page and "youtube.com/embed" not in page
+    assert "wireAudio(j)" in page and "audio.src = j.audio_url" in page
     local = Job(
         id="d" * 32,
-        target=r"C:\mixes\set.wav",
-        display=r"C:\mixes\set.wav",
+        target="C:/mixes/set.wav",
+        display="C:/mixes/set.wav",
         profile="free",
         acquire=False,
         build_index=False,
-        status="running",
-        phase="decode",
     )
-    assert 'class="job-player"' not in _job_page_html(local).decode("utf-8")
+    local_page = _job_page_html(local).decode("utf-8")
+    assert 'class="job-player"' in local_page and "Open on" not in local_page
 
 
 def test_home_and_job_pages_contain_no_usernames_or_identifier_fields() -> None:
@@ -512,18 +513,98 @@ def test_eta_uses_the_observed_listening_rate_once_it_is_known() -> None:
     assert job.eta_seconds(now=1_060.0) == 0
 
 
-def test_job_page_player_hides_until_ready_and_has_a_soft_failure_note() -> None:
-    """A blocked or timed-out embed (a Cloudflare challenge on w.soundcloud.com, say) must not show
-    the browser's raw error inside the card as if the analysis had failed: the frame starts hidden
-    behind a loading cover, is revealed on the player's READY, and otherwise gives way to a calm
-    note that the analysis is still running."""
+def _seed_fetched_mix(work_root: Path, target: str, payload: bytes) -> Path:
+    """A minimal ingest artefact set — source.json + original + completion sidecar — that
+    ``ingest._load_cached`` accepts for ``target``: the media key is the original's sha256."""
 
-    page = _job_page_html(_sample_job()).decode("utf-8")
-    assert 'id="jp-frame"' in page and 'class="jp-frame loading"' in page
-    assert 'id="jp-wait"' in page and "Loading the SoundCloud player" in page
-    assert 'id="jp-fail" hidden' in page
-    assert "The analysis below is still running." in page
-    assert "Open on SoundCloud" in page
-    # The widget API is loaded from the page script (with an error handler), not a bare <script>.
-    assert "w.soundcloud.com/player/api.js" in page
-    assert "SC.Widget.Events.READY" in page and "s.onerror = playerFailed" in page
+    import hashlib
+
+    from id_detector.contracts import derive_source_key
+    from id_detector.io import write_completion_sidecar
+    from tests.test_stage7_page import _source
+
+    base = _source("soundcloud")
+    media_key = hashlib.sha256(payload).hexdigest()
+    source = base.model_copy(
+        update={
+            "input_url": target,
+            "canonical_url": target,
+            "source_key": derive_source_key(target),
+            "media_key": media_key,
+            "original": base.original.model_copy(
+                update={"path": "ingest/original.m4a", "sha256": media_key, "container": "m4a"}
+            ),
+        }
+    )
+    media_dir = work_root / source.source_key / source.media_key
+    (media_dir / "ingest").mkdir(parents=True)
+    original = media_dir / "ingest" / "original.m4a"
+    original.write_bytes(payload)
+    source_path = media_dir / "ingest" / "source.json"
+    source_path.write_bytes(source.model_dump_json().encode("utf-8"))
+    write_completion_sidecar(source_path, {"ingest/original.m4a": original})
+    return original
+
+
+def test_audio_route_streams_the_fetched_original_with_range_support(tmp_path: Path) -> None:
+    """``/jobs/<id>/audio`` appears in the status once ingest is done and streams the original with
+    HTTP Range (206) so the page's <audio> can seek; before ingest, and for an unknown job, 404."""
+
+    target = "https://soundcloud.com/example/range-mix"
+    payload = bytes(range(64))
+    _seed_fetched_mix(tmp_path, target, payload)
+    gate = threading.Event()
+    ingested = threading.Event()
+
+    def runner(ctx: JobContext) -> None:
+        ctx.progress("ingest", 0, 1, "resolving source")
+        gate.wait(timeout=5)
+        ctx.progress("ingest", 1, 1, "Fixture Live Set")
+        ctx.progress("windows", 1, 1, "3 windows")
+        ingested.set()
+        gate.wait(timeout=5)
+
+    manager = JobManager(tmp_path, runner)
+    running = serve_in_background(tmp_path, port=0, job_manager=manager)
+    try:
+        job_id = manager.submit(target, "free")
+        base = running.base_url
+        assert _wait_until(lambda: manager.get(job_id).status == "running")
+        # Still fetching: no audio yet.
+        assert (
+            httpx.get(f"{base}/jobs/{job_id}/status", timeout=TIMEOUT).json()["audio_url"] is None
+        )
+        assert httpx.get(f"{base}/jobs/{job_id}/audio", timeout=TIMEOUT).status_code == 404
+        gate.set()
+        assert ingested.wait(timeout=5)
+        status = httpx.get(f"{base}/jobs/{job_id}/status", timeout=TIMEOUT).json()
+        assert status["audio_url"] == f"/jobs/{job_id}/audio"
+
+        whole = httpx.get(f"{base}/jobs/{job_id}/audio", timeout=TIMEOUT)
+        assert whole.status_code == 200
+        assert whole.headers["Content-Type"] == "audio/mp4"
+        assert whole.headers["Accept-Ranges"] == "bytes"
+        assert whole.content == payload
+
+        part = httpx.get(
+            f"{base}/jobs/{job_id}/audio", headers={"Range": "bytes=10-19"}, timeout=TIMEOUT
+        )
+        assert part.status_code == 206
+        assert part.headers["Content-Range"] == "bytes 10-19/64"
+        assert part.content == payload[10:20]
+        tail = httpx.get(
+            f"{base}/jobs/{job_id}/audio", headers={"Range": "bytes=60-"}, timeout=TIMEOUT
+        )
+        assert tail.status_code == 206 and tail.content == payload[60:]
+        head = httpx.head(f"{base}/jobs/{job_id}/audio", timeout=TIMEOUT)
+        assert head.status_code == 200 and head.headers["Content-Length"] == "64"
+        bad = httpx.get(
+            f"{base}/jobs/{job_id}/audio", headers={"Range": "bytes=999-"}, timeout=TIMEOUT
+        )
+        assert bad.status_code == 416
+        assert httpx.get(f"{base}/jobs/{'f' * 32}/audio", timeout=TIMEOUT).status_code == 404
+    finally:
+        gate.set()
+        running.shutdown()
+        manager.shutdown()
+    assert _wait_until(_no_worker_thread_alive)

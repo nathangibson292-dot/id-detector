@@ -19,7 +19,7 @@ from dataclasses import dataclass
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import parse_qs, quote, urlsplit
+from urllib.parse import parse_qs, urlsplit
 
 from id_detector.contracts import (
     GENERATED_BY,
@@ -30,6 +30,7 @@ from id_detector.contracts import (
     compose_natural_key,
     make_id,
 )
+from id_detector.ingest import _load_cached
 from id_detector.io import (
     atomic_write_bytes,
     canonical_json_bytes,
@@ -385,12 +386,13 @@ margin:6px 0 6px;overflow-wrap:anywhere}
 margin:0 0 18px}
 .job-player .jp-label{display:flex;align-items:center;gap:9px;font-size:12.5px;color:var(--muted);
 margin:2px 2px 12px}
-.job-player iframe{display:block;width:100%;border:0;border-radius:12px;background:#00000022}
+.job-player audio{display:block;width:100%;height:44px;border-radius:12px;outline:none}
+.job-player audio::-webkit-media-controls-panel{background:#1a1a26}
 .job-player .jp-yt{position:relative;width:100%;max-width:560px;aspect-ratio:16/9;
 border-radius:12px;overflow:hidden}
 .job-player .jp-yt iframe{position:absolute;inset:0;width:100%;height:100%;border-radius:0}
 .jp-frame{position:relative}.jp-frame[hidden]{display:none}
-.jp-frame.loading iframe,.jp-frame.loading .jp-yt{opacity:0}
+.jp-frame.loading audio{opacity:0}
 .jp-wait{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;
 gap:10px;color:var(--muted);font-size:13px;background:#0c0c13;border-radius:12px;
 border:1px solid var(--line);animation:blink 1.6s ease-in-out infinite}
@@ -723,6 +725,7 @@ function render(j){
   document.getElementById('cancel').style.display = j.terminal ? 'none' : '';
   var eyebrow = {succeeded: 'Analysed', failed: 'Analysis failed', cancelled: 'Analysis cancelled'};
   document.getElementById('eyebrow').textContent = eyebrow[j.status] || 'Analysing';
+  if(window.wireAudio) wireAudio(j);
   if(j.terminal) showOutcome(j); else if(flavourPhase !== j.phase) rotateFlavour();
 }
 function tick(){
@@ -745,30 +748,16 @@ tick();
 _PLAYER_JS = """
 (function(){
   var section = document.getElementById('job-player'); if(!section) return;
-  var kind = section.getAttribute('data-kind');
   var frame = document.getElementById('jp-frame'), fail = document.getElementById('jp-fail');
-  var iframe = frame.querySelector('iframe');
-  var settled = false, timer = setTimeout(playerFailed, 15000);
-  function playerReady(){
-    settled = true; clearTimeout(timer);
-    frame.classList.remove('loading'); frame.hidden = false; fail.hidden = true;
-  }
-  function playerFailed(){ if(settled) return; frame.hidden = true; fail.hidden = false; }
-  if(kind === 'soundcloud'){
-    // The widget API is the only reliable "it actually loaded" signal for a cross-origin embed;
-    // a Cloudflare challenge or a timeout on w.soundcloud.com never reports READY, and the raw
-    // browser error page must not surface inside the card as if the analysis had failed.
-    var s = document.createElement('script');
-    s.src = 'https://w.soundcloud.com/player/api.js';
-    s.onload = function(){
-      try{ SC.Widget(iframe).bind(SC.Widget.Events.READY, playerReady); }
-      catch(e){ playerFailed(); }
-    };
-    s.onerror = playerFailed;
-    document.head.appendChild(s);
-  } else {
-    iframe.addEventListener('load', playerReady);
-  }
+  var audio = document.getElementById('jp-audio'), wired = false;
+  audio.addEventListener('error', function(){ frame.hidden = true; fail.hidden = false; });
+  audio.addEventListener('loadedmetadata', function(){ frame.classList.remove('loading'); });
+  // Called from the status poll: the fetched original exists once ingest has completed.
+  window.wireAudio = function(j){
+    if(wired) return;
+    if(j.audio_url){ wired = true; audio.src = j.audio_url; return; }
+    if(j.terminal && j.status !== 'succeeded'){ section.hidden = true; }
+  };
 })();
 """
 
@@ -969,56 +958,79 @@ def _job_steps(job: Job) -> list[tuple[str, str, str]]:
     return steps
 
 
-def _job_player_html(plan: EmbedPlan) -> str:
-    """A self-contained, scrubbable platform player for the analysing page — listen while it works.
+#: Browser MIME types for the fetched original, by container (``OriginalAsset.container``) or
+#: file suffix.  Anything else is served as ``application/octet-stream`` and the page's ``<audio>``
+#: reports whether the browser can play it.
+_AUDIO_TYPES = {
+    "m4a": "audio/mp4",
+    "mp4": "audio/mp4",
+    "aac": "audio/aac",
+    "webm": "audio/webm",
+    "opus": "audio/ogg",
+    "ogg": "audio/ogg",
+    "oga": "audio/ogg",
+    "mp3": "audio/mpeg",
+    "wav": "audio/wav",
+    "flac": "audio/flac",
+}
+#: Phases during which the fetched original cannot exist yet (no point resolving it).
+_PRE_INGEST_PHASES = frozenset({"queued", "starting", "build_index", "ingest"})
 
-    Unlike the result page's embed this needs no page JavaScript: each player is a natively
-    interactive iframe (play / pause / seek on the platform's own waveform), so the owner can listen
-    and jump around the mix while the engines run.  A local file or a non-embeddable platform gets
-    no player (nothing to stream), and the section is simply omitted.
+
+def _audio_content_type(path: Path, container: str | None = None) -> str:
+    key = (container or "").casefold() or path.suffix.lstrip(".").casefold()
+    return _AUDIO_TYPES.get(
+        key, _AUDIO_TYPES.get(path.suffix.lstrip(".").casefold(), "application/octet-stream")
+    )
+
+
+def _resolve_job_audio(job: Job, work_root: Path) -> Path | None:
+    """The job's fetched original on disk, resolved (once) from the target after ingest.
+
+    ``ingest._load_cached`` verifies the completion sidecar and the media-key hash, so a partial
+    download is never served; the result is memoised on the job.
     """
 
-    if plan.kind == "soundcloud":
-        src = (
-            "https://w.soundcloud.com/player/?url="
-            + quote(plan.identifier, safe="")
-            + "&show_comments=false&auto_play=false&hide_related=true&color=%23ff3d8a"
-        )
-        frame = (
-            f'<iframe title="SoundCloud player" height="166" scrolling="no" frameborder="no" '
-            f'allow="autoplay" src="{html.escape(src)}"></iframe>'
-        )
-    elif plan.kind == "youtube":
-        src = "https://www.youtube.com/embed/" + quote(plan.identifier, safe="")
-        frame = (
-            f'<div class="jp-yt"><iframe title="YouTube player" '
-            f'allow="autoplay; encrypted-media; picture-in-picture" allowfullscreen '
-            f'src="{html.escape(src)}"></iframe></div>'
-        )
-    elif plan.kind == "mixcloud":
-        src = "https://player-widget.mixcloud.com/widget/iframe/?feed=" + quote(
-            plan.identifier, safe=""
-        )
-        frame = (
-            f'<iframe title="Mixcloud player" height="120" frameborder="0" allow="autoplay" '
-            f'src="{html.escape(src)}"></iframe>'
-        )
-    else:
-        return ""
-    name = PLATFORM_NAMES.get(plan.kind, plan.kind)
-    # The frame starts hidden behind a "loading" cover and is revealed only once the player
-    # reports ready; if it never does (blocked / timed out), a calm note replaces it so a flaky
-    # embed can't look like a failed analysis.  See ``_PLAYER_JS``.
+    if job.audio_path:
+        return Path(job.audio_path)
+    if job.phase in _PRE_INGEST_PHASES and job.status not in TERMINAL_STATES:
+        return None
+    try:
+        cached = _load_cached(work_root, job.target)
+    except (OSError, ValueError):
+        return None
+    if cached is None or not path_is_file(cached.original_path):
+        return None
+    job.audio_path = str(cached.original_path)
+    return cached.original_path
+
+
+def _job_player_html(plan: EmbedPlan, job: Job) -> str:
+    """The listen-while-it-works player: the fetched mix itself, played from disk.
+
+    An HTML5 ``<audio>`` over ``GET /jobs/<id>/audio`` (Range-capable, so seeking works) — no
+    platform widget, so no third-party outage or bot challenge can break it or masquerade as a
+    failed analysis.  Until ingest has written the file the card shows a "getting the audio" cover;
+    the status poll hands the page ``audio_url`` as soon as it exists.  A local-file target gets
+    the same player.
+    """
+
+    name = PLATFORM_NAMES.get(plan.kind)
+    link = (
+        f' <a rel="noopener" href="{html.escape(plan.link_url)}">Open on {html.escape(name)} ↗</a>'
+        if name and plan.link_url
+        else ""
+    )
     return (
-        f'<section class="job-player" id="job-player" data-kind="{html.escape(plan.kind)}">'
+        '<section class="job-player" id="job-player">'
         '<div class="jp-label"><span class="eq live"><i></i><i></i><i></i><i></i></span>'
         "Listen while it works — scrub around to pass the time</div>"
-        f'<div class="jp-frame loading" id="jp-frame">{frame}'
-        f'<div class="jp-wait" id="jp-wait">Loading the {html.escape(name)} player…</div></div>'
-        f'<div class="jp-fail" id="jp-fail" hidden>Couldn\'t load the {html.escape(name)} player '
-        "— the site didn't answer. <b>The analysis below is still running.</b> "
-        f'<a rel="noopener" href="{html.escape(plan.link_url)}">Open on {html.escape(name)} ↗</a>'
-        "</div></section>"
+        '<div class="jp-frame loading" id="jp-frame">'
+        '<audio id="jp-audio" controls preload="metadata"></audio>'
+        '<div class="jp-wait" id="jp-wait">Getting the audio…</div></div>'
+        '<div class="jp-fail" id="jp-fail" hidden>'
+        "Couldn't play the fetched audio in this browser. "
+        f"<b>The analysis below is still running.</b>{link}</div></section>"
     )
 
 
@@ -1044,7 +1056,7 @@ def _job_page_html(job: Job) -> bytes:
         f"{platform_chip(platform)}</div>"
         '<div class="job-actions"><span class="st" id="status">…</span>'
         '<button class="btn danger" id="cancel" type="button">Cancel</button></div></header>'
-        + _job_player_html(plan)
+        + _job_player_html(plan, job)
         + '<section class="scan" id="scan"><div class="scan-top">'
         '<div class="pct" id="pct">0<small>%</small></div>'
         '<div class="phase-line"><div class="phase-name" id="phase-name">Starting</div>'
@@ -1084,6 +1096,52 @@ class _Handler(BaseHTTPRequestHandler):
         self.end_headers()
         if self.command != "HEAD":
             self.wfile.write(body)
+
+    def _send_file_range(self, path: Path, content_type: str) -> None:
+        """Serve a file with HTTP Range support (206) — what makes <audio> seeking work."""
+
+        size = path.stat().st_size
+        start, end = 0, size - 1
+        status = HTTPStatus.OK
+        header = self.headers.get("Range") or ""
+        match = re.match(r"bytes=(\d*)-(\d*)$", header.strip())
+        if match and size:
+            first, last = match.group(1), match.group(2)
+            if first:
+                start = int(first)
+                end = min(int(last), size - 1) if last else size - 1
+            elif last:  # a suffix range: the final N bytes
+                start = max(0, size - int(last))
+            if start > end or start >= size:
+                self.send_response(HTTPStatus.REQUESTED_RANGE_NOT_SATISFIABLE)
+                self.send_header("Content-Range", f"bytes */{size}")
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+                return
+            status = HTTPStatus.PARTIAL_CONTENT
+        length = end - start + 1
+        self.send_response(status)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(length))
+        self.send_header("Accept-Ranges", "bytes")
+        self.send_header("Cache-Control", "no-store")
+        if status == HTTPStatus.PARTIAL_CONTENT:
+            self.send_header("Content-Range", f"bytes {start}-{end}/{size}")
+        self.end_headers()
+        if self.command == "HEAD":
+            return
+        with open(native_path(path), "rb") as handle:
+            handle.seek(start)
+            remaining = length
+            while remaining > 0:
+                chunk = handle.read(min(65536, remaining))
+                if not chunk:
+                    break
+                try:
+                    self.wfile.write(chunk)
+                except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
+                    return  # the browser seeked away or closed the player
+                remaining -= len(chunk)
 
     def _resolve_served_file(self, path: str) -> Path | None:
         """Map a URL path to a file strictly inside ``work_root`` and under a ``present/`` dir."""
@@ -1158,7 +1216,16 @@ class _Handler(BaseHTTPRequestHandler):
             if job is None:
                 self._send_json(HTTPStatus.NOT_FOUND, {"error": "unknown job"})
                 return
+            _resolve_job_audio(job, self.work_root)
             self._send_json(HTTPStatus.OK, job.status_dict())
+            return
+        if len(segments) == 3 and _JOB_ID.match(segments[1]) and segments[2] == "audio":
+            job = self.job_manager.get(segments[1])
+            audio = _resolve_job_audio(job, self.work_root) if job is not None else None
+            if audio is None:
+                self._send(HTTPStatus.NOT_FOUND, b"no audio yet", "text/plain; charset=utf-8")
+                return
+            self._send_file_range(audio, _audio_content_type(audio))
             return
         self._send(HTTPStatus.NOT_FOUND, b"not found", "text/plain; charset=utf-8")
 
