@@ -1,6 +1,6 @@
 """Single frozen-test certification evaluation (Stage 5).
 
-``id-detector benchmark certify --corpus <version> --profile <name> --test-version <v>`` runs the
+``idea benchmark certify --corpus <version> --profile <name> --test-version <v>`` runs the
 frozen profile over a **frozen** corpus, scores it with the pre-registered per
 ``(dimension, tier)`` targets, and writes the certification report.  It refuses to run on a corpus
 that is not frozen and refuses to re-run the same ``(profile, test_version)`` without a new test

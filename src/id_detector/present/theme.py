@@ -1,4 +1,4 @@
-"""Shared look for every id-detector page: design tokens, the top bar, buttons, chips, toast.
+"""Shared look for every IDea page: design tokens, the top bar, buttons, chips, toast.
 
 Pure strings — no I/O — so both the static result page (offline, written to ``present/index.html``)
 and the live server pages (home, new-mix, progress) share one visual system.  Dark by design: a
@@ -142,7 +142,7 @@ def topbar_html(*, back: bool = False, new: bool = True, middle: str = "") -> st
     return (
         '<nav class="topbar"><div class="topbar-in">'
         '<a class="brand" href="/"><span class="eq"><i></i><i></i><i></i><i></i></span>'
-        'id<span class="dot">·</span>detector</a>'
+        '<span class="dot">ID</span>ea</a>'
         f'{middle}<span class="nav">{nav}</span></div></nav>'
     )
 
