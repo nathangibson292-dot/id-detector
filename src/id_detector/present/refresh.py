@@ -40,7 +40,7 @@ def page_version(index_html: Path) -> int:
 def _load_config() -> AppConfig:
     """The owner's non-secret preferences (lead-in, collapse), mirroring the ``analyse`` command."""
 
-    path = Path("id-detector.toml")
+    path = Path("idea.toml")
     try:
         return AppConfig.load(path) if path.is_file() else AppConfig()
     except (ValueError, OSError):

@@ -1,4 +1,4 @@
-# id-detector
+# IDea
 
 **Find out what tracks are in a DJ set.** You give it a link to a mix (SoundCloud, YouTube, or
 Mixcloud); it downloads the audio, listens to it in short overlapping windows, asks music-recognition
@@ -19,7 +19,7 @@ You need two things installed first: **[uv](https://docs.astral.sh/uv/)** (the P
 
 Then the whole tool is a **browser page** — no commands after the first setup:
 
-1. **Double-click `id-detector.cmd`** in this folder. A terminal opens the local server and your
+1. **Double-click `idea.cmd`** in this folder. A terminal opens the local server and your
    **browser opens automatically** at `http://127.0.0.1:8765`.
 2. **Drop a mix link** (SoundCloud / YouTube / Mixcloud, or a local audio file path) into the big
    box on the home page and click **Analyse**. Open **Options** to pick *Free* (Shazam only) or
@@ -43,11 +43,11 @@ tool are refreshed to the current look the first time you open them — no re-an
 The same steps are available as commands if you prefer them:
 
 ```powershell
-uv run id-detector doctor                # check your machine is ready (ffmpeg, Python, etc.)
-uv run id-detector serve                 # start the browser app yourself (what id-detector.cmd runs)
-uv run id-detector analyse "<mix-url>"   # analyse a set from the terminal instead
-uv run id-detector acquire "<mix-url>"   # add "where to buy / download" links to a result
-uv run id-detector config show           # see every setting and its current value
+uv run idea doctor                # check your machine is ready (ffmpeg, Python, etc.)
+uv run idea serve                 # start the browser app yourself (what idea.cmd runs)
+uv run idea analyse "<mix-url>"   # analyse a set from the terminal instead
+uv run idea acquire "<mix-url>"   # add "where to buy / download" links to a result
+uv run idea config show           # see every setting and its current value
 ```
 
 `serve` opens the browser by default; add `--no-open` to skip that or `--no-analyse` for a
@@ -132,7 +132,7 @@ upload your audio to a third party):
 
 1. Put the credentials in **environment variables** (never in a file) — see `.env.example` for the
    exact names.
-2. In your `id-detector.toml`, set `allow_third_party_upload = true`, **and** pass
+2. In your `idea.toml`, set `allow_third_party_upload = true`, **and** pass
    `--i-own-this-audio-or-have-permission` on the command that uploads.
 
 If either is missing, uploads are refused with a message telling you exactly what to add.
@@ -148,12 +148,12 @@ If either is missing, uploads are refused with a message telling you exactly wha
 
 ## Configuration
 
-All non-secret settings live in one file, **`id-detector.toml`** (git-ignored). Create and inspect it
+All non-secret settings live in one file, **`idea.toml`** (git-ignored). Create and inspect it
 with:
 
 ```powershell
-uv run id-detector config init     # writes a fully-commented id-detector.toml
-uv run id-detector config show     # prints the effective settings (file + defaults), no secrets
+uv run idea config init     # writes a fully-commented idea.toml
+uv run idea config show     # prints the effective settings (file + defaults), no secrets
 ```
 
 It covers: the default **profile**, the request **budget**, **transform** hypotheses, the window
@@ -162,7 +162,7 @@ per-connector **hint** switches, and the `allow_third_party_upload` gate. Each k
 the file itself.
 
 **Precedence (highest wins):** command-line flags → a chosen `--profile` (fixes engines and
-window geometry) → your `id-detector.toml` → built-in defaults.
+window geometry) → your `idea.toml` → built-in defaults.
 
 **Secrets never go in the config file.** Provider credentials are read only from the environment
 variables in `.env.example`, and the logger redacts them. `config show` never prints a secret.
@@ -175,11 +175,11 @@ If you want to move tiers from *provisional* to *certified*, you build a **truth
 human-checked tracklists — and freeze it. The `truth` commands walk you through it:
 
 ```powershell
-uv run id-detector truth seed --help          # start a truth file for a set
-uv run id-detector truth verify --help         # first-pass verification
-uv run id-detector truth second-pass --help    # independent blind second pass
-uv run id-detector truth resolve --help         # resolve annotator disagreements
-uv run id-detector truth freeze --help          # freeze a corpus version (immutable manifest)
+uv run idea truth seed --help          # start a truth file for a set
+uv run idea truth verify --help         # first-pass verification
+uv run idea truth second-pass --help    # independent blind second pass
+uv run idea truth resolve --help         # resolve annotator disagreements
+uv run idea truth freeze --help          # freeze a corpus version (immutable manifest)
 ```
 
 Once a real-mix corpus is frozen you can run a single, pre-registered certification pass
@@ -223,7 +223,7 @@ uv run python scripts/audit_fixtures.py   # privacy/committed-data audit
 ```
 
 - Python 3.12, a `uv` project (`pyproject.toml`, `uv.lock`), source under `src/id_detector/`, a
-  `typer` CLI exposed as `id-detector`, tests under `tests/`.
+  `typer` CLI exposed as `idea`, tests under `tests/`.
 - JSON Schemas are checked in under `docs/schemas/`; regenerate them after a contract change with
   `uv run python scripts/export_schemas.py`.
 - Everything is content-addressed and deterministic: recognition evidence is immutable per invocation

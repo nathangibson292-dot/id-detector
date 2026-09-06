@@ -1,7 +1,7 @@
-"""The single documented ``id-detector.toml`` template and the ``config show`` renderer.
+"""The single documented ``idea.toml`` template and the ``config show`` renderer.
 
-``id-detector config init`` writes :data:`CONFIG_TEMPLATE` verbatim; the committed
-``id-detector.example.toml`` is the same bytes (a test asserts they never drift).  No secret ever
+``idea config init`` writes :data:`CONFIG_TEMPLATE` verbatim; the committed
+``idea.example.toml`` is the same bytes (a test asserts they never drift).  No secret ever
 belongs in this file — provider credentials are read only from environment variables (see
 ``.env.example``) and the logger redacts them.
 """
@@ -11,7 +11,7 @@ from __future__ import annotations
 from id_detector.providers.base import HINT_CONNECTORS, AppConfig
 
 CONFIG_TEMPLATE = """\
-# id-detector configuration.  This file holds only NON-SECRET runtime preferences.
+# IDea configuration.  This file holds only NON-SECRET runtime preferences.
 #
 # Secrets (SoundCloud/AudD/ACRCloud/Discogs credentials) are NEVER read from here; they come only
 # from environment variables listed in .env.example, and logs redact them.
@@ -24,8 +24,8 @@ CONFIG_TEMPLATE = """\
 #   3. the values in THIS file
 #   4. built-in defaults (what you see below)
 #
-# Copy this to id-detector.toml (that name is git-ignored) and edit.  `id-detector config show`
-# prints the effective, resolved configuration; `id-detector config init` writes this template.
+# Copy this to idea.toml (that name is git-ignored) and edit.  `idea config show`
+# prints the effective, resolved configuration; `idea config init` writes this template.
 
 # Uploading third-party audio to AudD/ACRCloud requires BOTH this flag AND a per-command
 # confirmation (--i-own-this-audio-or-have-permission).  Leave it false unless you own the audio
@@ -119,7 +119,7 @@ def render_effective_config(config: AppConfig) -> str:
 
     disabled = sorted(config.disabled_hint_connectors)
     lines = [
-        "# Effective id-detector configuration (resolved: file + profile + defaults).",
+        "# Effective IDea configuration (resolved: file + profile + defaults).",
         "# Secrets are never shown here; they come only from environment variables.",
         f"allow_third_party_upload = {str(config.allow_third_party_upload).lower()}",
         f"default_profile = {config.default_profile!r}"

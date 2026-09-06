@@ -15,7 +15,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
 
 def test_committed_example_config_matches_the_packaged_template() -> None:
-    example = (PROJECT_ROOT / "id-detector.example.toml").read_text(encoding="utf-8")
+    example = (PROJECT_ROOT / "idea.example.toml").read_text(encoding="utf-8")
     assert example == CONFIG_TEMPLATE
 
 

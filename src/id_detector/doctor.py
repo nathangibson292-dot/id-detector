@@ -1,4 +1,4 @@
-"""Offline runtime preflight used by ``id-detector doctor``."""
+"""Offline runtime preflight used by ``idea doctor``."""
 
 from __future__ import annotations
 

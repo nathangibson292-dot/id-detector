@@ -1067,8 +1067,8 @@ function requestRescan(trigger, startMs, endMs){
     body: JSON.stringify({media_key: CONFIG.mediaKey, trigger: trigger,
       start_ms: startMs, end_ms: endMs})})
     .then(function(r){ return r.ok ? r.json() : Promise.reject(r.status); })
-    .then(function(){ toast('Rescan queued — run `id-detector rescan`'); })
-    .catch(function(){ toast('Rescan needs the local server (id-detector serve)'); });
+    .then(function(){ toast('Rescan queued — run `idea rescan`'); })
+    .catch(function(){ toast('Rescan needs the local server (idea serve)'); });
 }
 """
 
@@ -1269,7 +1269,7 @@ play</span></div>
 </tbody>
 </table></div>
 <footer><span>🔒 ran entirely on this machine — nothing leaves 127.0.0.1</span>
-<span>id-detector</span></footer>
+<span>IDea</span></footer>
 <div class="toast" id="toast" role="status" aria-live="polite"></div>
 </main>
 <script>
@@ -1282,7 +1282,7 @@ let LEAD_IN_MS = CONFIG.leadInMs;
 </script>
 <script>{_PAGE_JS}</script>"""
     stamp = f'<meta name="id-detector-page" content="{PAGE_VERSION}">'
-    return head_html(f"{title} — id-detector", _CSS, stamp) + f"<body>{body}</body></html>\n"
+    return head_html(f"{title} — IDea", _CSS, stamp) + f"<body>{body}</body></html>\n"
 
 
 def generate_page(

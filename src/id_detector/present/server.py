@@ -2,7 +2,7 @@
 
 A read-only, ``127.0.0.1``-only server over ``work/**/present/`` plus a single ``POST /rescan``
 endpoint that only ever *appends a request to a queue file* — it makes no provider calls and writes
-nothing else.  The queue (``present/rescan_queue.jsonl``) is later consumed by ``id-detector
+nothing else.  The queue (``present/rescan_queue.jsonl``) is later consumed by ``idea
 rescan <url>`` to run another generation.
 
 The index page lists analysed sets by their ``source.json`` title only — never a username or any
@@ -262,7 +262,7 @@ def _index_html(sets: list[AnalysedSet]) -> bytes:
         + _footer_html()
         + "</main>"
     )
-    return _page_shell("id-detector — analysed sets", body)
+    return _page_shell("IDea — analysed sets", body)
 
 
 # --------------------------------------------------------------------------------------------------
@@ -720,7 +720,7 @@ function render(j){
   setSteps(j);
   document.title = (j.terminal ? (
   j.status === 'succeeded' ? 'Done' : j.status) : pct + '%') + ' · ' + (
-  t || 'Analysing') + ' — id-detector';
+  t || 'Analysing') + ' — IDea';
   document.getElementById('log').textContent = (j.log || []).join('\\n');
   document.getElementById('cancel').style.display = j.terminal ? 'none' : '';
   var eyebrow = {succeeded: 'Analysed', failed: 'Analysis failed', cancelled: 'Analysis cancelled'};
@@ -770,7 +770,7 @@ def _page_shell(title: str, body: str, script: str = "") -> bytes:
 def _footer_html() -> str:
     return (
         "<footer><span>🔒 everything runs on this machine — nothing leaves 127.0.0.1</span>"
-        "<span>id-detector</span></footer>"
+        "<span>IDea</span></footer>"
     )
 
 
@@ -908,7 +908,7 @@ def _home_html(sets: list[AnalysedSet], jobs: list[Job]) -> bytes:
         + _footer_html()
         + "</main>"
     )
-    return _page_shell("id-detector — your mixes", body, _FORM_JS + _HOME_JS)
+    return _page_shell("IDea — your mixes", body, _FORM_JS + _HOME_JS)
 
 
 def _new_html(prefill: str = "") -> bytes:
@@ -935,7 +935,7 @@ def _new_html(prefill: str = "") -> bytes:
         "<small>You get a page where clicking any track jumps the player to that moment.</small>"
         "</div></div>" + _footer_html() + "</main>"
     )
-    return _page_shell("id-detector — new mix", body, _FORM_JS)
+    return _page_shell("IDea — new mix", body, _FORM_JS)
 
 
 def _job_steps(job: Job) -> list[tuple[str, str, str]]:
@@ -1079,7 +1079,7 @@ def _job_page_html(job: Job) -> bytes:
         f"var JOB_ID={json.dumps(job.id)};var DISPLAY={json.dumps(job.display)};"
         f"var STEPS={json.dumps(steps)};" + _JOB_JS + _PLAYER_JS
     )
-    return _page_shell("Analysing — id-detector", body, script)
+    return _page_shell("Analysing — IDea", body, script)
 
 
 class _Handler(BaseHTTPRequestHandler):

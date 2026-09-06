@@ -1,4 +1,4 @@
-# id-detector configuration.  This file holds only NON-SECRET runtime preferences.
+# IDea configuration.  This file holds only NON-SECRET runtime preferences.
 #
 # Secrets (SoundCloud/AudD/ACRCloud/Discogs credentials) are NEVER read from here; they come only
 # from environment variables listed in .env.example, and logs redact them.
@@ -11,8 +11,8 @@
 #   3. the values in THIS file
 #   4. built-in defaults (what you see below)
 #
-# Copy this to id-detector.toml (that name is git-ignored) and edit.  `id-detector config show`
-# prints the effective, resolved configuration; `id-detector config init` writes this template.
+# Copy this to idea.toml (that name is git-ignored) and edit.  `idea config show`
+# prints the effective, resolved configuration; `idea config init` writes this template.
 
 # Uploading third-party audio to AudD/ACRCloud requires BOTH this flag AND a per-command
 # confirmation (--i-own-this-audio-or-have-permission).  Leave it false unless you own the audio

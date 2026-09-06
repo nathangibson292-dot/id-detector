@@ -89,7 +89,7 @@ def make_pipeline_runner(
 
     root = Path(work_root)
     project = project_root if project_root is not None else cli.PROJECT_ROOT
-    config_file = config_path if config_path is not None else Path("id-detector.toml")
+    config_file = config_path if config_path is not None else Path("idea.toml")
 
     def runner(ctx: JobContext) -> None:
         target = ctx.target
@@ -145,7 +145,7 @@ def make_pipeline_runner(
 def _run_build_index(ctx: JobContext, target: str, *, project_root: Path) -> None:
     """Best-effort reference-index build (discover uploader uploads, fingerprint them).
 
-    This mirrors ``id-detector build-index <set-url> --index``.  It needs a JDK/Panako runtime and
+    This mirrors ``idea build-index <set-url> --index``.  It needs a JDK/Panako runtime and
     network access, so any failure (no runtime, discovery/download error) is logged and the job
     continues to the audio analysis rather than failing — the reference index only *augments* it.
     """

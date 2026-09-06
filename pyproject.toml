@@ -23,7 +23,7 @@ dependencies = [
 ]
 
 [project.scripts]
-id-detector = "id_detector.cli:app"
+idea = "id_detector.cli:app"
 
 [dependency-groups]
 dev = [

@@ -77,7 +77,7 @@ def _report(progress: ProgressFn | None, phase: str, done: int, total: int, mess
 app = typer.Typer(no_args_is_help=True, pretty_exceptions_enable=False)
 benchmark_app = typer.Typer(no_args_is_help=True)
 truth_app = typer.Typer(no_args_is_help=True)
-config_app = typer.Typer(no_args_is_help=True, help="Show or create the id-detector.toml config.")
+config_app = typer.Typer(no_args_is_help=True, help="Show or create the idea.toml config.")
 app.add_typer(benchmark_app, name="benchmark")
 app.add_typer(truth_app, name="truth")
 app.add_typer(config_app, name="config")
@@ -266,7 +266,7 @@ def build_index_command(
 @config_app.command("show")
 def config_show(
     config: Path = typer.Option(  # noqa: B008
-        Path("id-detector.toml"),
+        Path("idea.toml"),
         "--config",
         help="TOML config to resolve (missing file is fine: built-in defaults are shown).",
     ),
@@ -284,11 +284,11 @@ def config_show(
 @config_app.command("init")
 def config_init(
     path: Path = typer.Option(  # noqa: B008
-        Path("id-detector.toml"), "--path", help="Where to write the documented template."
+        Path("idea.toml"), "--path", help="Where to write the documented template."
     ),
     force: bool = typer.Option(False, "--force", help="Overwrite an existing file."),
 ) -> None:
-    """Write the documented id-detector.toml template (never contains secrets)."""
+    """Write the documented idea.toml template (never contains secrets)."""
 
     if path.exists() and not force:
         typer.echo(f"{path} already exists; pass --force to overwrite", err=True)
@@ -605,7 +605,7 @@ def analyse(
     ),
     no_hints: bool = typer.Option(False, "--no-hints", help="Disable all hint connectors."),
     config: Path = typer.Option(  # noqa: B008
-        Path("id-detector.toml"), "--config", help="Non-secret schedule/transform TOML config."
+        Path("idea.toml"), "--config", help="Non-secret schedule/transform TOML config."
     ),
     profile: str | None = typer.Option(
         None,
@@ -748,7 +748,7 @@ async def _acquire(
     _report(progress, "enrich", 1, 1, "acquire links resolved")
     _report(progress, "present", 0, 1, "updating result page")
     episodes, identities = load_analysis(media_dir)
-    acquire_config = _load_app_config(Path("id-detector.toml"))
+    acquire_config = _load_app_config(Path("idea.toml"))
     duration_ms = PcmRecord.model_validate_json(
         read_text(media_dir / "decode" / "pcm.json")
     ).pcm.duration_ms
@@ -837,7 +837,7 @@ def serve(
         True, "--open/--no-open", help="Open the home page in the default browser (default)."
     ),
     config: Path = typer.Option(  # noqa: B008
-        Path("id-detector.toml"), "--config", help="Non-secret schedule/transform TOML config."
+        Path("idea.toml"), "--config", help="Non-secret schedule/transform TOML config."
     ),
 ) -> None:
     """Serve analysed sets on 127.0.0.1; by default also run analyses started from the browser."""
@@ -888,7 +888,7 @@ def rescan(
     ),
     work_root: Path = typer.Option(DEFAULT_WORK_ROOT, "--work-root"),  # noqa: B008
     config: Path = typer.Option(  # noqa: B008
-        Path("id-detector.toml"), "--config", help="Non-secret schedule/transform TOML config."
+        Path("idea.toml"), "--config", help="Non-secret schedule/transform TOML config."
     ),
     max_generations: int = typer.Option(
         1, "--max-generations", min=1, help="Rescan generations to run when consuming the queue."
@@ -1480,7 +1480,7 @@ def benchmark_shortlist(
     out: Annotated[Path, typer.Option("--out", help="Shortlist report JSON.")],
     config: Annotated[
         Path, typer.Option("--config", help="Non-secret TOML config with the upload gate.")
-    ] = Path("id-detector.toml"),
+    ] = Path("idea.toml"),
     i_own_this_audio_or_have_permission: Annotated[
         bool,
         typer.Option(
