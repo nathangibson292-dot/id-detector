@@ -510,3 +510,20 @@ def test_eta_uses_the_observed_listening_rate_once_it_is_known() -> None:
     # Terminal jobs report no ETA.
     job.status = "succeeded"
     assert job.eta_seconds(now=1_060.0) == 0
+
+
+def test_job_page_player_hides_until_ready_and_has_a_soft_failure_note() -> None:
+    """A blocked or timed-out embed (a Cloudflare challenge on w.soundcloud.com, say) must not show
+    the browser's raw error inside the card as if the analysis had failed: the frame starts hidden
+    behind a loading cover, is revealed on the player's READY, and otherwise gives way to a calm
+    note that the analysis is still running."""
+
+    page = _job_page_html(_sample_job()).decode("utf-8")
+    assert 'id="jp-frame"' in page and 'class="jp-frame loading"' in page
+    assert 'id="jp-wait"' in page and "Loading the SoundCloud player" in page
+    assert 'id="jp-fail" hidden' in page
+    assert "The analysis below is still running." in page
+    assert "Open on SoundCloud" in page
+    # The widget API is loaded from the page script (with an error handler), not a bare <script>.
+    assert "w.soundcloud.com/player/api.js" in page
+    assert "SC.Widget.Events.READY" in page and "s.onerror = playerFailed" in page

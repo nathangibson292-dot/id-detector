@@ -41,7 +41,7 @@ from id_detector.io import (
 from id_detector.present.exports import _format_time
 from id_detector.present.page import EmbedPlan, plan_embed_from_url
 from id_detector.present.refresh import ensure_fresh_page
-from id_detector.present.theme import head_html, platform_chip, topbar_html
+from id_detector.present.theme import PLATFORM_NAMES, head_html, platform_chip, topbar_html
 from id_detector.providers.base import AppConfig
 from id_detector.rescan import policy_for_trigger, priority_for_trigger
 from id_detector.webapp.jobs import TERMINAL_STATES, Job, JobManager, TargetValidationError
@@ -389,6 +389,14 @@ margin:2px 2px 12px}
 .job-player .jp-yt{position:relative;width:100%;max-width:560px;aspect-ratio:16/9;
 border-radius:12px;overflow:hidden}
 .job-player .jp-yt iframe{position:absolute;inset:0;width:100%;height:100%;border-radius:0}
+.jp-frame{position:relative}.jp-frame[hidden]{display:none}
+.jp-frame.loading iframe,.jp-frame.loading .jp-yt{opacity:0}
+.jp-wait{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;
+gap:10px;color:var(--muted);font-size:13px;background:#0c0c13;border-radius:12px;
+border:1px solid var(--line);animation:blink 1.6s ease-in-out infinite}
+.jp-frame:not(.loading) .jp-wait{display:none}
+.jp-fail{color:var(--muted);font-size:13px;padding:14px 16px;border:1px dashed var(--line2);
+border-radius:12px}.jp-fail[hidden]{display:none}.jp-fail b{color:var(--fg)}
 .scan{background:var(--card);border:1px solid var(--line);border-radius:18px;padding:22px 22px 18px;
 position:relative;overflow:hidden}
 .scan::after{content:"";position:absolute;inset:0;pointer-events:none;
@@ -734,6 +742,37 @@ tick();
 """
 
 
+_PLAYER_JS = """
+(function(){
+  var section = document.getElementById('job-player'); if(!section) return;
+  var kind = section.getAttribute('data-kind');
+  var frame = document.getElementById('jp-frame'), fail = document.getElementById('jp-fail');
+  var iframe = frame.querySelector('iframe');
+  var settled = false, timer = setTimeout(playerFailed, 15000);
+  function playerReady(){
+    settled = true; clearTimeout(timer);
+    frame.classList.remove('loading'); frame.hidden = false; fail.hidden = true;
+  }
+  function playerFailed(){ if(settled) return; frame.hidden = true; fail.hidden = false; }
+  if(kind === 'soundcloud'){
+    // The widget API is the only reliable "it actually loaded" signal for a cross-origin embed;
+    // a Cloudflare challenge or a timeout on w.soundcloud.com never reports READY, and the raw
+    // browser error page must not surface inside the card as if the analysis had failed.
+    var s = document.createElement('script');
+    s.src = 'https://w.soundcloud.com/player/api.js';
+    s.onload = function(){
+      try{ SC.Widget(iframe).bind(SC.Widget.Events.READY, playerReady); }
+      catch(e){ playerFailed(); }
+    };
+    s.onerror = playerFailed;
+    document.head.appendChild(s);
+  } else {
+    iframe.addEventListener('load', playerReady);
+  }
+})();
+"""
+
+
 def _page_shell(title: str, body: str, script: str = "") -> bytes:
     tail = f"<script>{script}</script>" if script else ""
     return (head_html(title, _APP_CSS) + f"<body>{body}{tail}</body></html>\n").encode("utf-8")
@@ -966,11 +1005,20 @@ def _job_player_html(plan: EmbedPlan) -> str:
         )
     else:
         return ""
+    name = PLATFORM_NAMES.get(plan.kind, plan.kind)
+    # The frame starts hidden behind a "loading" cover and is revealed only once the player
+    # reports ready; if it never does (blocked / timed out), a calm note replaces it so a flaky
+    # embed can't look like a failed analysis.  See ``_PLAYER_JS``.
     return (
-        '<section class="job-player" id="job-player">'
+        f'<section class="job-player" id="job-player" data-kind="{html.escape(plan.kind)}">'
         '<div class="jp-label"><span class="eq live"><i></i><i></i><i></i><i></i></span>'
         "Listen while it works — scrub around to pass the time</div>"
-        f"{frame}</section>"
+        f'<div class="jp-frame loading" id="jp-frame">{frame}'
+        f'<div class="jp-wait" id="jp-wait">Loading the {html.escape(name)} player…</div></div>'
+        f'<div class="jp-fail" id="jp-fail" hidden>Couldn\'t load the {html.escape(name)} player '
+        "— the site didn't answer. <b>The analysis below is still running.</b> "
+        f'<a rel="noopener" href="{html.escape(plan.link_url)}">Open on {html.escape(name)} ↗</a>'
+        "</div></section>"
     )
 
 
@@ -1013,7 +1061,7 @@ def _job_page_html(job: Job) -> bytes:
     )
     script = (
         f"var JOB_ID={json.dumps(job.id)};var DISPLAY={json.dumps(job.display)};"
-        f"var STEPS={json.dumps(steps)};" + _JOB_JS
+        f"var STEPS={json.dumps(steps)};" + _JOB_JS + _PLAYER_JS
     )
     return _page_shell("Analysing — id-detector", body, script)
 
