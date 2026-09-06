@@ -559,8 +559,9 @@ def test_audio_route_streams_the_fetched_original_with_range_support(tmp_path: P
     def runner(ctx: JobContext) -> None:
         ctx.progress("ingest", 0, 1, "resolving source")
         gate.wait(timeout=5)
+        # Ingest reports done == total once the file is written; the audio must be available
+        # from that tick, before any later phase starts.
         ctx.progress("ingest", 1, 1, "Fixture Live Set")
-        ctx.progress("windows", 1, 1, "3 windows")
         ingested.set()
         gate.wait(timeout=5)
 

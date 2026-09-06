@@ -974,7 +974,7 @@ _AUDIO_TYPES = {
     "flac": "audio/flac",
 }
 #: Phases during which the fetched original cannot exist yet (no point resolving it).
-_PRE_INGEST_PHASES = frozenset({"queued", "starting", "build_index", "ingest"})
+_PRE_INGEST_PHASES = frozenset({"queued", "starting", "build_index"})
 
 
 def _audio_content_type(path: Path, container: str | None = None) -> str:
@@ -993,8 +993,12 @@ def _resolve_job_audio(job: Job, work_root: Path) -> Path | None:
 
     if job.audio_path:
         return Path(job.audio_path)
-    if job.phase in _PRE_INGEST_PHASES and job.status not in TERMINAL_STATES:
-        return None
+    if job.status not in TERMINAL_STATES:
+        if job.phase in _PRE_INGEST_PHASES:
+            return None
+        # Still fetching: the ingest phase reports done == total once the file is written.
+        if job.phase == "ingest" and job.phase_done < job.phase_total:
+            return None
     try:
         cached = _load_cached(work_root, job.target)
     except (OSError, ValueError):
