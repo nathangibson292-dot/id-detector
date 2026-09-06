@@ -329,6 +329,8 @@ border:1px solid var(--line);border-radius:9px;background:#ffffff08;color:var(--
 font:12px/1.55 var(--mono);outline:none;transition:border-color .12s,box-shadow .12s}
 .tlbox textarea:focus{border-color:var(--accent);box-shadow:0 0 0 3px rgba(167,139,250,.18)}
 .tlbox textarea::placeholder{color:var(--dim)}
+.consent{grid-column:1/-1;border-color:rgba(251,191,36,.38);background:rgba(251,191,36,.06)}
+.consent[hidden]{display:none}
 /* library */
 .stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:12px;
 margin:8px 0 4px}
@@ -515,10 +517,20 @@ _FORM_JS = """
     if(f.querySelector('input[name=build_index]').checked) parts.push('reference index');
     sum.textContent = parts.join(' · ');
   }
+  var consent = document.getElementById('consent-row');
+  function gateConsent(){
+    if(!consent) return;
+    var prof = input.form.querySelector('input[name=profile]:checked');
+    var max = prof && prof.value === 'max_accuracy';
+    consent.hidden = !max;
+    if(!max){
+      var c = consent.querySelector('input[name=upload_consent]'); if(c) c.checked = false;
+    }
+  }
   Array.prototype.forEach.call(input.form.querySelectorAll(
   'input[type=radio],input[type=checkbox]'),
-    function(el){ el.addEventListener('change', summary); });
-  summary();
+    function(el){ el.addEventListener('change', function(){ summary(); gateConsent(); }); });
+  summary(); gateConsent();
 })();
 """
 
@@ -802,6 +814,11 @@ def _form_html(prefill: str = "") -> str:
         '<label class="segopt"><input type="radio" name="profile" value="max_accuracy">'
         "<span><b>Max accuracy</b><small>every engine you have configured</small></span></label>"
         "</div>"
+        '<label class="tog consent" id="consent-row" hidden>'
+        '<input type="checkbox" name="upload_consent" value="1"><span class="sw"></span>'
+        "<span><b>I own this audio, or have permission to analyse it</b>"
+        "<small>Required before Max accuracy uploads a clip to a paid engine "
+        "(AudD / ACRCloud). Leave off to keep everything on this machine.</small></span></label>"
         '<label class="tog"><input type="checkbox" name="acquire" value="1">'
         '<span class="sw"></span>'
         "<span><b>Find where to get each track</b>"
