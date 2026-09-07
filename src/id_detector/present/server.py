@@ -711,6 +711,7 @@ function countdown(url){
 }
 function render(j){
   LAST = j;
+  document.body.classList.toggle('analysing', !j.terminal);
   var st = document.getElementById('status'); st.textContent = j.status;
   st.className = 'st st-' + j.status;
   var t = titleFromLog(j); if(t){ document.getElementById('title').textContent = t;

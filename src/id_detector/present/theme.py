@@ -67,7 +67,7 @@ border-radius:9px;background:var(--grad);box-shadow:0 6px 18px -7px rgba(139,92,
 .eq{display:inline-flex;align-items:flex-end;gap:2px;height:14px;width:16px}
 .eq i{display:block;width:3px;height:5px;border-radius:2px;background:var(--grad);
 transform-origin:bottom;transition:height .3s}
-body.playing .eq i,.eq.live i{animation:eq .9s ease-in-out infinite}
+body.analysing .logo .eq i,.eq.live i{animation:eq .9s ease-in-out infinite}
 .eq i:nth-child(1){height:8px}
 .eq i:nth-child(2){height:14px;animation-delay:.15s}
 .eq i:nth-child(3){height:6px;animation-delay:.3s}
