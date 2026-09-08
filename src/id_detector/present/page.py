@@ -45,7 +45,7 @@ UNRESOLVED_CAP_MS = 120_000
 #: Bump when the page's look or behaviour changes: ``present.refresh.ensure_fresh_page`` re-renders
 #: any written page whose ``<meta name="id-detector-page">`` stamp is older, so already-analysed
 #: mixes pick up the new page the next time they are opened (no re-analysis).
-PAGE_VERSION = 12
+PAGE_VERSION = 13
 
 
 # --------------------------------------------------------------------------------------------------
@@ -330,13 +330,14 @@ def _acquire_links_html(acquire: dict[str, Any] | None) -> str:
     purchase = soundcloud.get("purchase_url")
     if acquire.get("free_download") and permalink:
         chips.append(
-            f'<a class="acq free" rel="noopener" href="{_esc(permalink)}">SoundCloud · Free</a>'
+            f'<a class="acq free" target="_blank" rel="noopener" '
+            f'href="{_esc(permalink)}">SoundCloud · Free</a>'
         )
     if acquire.get("gate") and (permalink or purchase):
         # Land on the SoundCloud track page (where the Free Download button lives) rather than
         # bouncing straight to the off-SoundCloud gate host, which reads like a broken link.
         chips.append(
-            f'<a class="acq gate" rel="noopener" '
+            f'<a class="acq gate" target="_blank" rel="noopener" '
             f'href="{_esc(permalink or purchase)}">SoundCloud · Gate</a>'
         )
     # A SoundCloud buy link points at the uploader's purchase_url, which is usually off on
@@ -350,19 +351,20 @@ def _acquire_links_html(acquire: dict[str, Any] | None) -> str:
             break
     if acquire.get("buy") and buy_url:
         chips.append(
-            f'<a class="acq buy" rel="noopener" href="{_esc(buy_url)}">{_esc(buy_label)}</a>'
+            f'<a class="acq buy" target="_blank" rel="noopener" '
+            f'href="{_esc(buy_url)}">{_esc(buy_label)}</a>'
         )
     for link in acquire.get("direct") or ():
         if link.get("kind") in {"stream", "catalogue"}:
             source = link.get("source", "link")
             chips.append(
-                f'<a class="acq direct" rel="noopener" href="{_esc(link.get("url"))}">'
-                f"{_esc(source)}</a>"
+                f'<a class="acq direct" target="_blank" rel="noopener" '
+                f'href="{_esc(link.get("url"))}">{_esc(source)}</a>'
             )
     for link in acquire.get("search_links") or ():
         source = link.get("source", "search")
         chips.append(
-            f'<a class="acq search" rel="noopener" href="{_esc(link.get("url"))}">'
+            f'<a class="acq search" target="_blank" rel="noopener" href="{_esc(link.get("url"))}">'
             f"{_esc(source)}</a>"
         )
     return "".join(chips) if chips else '<span class="acq none">—</span>'
@@ -616,7 +618,10 @@ def _stats_html(
 
 
 def _embed_html(embed: EmbedPlan, audio_src: str | None = None) -> str:
-    link = f'<a class="setlink" rel="noopener" href="{_esc(embed.link_url)}">Open the set ↗</a>'
+    link = (
+        f'<a class="setlink" target="_blank" rel="noopener" '
+        f'href="{_esc(embed.link_url)}">Open the set ↗</a>'
+    )
     if audio_src:
         # Play the fetched original locally: robust (works even when the platform video is removed
         # or embedding is disabled) and reliably seekable, unlike a third-party iframe.  The link to
