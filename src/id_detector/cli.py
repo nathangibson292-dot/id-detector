@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import sys
 import tomllib
 import uuid
@@ -86,10 +87,33 @@ PROJECT_ROOT = Path.cwd()
 DEFAULT_WORK_ROOT = Path("work")
 
 
+def _load_dotenv(root: Path) -> None:
+    """Load ``KEY=VALUE`` lines from ``<root>/.env`` into the environment, never overriding a real
+    variable already set in the shell.
+
+    Secrets (``AUDD_API_TOKEN`` etc.) are read only from the environment; this makes the documented
+    ``.env`` file work without adding a dependency.  A missing file and malformed lines are ignored.
+    """
+
+    try:
+        text = (root / ".env").read_text(encoding="utf-8")
+    except OSError:
+        return
+    for line in text.splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#") or "=" not in stripped:
+            continue
+        key, _, value = stripped.partition("=")
+        key = key.strip()
+        if key and key not in os.environ:
+            os.environ[key] = value.strip().strip('"').strip("'")
+
+
 @app.callback()
 def main() -> None:
     """Evidence-first DJ-set identification."""
 
+    _load_dotenv(PROJECT_ROOT)
     # Redirected Windows consoles commonly default to cp1252. Provider labels are Unicode and
     # must never make a completed analysis fail during its final presentation step.
     for stream in (sys.stdout, sys.stderr):

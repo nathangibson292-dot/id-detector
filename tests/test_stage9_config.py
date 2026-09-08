@@ -152,3 +152,19 @@ def test_config_init_writes_template_and_refuses_to_clobber(tmp_path: Path) -> N
     assert second.exit_code == 1
     forced = runner.invoke(app, ["config", "init", "--path", str(target), "--force"])
     assert forced.exit_code == 0
+
+
+def test_load_dotenv_fills_missing_keys_and_never_overrides_the_shell(tmp_path, monkeypatch):
+    import os
+
+    from id_detector.cli import _load_dotenv
+
+    (tmp_path / ".env").write_text(
+        'AUDD_API_TOKEN="tok-123"\n# a comment\n\nSHELL_WINS=from_file\n', encoding="utf-8"
+    )
+    monkeypatch.delenv("AUDD_API_TOKEN", raising=False)
+    monkeypatch.setenv("SHELL_WINS", "from_shell")
+    _load_dotenv(tmp_path)
+    assert os.environ["AUDD_API_TOKEN"] == "tok-123"  # quotes stripped, missing key filled
+    assert os.environ["SHELL_WINS"] == "from_shell"  # a real env var is never overridden
+    _load_dotenv(tmp_path / "nope")  # a missing .env is a silent no-op
