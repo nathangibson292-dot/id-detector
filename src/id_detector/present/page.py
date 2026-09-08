@@ -45,7 +45,7 @@ UNRESOLVED_CAP_MS = 120_000
 #: Bump when the page's look or behaviour changes: ``present.refresh.ensure_fresh_page`` re-renders
 #: any written page whose ``<meta name="id-detector-page">`` stamp is older, so already-analysed
 #: mixes pick up the new page the next time they are opened (no re-analysis).
-PAGE_VERSION = 11
+PAGE_VERSION = 12
 
 
 # --------------------------------------------------------------------------------------------------
@@ -332,11 +332,16 @@ def _acquire_links_html(acquire: dict[str, Any] | None) -> str:
         chips.append(
             f'<a class="acq free" rel="noopener" href="{_esc(permalink)}">SoundCloud · Free</a>'
         )
-    if acquire.get("gate") and purchase:
+    if acquire.get("gate") and (permalink or purchase):
+        # Land on the SoundCloud track page (where the Free Download button lives) rather than
+        # bouncing straight to the off-SoundCloud gate host, which reads like a broken link.
         chips.append(
-            f'<a class="acq gate" rel="noopener" href="{_esc(purchase)}">SoundCloud · Gate</a>'
+            f'<a class="acq gate" rel="noopener" '
+            f'href="{_esc(permalink or purchase)}">SoundCloud · Gate</a>'
         )
-    buy_url = purchase if acquire.get("buy") else None
+    # A SoundCloud buy link points at the uploader's purchase_url, which is usually off on
+    # Bandcamp/Beatport and looks broken; send to the SoundCloud track page and buy from there.
+    buy_url = (permalink or purchase) if acquire.get("buy") else None
     buy_label = "SoundCloud · Buy"
     for link in acquire.get("direct") or ():
         if link.get("kind") == "purchase":

@@ -36,6 +36,7 @@ from id_detector.io import (
     canonical_json_bytes,
     native_path,
     path_is_file,
+    path_mtime,
     read_text,
     sha256_file,
 )
@@ -175,10 +176,10 @@ class AnalysedSet:
 
 
 def _discover_sets(work_root: Path) -> list[AnalysedSet]:
-    sets: list[AnalysedSet] = []
+    dated: list[tuple[float, AnalysedSet]] = []
     if not work_root.is_dir():
-        return sets
-    for source_json in sorted(work_root.glob("*/*/ingest/source.json")):
+        return []
+    for source_json in work_root.glob("*/*/ingest/source.json"):
         index_html = source_json.parents[1] / "present" / "index.html"
         if not path_is_file(index_html):
             continue
@@ -186,16 +187,24 @@ def _discover_sets(work_root: Path) -> list[AnalysedSet]:
             source = SourceRecord.model_validate_json(read_text(source_json))
         except (ValueError, OSError):
             continue
-        sets.append(
-            AnalysedSet(
-                source_key=source.source_key,
-                media_key=source.media_key,
-                media_dir=source_json.parents[1],
-                title=source.title or "(untitled set)",
-                platform=source.platform,
+        # "Analysed at" = when the set was ingested (source.json is written once and never touched
+        # on a re-render or an open, unlike present/index.html), so viewing a mix never reorders
+        # the library.  Newest first.
+        analysed_at = path_mtime(source_json)
+        dated.append(
+            (
+                analysed_at,
+                AnalysedSet(
+                    source_key=source.source_key,
+                    media_key=source.media_key,
+                    media_dir=source_json.parents[1],
+                    title=source.title or "(untitled set)",
+                    platform=source.platform,
+                ),
             )
         )
-    return sets
+    dated.sort(key=lambda item: item[0], reverse=True)
+    return [item for _, item in dated]
 
 
 def _human_duration(milliseconds: int) -> str:
