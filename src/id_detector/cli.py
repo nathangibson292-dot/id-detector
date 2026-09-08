@@ -40,6 +40,7 @@ from id_detector.ingest import _load_cached, ingest
 from id_detector.io import read_text, redact_text
 from id_detector.jobs import AsyncJobStore, ProcessLock
 from id_detector.journal import InvocationTimer, append_invocation
+from id_detector.local_index import run_local_index_recognition
 from id_detector.orchestrate import run_generation_loop
 from id_detector.paid_clip import PAID_CLIP_ENGINES, run_paid_clip_recognition
 from id_detector.present import export_tracklist, generate_page
@@ -359,6 +360,9 @@ async def _analyse(
     enabled_engines: tuple[str, ...] = (),
     cli_confirmation: bool = False,
     paid_scan_adapters: Mapping[str, object] | None = None,
+    local_index_label: str | None = None,
+    index_root: Path = Path("data/local/panako-db"),
+    panako_tool_dir: Path = Path("data/local/panako"),
     progress: ProgressFn | None = None,
 ) -> int:
     app_config = app_config or AppConfig()
@@ -549,16 +553,21 @@ async def _analyse(
         timer.finish_stage("fuse_ms")
         _report(progress, "fuse", 1, 1, f"{len(fused.episodes.episodes)} episodes")
 
-        # Phase 2 — paid CLIP recognition, the gate-free path for OTHER people's mixes.  The free
-        # fuse just told us which spans are still uncertain; send only those window clips to the
-        # paid engine (same ~12 s clips Shazam saw — no whole-file upload, no consent gate) and
-        # re-fuse.  Agreement lifts a track's confidence, disagreement lets a Shazam phantom be
-        # demoted, and a Shazam-blind but catalogued track is recovered.  A no-op unless a
-        # clip-capable engine is enabled and uncertain spans remain.
+        # Phase 2 — cross-check the still-uncertain spans with the levers that see what Shazam
+        # can't.  The free fuse just told us which spans remain uncertain; both levers send only
+        # those window clips (the same ~12 s clips Shazam saw — no whole-file upload, no consent
+        # gate) and re-fuse, so agreement lifts confidence, disagreement lets a Shazam phantom be
+        # demoted, and a Shazam-blind track is recovered:
+        #   • the paid engine's CLIP path (AudD) — catalogued-but-Shazam-blind tracks;
+        #   • a local Panako index — the DJ's OWN unreleased uploads, in no public catalogue.
+        # A no-op unless one of them is enabled and uncertain spans remain.
         clip_scan = PaidScanResult()
-        if set(enabled_engines) & set(PAID_CLIP_ENGINES):
+        index_scan = PaidScanResult()
+        want_clips = bool(set(enabled_engines) & set(PAID_CLIP_ENGINES))
+        want_index = local_index_label is not None
+        if want_clips or want_index:
             targets = select_scan_targets(fused.episodes.episodes, decoded.record.pcm.duration_ms)
-            if targets:
+            if targets and want_clips:
                 _report(progress, "scan", 0, 1, "clip-checking uncertain spans with paid engine")
                 timer.start_stage("clip_scan_ms")
                 clip_scan = await run_paid_clip_recognition(
@@ -575,17 +584,46 @@ async def _analyse(
                     log=lambda message: _report(progress, "scan", 0, 1, message),
                 )
                 timer.finish_stage("clip_scan_ms")
-                for provider, reason in clip_scan.skipped:
-                    _report(progress, "scan", 1, 1, f"{provider} skipped: {reason}")
-            if clip_scan.observations:
+                for name, reason in clip_scan.skipped:
+                    _report(progress, "scan", 1, 1, f"{name} skipped: {reason}")
+            if targets and want_index:
+                _report(progress, "scan", 0, 1, "querying the local reference index")
+                timer.start_stage("index_scan_ms")
+                index_scan = await run_local_index_recognition(
+                    media_key=ingested.record.media_key,
+                    media_dir=media_dir,
+                    windows=windows,
+                    targets=targets,
+                    duration_ms=decoded.record.pcm.duration_ms,
+                    run_id=run_id,
+                    index_label=local_index_label,
+                    index_root=index_root,
+                    tool_dir=panako_tool_dir,
+                    log=lambda message: _report(progress, "scan", 0, 1, message),
+                )
+                timer.finish_stage("index_scan_ms")
+                for name, reason in index_scan.skipped:
+                    _report(progress, "scan", 1, 1, f"{name} skipped: {reason}")
+            if clip_scan.observations or index_scan.observations:
                 counts["clip_matches"] = sum(
                     item.status == "match" for item in clip_scan.observations
                 )
-                _report(progress, "fuse", 0, 1, "re-fusing with paid clip evidence")
+                counts["local_index_matches"] = sum(
+                    item.status == "match" for item in index_scan.observations
+                )
+                _report(progress, "fuse", 0, 1, "re-fusing with cross-check evidence")
                 timer.start_stage("refuse_ms")
                 orchestrated = await _fuse(
-                    (*paid_scan.observations, *clip_scan.observations),
-                    (*paid_scan.observation_paths, *clip_scan.observation_paths),
+                    (
+                        *paid_scan.observations,
+                        *clip_scan.observations,
+                        *index_scan.observations,
+                    ),
+                    (
+                        *paid_scan.observation_paths,
+                        *clip_scan.observation_paths,
+                        *index_scan.observation_paths,
+                    ),
                 )
                 fused = orchestrated.fusion
                 counts.update(
@@ -787,6 +825,21 @@ def analyse(
             "profile (a frozen profile lists paid engines only once benchmarked with credentials)."
         ),
     ),
+    local_index: str | None = typer.Option(  # noqa: B008
+        None,
+        "--local-index",
+        help=(
+            "Query a local Panako reference index (by its --index-label from `build-index`) over "
+            "the still-uncertain spans, to recover the DJ's own unreleased tracks that no public "
+            "catalogue holds. Free and self-hosted; needs a built index and a JDK, else it skips."
+        ),
+    ),
+    index_root: Path = typer.Option(  # noqa: B008
+        Path("data/local/panako-db"), "--index-root", help="Root holding built local indexes."
+    ),
+    panako_tool_dir: Path = typer.Option(  # noqa: B008
+        Path("data/local/panako"), "--panako-tool-dir", help="Directory holding the Panako jar."
+    ),
 ) -> None:
     """Run the full multi-generation pipeline and export a flattened tracklist."""
     calibrator = None
@@ -869,6 +922,9 @@ def analyse(
                 calibrator=calibrator,
                 enabled_engines=enabled_engines,
                 cli_confirmation=i_own_this_audio_or_have_permission,
+                local_index_label=local_index,
+                index_root=index_root,
+                panako_tool_dir=panako_tool_dir,
             )
         )
     except KeyboardInterrupt:
