@@ -1,10 +1,28 @@
 """The live paid file-scanner stage: run AudD / ACRCloud once over the whole mix.
 
-Shazam (the free ``clip_recognizer``) sweeps overlapping windows; the paid engines instead scan
-the entire file in one durable submission and return positioned ``file_scanner`` observations that
-enter the *same* fuser as clip observations (see :mod:`id_detector.fuse.scanners`).  Because a
-whole-file scan is not re-run per rescan generation, these observations are injected once as the
-generation loop's static ``extra_observations``.
+.. warning::
+   CORRECTED POST-KEY PLAN — do NOT extend this whole-file mode.  Uploading the entire mix to
+   AudD's *enterprise file scanner* is why the ownership-consent gate exists, and that makes the
+   paid engine useless for its actual use case: analysing OTHER people's published mixes, which you
+   don't own.  The free engine already sends short ~12 s CLIPS to Shazam with NO consent gate, so
+   the correct paid design is the same shape:
+
+     * Recognise CLIPS via AudD's standard recognition API (``api.audd.io``), NOT the whole-file
+       ``enterprise.audd.io`` endpoint — send only the ~12 s windows of the UNCERTAIN regions that
+       :func:`id_detector.scan_targeting.select_scan_targets` already picks out.
+     * DROP ``require_upload_permission`` for that clip mode: a clip to a paid recogniser is no
+       different from the Shazam clip we already send gate-free (keep the gate only for a genuine
+       whole-file upload, which we will not use).
+     * The paid clip observations feed the SAME fuser as Shazam's, so they recover Shazam-missed
+       tracks and let a paid disagreement demote a Shazam phantom.
+   This whole-file path stays only as the tested scaffolding until a key exists to build + verify
+   the clip path live.  See the ``paid-engine-activation`` project memory.
+
+Shazam (the free ``clip_recognizer``) sweeps overlapping windows; this (interim) whole-file mode has
+the paid engines scan the entire file in one durable submission and return positioned
+``file_scanner`` observations that enter the *same* fuser as clip observations (see
+:mod:`id_detector.fuse.scanners`).  Because a whole-file scan is not re-run per rescan generation,
+these observations are injected once as the generation loop's static ``extra_observations``.
 
 Three independent gates must ALL hold before a paid engine runs; any missing gate skips just that
 engine (with a logged reason) and never fails the free analysis:
