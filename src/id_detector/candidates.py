@@ -22,7 +22,7 @@ from hashlib import sha256
 from pathlib import Path
 
 from id_detector.io import atomic_write_bytes, canonical_json_bytes, native_path
-from id_detector.process import run_process
+from id_detector.process import ProcessError, ProcessTimeout, run_process
 from id_detector.providers.panako import (
     PANAKO_JAR_SHA256,
     PANAKO_VERSION,
@@ -183,6 +183,31 @@ async def discover_artist(
     return parse_flat_playlist(listing, source=f"artist_search:{name}")
 
 
+async def discover_explicit_url(url: str, *, timeout: float = 120) -> Candidate:
+    """Resolve one user-supplied track URL to a candidate, fetching its real title/uploader.
+
+    Best-effort: if yt-dlp can't read metadata, fall back to a bare candidate so the URL is still
+    indexable (its match label then falls back to the reference file stem).
+    """
+
+    try:
+        listing = await _ytdlp_flat_json(url, timeout=timeout)
+        resolved = parse_flat_playlist(listing, source="explicit_url")
+    except (ProcessError, ProcessTimeout, ValueError):
+        resolved = []
+    if resolved:
+        # Keep the caller's exact URL (dedup/label stability) but take the fetched title/uploader.
+        first = resolved[0]
+        return Candidate(
+            url=url,
+            title=first.title,
+            uploader=first.uploader,
+            source="explicit_url",
+            platform_id=first.platform_id,
+        )
+    return Candidate(url=url, title=None, uploader=None, source="explicit_url")
+
+
 def uploader_uploads_url(set_listing_json: str) -> str | None:
     """Derive the uploader's own uploads URL (``.../tracks``) from a set's flat-playlist JSON."""
 
@@ -222,7 +247,7 @@ async def discover_candidates(
     for name in artists:
         candidates.extend(await discover_artist(name, limit=search_limit))
     for url in extra_urls:
-        candidates.append(Candidate(url=url, title=None, uploader=None, source="explicit_url"))
+        candidates.append(await discover_explicit_url(url))
     return deduplicate_candidates(candidates)
 
 
