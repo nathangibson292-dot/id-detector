@@ -26,6 +26,7 @@ from id_detector.contracts import (
     ObservationRecord,
     QueryRecord,
     RawLabel,
+    WindowRecord,
     compose_natural_key,
     file_scan_cache_key,
     make_id,
@@ -53,6 +54,9 @@ from id_detector.shazam import canonicalize_provider_json
 PROVIDER = "audd"
 PROVIDER_CONFIG_VERSION = "audd-v1.json"
 ENTERPRISE_ENDPOINT = "https://enterprise.audd.io/"
+#: AudD's standard recognition endpoint: send one short clip, get one song back — the same shape as
+#: the Shazam clip we already send gate-free, so this path needs NO third-party-upload consent.
+MAIN_ENDPOINT = "https://api.audd.io/"
 CHUNK_MS = 12_000
 PRICE_PER_HOUR_USD_E2 = 150
 CAPABILITY = ProviderCapability(PROVIDER, "file_scanner", True, "enterprise whole-file scan")
@@ -292,6 +296,76 @@ def parse_response(
     return tuple(sort_records(observations))
 
 
+def clip_response_to_observation(
+    response: Mapping[str, Any],
+    *,
+    query: QueryRecord,
+    window: WindowRecord,
+    media_key: str,
+    raw_response_ref: str,
+) -> ObservationRecord:
+    """Turn one AudD main-endpoint clip response into a positioned ``clip_recognizer`` observation.
+
+    The clip is a window already cut for the free engine, so the observation is positioned on that
+    window's span and competes in the fuser exactly like a Shazam clip observation.
+    """
+
+    if response.get("status") != "success":
+        raise ProviderProtocolError("AudD clip response is not a success")
+    result = response.get("result")
+    label = _empty_label()
+    status = "no_match"
+    provider_ids: dict[str, Any] = {}
+    native: dict[str, Any] = {"result": None}
+    if isinstance(result, Mapping):
+        status = "match"
+        label = RawLabel(
+            artist=str(result["artist"]) if result.get("artist") is not None else None,
+            title=str(result["title"]) if result.get("title") is not None else None,
+            album=str(result["album"]) if result.get("album") is not None else None,
+            label=str(result["label"]) if result.get("label") is not None else None,
+            release_date=(
+                str(result["release_date"]) if result.get("release_date") is not None else None
+            ),
+        )
+        if result.get("isrc") is not None:
+            provider_ids["isrc"] = str(result["isrc"])
+        if result.get("song_link") is not None:
+            provider_ids["audd_song_link"] = str(result["song_link"])
+        native = {"result": canonicalize_provider_json(result)}
+    label_hash = sha256(canonical_json_bytes(label)).hexdigest()
+    natural = {
+        "query_id": query.id,
+        "mix_span_ms": list(window.support_ms),
+        "raw_label_hash": label_hash,
+        "native_index": 0,
+        "transform": window.transform.model_dump(mode="json"),
+    }
+    return ObservationRecord(
+        schema_version=SCHEMA_VERSION,
+        generated_by=GENERATED_BY,
+        id=make_id(media_key, "observation", compose_natural_key("observation", natural)),
+        generation=query.generation,
+        query_id=query.id,
+        provider=PROVIDER,
+        capability="clip_recognizer",
+        status=status,
+        is_final=True,
+        mix_span_ms=window.support_ms,
+        support_ms=window.support_ms,
+        transform=window.transform,
+        logical_trial_id=window.logical_trial_id,
+        raw_label=label,
+        provider_ids=provider_ids,
+        native=native,
+        anchor=None,
+        score_raw=None,
+        quality=None,
+        raw_response_ref=raw_response_ref,
+        source_ids=[f"query:{query.id}", f"window:{window.id}"],
+    )
+
+
 @dataclass
 class AudDAdapter:
     credentials: AudDCredentials
@@ -325,6 +399,39 @@ class AudDAdapter:
         except (httpx.TimeoutException, httpx.NetworkError) as exc:
             message = "AudD response was lost; no reconciliation exists"
             raise AmbiguousProviderOutcome(message) from exc
+        if result.status_code >= 400:
+            raise ProviderProtocolError(f"AudD HTTP {result.status_code}")
+        try:
+            payload = result.json()
+        except ValueError as exc:
+            raise ProviderProtocolError("AudD returned a non-JSON response") from exc
+        if not isinstance(payload, dict):
+            raise ProviderProtocolError("AudD response root is not an object")
+        return redact_value(payload)
+
+    async def recognize_clip(self, path: Path, on_attempt: AttemptCallback) -> dict[str, Any]:
+        """Recognise a short clip via AudD's main endpoint (api.audd.io).
+
+        No consent gate: a clip to a paid recogniser is the same shape as the Shazam clip we already
+        send gate-free.  A lost response is unrecoverable (``AmbiguousProviderOutcome``).
+        """
+
+        if not path_is_file(path):
+            raise FileNotFoundError(path)
+        timeout = httpx.Timeout(connect=30, write=120, read=120, pool=30)
+        try:
+            with open(native_path(path), "rb") as handle:
+                await on_attempt()
+                async with httpx.AsyncClient(
+                    transport=self.transport, timeout=timeout, follow_redirects=False
+                ) as client:
+                    result = await client.post(
+                        MAIN_ENDPOINT,
+                        data={"api_token": self.credentials.api_token},
+                        files={"file": (path.name, handle, "application/octet-stream")},
+                    )
+        except (httpx.TimeoutException, httpx.NetworkError) as exc:
+            raise AmbiguousProviderOutcome("AudD clip response was lost") from exc
         if result.status_code >= 400:
             raise ProviderProtocolError(f"AudD HTTP {result.status_code}")
         try:
