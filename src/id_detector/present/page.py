@@ -45,7 +45,7 @@ UNRESOLVED_CAP_MS = 120_000
 #: Bump when the page's look or behaviour changes: ``present.refresh.ensure_fresh_page`` re-renders
 #: any written page whose ``<meta name="id-detector-page">`` stamp is older, so already-analysed
 #: mixes pick up the new page the next time they are opened (no re-analysis).
-PAGE_VERSION = 9
+PAGE_VERSION = 10
 
 
 # --------------------------------------------------------------------------------------------------

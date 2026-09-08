@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import html
 
-#: Browser-tab icon, matching the top-bar logo: white equaliser bars at varied heights on the
+#: Browser-tab icon, matching the top-bar logo: white equaliser bars rising left-to-right on the
 #: brand-gradient tile (a static data URI, so it works offline).
 FAVICON = (
     "data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E"
@@ -19,10 +19,10 @@ FAVICON = (
     "%3Cstop offset='0' stop-color='%23ff3d8a'/%3E%3Cstop offset='.55' stop-color='%238b5cf6'/%3E"
     "%3Cstop offset='1' stop-color='%2322d3ee'/%3E%3C/linearGradient%3E%3C/defs%3E"
     "%3Crect width='32' height='32' rx='8' fill='url(%23g)'/%3E"
-    "%3Crect x='6' y='13' width='4' height='11' rx='2' fill='%23fff'/%3E"
-    "%3Crect x='12' y='6' width='4' height='18' rx='2' fill='%23fff'/%3E"
-    "%3Crect x='18' y='16' width='4' height='8' rx='2' fill='%23fff'/%3E"
-    "%3Crect x='24' y='10' width='4' height='14' rx='2' fill='%23fff'/%3E%3C/svg%3E"
+    "%3Crect x='6' y='16' width='4' height='8' rx='2' fill='%23fff'/%3E"
+    "%3Crect x='12' y='12' width='4' height='12' rx='2' fill='%23fff'/%3E"
+    "%3Crect x='18' y='8' width='4' height='16' rx='2' fill='%23fff'/%3E"
+    "%3Crect x='24' y='4' width='4' height='20' rx='2' fill='%23fff'/%3E%3C/svg%3E"
 )
 
 PLATFORM_NAMES = {"soundcloud": "SoundCloud", "youtube": "YouTube", "mixcloud": "Mixcloud"}
@@ -68,10 +68,10 @@ border-radius:9px;background:var(--grad);box-shadow:0 6px 18px -7px rgba(139,92,
 .eq i{display:block;width:3px;height:5px;border-radius:2px;background:var(--grad);
 transform-origin:bottom;transition:height .3s}
 body.analysing .logo .eq i,.eq.live i{animation:eq .9s ease-in-out infinite}
-.eq i:nth-child(1){height:8px}
-.eq i:nth-child(2){height:14px;animation-delay:.15s}
-.eq i:nth-child(3){height:6px;animation-delay:.3s}
-.eq i:nth-child(4){height:11px;animation-delay:.45s}
+.eq i:nth-child(1){height:5px}
+.eq i:nth-child(2){height:8px;animation-delay:.15s}
+.eq i:nth-child(3){height:11px;animation-delay:.3s}
+.eq i:nth-child(4){height:14px;animation-delay:.45s}
 @keyframes eq{0%,100%{height:4px}50%{height:14px}}
 .nav{margin-left:auto;display:flex;gap:8px;align-items:center}
 .btn{display:inline-flex;align-items:center;gap:6px;padding:8px 14px;border-radius:9px;
