@@ -166,6 +166,22 @@ class Job:
         }
 
 
+def _strip_extended_prefix(path: Path) -> Path:
+    r"""Drop the Windows extended-length (``\\?\``) prefix ``Path.resolve()`` adds to deep paths.
+
+    Deeply-nested ``work/<keys>/…`` result paths exceed 260 chars, so ``resolve()`` returns the
+    ``\\?\`` form on one side but not the short work-root — which made ``relative_to`` raise and
+    silently lose the result link.  Stripping it from both sides fixes that; a no-op elsewhere.
+    """
+
+    text = str(path)
+    if text.startswith("\\\\?\\UNC\\"):
+        return Path("\\\\" + text[len("\\\\?\\UNC\\") :])
+    if text.startswith("\\\\?\\"):
+        return Path(text[len("\\\\?\\") :])
+    return path
+
+
 class JobContext:
     """The handle a runner uses to report progress, log, check cancellation, and set the result."""
 
@@ -237,7 +253,11 @@ class JobContext:
 
     def set_result(self, index_html: Path) -> None:
         try:
-            relative = index_html.resolve().relative_to(self.work_root.resolve()).as_posix()
+            relative = (
+                _strip_extended_prefix(index_html.resolve())
+                .relative_to(_strip_extended_prefix(self.work_root.resolve()))
+                .as_posix()
+            )
         except ValueError:
             return
         with self._manager.lock:

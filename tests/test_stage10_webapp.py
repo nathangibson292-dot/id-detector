@@ -650,3 +650,23 @@ def test_submit_threads_known_tracklist_to_the_runner(tmp_path: Path) -> None:
     finally:
         manager.shutdown()
     assert _wait_until(_no_worker_thread_alive)
+
+
+def test_set_result_survives_windows_extended_length_paths(tmp_path: Path) -> None:
+    # Deep result paths get the \?\ prefix from resolve() on Windows; set_result must still record
+    # the result (regression: relative_to() threw and the tracklist link was silently lost).
+    from id_detector.webapp.jobs import _strip_extended_prefix
+
+    bs = chr(92)  # a single backslash, built via chr() to dodge source-escaping headaches
+    ext = bs + bs + "?" + bs  # the Windows extended-length prefix
+    assert _strip_extended_prefix(Path(ext + "C:" + bs + "a")) == Path("C:" + bs + "a")
+    assert _strip_extended_prefix(Path("C:" + bs + "a")) == Path("C:" + bs + "a")  # no-op
+
+    manager = JobManager(tmp_path, _fast_runner_factory(tmp_path))
+    try:
+        job_id = manager.submit(CLEAN_URL, "free")
+        assert _wait_until(lambda: manager.get(job_id).status == "succeeded")
+        assert manager.get(job_id).status_dict()["result_url"] == "/src/med/present/index.html"
+    finally:
+        manager.shutdown()
+    assert _wait_until(_no_worker_thread_alive)
