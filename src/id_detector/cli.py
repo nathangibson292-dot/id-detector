@@ -42,7 +42,11 @@ from id_detector.jobs import AsyncJobStore, ProcessLock
 from id_detector.journal import InvocationTimer, append_invocation
 from id_detector.local_index import run_local_index_recognition
 from id_detector.orchestrate import run_generation_loop
-from id_detector.paid_clip import PAID_CLIP_ENGINES, run_paid_clip_recognition
+from id_detector.paid_clip import (
+    DEFAULT_MAX_CLIPS,
+    PAID_CLIP_ENGINES,
+    run_paid_clip_recognition,
+)
 from id_detector.present import export_tracklist, generate_page
 from id_detector.present.server import consume_rescan_queue, read_rescan_queue
 from id_detector.process import run_process
@@ -360,6 +364,7 @@ async def _analyse(
     enabled_engines: tuple[str, ...] = (),
     cli_confirmation: bool = False,
     paid_scan_adapters: Mapping[str, object] | None = None,
+    max_paid_clips: int = DEFAULT_MAX_CLIPS,
     local_index_label: str | None = None,
     index_root: Path = Path("data/local/panako-db"),
     panako_tool_dir: Path = Path("data/local/panako"),
@@ -580,6 +585,7 @@ async def _analyse(
                     enabled_engines=enabled_engines,
                     cli_confirmation=cli_confirmation,
                     refresh=refresh,
+                    max_clips=max_paid_clips,
                     adapters=paid_scan_adapters,
                     log=lambda message: _report(progress, "scan", 0, 1, message),
                 )
@@ -825,6 +831,16 @@ def analyse(
             "profile (a frozen profile lists paid engines only once benchmarked with credentials)."
         ),
     ),
+    max_paid_clips: int = typer.Option(
+        DEFAULT_MAX_CLIPS,
+        "--max-paid-clips",
+        min=1,
+        help=(
+            "Per-mix budget of clips sent to a paid engine, spread evenly across the uncertain "
+            f"spans (default {DEFAULT_MAX_CLIPS} ≈ $0.75/mix at AudD's $5/1000). Raise to trade "
+            "cost for reach; only matters when a paid --engine is active."
+        ),
+    ),
     local_index: str | None = typer.Option(  # noqa: B008
         None,
         "--local-index",
@@ -922,6 +938,7 @@ def analyse(
                 calibrator=calibrator,
                 enabled_engines=enabled_engines,
                 cli_confirmation=i_own_this_audio_or_have_permission,
+                max_paid_clips=max_paid_clips,
                 local_index_label=local_index,
                 index_root=index_root,
                 panako_tool_dir=panako_tool_dir,

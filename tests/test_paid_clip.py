@@ -13,7 +13,7 @@ import wave
 from pathlib import Path
 
 from id_detector.contracts import WindowRecord
-from id_detector.paid_clip import run_paid_clip_recognition
+from id_detector.paid_clip import _subsample_evenly, run_paid_clip_recognition
 from id_detector.providers.base import AppConfig
 from id_detector.windows import WindowsResult
 
@@ -50,6 +50,18 @@ class _FakeAdapter:
 
 def _run(**kwargs: object):
     return asyncio.run(run_paid_clip_recognition(**kwargs))  # type: ignore[arg-type]
+
+
+def test_subsample_spreads_a_budget_evenly_across_the_timeline() -> None:
+    items = list(range(100))
+    # Under budget: everything is kept.
+    assert _subsample_evenly(items[:40], 150) == items[:40]  # type: ignore[arg-type]
+    # Over budget: exactly `budget` items, spanning the whole range (first kept, last near the end).
+    picked = _subsample_evenly(items, 10)  # type: ignore[arg-type]
+    assert len(picked) == 10
+    assert picked[0] == 0 and picked[-1] >= 90  # covers the tail, not just the first 10
+    assert picked == sorted(picked) and len(set(picked)) == 10  # ordered, distinct
+    assert _subsample_evenly(items, 0) == []  # type: ignore[arg-type]
 
 
 def test_only_uncertain_windows_are_recognised_and_a_match_is_positioned(tmp_path: Path) -> None:

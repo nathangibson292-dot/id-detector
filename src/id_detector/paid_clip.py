@@ -52,10 +52,27 @@ from id_detector.windows import WindowsResult
 #: Paid clip-recognition engines (only AudD for now; ACRCloud is whole-file-only in this codebase).
 PAID_CLIP_ENGINES: tuple[str, ...] = ("audd",)
 CLIP_CONFIG_VERSION = "audd-main-v1"
-#: Default ceiling on how many clips one analysis sends to the paid engine (cost guard).
-DEFAULT_MAX_CLIPS = 300
+#: Default per-mix clip budget (cost guard).  At AudD's $5/1000, 150 clips ≈ $0.75/mix, and the
+#: 300-request free trial covers ~2 mixes.  A track spans minutes, so an evenly-spread 150 still
+#: samples every uncertain track many times; raise it with --max-paid-clips to trade cost for reach.
+DEFAULT_MAX_CLIPS = 150
 
 LogFn = Callable[[str], None]
+
+
+def _subsample_evenly(items: list[WindowRecord], budget: int) -> list[WindowRecord]:
+    """At most ``budget`` items, spread uniformly across ``items`` (not just the first ``budget``).
+
+    Taking the first N would leave a long mix's later half unchecked; even spacing keeps whole-mix
+    coverage while bounding spend.
+    """
+
+    if budget <= 0:
+        return []
+    if len(items) <= budget:
+        return items
+    step = len(items) / budget
+    return [items[int(index * step)] for index in range(budget)]
 
 
 def _clip_query(media_key: str, window: WindowRecord) -> QueryRecord:
@@ -136,7 +153,7 @@ async def run_paid_clip_recognition(
         emit(f"paid clip engine audd skipped: {exc}")
         return PaidScanResult(skipped=((("audd"), str(exc)),))
 
-    selected = _windows_in_targets(windows, tuple(targets))[:max_clips]
+    selected = _subsample_evenly(_windows_in_targets(windows, tuple(targets)), max_clips)
     if not selected:
         return PaidScanResult()
 
