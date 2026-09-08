@@ -69,11 +69,17 @@ phase_ms = 0
 
 # Base rescan policy (plan rev 5.2): the Stage 4b denser schedule the Stage 4c generation loop
 # consumes.  max_generations counts generations AFTER generation 0; 0 disables rescans.
+#
+# DEFAULT 0 (rescans OFF): on real DJ mixes the pitch/rate-transform rescans recover ~no tracks that
+# generation 0 misses, while adding famous-track phantoms and 5-65x the request load -- one 46-min
+# mix took ~3 hours and used the whole 2000-request budget on them.  Raise this (e.g. to 3) only if
+# you have heavily pitched tracks generation 0 misses; it caps whatever a --profile enables, and
+# --max-generations wins over both.
 [rescan]
 window_ms = 12000
 hop_ms = 5000
 phase_ms = 0
-max_generations = 3
+max_generations = 0
 
 # Recognition cache TTLs (days).  A positive match is trusted this long; a no-match a shorter time;
 # errors are never cached.  --refresh bypasses both.

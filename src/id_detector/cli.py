@@ -729,6 +729,12 @@ def analyse(
             cache_no_match_max_age_days=file_config.cache_no_match_max_age_days,
             hints_enabled=file_config.hints_enabled,
             disabled_hint_connectors=file_config.disabled_hint_connectors,
+            # The config's rescan ceiling caps the profile's rescan generations.  The default
+            # ceiling is 0 (rescans off) because on real mixes they cost hours and add only
+            # phantoms; set [rescan] max_generations in config (or --max-generations) to opt in.
+            rescan_max_generations=min(
+                frozen.rescan.max_generations, file_config.rescan_max_generations
+            ),
         )
         # A frozen profile is the authority on its feature toggles and its engine set (only
         # max_accuracy lists paid file_scanner engines).

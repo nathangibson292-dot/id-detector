@@ -98,11 +98,13 @@ def test_boundary_triggers_use_shorter_windows_and_whole_episode_triggers_use_th
     assert trigger_geometry("long_episode") == (12_000, 5_000, 0)
 
 
-def test_example_config_carries_the_stage_4c_generation_limit() -> None:
-    from id_detector.providers.base import DEFAULT_MAX_GENERATIONS
+def test_example_config_defaults_rescans_off_but_keeps_the_geometry() -> None:
+    from id_detector.providers.base import LIVE_DEFAULT_MAX_GENERATIONS
 
-    example = AppConfig.load(Path(__file__).resolve().parents[1] / "id-detector.example.toml")
-    assert example.rescan_max_generations == DEFAULT_MAX_GENERATIONS == 3
+    example = AppConfig.load(Path(__file__).resolve().parents[1] / "idea.example.toml")
+    # Rescans ship OFF by default (they cost hours and add only phantoms on real mixes); the
+    # denser 12s/5s rescan geometry is still there for when a config/flag opts back in.
+    assert example.rescan_max_generations == LIVE_DEFAULT_MAX_GENERATIONS == 0
     assert (example.rescan_window_ms, example.rescan_hop_ms, example.rescan_phase_ms) == (
         12_000,
         5_000,

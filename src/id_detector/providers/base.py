@@ -20,8 +20,15 @@ DEFAULT_PHASE_MS = 0
 DEFAULT_RESCAN_WINDOW_MS = 12_000
 DEFAULT_RESCAN_HOP_MS = 5_000
 DEFAULT_RESCAN_PHASE_MS = 0
-#: Plan rev 5.2: the generation loop stops after this many rescan generations.
+#: Plan rev 5.2: the generation loop stops after this many rescan generations.  This is the value
+#: the frozen profiles certify (rescans ON) from the synthetic corpus, and it stays fixed so those
+#: profiles remain byte-for-byte reproducible.
 DEFAULT_MAX_GENERATIONS = 3
+#: Live default for real analyses (CLI/web): rescans OFF.  On four real owner mixes the transform
+#: rescans recovered ZERO tracks gen0 missed while injecting famous-track phantoms at 5-65x the
+#: request cost (a 46-min mix took ~3h and drained the 2000-request budget).  So live runs default
+#: to 0; a config ``[rescan] max_generations`` or ``--max-generations N`` opts back in.
+LIVE_DEFAULT_MAX_GENERATIONS = 0
 #: Seek lead-in applied by the web page and exports (jump this many ms before the proved start).
 DEFAULT_LEAD_IN_MS = 5_000
 #: Default same-exact-track display bridge: two appearances of one track (equal work key) up to this
@@ -93,7 +100,7 @@ class AppConfig:
     rescan_window_ms: int = DEFAULT_RESCAN_WINDOW_MS
     rescan_hop_ms: int = DEFAULT_RESCAN_HOP_MS
     rescan_phase_ms: int = DEFAULT_RESCAN_PHASE_MS
-    rescan_max_generations: int = DEFAULT_MAX_GENERATIONS
+    rescan_max_generations: int = LIVE_DEFAULT_MAX_GENERATIONS
     default_profile: str | None = None
     max_requests: int = DEFAULT_MAX_REQUESTS
     shazam_requests_per_minute: int = DEFAULT_SHAZAM_REQUESTS_PER_MINUTE
@@ -174,7 +181,7 @@ class AppConfig:
                 DEFAULT_RESCAN_PHASE_MS,
             ),
         )
-        max_generations = rescan.get("max_generations", DEFAULT_MAX_GENERATIONS)
+        max_generations = rescan.get("max_generations", LIVE_DEFAULT_MAX_GENERATIONS)
         if isinstance(max_generations, bool) or not isinstance(max_generations, int):
             raise ValueError("rescan.max_generations must be a non-negative integer")
         if max_generations < 0:

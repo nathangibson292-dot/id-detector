@@ -64,6 +64,11 @@ def _resolve_settings(project_root: Path, config_path: Path, profile: str | None
                 cache_no_match_max_age_days=file_config.cache_no_match_max_age_days,
                 hints_enabled=file_config.hints_enabled,
                 disabled_hint_connectors=file_config.disabled_hint_connectors,
+                # Config rescan ceiling caps the profile (default 0 = rescans off; they cost hours
+                # and add only phantoms on real mixes).  Raise [rescan] max_generations to opt in.
+                rescan_max_generations=min(
+                    frozen.rescan.max_generations, file_config.rescan_max_generations
+                ),
             )
             return _RunSettings(
                 config=loaded,

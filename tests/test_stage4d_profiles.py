@@ -187,4 +187,6 @@ def test_analyse_accepts_a_frozen_profile_and_derives_its_config(monkeypatch) ->
     assert config.hop_ms == 9_000 and config.rescan_hop_ms == 5_000
     assert captured["novelty"] is True
     assert captured["no_hints"] is False
-    assert captured["max_generations"] == 3
+    # The profile certifies rescans on (=3), but the config's default rescan ceiling (0) caps it, so
+    # live analyses ship rescans OFF; a config [rescan] setting or --max-generations opts back in.
+    assert captured["max_generations"] == 0
