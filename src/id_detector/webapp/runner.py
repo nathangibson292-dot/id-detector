@@ -134,13 +134,15 @@ def make_pipeline_runner(
 
         settings = _resolve_settings(project, config_file, ctx.profile)
         tracklist_path = _materialise_tracklist(root, ctx.known_tracklist)
-        # The browser's paid tier: choosing max_accuracy AND ticking upload consent activates ONE
-        # paid scanner (AudD — the broadest single catalogue; running both engines is mostly
-        # redundant spend).  It still self-gates on its credentials and on the config's
-        # allow_third_party_upload, so a missing key simply skips it.  ACRCloud stays available for
-        # a deliberate comparison via the CLI's --engine flag.
+        # The browser's paid tier.  Choosing max_accuracy activates ONE paid engine (AudD — the
+        # broadest single catalogue; running both is mostly redundant spend) via its gate-free CLIP
+        # path: only the still-uncertain window clips are sent — the same ~12 s clips Shazam already
+        # saw — so it needs no whole-file upload and no ownership.  That is what lets us cross-check
+        # OTHER people's mixes.  It self-gates on its credentials, so a missing key simply skips.
+        # Ticking upload consent additionally permits the whole-file scan (only useful when the user
+        # owns the audio).  ACRCloud stays available for a deliberate comparison via `--engine`.
         engines = settings.enabled_engines
-        if ctx.upload_consent and ctx.profile == "max_accuracy":
+        if ctx.profile == "max_accuracy":
             engines = tuple(dict.fromkeys([*engines, WEB_PAID_ENGINE]))
 
         def progress(phase: str, done: int, total: int, message: str = "") -> None:

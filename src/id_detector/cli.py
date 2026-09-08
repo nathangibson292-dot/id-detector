@@ -41,6 +41,7 @@ from id_detector.io import read_text, redact_text
 from id_detector.jobs import AsyncJobStore, ProcessLock
 from id_detector.journal import InvocationTimer, append_invocation
 from id_detector.orchestrate import run_generation_loop
+from id_detector.paid_clip import PAID_CLIP_ENGINES, run_paid_clip_recognition
 from id_detector.present import export_tracklist, generate_page
 from id_detector.present.server import consume_rescan_queue, read_rescan_queue
 from id_detector.process import run_process
@@ -54,6 +55,7 @@ from id_detector.providers.base import AppConfig
 from id_detector.recognise import recognise_generation
 from id_detector.rescan import DEFAULT_MAX_GENERATIONS
 from id_detector.scan import PAID_FILE_SCANNERS, PaidScanResult, run_paid_scanners
+from id_detector.scan_targeting import select_scan_targets
 from id_detector.truth import (
     freeze_truth,
     resolve_truth,
@@ -507,28 +509,34 @@ async def _analyse(
             timer.finish_stage("hints_ms")
             counts["hints"] = len(hint_result.hints)
             _report(progress, "hints", 1, 1, f"{len(hint_result.hints)} hints")
+        async def _fuse(
+            extra_observations: tuple[object, ...],
+            extra_observation_paths: tuple[Path, ...],
+        ) -> object:
+            return await run_generation_loop(
+                media_key=ingested.record.media_key,
+                media_dir=media_dir,
+                decoded=decoded,
+                windows=windows,
+                observations=recognised.observations,
+                observations_path=recognised.observations_path,
+                recognise=recognise_windows,
+                app_config=app_config,
+                extra_observations=extra_observations,
+                extra_observation_paths=extra_observation_paths,
+                hints=hint_result.hints if hint_result is not None else (),
+                hints_path=hint_result.hints_path if hint_result is not None else None,
+                max_generations=max_generations,
+                request_budget=max_requests,
+                novelty_enabled=novelty,
+                gen0_requests=recognised.requests,
+                gen0_physical_attempts=recognised.physical_attempts,
+                calibrator=calibrator,
+            )
+
         _report(progress, "fuse", 0, 1, "fusing episodes")
         timer.start_stage("fuse_ms")
-        orchestrated = await run_generation_loop(
-            media_key=ingested.record.media_key,
-            media_dir=media_dir,
-            decoded=decoded,
-            windows=windows,
-            observations=recognised.observations,
-            observations_path=recognised.observations_path,
-            recognise=recognise_windows,
-            app_config=app_config,
-            extra_observations=paid_scan.observations,
-            extra_observation_paths=paid_scan.observation_paths,
-            hints=hint_result.hints if hint_result is not None else (),
-            hints_path=hint_result.hints_path if hint_result is not None else None,
-            max_generations=max_generations,
-            request_budget=max_requests,
-            novelty_enabled=novelty,
-            gen0_requests=recognised.requests,
-            gen0_physical_attempts=recognised.physical_attempts,
-            calibrator=calibrator,
-        )
+        orchestrated = await _fuse(paid_scan.observations, paid_scan.observation_paths)
         fused = orchestrated.fusion
         counts.update(
             {
@@ -540,6 +548,56 @@ async def _analyse(
         )
         timer.finish_stage("fuse_ms")
         _report(progress, "fuse", 1, 1, f"{len(fused.episodes.episodes)} episodes")
+
+        # Phase 2 — paid CLIP recognition, the gate-free path for OTHER people's mixes.  The free
+        # fuse just told us which spans are still uncertain; send only those window clips to the
+        # paid engine (same ~12 s clips Shazam saw — no whole-file upload, no consent gate) and
+        # re-fuse.  Agreement lifts a track's confidence, disagreement lets a Shazam phantom be
+        # demoted, and a Shazam-blind but catalogued track is recovered.  A no-op unless a
+        # clip-capable engine is enabled and uncertain spans remain.
+        clip_scan = PaidScanResult()
+        if set(enabled_engines) & set(PAID_CLIP_ENGINES):
+            targets = select_scan_targets(fused.episodes.episodes, decoded.record.pcm.duration_ms)
+            if targets:
+                _report(progress, "scan", 0, 1, "clip-checking uncertain spans with paid engine")
+                timer.start_stage("clip_scan_ms")
+                clip_scan = await run_paid_clip_recognition(
+                    media_key=ingested.record.media_key,
+                    media_dir=media_dir,
+                    windows=windows,
+                    targets=targets,
+                    run_id=run_id,
+                    app_config=app_config,
+                    enabled_engines=enabled_engines,
+                    cli_confirmation=cli_confirmation,
+                    refresh=refresh,
+                    adapters=paid_scan_adapters,
+                    log=lambda message: _report(progress, "scan", 0, 1, message),
+                )
+                timer.finish_stage("clip_scan_ms")
+                for provider, reason in clip_scan.skipped:
+                    _report(progress, "scan", 1, 1, f"{provider} skipped: {reason}")
+            if clip_scan.observations:
+                counts["clip_matches"] = sum(
+                    item.status == "match" for item in clip_scan.observations
+                )
+                _report(progress, "fuse", 0, 1, "re-fusing with paid clip evidence")
+                timer.start_stage("refuse_ms")
+                orchestrated = await _fuse(
+                    (*paid_scan.observations, *clip_scan.observations),
+                    (*paid_scan.observation_paths, *clip_scan.observation_paths),
+                )
+                fused = orchestrated.fusion
+                counts.update(
+                    {
+                        "requests": orchestrated.requests,
+                        "physical_attempts": orchestrated.physical_attempts,
+                        "generations": orchestrated.final_generation + 1,
+                    }
+                )
+                timer.finish_stage("refuse_ms")
+                _report(progress, "fuse", 1, 1, f"{len(fused.episodes.episodes)} episodes")
+
         _report(progress, "present", 0, 1, "writing result page")
         timer.start_stage("export_ms")
         exported = export_tracklist(
