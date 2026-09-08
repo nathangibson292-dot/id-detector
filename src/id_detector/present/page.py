@@ -45,7 +45,7 @@ UNRESOLVED_CAP_MS = 120_000
 #: Bump when the page's look or behaviour changes: ``present.refresh.ensure_fresh_page`` re-renders
 #: any written page whose ``<meta name="id-detector-page">`` stamp is older, so already-analysed
 #: mixes pick up the new page the next time they are opened (no re-analysis).
-PAGE_VERSION = 10
+PAGE_VERSION = 11
 
 
 # --------------------------------------------------------------------------------------------------
@@ -329,16 +329,24 @@ def _acquire_links_html(acquire: dict[str, Any] | None) -> str:
     permalink = soundcloud.get("permalink_url")
     purchase = soundcloud.get("purchase_url")
     if acquire.get("free_download") and permalink:
-        chips.append(f'<a class="acq free" rel="noopener" href="{_esc(permalink)}">Free DL</a>')
+        chips.append(
+            f'<a class="acq free" rel="noopener" href="{_esc(permalink)}">SoundCloud · Free</a>'
+        )
     if acquire.get("gate") and purchase:
-        chips.append(f'<a class="acq gate" rel="noopener" href="{_esc(purchase)}">Gate</a>')
+        chips.append(
+            f'<a class="acq gate" rel="noopener" href="{_esc(purchase)}">SoundCloud · Gate</a>'
+        )
     buy_url = purchase if acquire.get("buy") else None
+    buy_label = "SoundCloud · Buy"
     for link in acquire.get("direct") or ():
         if link.get("kind") == "purchase":
             buy_url = link.get("url")
+            buy_label = f"{link.get('source', 'link')} · Buy"
             break
     if acquire.get("buy") and buy_url:
-        chips.append(f'<a class="acq buy" rel="noopener" href="{_esc(buy_url)}">Buy</a>')
+        chips.append(
+            f'<a class="acq buy" rel="noopener" href="{_esc(buy_url)}">{_esc(buy_label)}</a>'
+        )
     for link in acquire.get("direct") or ():
         if link.get("kind") in {"stream", "catalogue"}:
             source = link.get("source", "link")
@@ -602,8 +610,17 @@ def _stats_html(
     )
 
 
-def _embed_html(embed: EmbedPlan) -> str:
+def _embed_html(embed: EmbedPlan, audio_src: str | None = None) -> str:
     link = f'<a class="setlink" rel="noopener" href="{_esc(embed.link_url)}">Open the set ↗</a>'
+    if audio_src:
+        # Play the fetched original locally: robust (works even when the platform video is removed
+        # or embedding is disabled) and reliably seekable, unlike a third-party iframe.  The link to
+        # the original set stays as a courtesy.
+        return (
+            f'<audio id="localplayer" class="localplayer" controls preload="metadata" '
+            f'src="{_esc(audio_src)}"></audio>'
+            f'<div class="fallback">{link}</div>'
+        )
     if embed.kind == "soundcloud":
         src = (
             "https://w.soundcloud.com/player/?url="
@@ -672,6 +689,7 @@ margin-right:5px;background:var(--k)}
 /* player + exports */
 .player{background:var(--card);border:1px solid var(--line);border-radius:16px;padding:14px;
 margin:18px 0 14px;box-shadow:0 20px 50px -30px rgba(0,0,0,.9)}
+.localplayer{width:100%;display:block;border-radius:10px}
 .player iframe{display:block;border-radius:10px;border:0}
 .yt{aspect-ratio:16/9;width:100%;border-radius:10px;overflow:hidden;background:#000}
 .yt iframe,iframe#yt-player{width:100%;height:100%;aspect-ratio:16/9}
@@ -860,6 +878,10 @@ th:nth-child(6),td.acquire{display:none}.stat .big{font-size:28px}.hero{padding-
 # verbatim; on top of it: the NOW pill, copy-tracklist, arrow-key row navigation, row↔lane hover.
 _PAGE_JS = """
 let CURRENT_POSITION_MS = null, PLAYER_DURATION_MS = 0;
+// A row the user just clicked stays highlighted through its lead-in (the player is still in the
+// previous track showing the mix-in) until the playhead actually reaches the clicked track's start.
+let PINNED_ID = null, PINNED_UNTIL_MS = 0;
+let localAudio = null;  // the fetched-original <audio>, when the page plays locally (the default)
 let scWidget = null, ytPlayer = null, mcWidget = null, ytTimer = null, playTimer = null;
 const ROW_LABELS = {};
 function ready(fn){ if(document.readyState!=='loading'){fn();}
@@ -895,6 +917,11 @@ function highlightCurrent(positionMs){
     const span = EPISODE_SPANS[i];
     if(positionMs >= span.start && positionMs < span.end){ currentId = span.id; break; }
   }
+  // Hold the just-clicked row as "current" while the player is still in its lead-in.
+  if(PINNED_ID !== null){
+    if(positionMs < PINNED_UNTIL_MS){ currentId = PINNED_ID; }
+    else { PINNED_ID = null; }
+  }
   document.querySelectorAll('tr.track.current, .tl-lane.current').forEach(function(el){
     el.classList.remove('current'); });
   if(currentId){
@@ -914,6 +941,14 @@ function setNowPlaying(id, positionMs){
 }
 // Player bindings ------------------------------------------------------------
 ready(function(){
+  localAudio = document.getElementById('localplayer');
+  if(localAudio){
+    localAudio.addEventListener('timeupdate', function(){
+      updatePlayhead(localAudio.currentTime * 1000); });
+    localAudio.addEventListener('loadedmetadata', function(){
+      if(localAudio.duration > 0) PLAYER_DURATION_MS = localAudio.duration * 1000; });
+    return;  // local audio is the player — the platform-widget bindings below are the fallback
+  }
   try{
     if(CONFIG.embedKind==='soundcloud' && window.SC){
       scWidget = SC.Widget(document.getElementById('sc-player'));
@@ -970,8 +1005,14 @@ function seekPlayerArg(arg){
 }
 // Seek with the lead-in (a tracklist row) or exactly to a point (a timeline click); both reuse the
 // shared seek arithmetic — a timeline click is a zero-lead-in seek to the clicked position.
-function seekToMs(bestStartMs){ return seekPlayerArg(seekArgument(bestStartMs, LEAD_IN_MS)); }
-function seekToPositionMs(positionMs){ return seekPlayerArg(seekArgument(positionMs, 0)); }
+function seekToMs(bestStartMs){
+  if(localAudio){ localAudio.currentTime = seekTargetMs(bestStartMs, LEAD_IN_MS) / 1000;
+    if(localAudio.play){ localAudio.play().catch(function(){}); } return true; }
+  return seekPlayerArg(seekArgument(bestStartMs, LEAD_IN_MS)); }
+function seekToPositionMs(positionMs){
+  if(localAudio){ localAudio.currentTime = Math.max(0, positionMs) / 1000;
+    if(localAudio.play){ localAudio.play().catch(function(){}); } return true; }
+  return seekPlayerArg(seekArgument(positionMs, 0)); }
 // Copy the tracklist as plain text (time, artist — title; ID for a gap) ------
 function tracklistText(){
   const lines = [];
@@ -1025,6 +1066,9 @@ ready(function(){
     ROW_LABELS[id] = (ar ? ar.textContent + ' — ' : '') + (tt ? tt.textContent : '');
     function go(){
       const ms = parseInt(row.getAttribute('data-best-start-ms'), 10) || 0;
+      // Pin THIS row so it reads as playing from the click, even during its lead-in mix-in.
+      PINNED_ID = id; PINNED_UNTIL_MS = ms;
+      highlightCurrent(seekTargetMs(ms, LEAD_IN_MS));
       if(!seekToMs(ms)){ toast('Player not ready — open the set link'); }
     }
     row.addEventListener('click', function(e){
@@ -1102,6 +1146,10 @@ def render_page(
     """
 
     embed = plan_embed(source)
+    # The fetched original lives at media_dir/<original.path>; the page is at media_dir/present/, so
+    # a "../" relative URL reaches it (the server serves it Range-capable for seeking).
+    original_path = getattr(getattr(source, "original", None), "path", None)
+    audio_src = "../" + quote(str(original_path), safe="/") if original_path else None
     # Every row, including short/suppressed ones: the page hides them itself (see hidden_by_id).
     entries = flatten_tracklist(
         episodes,
@@ -1231,7 +1279,7 @@ class="pd"></span>{_esc(platform_name)}</span>
 <h1>{_esc(title)}</h1>
 {_stats_html(visible, episodes, duration_ms)}
 </header>
-<section class="player">{_embed_html(embed)}</section>
+<section class="player">{_embed_html(embed, audio_src)}</section>
 <div class="exports">
   <span class="lbl">Export</span>
   <button type="button" class="xbtn copy" id="copy">Copy tracklist</button>

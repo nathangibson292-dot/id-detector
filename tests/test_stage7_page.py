@@ -410,7 +410,9 @@ def test_embedding_disabled_falls_back_to_plain_link() -> None:
     page = render_page(
         source=source, episodes=_episodes_file(), identities=_identities(), duration_ms=DURATION_MS
     )
-    assert "Player embed unavailable" in page
+    # Platform embedding is disabled, but we still play the fetched original locally (robust +
+    # seekable) rather than degrading to a bare link; the platform api and iframe stay absent.
+    assert '<audio id="localplayer"' in page
     assert "w.soundcloud.com/player/api.js" not in page
     assert 'href="https://soundcloud.com/example/mix"' in page
 
@@ -453,7 +455,7 @@ def test_generate_page_writes_index_and_sidecar(tmp_path: Path) -> None:
     assert index.is_file()
     assert index.name == "index.html"
     assert (media_dir / "present" / "index.done.json").is_file()
-    assert "iframe_api" in index.read_text("utf-8")  # youtube embed
+    assert '<audio id="localplayer"' in index.read_text("utf-8")  # local audio player
 
 
 def test_page_carries_its_version_stamp() -> None:

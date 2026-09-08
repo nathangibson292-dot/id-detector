@@ -1202,6 +1202,30 @@ class _Handler(BaseHTTPRequestHandler):
             return None
         return resolved if path_is_file(resolved) else None
 
+    def _resolve_served_audio(self, path: str) -> Path | None:
+        """Map a URL to an audio file strictly inside ``work_root`` (the result page's <audio> src).
+
+        Mirrors :meth:`_resolve_served_file`'s traversal guard, but allows the fetched original
+        (under ``ingest/``, not ``present/``) so a persistent result page can play + seek it.
+        """
+
+        segments = [segment for segment in path.split("/") if segment not in ("", ".")]
+        if any(segment == ".." for segment in segments):
+            return None
+        candidate = self.work_root
+        for segment in segments:
+            candidate = candidate / segment
+        try:
+            resolved = candidate.resolve()
+            root = self.work_root.resolve()
+        except OSError:
+            return None
+        if root != resolved and root not in resolved.parents:
+            return None
+        if resolved.suffix.lstrip(".").casefold() not in _AUDIO_TYPES:
+            return None
+        return resolved if path_is_file(resolved) else None
+
     def _send_json(self, status: HTTPStatus, payload: object) -> None:
         body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
         self._send(status, body, _CONTENT_TYPES[".json"])
@@ -1226,6 +1250,12 @@ class _Handler(BaseHTTPRequestHandler):
             return
         if self._app_active() and route.startswith("/jobs/"):
             self._handle_job_get(route)
+            return
+        served_audio = self._resolve_served_audio(route)
+        if served_audio is not None:
+            # The result page's <audio> points at the fetched original; serve it Range-capable so
+            # scrubbing/seeking works (a plain send would force a full download and break seeking).
+            self._send_file_range(served_audio, _audio_content_type(served_audio))
             return
         served = self._resolve_served_file(route)
         if served is None:
