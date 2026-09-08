@@ -176,6 +176,55 @@ class _UnionFind:
         self.parent[discard] = keep
 
 
+def _within_one_edit(x: str, y: str) -> bool:
+    """True if x and y are equal or one insertion/deletion/substitution apart (Levenshtein ≤ 1)."""
+
+    if x == y:
+        return True
+    lx, ly = len(x), len(y)
+    if abs(lx - ly) > 1:
+        return False
+    if lx == ly:  # a single substitution
+        return sum(cx != cy for cx, cy in zip(x, y, strict=True)) == 1
+    if lx > ly:  # make x the shorter one; y is x with one extra char
+        x, y = y, x
+    i = j = 0
+    edited = False
+    while i < len(x) and j < len(y):
+        if x[i] == y[j]:
+            i += 1
+            j += 1
+        elif edited:
+            return False
+        else:
+            edited = True
+            j += 1
+    return True
+
+
+def _word_sets_corroborate(a: frozenset[str], b: frozenset[str]) -> bool:
+    """Whether a hint word set and an audio word set name the same work (order-independent).
+
+    Exact rule: one set fully contains the other (≥2 words), so collaborators/extra words never
+    block a genuine ID.  Tolerant rule: everything matches except a single long title token that is
+    only a near-spelling apart (e.g. "clubgrls" vs "clubgirls") — that is a crowd ID of the SAME
+    track, not a different one, so it should corroborate the audio match rather than duplicate it.
+    """
+
+    if min(len(a), len(b)) < 2:
+        return False
+    if a <= b or b <= a:
+        return True
+    a_only = a - b
+    b_only = b - a
+    if len(a_only) == 1 and len(b_only) == 1 and (a & b):
+        (x,) = tuple(a_only)
+        (y,) = tuple(b_only)
+        if len(x) >= 4 and len(y) >= 4 and _within_one_edit(x, y):
+            return True
+    return False
+
+
 def build_identity_graph(
     media_key: str,
     observations: list[ObservationRecord] | tuple[ObservationRecord, ...],
@@ -291,9 +340,7 @@ def build_identity_graph(
             continue
         hint_words = _words(text_node)
         for audio_node, words in audio_words:
-            if min(len(hint_words), len(words)) >= 2 and (
-                hint_words <= words or words <= hint_words
-            ):
+            if _word_sets_corroborate(hint_words, words):
                 item = _assertion(
                     media_key,
                     a=text_node,
