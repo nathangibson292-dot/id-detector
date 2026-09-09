@@ -45,7 +45,7 @@ UNRESOLVED_CAP_MS = 120_000
 #: Bump when the page's look or behaviour changes: ``present.refresh.ensure_fresh_page`` re-renders
 #: any written page whose ``<meta name="id-detector-page">`` stamp is older, so already-analysed
 #: mixes pick up the new page the next time they are opened (no re-analysis).
-PAGE_VERSION = 15
+PAGE_VERSION = 16
 
 
 # --------------------------------------------------------------------------------------------------
@@ -1285,6 +1285,13 @@ def render_page(
         '<span class="now-k">NOW</span><span class="now-t" id="now-time"></span>'
         '<span class="now-l" id="now-label"></span></div>'
     )
+    # Rescans are off by default, so generation is almost always 0 — a meaningless chip. Show it
+    # only when someone deliberately ran rescans (generation > 0).
+    gen_chip = (
+        f'<span class="chip">generation <b>{episodes.generation}</b></span>'
+        if episodes.generation
+        else ""
+    )
 
     body = f"""{topbar_html(back=True, new=True, middle=now_pill)}
 <main>
@@ -1294,7 +1301,7 @@ def render_page(
 class="pd"></span>{_esc(platform_name)}</span>
   <span class="chip" id="dur">length <b>{_esc(_format_time(duration_ms))}</b></span>
   <span class="chip">profile <b>{_esc(episodes.certification.profile)}</b></span>
-  <span class="chip">generation <b>{episodes.generation}</b></span>
+  {gen_chip}
 </div>
 <h1>{_esc(title)}</h1>
 {_stats_html(visible, episodes, duration_ms)}
