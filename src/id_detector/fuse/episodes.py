@@ -145,6 +145,17 @@ def _independent_trials_e4(votes: list[ObservationRecord]) -> int:
     return total
 
 
+def _engine_corroborated(votes: list[ObservationRecord]) -> bool:
+    """True when two or more distinct recognizer providers matched this occurrence.
+
+    Two independent engines (e.g. Shazam and AudD) landing on the same track at the same time is a
+    strong precision signal — the statistical basis for a paid cross-check — so it earns the
+    confident tier the way an independent hint does, without disturbing the calibrated badge maths.
+    """
+
+    return len({item.provider for item in votes}) >= 2
+
+
 NOVELTY_REGION_PAD_MS = 10_000
 
 
@@ -543,6 +554,8 @@ def build_episodes(
                 flags.append("alignment_outlier")
             if supporting_hints:
                 flags.append("hint_supported")
+            if _engine_corroborated(votes):
+                flags.append("engine_corroborated")
             provisional.append(
                 {
                     "id": episode_id,
@@ -703,7 +716,9 @@ def build_episodes(
     confident_spans = [
         (episode.evidence_support_ms[0][0], episode.evidence_support_ms[-1][1])
         for episode in episode_records
-        if episode.badge in {"likely", "verified"} or "hint_supported" in episode.flags
+        if episode.badge in {"likely", "verified"}
+        or "hint_supported" in episode.flags
+        or "engine_corroborated" in episode.flags
     ]
     answer_positions = [
         (hint.position_range_ms, identity.hint_work_ids.get(hint.id))
@@ -723,7 +738,11 @@ def build_episodes(
         return sum(b - a for a, b in clipped) / (hi - lo)
 
     def _suppressed_reason(episode: EpisodeRecord) -> str | None:
-        if episode.badge in {"likely", "verified"} or "hint_supported" in episode.flags:
+        if (
+            episode.badge in {"likely", "verified"}
+            or "hint_supported" in episode.flags
+            or "engine_corroborated" in episode.flags
+        ):
             return None
         span = (episode.evidence_support_ms[0][0], episode.evidence_support_ms[-1][1])
         hull = span[1] - span[0]
@@ -933,7 +952,7 @@ def build_episodes(
             return True
         if episode.badge == "likely" or episode.version_status == "verified":
             return True
-        if "hint_supported" in episode.flags:
+        if "hint_supported" in episode.flags or "engine_corroborated" in episode.flags:
             return True
         hull = episode.evidence_support_ms
         return hull[-1][1] - hull[0][0] >= rescan_min_track_ms

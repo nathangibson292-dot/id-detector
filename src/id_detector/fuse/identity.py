@@ -458,7 +458,18 @@ def build_identity_graph(
         if preferred is None:
             continue
         component = recording_component_by_node.get(preferred, (preferred,))
-        candidate_id = candidate_by_node[component[0]]
+        candidate_id = candidate_by_node.get(component[0])
+        if candidate_id is None:
+            # A provider match with no recording id (e.g. an AudD clip whose only field is a song
+            # link) contributes just a text node.  When that title is provider-linked — a Shazam
+            # recording shares it — the pure-text component was excluded from the candidate set, so
+            # attach the observation to that title's work candidate instead of failing.  This is how
+            # a paid clip corroborates (and can promote) a Shazam track it agrees with.
+            work_id = work_id_by_node.get(preferred)
+            work_candidates = sorted(by_work.get(work_id, [])) if work_id else []
+            if not work_candidates:
+                continue
+            candidate_id = work_candidates[0]
         observation_candidates[observation.id] = candidate_id
         candidate_labels.setdefault(
             candidate_id,

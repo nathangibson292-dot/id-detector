@@ -136,6 +136,8 @@ def short_track(entry: dict[str, Any], min_track_ms: int) -> bool:
         return False
     if entry.get("badge") in _KEEP_SHORT_BADGES or entry.get("hint_supported"):
         return False
+    if entry.get("engine_corroborated"):  # two engines agree — not a lone-window phantom
+        return False
     return int(entry.get("on_air_ms") or 0) < min_track_ms
 
 
@@ -211,6 +213,8 @@ def _track_entry(
         "badge": episode.badge,
         "version_status": episode.version_status,
         "hint_supported": "hint_supported" in episode.flags,
+        # Two independent recognizers (e.g. Shazam + AudD) matched this track at the same time.
+        "engine_corroborated": "engine_corroborated" in episode.flags,
         # A crowd ID: named by a confident comment answer, but no engine matched the audio.
         "hint_only": "hint_only" in episode.flags,
         "on_air_ms": _on_air_ms(episode),
@@ -407,6 +411,8 @@ def export_tracklist(
                 badge += " FROM COMMENTS"
             elif entry["hint_supported"]:
                 badge += " +HINT"
+            if entry.get("engine_corroborated"):
+                badge += " +2ENGINES"
             version_status = str(entry["version_status"]).upper()
             label = f"{entry['artist']} — {entry['title']}"
             if entry.get("also_count"):

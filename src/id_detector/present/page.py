@@ -45,7 +45,7 @@ UNRESOLVED_CAP_MS = 120_000
 #: Bump when the page's look or behaviour changes: ``present.refresh.ensure_fresh_page`` re-renders
 #: any written page whose ``<meta name="id-detector-page">`` stamp is older, so already-analysed
 #: mixes pick up the new page the next time they are opened (no re-analysis).
-PAGE_VERSION = 13
+PAGE_VERSION = 14
 
 
 # --------------------------------------------------------------------------------------------------
@@ -413,6 +413,11 @@ def _tags_html(entry: dict[str, Any], hidden: str | None = None) -> str:
         )
     elif entry["hint_supported"]:
         tags.append('<span class="hint" title="supported by a text hint">hint</span>')
+    if entry.get("engine_corroborated"):
+        tags.append(
+            '<span class="hint engine" title="a second recognizer (e.g. AudD) independently '
+            'matched this track here">cross-checked</span>'
+        )
     if hidden == "short":
         seconds = round(int(entry.get("on_air_ms") or 0) / 1000)
         tags.append(f'<span class="tag short-tag">short · {seconds}s</span>')
@@ -863,6 +868,7 @@ font-size:12px}
 .linkish:hover{text-decoration:underline}
 /* crowd IDs (named in the comments, no audio match): dashed, never drawn as proved evidence */
 .hint.crowd{background:none;border:1px dashed var(--accent);color:var(--accent)}
+.hint.engine{background:none;border:1px solid var(--verified);color:var(--verified)}
 tr.track.crowd td:first-child{box-shadow:inset 3px 0 0 transparent;
 border-left:3px dashed rgba(167,139,250,.6)}
 .tl-lane[data-crowd="1"] .tl-extent{display:none}

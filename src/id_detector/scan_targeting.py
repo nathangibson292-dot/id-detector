@@ -19,8 +19,8 @@ from id_detector.process import run_process
 
 #: Badges we trust enough to skip paying to rescan.
 CONFIDENT_BADGES = frozenset({"likely", "verified"})
-#: Flags that mark a track as hint/crowd corroborated (also trusted).
-CONFIDENT_FLAGS = frozenset({"hint_supported", "hint_only"})
+#: Flags that mark a track as corroborated (also trusted): a text/crowd hint, or a second engine.
+CONFIDENT_FLAGS = frozenset({"hint_supported", "hint_only", "engine_corroborated"})
 
 Span = tuple[int, int]
 
