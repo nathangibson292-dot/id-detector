@@ -45,7 +45,7 @@ UNRESOLVED_CAP_MS = 120_000
 #: Bump when the page's look or behaviour changes: ``present.refresh.ensure_fresh_page`` re-renders
 #: any written page whose ``<meta name="id-detector-page">`` stamp is older, so already-analysed
 #: mixes pick up the new page the next time they are opened (no re-analysis).
-PAGE_VERSION = 14
+PAGE_VERSION = 15
 
 
 # --------------------------------------------------------------------------------------------------
@@ -354,14 +354,18 @@ def _acquire_links_html(acquire: dict[str, Any] | None) -> str:
             f'<a class="acq buy" target="_blank" rel="noopener" '
             f'href="{_esc(buy_url)}">{_esc(buy_label)}</a>'
         )
+    # "Where to get it" means where to hear or buy the track — so keep streaming links (Deezer) but
+    # drop pure-database entries (MusicBrainz) that a normal user can't get the track from.
     for link in acquire.get("direct") or ():
-        if link.get("kind") in {"stream", "catalogue"}:
+        if link.get("kind") == "stream":
             source = link.get("source", "link")
             chips.append(
                 f'<a class="acq direct" target="_blank" rel="noopener" '
                 f'href="{_esc(link.get("url"))}">{_esc(source)}</a>'
             )
-    for link in acquire.get("search_links") or ():
+    # Search fallbacks are the least specific, so cap them (2) to keep the row scannable — for this
+    # music Bandcamp/Beatport are the useful stores, ordered as the enrichment ranked them.
+    for link in (acquire.get("search_links") or ())[:2]:
         source = link.get("source", "search")
         chips.append(
             f'<a class="acq search" target="_blank" rel="noopener" href="{_esc(link.get("url"))}">'
