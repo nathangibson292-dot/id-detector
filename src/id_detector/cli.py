@@ -45,6 +45,7 @@ from id_detector.orchestrate import run_generation_loop
 from id_detector.paid_clip import (
     DEFAULT_MAX_CLIPS,
     PAID_CLIP_ENGINES,
+    PaidScanResult,
     run_paid_clip_recognition,
 )
 from id_detector.present import export_tracklist, generate_page
@@ -59,8 +60,9 @@ from id_detector.profiles import (
 from id_detector.providers.base import AppConfig
 from id_detector.recognise import recognise_generation
 from id_detector.rescan import DEFAULT_MAX_GENERATIONS
-from id_detector.scan import PAID_FILE_SCANNERS, PaidScanResult, run_paid_scanners
+from id_detector.scan import PAID_FILE_SCANNERS, run_paid_scanners
 from id_detector.scan_targeting import select_gap_targets, select_scan_targets
+from id_detector.shazam import HTTPClientInterface
 from id_detector.truth import (
     freeze_truth,
     resolve_truth,
@@ -352,9 +354,7 @@ def _validate_config_or_exit() -> None:
         temp_path.unlink(missing_ok=True)
 
 
-def _windows_in_spans(
-    windows: WindowsResult, spans: tuple[tuple[int, int], ...]
-) -> WindowsResult:
+def _windows_in_spans(windows: WindowsResult, spans: tuple[tuple[int, int], ...]) -> WindowsResult:
     """A WindowsResult holding only the generation-0 windows whose start falls in one of ``spans``.
 
     Used by the paid-first path to run the free engine over just the gap spans the paid engine left
@@ -375,6 +375,7 @@ async def _analyse(
     work_root: Path,
     print_raw: bool,
     refresh: bool,
+    refresh_states: frozenset[str] = frozenset({"no_match"}),
     max_requests: int,
     tracklist: Path | None,
     no_hints: bool,
@@ -387,6 +388,7 @@ async def _analyse(
     cli_confirmation: bool = False,
     primary_engine: str = "shazam",
     paid_scan_adapters: Mapping[str, object] | None = None,
+    shazam_http_client: HTTPClientInterface | None = None,
     max_paid_clips: int = DEFAULT_MAX_CLIPS,
     local_index_label: str | None = None,
     index_root: Path = Path("data/local/panako-db"),
@@ -469,6 +471,8 @@ async def _analyse(
                 positive_max_age_seconds=app_config.cache_positive_max_age_seconds,
                 no_match_max_age_seconds=app_config.cache_no_match_max_age_seconds,
                 on_window=_on_recognise_window if progress is not None else None,
+                http_client=shazam_http_client,
+                refresh_states=refresh_states,
             )
 
         # Which engine identifies the WHOLE mix first (generation 0).  Free = the rate-limited free
@@ -480,6 +484,7 @@ async def _analyse(
         gen0_observations_path: Path | None = None
         gen0_requests = 0
         gen0_physical = 0
+        free_failures = 0
         if paid_first:
             _report(progress, "recognise", 0, 1, "identifying the whole mix (paid)")
             primary_clip = await run_paid_clip_recognition(
@@ -492,9 +497,19 @@ async def _analyse(
                 enabled_engines=enabled_engines,
                 cli_confirmation=cli_confirmation,
                 refresh=refresh,
+                refresh_states=refresh_states,
                 max_clips=len(windows.records) + 1,  # the whole mix, no per-mix cap
                 adapters=paid_scan_adapters,
                 log=lambda message: _report(progress, "recognise", 0, 1, message),
+            )
+            counts.update(
+                {
+                    "paid_requests": primary_clip.requests,
+                    "paid_resolved": primary_clip.resolved,
+                    "paid_failures": primary_clip.failures,
+                    "paid_cache_hits": primary_clip.cache_hits,
+                    "paid_billable_units": primary_clip.billable_units,
+                }
             )
             if primary_clip.observations:
                 gen0_observations = primary_clip.observations
@@ -502,24 +517,36 @@ async def _analyse(
                 counts["matches"] = sum(
                     item.status == "match" for item in primary_clip.observations
                 )
-            else:  # no key / unavailable — fall back to the free engine as primary
-                paid_first = False
+            else:
+                # A Deep request never silently turns into a Free request. The explicit local
+                # --allow-degrade restart belongs to 0a-iv; for now this is terminal and unspent.
+                entry = timer.entry(
+                    status="provider_unavailable",
+                    exit_code=3,
+                    counts=counts,
+                    costs={"usd_e2": 0},
+                    source_ids=source_ids,
+                    ffmpeg_version=ffmpeg_version,
+                )
+                append_invocation(media_dir / "invocations.jsonl", entry)
+                return 3
         if not paid_first:
             recognised = await recognise_windows(windows=windows, generation=0)
             gen0_observations = recognised.observations
             gen0_observations_path = recognised.observations_path
             gen0_requests = recognised.requests
             gen0_physical = recognised.physical_attempts
-            matches = [item for item in recognised.observations if item.status == "match"]
+            free_failures = recognised.failures
             counts.update(
                 {
                     "requests": recognised.requests,
                     "physical_attempts": recognised.physical_attempts,
-                    "matches": len(matches),
+                    "matches": sum(item.status == "match" for item in recognised.observations),
                     "failures": recognised.failures,
                     "cache_hits": recognised.cache_hits,
                 }
             )
+        matches = [item for item in gen0_observations if item.status == "match"]
         timer.finish_stage("recognise_ms")
 
         # Paid whole-file scanners (AudD/ACRCloud) run once here when the active profile enables
@@ -547,9 +574,7 @@ async def _analyse(
                 log=lambda message: _report(progress, "scan", 0, 1, message),
             )
             timer.finish_stage("scan_ms")
-            counts["paid_matches"] = sum(
-                item.status == "match" for item in paid_scan.observations
-            )
+            counts["paid_matches"] = sum(item.status == "match" for item in paid_scan.observations)
             for provider, reason in paid_scan.skipped:
                 _report(progress, "scan", 1, 1, f"{provider} skipped: {reason}")
             summary = (
@@ -578,6 +603,7 @@ async def _analyse(
             timer.finish_stage("hints_ms")
             counts["hints"] = len(hint_result.hints)
             _report(progress, "hints", 1, 1, f"{len(hint_result.hints)} hints")
+
         async def _fuse(
             extra_observations: tuple[object, ...],
             extra_observation_paths: tuple[Path, ...],
@@ -630,6 +656,8 @@ async def _analyse(
         # A no-op unless a lever is enabled and uncertain spans remain.
         clip_scan = PaidScanResult()
         index_scan = PaidScanResult()
+        supplemental_requests = 0
+        supplemental_physical_attempts = 0
         # In paid-first mode the paid engine already covered the whole mix, so the paid CLIP lever
         # is not a phase-2 step here; the free engine's gap-fill is.
         want_clips = bool(set(enabled_engines) & set(PAID_CLIP_ENGINES)) and not paid_first
@@ -648,8 +676,12 @@ async def _analyse(
             fused = orchestrated.fusion
             counts.update(
                 {
-                    "requests": orchestrated.requests,
-                    "physical_attempts": orchestrated.physical_attempts,
+                    # Re-fusion recomputes the generation-loop totals from generation zero. Keep
+                    # separately-run paid-first gap-fill work instead of overwriting it with zero.
+                    "requests": orchestrated.requests + supplemental_requests,
+                    "physical_attempts": (
+                        orchestrated.physical_attempts + supplemental_physical_attempts
+                    ),
                     "generations": orchestrated.final_generation + 1,
                 }
             )
@@ -670,10 +702,15 @@ async def _analyse(
                 timer.start_stage("gapfill_ms")
                 gap_rec = await recognise_windows(windows=gap_windows, generation=0)
                 timer.finish_stage("gapfill_ms")
-                counts["gap_matches"] = sum(
-                    item.status == "match" for item in gap_rec.observations
+                counts["gap_matches"] = sum(item.status == "match" for item in gap_rec.observations)
+                supplemental_requests += gap_rec.requests
+                supplemental_physical_attempts += gap_rec.physical_attempts
+                counts["requests"] = orchestrated.requests + supplemental_requests
+                counts["physical_attempts"] = (
+                    orchestrated.physical_attempts + supplemental_physical_attempts
                 )
-                counts["requests"] = counts.get("requests", 0) + gap_rec.requests
+                counts["failures"] = free_failures + gap_rec.failures
+                counts["cache_hits"] += gap_rec.cache_hits
                 if any(item.status == "match" for item in gap_rec.observations):
                     gap_scan = PaidScanResult(
                         observations=tuple(gap_rec.observations),
@@ -747,6 +784,7 @@ async def _analyse(
                     enabled_engines=enabled_engines,
                     cli_confirmation=cli_confirmation,
                     refresh=refresh,
+                    refresh_states=refresh_states,
                     max_clips=max_paid_clips,
                     adapters=paid_scan_adapters,
                     log=lambda message: _report(progress, "scan", 0, 1, message),
@@ -808,8 +846,8 @@ async def _analyse(
             typer.echo(json.dumps(output, ensure_ascii=False, separators=(",", ":")))
         else:
             typer.echo(
-                f"{len(matches)} matches; {recognised.failures} failures; "
-                f"{orchestrated.physical_attempts} physical attempts; "
+                f"{len(matches)} matches; {counts['failures']} failures; "
+                f"{counts['physical_attempts']} physical attempts; "
                 f"{orchestrated.final_generation + 1} generations "
                 f"(stop={orchestrated.stop_reason}); "
                 f"{len(fused.episodes.episodes)} episodes; tracklist={exported.json_path}"
@@ -880,6 +918,11 @@ def analyse(
     url: str = typer.Argument(..., help="Public mix URL (or a local media file)."),
     raw: bool = typer.Option(False, "--raw", help="Print raw match tuples with mix times."),
     refresh: bool = typer.Option(False, "--refresh", help="Bypass positive/no-match TTLs."),
+    refresh_states: str = typer.Option(
+        "no_match",
+        "--refresh-states",
+        help="Comma-separated cached provider states to re-query (match and/or no_match).",
+    ),
     work_root: Path = typer.Option(DEFAULT_WORK_ROOT, "--work-root"),  # noqa: B008
     max_requests: int = typer.Option(
         -1,
@@ -949,6 +992,11 @@ def analyse(
             "profile (a frozen profile lists paid engines only once benchmarked with credentials)."
         ),
     ),
+    fake_providers: str | None = typer.Option(
+        None,
+        "--fake-providers",
+        hidden=True,
+    ),
     max_paid_clips: int = typer.Option(
         DEFAULT_MAX_CLIPS,
         "--max-paid-clips",
@@ -978,6 +1026,8 @@ def analyse(
     """Run the full multi-generation pipeline and export a flattened tracklist."""
     calibrator = None
     enabled_engines: tuple[str, ...] = ()
+    paid_scan_adapters: Mapping[str, object] | None = None
+    shazam_http_client: HTTPClientInterface | None = None
     # The file config is always the source of non-schedule preferences (lead-in, budget, cache TTLs,
     # per-connector hint switches).  A --profile (or the file's default_profile) is the authority on
     # engines and the transform/schedule/rescan geometry, so it overrides those tables while the
@@ -1028,8 +1078,48 @@ def analyse(
             )
             raise typer.Exit(2)
         enabled_engines = tuple(dict.fromkeys([*enabled_engines, *requested]))
+    if fake_providers is not None:
+        if os.environ.get("IDEA_TEST_MODE") != "1":
+            typer.echo("--fake-providers is available only when IDEA_TEST_MODE=1", err=True)
+            raise typer.Exit(2)
+        names = tuple(
+            dict.fromkeys(
+                name.strip().casefold() for name in fake_providers.split(",") if name.strip()
+            )
+        )
+        unknown = [name for name in names if name not in {"audd", "shazam"}]
+        if not names or unknown:
+            detail = f": {', '.join(unknown)}" if unknown else ""
+            typer.echo(f"unknown fake provider{detail} (choose audd and/or shazam)", err=True)
+            raise typer.Exit(2)
+        script_value = os.environ.get("IDEA_FAKE_SCRIPT", "").strip()
+        if not script_value:
+            typer.echo("IDEA_FAKE_SCRIPT must name a fake-provider script", err=True)
+            raise typer.Exit(2)
+        try:
+            import runpy
+
+            fake_module = runpy.run_path(str(PROJECT_ROOT / "tests" / "fakes" / "providers.py"))
+            load_fake_providers = fake_module["load_fake_providers"]
+            fake_audd, fake_shazam = load_fake_providers(Path(script_value), names)
+        except (OSError, ValueError, json.JSONDecodeError) as exc:
+            typer.echo(f"invalid IDEA_FAKE_SCRIPT: {redact_text(str(exc))}", err=True)
+            raise typer.Exit(2) from None
+        if fake_audd is not None:
+            paid_scan_adapters = {"audd": fake_audd}
+            enabled_engines = tuple(dict.fromkeys([*enabled_engines, "audd"]))
+        shazam_http_client = fake_shazam
     if collapse is not None:
         loaded_config = replace(loaded_config, collapse=collapse)
+    selected_refresh_states = frozenset(
+        state.strip().casefold() for state in refresh_states.split(",") if state.strip()
+    )
+    invalid_refresh_states = selected_refresh_states - {"match", "no_match"}
+    if invalid_refresh_states:
+        typer.echo(
+            f"unknown --refresh-states: {', '.join(sorted(invalid_refresh_states))}", err=True
+        )
+        raise typer.Exit(2)
     if max_requests < 0:
         max_requests = loaded_config.max_requests
     if no_hints and (tracklist is not None or confirm_mirror):
@@ -1042,6 +1132,7 @@ def analyse(
                 work_root=work_root,
                 print_raw=raw,
                 refresh=refresh,
+                refresh_states=selected_refresh_states,
                 max_requests=max_requests,
                 tracklist=tracklist,
                 no_hints=no_hints,
@@ -1059,6 +1150,8 @@ def analyse(
                 # max_accuracy is now paid-first: the paid engine identifies the whole mix and the
                 # free engine only fills the gaps. Falls back to free-primary if audd isn't enabled.
                 primary_engine="audd" if selected_profile == "max_accuracy" else "shazam",
+                paid_scan_adapters=paid_scan_adapters,
+                shazam_http_client=shazam_http_client,
                 max_paid_clips=max_paid_clips,
                 local_index_label=local_index,
                 index_root=index_root,

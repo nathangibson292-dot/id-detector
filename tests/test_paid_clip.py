@@ -84,9 +84,7 @@ def test_only_uncertain_windows_are_recognised_and_a_match_is_positioned(tmp_pat
     media_dir.mkdir()
     _write_clip(media_dir, window)
     windows = WindowsResult(records=(window,), record_path=media_dir / "w.jsonl", cached=True)
-    adapter = _FakeAdapter(
-        {"status": "success", "result": {"artist": "Effy", "title": "CLUBGRLS"}}
-    )
+    adapter = _FakeAdapter({"status": "success", "result": {"artist": "Effy", "title": "CLUBGRLS"}})
     lo = window.support_ms[0]
 
     result = _run(

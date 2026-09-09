@@ -46,6 +46,7 @@ from id_detector.jobs import (
     Job,
 )
 from id_detector.shazam import (
+    HTTPClientInterface,
     ShazamAdapter,
     ShazamHTTPError,
     TokenBucket,
@@ -366,6 +367,8 @@ async def recognise_generation(
     positive_max_age_seconds: int = POSITIVE_MAX_AGE_SECONDS,
     no_match_max_age_seconds: int = NO_MATCH_MAX_AGE_SECONDS,
     on_window: Callable[[int, int], None] | None = None,
+    http_client: HTTPClientInterface | None = None,
+    refresh_states: frozenset[str] = frozenset(),
 ) -> RecognitionResult:
     config, config_name = load_provider_config(project_root)
     queries = build_queries(media_key, windows, config, generation)
@@ -396,12 +399,22 @@ async def recognise_generation(
     adapter = adapter or ShazamAdapter(
         config,
         limiter=TokenBucket(rate_per_minute=requests_per_minute, capacity=worker_count),
+        http_client=http_client,
     )
     cache_hits = 0
     initial_physical = 0
     initial_by_query: dict[str, int] = {}
     async with AsyncJobStore(media_dir / "jobs.sqlite") as store:
         await store.ensure_budget(media_key, "shazam", max_requests=max_requests)
+        refresh_allowance_added = False
+
+        async def reset_with_fresh_allowance(job_id: str) -> None:
+            nonlocal refresh_allowance_added
+            if not refresh_allowance_added:
+                await store.extend_budget(media_key, "shazam", requests=max_requests)
+                refresh_allowance_added = True
+            await store.reset_for_refresh(job_id)
+
         # Cross-generation content cache. Window ids carry the generation, so a later generation
         # that happens to fingerprint byte-identical audio gets a *new* query id and would submit
         # it again. Reuse the earlier generation's stored raw response instead: the plan's cache
@@ -409,6 +422,9 @@ async def recognise_generation(
         cached_by_content: dict[str, tuple[str, str]] = {}
         for existing in await store.list_jobs():
             if existing.provider != "shazam" or existing.state not in {"succeeded", "no_match"}:
+                continue
+            cache_state = "match" if existing.state == "succeeded" else "no_match"
+            if cache_state in refresh_states:
                 continue
             if not existing.result_path:
                 continue
@@ -428,13 +444,14 @@ async def recognise_generation(
             initial_by_query[query.id] = job.physical_attempts
             raw_path = raw_dir / f"{query.cache_key}.json"
             cached_raw_path = media_dir / job.result_path if job.result_path else None
-            if refresh and job.state in {
+            cache_state = "match" if job.state == "succeeded" else job.state
+            if (refresh or cache_state in refresh_states) and job.state in {
                 "succeeded",
                 "no_match",
                 "retryable_failure",
                 "permanent_failure",
             }:
-                await store.reset_for_refresh(job.id)
+                await reset_with_fresh_allowance(job.id)
             elif cached_raw_path is not None and cache_valid(
                 cached_raw_path,
                 job.state,
@@ -453,7 +470,7 @@ async def recognise_generation(
                 )
                 cache_hits += 1
             elif job.state in {"succeeded", "no_match", "permanent_failure"}:
-                await store.reset_for_refresh(job.id)
+                await reset_with_fresh_allowance(job.id)
 
         # Optional, zero-overhead progress: the total is the number of unique query windows and the
         # done count folds cache hits (resolved above) plus each leased job as it finishes. Purely a
@@ -462,6 +479,7 @@ async def recognise_generation(
         window_done = cache_hits
         if on_window is not None:
             on_window(window_done, window_total)
+
         # Bounded worker pool: each worker leases and runs one window at a time; the shared
         # ``store`` serialises every lease through its single writer, so two workers can never
         # grab the same window, and the shared ``adapter`` limiter paces the whole pool. Windows

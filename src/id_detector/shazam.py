@@ -172,7 +172,10 @@ class InjectedHTTPClient(HTTPClientInterface):
         timeout = httpx.Timeout(connect=10, write=30, read=60, pool=10)
         try:
             async with httpx.AsyncClient(
-                timeout=timeout, transport=self.transport, follow_redirects=False
+                timeout=timeout,
+                transport=self.transport,
+                follow_redirects=False,
+                trust_env=False,
             ) as client:
                 response = await client.request(method, self.url_override or url, **kwargs)
         except (httpx.TimeoutException, httpx.NetworkError) as exc:
@@ -335,15 +338,25 @@ class ShazamAdapter:
     breaker: CircuitBreaker = field(default_factory=CircuitBreaker)
     transport: httpx.AsyncBaseTransport | None = None
     url_override: str | None = None
+    http_client: HTTPClientInterface | None = None
 
     async def recognize_once(self, wav_path: Path, on_attempt: AttemptCallback) -> dict[str, Any]:
-        client = InjectedHTTPClient(
-            on_attempt=on_attempt,
-            limiter=self.limiter,
-            breaker=self.breaker,
-            transport=self.transport,
-            url_override=self.url_override,
-        )
+        client = self.http_client
+        if client is None:
+            client = InjectedHTTPClient(
+                on_attempt=on_attempt,
+                limiter=self.limiter,
+                breaker=self.breaker,
+                transport=self.transport,
+                url_override=self.url_override,
+            )
+        else:
+            prepare_path = getattr(client, "prepare_path", None)
+            if callable(prepare_path):
+                prepare_path(wav_path)
+            # Production accounts immediately before network I/O inside InjectedHTTPClient. An
+            # injected HTTP boundary has no access to the job store, so account here instead.
+            await on_attempt()
         shazam = Shazam(http_client=client, segment_duration_seconds=12)
         result = await shazam.recognize(native_path(wav_path))
         if not isinstance(result, dict):

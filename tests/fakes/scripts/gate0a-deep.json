@@ -1,0 +1,13 @@
+{
+  "audd": {
+    "default": "match",
+    "windows": {
+      "3": "no_match",
+      "5": "match"
+    }
+  },
+  "shazam": {
+    "default": "match",
+    "windows": {}
+  }
+}

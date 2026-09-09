@@ -174,6 +174,15 @@ def _empty_label() -> RawLabel:
     return RawLabel(artist=None, title=None, album=None, label=None, release_date=None)
 
 
+def clip_result_has_identity(result: Mapping[str, Any]) -> bool:
+    """Return whether a main-endpoint result identifies a work by artist and title."""
+
+    return all(
+        isinstance(result.get(field), str) and result[field].strip()
+        for field in ("artist", "title")
+    )
+
+
 def _logical_trial_id(chunk_index: int) -> str:
     return scanner_logical_trial_id(PROVIDER, chunk_index)
 
@@ -313,6 +322,10 @@ def clip_response_to_observation(
     if response.get("status") != "success":
         raise ProviderProtocolError("AudD clip response is not a success")
     result = response.get("result")
+    if result is not None and not isinstance(result, Mapping):
+        raise ProviderProtocolError("AudD clip result must be an object or null")
+    if isinstance(result, Mapping) and not clip_result_has_identity(result):
+        raise ProviderProtocolError("AudD clip result must include artist and title")
     label = _empty_label()
     status = "no_match"
     provider_ids: dict[str, Any] = {}
@@ -389,7 +402,10 @@ class AudDAdapter:
             with open(native_path(path), "rb") as handle:
                 await on_attempt()
                 async with httpx.AsyncClient(
-                    transport=self.transport, timeout=timeout, follow_redirects=False
+                    transport=self.transport,
+                    timeout=timeout,
+                    follow_redirects=False,
+                    trust_env=False,
                 ) as client:
                     result = await client.post(
                         self.endpoint,
@@ -423,7 +439,10 @@ class AudDAdapter:
             with open(native_path(path), "rb") as handle:
                 await on_attempt()
                 async with httpx.AsyncClient(
-                    transport=self.transport, timeout=timeout, follow_redirects=False
+                    transport=self.transport,
+                    timeout=timeout,
+                    follow_redirects=False,
+                    trust_env=False,
                 ) as client:
                     result = await client.post(
                         MAIN_ENDPOINT,
@@ -457,6 +476,7 @@ class AudDAdapter:
                 transport=self.transport,
                 timeout=httpx.Timeout(connect=30, write=1_800, read=1_800, pool=30),
                 follow_redirects=False,
+                trust_env=False,
             ) as client:
                 result = await client.post(self.endpoint, data=data)
         except (httpx.TimeoutException, httpx.NetworkError) as exc:

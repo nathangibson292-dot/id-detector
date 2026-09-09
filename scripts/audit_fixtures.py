@@ -92,6 +92,13 @@ def _pattern_exempt(relative: Path) -> bool:
     )
 
 
+def _has_binary_content(path: Path) -> bool:
+    """Detect binary fixtures without granting any filename extension an audit exemption."""
+
+    with path.open("rb") as handle:
+        return b"\x00" in handle.read(8192)
+
+
 # Stage 6 per-path allow rule.  The committed enrichment artefact `enrich/acquire.json` and the
 # `present/tracklist.{json,md}` exports (and their `tests/golden/` fixtures) legitimately carry
 # **public catalogue item URLs** — Deezer/Apple/MusicBrainz/Discogs/SoundCloud/Bandcamp/Beatport/
@@ -277,12 +284,14 @@ def audit() -> list[str]:
         for path in sorted(item for item in scan_root.rglob("*") if item.is_file()):
             scanned += 1
             relative = path.relative_to(ROOT)
+            if not _pattern_exempt(relative) and re.search(r"\d{6,}", relative.as_posix()):
+                failures.append(f"{relative}: filename contains a numeric platform ID")
+            if _has_binary_content(path):
+                continue
             text = path.read_text(encoding="utf-8", errors="replace")
             if relative.is_relative_to(_DERIVED_PATH):
                 failures.extend(_audit_derived(relative, text))
             if not _pattern_exempt(relative):
-                if re.search(r"\d{6,}", relative.as_posix()):
-                    failures.append(f"{relative}: filename contains a numeric platform ID")
                 acquisition = _acquisition_artifact(relative)
                 # `enrich/acquire.json` and the tracklist exports may carry public catalogue URLs
                 # (acquisition targets, not personal data); there the URL and long-numeric-id checks

@@ -148,7 +148,7 @@ def make_pipeline_runner(
         def progress(phase: str, done: int, total: int, message: str = "") -> None:
             ctx.progress(phase, done, total, message)
 
-        asyncio.run(
+        exit_code = asyncio.run(
             cli._analyse(
                 target,
                 work_root=root,
@@ -168,6 +168,8 @@ def make_pipeline_runner(
                 progress=progress,
             )
         )
+        if exit_code == 3:
+            raise RuntimeError("analysis failed: paid provider unavailable (exit code 3)")
 
         if ctx.acquire:
             ctx.check_cancel()

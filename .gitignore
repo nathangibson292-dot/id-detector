@@ -27,6 +27,7 @@ cache/
 *.opus
 *.ogg
 *.wav
+!tests/fixtures/audio/tone-60s.wav
 *.flac
 *.aiff
 *.aif

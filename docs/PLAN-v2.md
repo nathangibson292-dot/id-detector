@@ -532,6 +532,9 @@ earlier cycles.
 - `scripts/smoke_serve.ps1` / `.sh`: start `uv run idea serve --no-open --port 8791` in the background, poll
   `GET /healthz` (≤ 20 s), assert 200 and that `GET /` contains `Drop a mix`, stop the process; non-zero exit
   on any failure.
+  **PowerShell host:** gates written as `pwsh scripts/<x>.ps1` are equivalently satisfied by
+  `powershell -NoProfile -ExecutionPolicy Bypass -File scripts/<x>.ps1` (Windows PowerShell 5.1, the host
+  installed on the owner's machine); scripts must run under both.
 
 ### Phase S — spikes and owner gates (parallel; not build cycles)
 - **S1 (owner):** AudD production terms + per-clip rate + whether throttled/refused requests bill +

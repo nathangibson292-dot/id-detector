@@ -31,6 +31,7 @@ from id_detector.contracts import (
     sort_records,
 )
 from id_detector.io import atomic_write_bytes, path_is_file, read_text
+from id_detector.paid_clip import PaidScanResult
 from id_detector.providers.base import ProviderUnavailable
 from id_detector.providers.panako import (
     CAPABILITY_NAME,
@@ -46,7 +47,6 @@ from id_detector.providers.panako import (
 )
 from id_detector.providers.panako_setup import jar_path
 from id_detector.recognise import _write_jsonl
-from id_detector.scan import PaidScanResult
 from id_detector.scan_targeting import Span
 from id_detector.windows import WindowsResult
 

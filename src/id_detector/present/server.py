@@ -1234,6 +1234,9 @@ class _Handler(BaseHTTPRequestHandler):
 
     def do_GET(self) -> None:  # noqa: N802 - stdlib naming
         route = self.path.split("?", 1)[0]
+        if route == "/healthz":
+            self._send_json(HTTPStatus.OK, {"ok": True})
+            return
         if route in ("/", "/index.html"):
             if self._app_active():
                 assert self.job_manager is not None

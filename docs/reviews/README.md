@@ -60,3 +60,9 @@ Object under review: `docs/PLAN-v2.md`. Sources: `v2-review-engines.md`, `v2-rev
 | [3](plan-v2-review-round-3.md) | 3 | CHANGES_REQUESTED | 6/9/1 | rev 4: explicit `serves()` table, attempt state machine, `bundle_id`, lots + allocations, `provider_attempts`, fenced backups, M1/M2 milestones |
 | [4](plan-v2-review-round-4.md) | 4 | CHANGES_REQUESTED | 6/8/1 | rev 5: overlap rule fixed, status matrix, per-dispatch USD admission, intake job, scope in `analysis_key`, executable smoke/readiness gates, 29 + 6 cycles |
 | [5](plan-v2-review-round-5.md) | 5 | CHANGES_REQUESTED | 7/8/1 | final round (owner cap); rev 6 applies all seven P0s and the cheap P1/P2s (auth/quota outcomes, `/healthz` in 0a-i, provisional `targeting:0`, density rule fixed, provisional subscriber reservations + payer transfer, `BUILD_ID` readiness, lock-before-snapshot backups) without a further review; 33 M1 + 6 M2 cycles; build starts at 0a-i |
+
+## v2 build cycles (Codex gpt-5.6-sol xhigh builds; Codex read-only diff reviews; owner's orchestrator verifies + commits)
+
+| Cycle | Build report | Diff review | Verdict → outcome | Commit |
+|---|---|---|---|---|
+| 0a-i | [build-0a-i](build-0a-i.md) | [diff-review-0a-i](diff-review-0a-i.md) | FIX_FIRST (4 P0 / 2 P1 / 1 P2) → items 2–7 fixed with regressions; item 1 (PowerShell host) overridden by the orchestrator (`pwsh` not installed; Windows PowerShell accepted in the plan); 594 passed | see git log |

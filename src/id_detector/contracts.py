@@ -923,7 +923,7 @@ class InvocationJournalEntry(Record):
     command: list[str]
     started_at: str
     finished_at: str | None
-    status: Literal["running", "succeeded", "failed", "cancelled"]
+    status: Literal["running", "succeeded", "provider_unavailable", "failed", "cancelled"]
     exit_code: int | None
     duration_ms: NonNegativeInt | None
     tool_versions: dict[str, str]

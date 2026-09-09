@@ -65,6 +65,7 @@ from id_detector.io import (
     write_completion_sidecar,
 )
 from id_detector.jobs import AsyncJobStore
+from id_detector.paid_clip import PaidScanResult
 from id_detector.providers import acrcloud as acrcloud_mod
 from id_detector.providers import audd as audd_mod
 from id_detector.providers.base import (
@@ -133,25 +134,7 @@ _BUNDLES: dict[str, _Bundle] = {
     ),
 }
 
-_TERMINAL_STATES = frozenset(
-    {"succeeded", "no_match", "retryable_failure", "permanent_failure"}
-)
-
-
-@dataclass(frozen=True)
-class PaidScanResult:
-    """The paid stage's contribution to fusion, plus an audit of what ran or was skipped."""
-
-    observations: tuple[ObservationRecord, ...] = ()
-    observation_paths: tuple[Path, ...] = ()
-    engines_run: tuple[str, ...] = ()
-    #: ``(provider, reason)`` for every requested engine that did not run.
-    skipped: tuple[tuple[str, str], ...] = ()
-    usd_e2: int = 0
-
-    @property
-    def ran(self) -> bool:
-        return bool(self.engines_run)
+_TERMINAL_STATES = frozenset({"succeeded", "no_match", "retryable_failure", "permanent_failure"})
 
 
 async def run_paid_scanners(
@@ -322,9 +305,7 @@ async def _scan_one(
         if observations_out is None and existing.state in _TERMINAL_STATES:
             # The cache expired, was malformed, was an (uncacheable) error, or --refresh forced a
             # re-run: add exactly one run's ceiling back to the budget and reset the job.
-            await store.extend_budget(
-                media_key, bundle.provider, requests=units, usd=expected_cost
-            )
+            await store.extend_budget(media_key, bundle.provider, requests=units, usd=expected_cost)
             await store.reset_for_refresh(existing.id)
         if observations_out is None:
             # Build the adapter only now (a cache hit needs no credentials): production reads the

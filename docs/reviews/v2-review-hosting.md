@@ -423,17 +423,19 @@ Everything here is from Stripe's docs unless tagged.
 
 ```python
 client = stripe.StripeClient(os.environ["STRIPE_SECRET_KEY"], max_network_retries=2)
-session = client.v1.checkout.sessions.create(params={
-    "line_items": [{"price": SERVER_SIDE_PRICE_ID, "quantity": 1}],
-    "mode": "subscription",
-    "success_url": DOMAIN + "/billing/done?session_id={CHECKOUT_SESSION_ID}",
-    "cancel_url": DOMAIN + "/pricing",
-    "client_reference_id": str(user.id),        # from the SESSION, never a form field
-    "customer": user.stripe_customer_id or None,
-    "customer_email": user.email if not user.stripe_customer_id else None,
-    "subscription_data": {"metadata": {"app_user_id": str(user.id)}},
-    "allow_promotion_codes": True,
-})
+session = client.v1.checkout.sessions.create(
+    params={
+        "line_items": [{"price": SERVER_SIDE_PRICE_ID, "quantity": 1}],
+        "mode": "subscription",
+        "success_url": DOMAIN + "/billing/done?session_id={CHECKOUT_SESSION_ID}",
+        "cancel_url": DOMAIN + "/pricing",
+        "client_reference_id": str(user.id),  # from the SESSION, never a form field
+        "customer": user.stripe_customer_id or None,
+        "customer_email": user.email if not user.stripe_customer_id else None,
+        "subscription_data": {"metadata": {"app_user_id": str(user.id)}},
+        "allow_promotion_codes": True,
+    }
+)
 ```
 
 Note `subscription_data.metadata` — Session metadata does **not** propagate to the Subscription, so
@@ -535,17 +537,20 @@ with no network. Keep the boundary narrow:
 ```python
 Plan = Literal["free", "pro"]
 
+
 @dataclass(frozen=True)
 class PlanState:
     plan: Plan
-    status: str                       # active | trialing | past_due | canceled | none
+    status: str  # active | trialing | past_due | canceled | none
     current_period_end: int | None = None
     cancel_at_period_end: bool = False
-    managed_externally: bool = True    # False => admin-granted; hide "Manage billing"
+    managed_externally: bool = True  # False => admin-granted; hide "Manage billing"
+
 
 class BillingProvider(Protocol):
-    def create_checkout_url(self, user_id: str, email: str,
-                            success_url: str, cancel_url: str) -> str: ...
+    def create_checkout_url(
+        self, user_id: str, email: str, success_url: str, cancel_url: str
+    ) -> str: ...
     def portal_url(self, user_id: str, return_url: str) -> str: ...
     def handle_webhook(self, raw_body: bytes, sig_header: str) -> None: ...
     def current_plan(self, user_id: str) -> PlanState: ...

@@ -8,14 +8,16 @@ observations join the fuser and re-fuse alongside Shazam's: agreeing lifts a tra
 disagreeing lets a Shazam phantom be demoted, and a Shazam-blind (but catalogued) track is
 recovered.
 
-Raw responses are cached by clip cache-key across runs so a repeat analysis of the same mix never
-re-bills; a per-run request cap bounds the spend.  Only the live HTTP call needs a credential.
+Only validated match/no-match responses are cached by clip cache-key across runs. Matches are reused
+by default, while cached no-matches are re-queried by default and ``refresh_states`` controls that
+selection; a per-run request cap bounds the spend. Only the live HTTP call needs a credential.
 """
 
 from __future__ import annotations
 
 import json
 from collections.abc import Callable, Mapping
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -36,6 +38,7 @@ from id_detector.providers.audd import (
     AudDAdapter,
     AudDCredentials,
     clip_response_to_observation,
+    clip_result_has_identity,
 )
 from id_detector.providers.base import (
     AmbiguousProviderOutcome,
@@ -44,7 +47,6 @@ from id_detector.providers.base import (
     ProviderUnavailable,
 )
 from id_detector.recognise import _write_jsonl
-from id_detector.scan import PaidScanResult
 from id_detector.scan_targeting import Span
 from id_detector.shazam import canonicalize_provider_json
 from id_detector.windows import WindowsResult
@@ -58,6 +60,60 @@ CLIP_CONFIG_VERSION = "audd-main-v1"
 DEFAULT_MAX_CLIPS = 150
 
 LogFn = Callable[[str], None]
+
+
+@dataclass(frozen=True)
+class PaidScanResult:
+    """A paid stage's fusion contribution and request/cache audit."""
+
+    observations: tuple[ObservationRecord, ...] = ()
+    observation_paths: tuple[Path, ...] = ()
+    engines_run: tuple[str, ...] = ()
+    #: ``(provider, reason)`` for every requested engine that did not run.
+    skipped: tuple[tuple[str, str], ...] = ()
+    usd_e2: int = 0
+    requests: int = 0
+    resolved: int = 0
+    failures: int = 0
+    cache_hits: int = 0
+    billable_units: int = 0
+
+    @property
+    def ran(self) -> bool:
+        return bool(self.engines_run)
+
+
+def _cache_state(response: Mapping[str, Any]) -> str | None:
+    """Return the only two states allowed in the raw response cache."""
+
+    if response.get("status") != "success":
+        return None
+    result = response.get("result")
+    if result is None:
+        return "no_match"
+    if isinstance(result, Mapping) and clip_result_has_identity(result):
+        return "match"
+    return None
+
+
+def _error_body_is_free(response: Mapping[str, Any]) -> bool:
+    """Identify provider refusals that the frozen billing rules price at zero units."""
+
+    error = response.get("error")
+    if isinstance(error, Mapping):
+        code = error.get("error_code", error.get("code"))
+        message = " ".join(str(value) for value in error.values())
+    else:
+        code = response.get("status_code")
+        message = str(error or response.get("message") or "")
+    try:
+        status_code = int(code)
+    except (TypeError, ValueError):
+        status_code = 0
+    lowered = message.casefold()
+    return status_code in {401, 402, 403, 429, 503} or any(
+        word in lowered for word in ("quota", "credit", "auth")
+    )
 
 
 def _subsample_evenly(items: list[WindowRecord], budget: int) -> list[WindowRecord]:
@@ -128,6 +184,7 @@ async def run_paid_clip_recognition(
     enabled_engines: tuple[str, ...] | list[str],
     cli_confirmation: bool,
     refresh: bool = False,
+    refresh_states: frozenset[str] = frozenset({"no_match"}),
     max_clips: int = DEFAULT_MAX_CLIPS,
     adapters: Mapping[str, Any] | None = None,
     log: LogFn | None = None,
@@ -162,6 +219,8 @@ async def run_paid_clip_recognition(
     observations: list[ObservationRecord] = []
     queries: list[QueryRecord] = []
     requests = 0
+    cache_hits = 0
+    billable_units = 0
 
     async def _noop() -> None:
         return None
@@ -172,34 +231,54 @@ async def run_paid_clip_recognition(
         raw_path = cache_dir / f"{query.cache_key}.json"
         raw_ref = raw_path.relative_to(media_dir).as_posix()
         response: dict[str, Any] | None = None
+        was_cached = False
         if not refresh and path_is_file(raw_path):
             try:
                 cached = json.loads(read_text(raw_path))
-                if isinstance(cached, dict):
+                state = _cache_state(cached) if isinstance(cached, dict) else None
+                if state is not None and state not in refresh_states:
                     response = cached
+                    was_cached = True
+                    cache_hits += 1
             except (ValueError, OSError):
                 response = None
         if response is None:
             wav = media_dir / window.wav_path
+            requests += 1
             try:
                 response = await adapter.recognize_clip(wav, on_attempt=_noop)
-                requests += 1
-            except (ProviderProtocolError, AmbiguousProviderOutcome, FileNotFoundError) as exc:
+            except ProviderUnavailable as exc:
                 emit(f"audd clip error @{window.support_ms[0] // 1000}s: {type(exc).__name__}")
                 continue
-            atomic_write_json(raw_path, canonicalize_provider_json(response))
+            except AmbiguousProviderOutcome as exc:
+                billable_units += 1
+                emit(f"audd clip error @{window.support_ms[0] // 1000}s: {type(exc).__name__}")
+                continue
+            except (ProviderProtocolError, FileNotFoundError) as exc:
+                message = str(exc).casefold()
+                if not any(code in message for code in ("401", "402", "403", "429", "503")):
+                    billable_units += 1
+                emit(f"audd clip error @{window.support_ms[0] // 1000}s: {type(exc).__name__}")
+                continue
         try:
-            observations.append(
-                clip_response_to_observation(
-                    response,
-                    query=query,
-                    window=window,
-                    media_key=media_key,
-                    raw_response_ref=raw_ref,
-                )
+            observation = clip_response_to_observation(
+                response,
+                query=query,
+                window=window,
+                media_key=media_key,
+                raw_response_ref=raw_ref,
             )
         except ProviderProtocolError as exc:
+            if response is not None and not _error_body_is_free(response):
+                billable_units += 1
             emit(f"audd clip parse error @{window.support_ms[0] // 1000}s: {exc}")
+            continue
+        observations.append(observation)
+        if not was_cached:
+            # Parsing established a match/no-match state. Provider errors and malformed successes
+            # never reach this content-addressed cache write.
+            atomic_write_json(raw_path, canonicalize_provider_json(response))
+            billable_units += 1
 
     observations_out = tuple(sort_records(observations))
     observation_path = invocation_dir / "observations.gen0.jsonl"
@@ -208,10 +287,15 @@ async def run_paid_clip_recognition(
     matched = sum(item.status == "match" for item in observations_out)
     emit(
         f"audd clips: {matched} match(es) across {len(observations_out)} uncertain windows "
-        f"({requests} billable, {len(selected) - requests} cached)"
+        f"({requests} requests, {len(selected) - requests} cached)"
     )
     return PaidScanResult(
         observations=observations_out,
         observation_paths=(observation_path,),
         engines_run=("audd",),
+        requests=requests,
+        resolved=len(observations_out),
+        failures=len(selected) - len(observations_out),
+        cache_hits=cache_hits,
+        billable_units=billable_units,
     )
