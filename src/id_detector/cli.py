@@ -559,19 +559,72 @@ async def _analyse(
         _report(progress, "fuse", 1, 1, f"{len(fused.episodes.episodes)} episodes")
 
         # Phase 2 — cross-check the still-uncertain spans with the levers that see what Shazam
-        # can't.  The free fuse just told us which spans remain uncertain; both levers send only
+        # can't.  The free fuse just told us which spans remain uncertain; each lever sends only
         # those window clips (the same ~12 s clips Shazam saw — no whole-file upload, no consent
-        # gate) and re-fuse, so agreement lifts confidence, disagreement lets a Shazam phantom be
+        # gate) and re-fuses, so agreement lifts confidence, disagreement lets a Shazam phantom be
         # demoted, and a Shazam-blind track is recovered:
-        #   • the paid engine's CLIP path (AudD) — catalogued-but-Shazam-blind tracks;
-        #   • a local Panako index — the DJ's OWN unreleased uploads, in no public catalogue.
-        # A no-op unless one of them is enabled and uncertain spans remain.
+        #   • a local Panako index — the DJ's OWN unreleased uploads, in no public catalogue;
+        #   • the paid engine's CLIP path (AudD) — catalogued-but-Shazam-blind tracks.
+        # FREE-FIRST: Panako runs and re-fuses BEFORE AudD, so whatever it confidently identifies
+        # shrinks the uncertain region — we never pay AudD to check a span the free index nailed.
+        # A no-op unless a lever is enabled and uncertain spans remain.
         clip_scan = PaidScanResult()
         index_scan = PaidScanResult()
         want_clips = bool(set(enabled_engines) & set(PAID_CLIP_ENGINES))
         want_index = local_index_label is not None
+
+        async def _refuse_with(*scans: PaidScanResult) -> None:
+            nonlocal fused, orchestrated
+            _report(progress, "fuse", 0, 1, "re-fusing with cross-check evidence")
+            timer.start_stage("refuse_ms")
+            extra_obs = (*paid_scan.observations, *(o for s in scans for o in s.observations))
+            extra_paths = (
+                *paid_scan.observation_paths,
+                *(p for s in scans for p in s.observation_paths),
+            )
+            orchestrated = await _fuse(extra_obs, extra_paths)
+            fused = orchestrated.fusion
+            counts.update(
+                {
+                    "requests": orchestrated.requests,
+                    "physical_attempts": orchestrated.physical_attempts,
+                    "generations": orchestrated.final_generation + 1,
+                }
+            )
+            timer.finish_stage("refuse_ms")
+            _report(progress, "fuse", 1, 1, f"{len(fused.episodes.episodes)} episodes")
+
         if want_clips or want_index:
             targets = select_scan_targets(fused.episodes.episodes, decoded.record.pcm.duration_ms)
+            # Free lever first.
+            if targets and want_index:
+                _report(progress, "scan", 0, 1, "querying the local reference index")
+                timer.start_stage("index_scan_ms")
+                index_scan = await run_local_index_recognition(
+                    media_key=ingested.record.media_key,
+                    media_dir=media_dir,
+                    windows=windows,
+                    targets=targets,
+                    duration_ms=decoded.record.pcm.duration_ms,
+                    run_id=run_id,
+                    index_label=local_index_label,
+                    index_root=index_root,
+                    tool_dir=panako_tool_dir,
+                    log=lambda message: _report(progress, "scan", 0, 1, message),
+                )
+                timer.finish_stage("index_scan_ms")
+                for name, reason in index_scan.skipped:
+                    _report(progress, "scan", 1, 1, f"{name} skipped: {reason}")
+                counts["local_index_matches"] = sum(
+                    item.status == "match" for item in index_scan.observations
+                )
+                if any(item.status == "match" for item in index_scan.observations):
+                    # Re-fuse so Panako's confident IDs recompute (and shrink) the uncertain region.
+                    await _refuse_with(index_scan)
+                    targets = select_scan_targets(
+                        fused.episodes.episodes, decoded.record.pcm.duration_ms
+                    )
+            # Paid lever next, only on what is still uncertain after the free lever.
             if targets and want_clips:
                 _report(progress, "scan", 0, 1, "clip-checking uncertain spans with paid engine")
                 timer.start_stage("clip_scan_ms")
@@ -592,55 +645,11 @@ async def _analyse(
                 timer.finish_stage("clip_scan_ms")
                 for name, reason in clip_scan.skipped:
                     _report(progress, "scan", 1, 1, f"{name} skipped: {reason}")
-            if targets and want_index:
-                _report(progress, "scan", 0, 1, "querying the local reference index")
-                timer.start_stage("index_scan_ms")
-                index_scan = await run_local_index_recognition(
-                    media_key=ingested.record.media_key,
-                    media_dir=media_dir,
-                    windows=windows,
-                    targets=targets,
-                    duration_ms=decoded.record.pcm.duration_ms,
-                    run_id=run_id,
-                    index_label=local_index_label,
-                    index_root=index_root,
-                    tool_dir=panako_tool_dir,
-                    log=lambda message: _report(progress, "scan", 0, 1, message),
-                )
-                timer.finish_stage("index_scan_ms")
-                for name, reason in index_scan.skipped:
-                    _report(progress, "scan", 1, 1, f"{name} skipped: {reason}")
-            if clip_scan.observations or index_scan.observations:
                 counts["clip_matches"] = sum(
                     item.status == "match" for item in clip_scan.observations
                 )
-                counts["local_index_matches"] = sum(
-                    item.status == "match" for item in index_scan.observations
-                )
-                _report(progress, "fuse", 0, 1, "re-fusing with cross-check evidence")
-                timer.start_stage("refuse_ms")
-                orchestrated = await _fuse(
-                    (
-                        *paid_scan.observations,
-                        *clip_scan.observations,
-                        *index_scan.observations,
-                    ),
-                    (
-                        *paid_scan.observation_paths,
-                        *clip_scan.observation_paths,
-                        *index_scan.observation_paths,
-                    ),
-                )
-                fused = orchestrated.fusion
-                counts.update(
-                    {
-                        "requests": orchestrated.requests,
-                        "physical_attempts": orchestrated.physical_attempts,
-                        "generations": orchestrated.final_generation + 1,
-                    }
-                )
-                timer.finish_stage("refuse_ms")
-                _report(progress, "fuse", 1, 1, f"{len(fused.episodes.episodes)} episodes")
+                if any(item.status == "match" for item in clip_scan.observations):
+                    await _refuse_with(index_scan, clip_scan)
 
         _report(progress, "present", 0, 1, "writing result page")
         timer.start_stage("export_ms")
