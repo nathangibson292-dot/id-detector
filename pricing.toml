@@ -1,0 +1,26 @@
+pricing_version = "v1"
+audd_usd_e6_per_request = 5000
+bill_on_throttle = false
+usd_cap_account_month_e2 = 2000
+usd_cap_global_day_e2 = 5000
+cache_hits_per_day = 20
+hints_max_age_days = 7
+alias_revalidate_days = 7
+serve_free_from_deep = false
+compat_version = 1
+
+[free]
+minutes_per_week = 150
+max_mix_minutes = 150
+sources = ["soundcloud", "mixcloud"]
+
+[pro]
+price_gbp_month = 9
+price_gbp_year = 90
+deep_minutes_per_month = 90
+max_mix_minutes = 240
+sources = ["soundcloud", "mixcloud", "youtube", "upload"]
+
+[pack.small]
+gbp = 6
+minutes = 55

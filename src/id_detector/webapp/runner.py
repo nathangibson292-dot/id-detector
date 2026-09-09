@@ -45,7 +45,7 @@ def _resolve_settings(project_root: Path, config_path: Path, profile: str | None
     from id_detector.calibrate.model import load_calibration
     from id_detector.profiles import UnknownProfile, load_profile, profile_app_config
 
-    file_config = AppConfig.load(config_path) if config_path.is_file() else AppConfig()
+    file_config = AppConfig.load(config_path)
     no_hints = not file_config.hints_enabled
     selected = profile if profile is not None else file_config.default_profile
     if selected is not None:
@@ -59,6 +59,11 @@ def _resolve_settings(project_root: Path, config_path: Path, profile: str | None
                 allow_third_party_upload=file_config.allow_third_party_upload,
                 default_profile=file_config.default_profile,
                 max_requests=file_config.max_requests,
+                pricing_version=file_config.pricing_version,
+                audd_usd_e6_per_request=file_config.audd_usd_e6_per_request,
+                bill_on_throttle=file_config.bill_on_throttle,
+                max_usd_e2=file_config.max_usd_e2,
+                deep_primary_density=file_config.deep_primary_density,
                 lead_in_ms=file_config.lead_in_ms,
                 cache_positive_max_age_days=file_config.cache_positive_max_age_days,
                 cache_no_match_max_age_days=file_config.cache_no_match_max_age_days,

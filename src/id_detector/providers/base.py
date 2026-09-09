@@ -7,6 +7,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
 
+from id_detector.pricing import load_pricing
+
 TransformPolicy = Literal["off", "rescan_only", "global"]
 
 DEFAULT_TRANSFORM_RATES_E4 = (9_200, 9_600, 10_400, 10_800)
@@ -103,6 +105,11 @@ class AppConfig:
     rescan_max_generations: int = LIVE_DEFAULT_MAX_GENERATIONS
     default_profile: str | None = None
     max_requests: int = DEFAULT_MAX_REQUESTS
+    pricing_version: str = "v1"
+    audd_usd_e6_per_request: int = 5_000
+    bill_on_throttle: bool = False
+    max_usd_e2: int | None = None
+    deep_primary_density: int = 1
     shazam_requests_per_minute: int = DEFAULT_SHAZAM_REQUESTS_PER_MINUTE
     recognise_concurrency: int = DEFAULT_RECOGNISE_CONCURRENCY
     lead_in_ms: int = DEFAULT_LEAD_IN_MS
@@ -123,9 +130,21 @@ class AppConfig:
         return self.cache_no_match_max_age_days * 24 * 60 * 60
 
     @classmethod
-    def load(cls, path: Path | None) -> AppConfig:
+    def load(cls, path: Path | None, *, pricing_path: Path | None = None) -> AppConfig:
+        """Parse the owner's config; money fields always come from the pricing authority.
+
+        ``pricing_path`` defaults to the repository ``pricing.toml`` resolved from the package, so
+        prices never depend on the working directory; tests pass an explicit file.
+        """
+
+        pricing = load_pricing(pricing_path)
         if path is None or not path.is_file():
-            return cls()
+            return cls(
+                pricing_version=pricing.pricing_version,
+                audd_usd_e6_per_request=pricing.audd_usd_e6_per_request,
+                bill_on_throttle=pricing.bill_on_throttle,
+                max_usd_e2=pricing.max_usd_e2,
+            )
         with path.open("rb") as handle:
             payload = tomllib.load(handle)
         value = payload.get("allow_third_party_upload", False)
@@ -138,6 +157,7 @@ class AppConfig:
         hints = payload.get("hints", {})
         present = payload.get("present", {})
         recognise = payload.get("recognise", {})
+        deep = payload.get("deep", {})
         if not isinstance(transforms, dict):
             raise ValueError("transforms must be a TOML table")
         if not isinstance(recognise, dict):
@@ -152,6 +172,14 @@ class AppConfig:
             raise ValueError("hints must be a TOML table")
         if not isinstance(present, dict):
             raise ValueError("present must be a TOML table")
+        if not isinstance(deep, dict):
+            raise ValueError("deep must be a TOML table")
+        unknown_deep = sorted(set(deep) - {"primary_density"})
+        if unknown_deep:
+            raise ValueError(f"unknown deep setting: {', '.join(unknown_deep)}")
+        deep_primary_density = deep.get("primary_density", 1)
+        if isinstance(deep_primary_density, bool) or deep_primary_density not in {1, 2}:
+            raise ValueError("deep.primary_density must be 1 or 2")
         policy = transforms.get("policy", "rescan_only")
         if policy not in {"off", "rescan_only", "global"}:
             raise ValueError("transforms.policy must be off, rescan_only, or global")
@@ -249,6 +277,11 @@ class AppConfig:
             rescan_max_generations=max_generations,
             default_profile=default_profile,
             max_requests=max_requests,
+            pricing_version=pricing.pricing_version,
+            audd_usd_e6_per_request=pricing.audd_usd_e6_per_request,
+            bill_on_throttle=pricing.bill_on_throttle,
+            max_usd_e2=pricing.max_usd_e2,
+            deep_primary_density=deep_primary_density,
             shazam_requests_per_minute=requests_per_minute,
             recognise_concurrency=recognise_concurrency,
             lead_in_ms=lead_in_ms,

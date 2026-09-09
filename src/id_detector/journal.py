@@ -16,6 +16,7 @@ from id_detector.io import (
     read_bytes,
     redact_command_argument,
 )
+from id_detector.recipes import FREE_RECIPE
 
 
 def timestamp() -> str:
@@ -67,6 +68,15 @@ class InvocationTimer:
         costs: dict[str, int],
         source_ids: list[str],
         ffmpeg_version: str | None,
+        reason: str | None = None,
+        usd_e6_reserved: int = 0,
+        usd_e6_spent: int = 0,
+        usd_e2_reserved: int = 0,
+        usd_e2_spent: int = 0,
+        requested_recipe_id: str = FREE_RECIPE.recipe_id,
+        algorithm_version: str = FREE_RECIPE.algorithm_version,
+        pricing_version: str = "v1",
+        audd_usd_e6_per_request: int = 5_000,
     ) -> InvocationJournalEntry:
         return InvocationJournalEntry(
             schema_version=SCHEMA_VERSION,
@@ -76,11 +86,20 @@ class InvocationTimer:
             started_at=self.started_at,
             finished_at=timestamp(),
             status=status,
+            reason=reason,
             exit_code=exit_code,
             duration_ms=round((time.monotonic() - self.started_monotonic) * 1000),
             tool_versions=tool_versions(ffmpeg_version),
             timings=self.timings,
             counts=counts,
             costs=costs,
+            usd_e6_reserved=usd_e6_reserved,
+            usd_e6_spent=usd_e6_spent,
+            usd_e2_reserved=usd_e2_reserved,
+            usd_e2_spent=usd_e2_spent,
+            requested_recipe_id=requested_recipe_id,
+            algorithm_version=algorithm_version,
+            pricing_version=pricing_version,
+            audd_usd_e6_per_request=audd_usd_e6_per_request,
             source_ids=source_ids,
         )

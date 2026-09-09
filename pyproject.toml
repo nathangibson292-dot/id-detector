@@ -35,6 +35,12 @@ dev = [
 [tool.hatch.build.targets.wheel]
 packages = ["src/id_detector"]
 
+# The single pricing authority lives at the repository root (plan §3.3). The wheel carries a
+# build-time copy so an installed `idea` prices runs identically; there is no second committed
+# copy that could drift from the authority.
+[tool.hatch.build.targets.wheel.force-include]
+"pricing.toml" = "id_detector/resources/pricing.toml"
+
 [tool.pytest.ini_options]
 # Default run is fast and offline: it deselects both slow (controlled-render / full-pipeline) and
 # live (network) tests. Full offline run: `uv run pytest -m "not live"`. Live: `uv run pytest -m live`.

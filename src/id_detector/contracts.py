@@ -923,13 +923,30 @@ class InvocationJournalEntry(Record):
     command: list[str]
     started_at: str
     finished_at: str | None
-    status: Literal["running", "succeeded", "provider_unavailable", "failed", "cancelled"]
+    status: Literal[
+        "running",
+        "succeeded",
+        "partial",
+        "provider_unavailable",
+        "budget_exhausted",
+        "failed",
+        "cancelled",
+    ]
+    reason: str | None
     exit_code: int | None
     duration_ms: NonNegativeInt | None
     tool_versions: dict[str, str]
     timings: dict[str, NonNegativeInt]
     counts: dict[str, int]
     costs: dict[str, int]
+    usd_e6_reserved: NonNegativeInt
+    usd_e6_spent: NonNegativeInt
+    usd_e2_reserved: MoneyE2
+    usd_e2_spent: MoneyE2
+    requested_recipe_id: Sha256
+    algorithm_version: str
+    pricing_version: str
+    audd_usd_e6_per_request: NonNegativeInt
     source_ids: list[str]
 
 

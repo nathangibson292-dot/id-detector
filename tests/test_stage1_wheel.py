@@ -28,6 +28,8 @@ def test_built_wheel_contains_and_loads_runtime_resources(tmp_path: Path) -> Non
     assert "id_detector/resources/provider_configs/shazam-v3.json" in names
     assert "id_detector/resources/profiles/free-v1.json" in names
     assert "id_detector/resources/profiles/max_accuracy-v1.json" in names
+    # Money: an installed `idea` must find the pricing authority without a source checkout.
+    assert "id_detector/resources/pricing.toml" in names
 
     program = """
 import asyncio

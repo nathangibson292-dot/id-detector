@@ -66,3 +66,6 @@ Object under review: `docs/PLAN-v2.md`. Sources: `v2-review-engines.md`, `v2-rev
 | Cycle | Build report | Diff review | Verdict → outcome | Commit |
 |---|---|---|---|---|
 | 0a-i | [build-0a-i](build-0a-i.md) | [diff-review-0a-i](diff-review-0a-i.md) | FIX_FIRST (4 P0 / 2 P1 / 1 P2) → items 2–7 fixed with regressions; item 1 (PowerShell host) overridden by the orchestrator (`pwsh` not installed; Windows PowerShell accepted in the plan); 594 passed | see git log |
+| 0a-ii | [build-0a-ii](build-0a-ii.md) | (in report, § Review + fix pass) | Codex build interrupted by a session restart; completed by a Claude Opus builder (4 gaps: pricing path, settlement on mid-dispatch crash, free zero-cap, journal-before-settle); Opus review OK_TO_COMMIT after fixing P0 (bare `--profile max_accuracy` silently billed AudD) + 4 P1; 620 passed | see git log |
+
+**Model switch (2026-09-09, owner):** from cycle 0a-iv builds run on Claude **Fable** subagents and reviews/fixes on Claude **Opus**; Codex is parked until its weekly quota resets. Agent prompts carry a hard no-live-provider-calls rule (the CLI auto-loads `.env`).

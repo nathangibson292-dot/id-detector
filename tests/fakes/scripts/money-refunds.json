@@ -1,0 +1,18 @@
+{
+  "audd": {
+    "default": "no_match",
+    "windows": {
+      "0": "http_429",
+      "1": "http_503",
+      "2": "http_401",
+      "3": "quota_error",
+      "4": "timeout_pre",
+      "5": "timeout_post",
+      "6": "no_match"
+    }
+  },
+  "shazam": {
+    "default": "no_match",
+    "windows": {}
+  }
+}

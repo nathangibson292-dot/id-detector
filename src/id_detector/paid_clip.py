@@ -1,7 +1,7 @@
-"""The paid CLIP-recognition stage (the corrected, gate-free design).
+"""AudD clip recognition for recipe-primary and legacy supplemental passes.
 
-The free (Shazam) pass runs and fuses first.  This stage then sends ONLY the window clips that fall
-in the still-uncertain regions (see :func:`id_detector.scan_targeting.select_scan_targets`) to a
+Recipe-primary deep scans sweep deterministic windows. Legacy supplemental scans send only clips
+in still-uncertain regions (see :func:`id_detector.scan_targeting.select_scan_targets`) to a
 paid recogniser's clip endpoint — the same ~12 s clips Shazam already sees, so there is no
 whole-file upload and no third-party-upload consent gate.  The resulting ``clip_recognizer``
 observations join the fuser and re-fuse alongside Shazam's: agreeing lifts a track's confidence,
@@ -10,12 +10,15 @@ recovered.
 
 Only validated match/no-match responses are cached by clip cache-key across runs. Matches are reused
 by default, while cached no-matches are re-queried by default and ``refresh_states`` controls that
-selection; a per-run request cap bounds the spend. Only the live HTTP call needs a credential.
+selection. Dollar admission bounds live calls before dispatch; only the live call needs a
+credential.
 """
 
 from __future__ import annotations
 
+import asyncio
 import json
+import re
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
@@ -34,6 +37,10 @@ from id_detector.contracts import (
     sort_records,
 )
 from id_detector.io import atomic_write_json, path_is_file, read_text
+from id_detector.money import (
+    ReservationExhausted,
+    UsdAdmitter,
+)
 from id_detector.providers.audd import (
     AudDAdapter,
     AudDCredentials,
@@ -54,9 +61,8 @@ from id_detector.windows import WindowsResult
 #: Paid clip-recognition engines (only AudD for now; ACRCloud is whole-file-only in this codebase).
 PAID_CLIP_ENGINES: tuple[str, ...] = ("audd",)
 CLIP_CONFIG_VERSION = "audd-main-v1"
-#: Default per-mix clip budget (cost guard).  At AudD's $5/1000, 150 clips ≈ $0.75/mix, and the
-#: 300-request free trial covers ~2 mixes.  A track spans minutes, so an evenly-spread 150 still
-#: samples every uncertain track many times; raise it with --max-paid-clips to trade cost for reach.
+#: Legacy supplemental selection ceiling; it is not the Deep recipe's dollar cap. Phase 0a-iv
+#: removes the call site when it installs the provisional secondary scheduler.
 DEFAULT_MAX_CLIPS = 150
 
 LogFn = Callable[[str], None]
@@ -77,6 +83,7 @@ class PaidScanResult:
     failures: int = 0
     cache_hits: int = 0
     billable_units: int = 0
+    reservation_exhausted: bool = False
 
     @property
     def ran(self) -> bool:
@@ -96,8 +103,8 @@ def _cache_state(response: Mapping[str, Any]) -> str | None:
     return None
 
 
-def _error_body_is_free(response: Mapping[str, Any]) -> bool:
-    """Identify provider refusals that the frozen billing rules price at zero units."""
+def _error_body_outcome(response: Mapping[str, Any]) -> str:
+    """Classify an AudD error body into the frozen money outcomes."""
 
     error = response.get("error")
     if isinstance(error, Mapping):
@@ -111,9 +118,42 @@ def _error_body_is_free(response: Mapping[str, Any]) -> bool:
     except (TypeError, ValueError):
         status_code = 0
     lowered = message.casefold()
-    return status_code in {401, 402, 403, 429, 503} or any(
-        word in lowered for word in ("quota", "credit", "auth")
-    )
+    if status_code in {401, 403} or "auth" in lowered:
+        return "auth_error"
+    if status_code == 402 or any(word in lowered for word in ("quota", "credit")):
+        return "quota_error"
+    if status_code == 429:
+        return "http_429"
+    if status_code == 503:
+        return "http_503"
+    if 500 <= status_code <= 599:
+        return "http_5xx"
+    return "malformed"
+
+
+#: The status code in ``ProviderProtocolError("AudD HTTP <code>")``.  Parsed rather than substring-
+#: matched: a bare ``"503" in message`` would refund a billable unit for any message that merely
+#: contains those digits (a byte count, a clip offset, a future error code).
+_HTTP_STATUS = re.compile(r"\bhttp (\d{3})\b")
+
+
+def _protocol_outcome(error: ProviderProtocolError) -> str:
+    """Classify an AudD transport-level protocol error into the frozen money outcomes."""
+
+    message = str(error).casefold()
+    found = _HTTP_STATUS.search(message)
+    status_code = int(found.group(1)) if found is not None else 0
+    if status_code in {401, 403} or "auth" in message:
+        return "auth_error"
+    if status_code == 402 or any(word in message for word in ("quota", "credit")):
+        return "quota_error"
+    if status_code == 429:
+        return "http_429"
+    if status_code == 503:
+        return "http_503"
+    if 500 <= status_code <= 599:
+        return "http_5xx"
+    return "malformed"
 
 
 def _subsample_evenly(items: list[WindowRecord], budget: int) -> list[WindowRecord]:
@@ -186,6 +226,8 @@ async def run_paid_clip_recognition(
     refresh: bool = False,
     refresh_states: frozenset[str] = frozenset({"no_match"}),
     max_clips: int = DEFAULT_MAX_CLIPS,
+    primary_density: int = 1,
+    usd_admitter: UsdAdmitter | None = None,
     adapters: Mapping[str, Any] | None = None,
     log: LogFn | None = None,
 ) -> PaidScanResult:
@@ -210,7 +252,18 @@ async def run_paid_clip_recognition(
         emit(f"paid clip engine audd skipped: {exc}")
         return PaidScanResult(skipped=((("audd"), str(exc)),))
 
-    selected = _subsample_evenly(_windows_in_targets(windows, tuple(targets)), max_clips)
+    if primary_density <= 0:
+        raise ValueError("primary_density must be positive")
+    eligible = _windows_in_targets(windows, tuple(targets))
+    if usd_admitter is not None:
+        # Recipe reservations are calculated from the frozen generation-zero window set. Keep
+        # dispatch selection on that identical set even if a legacy global transform policy is on.
+        eligible = [
+            window
+            for window in eligible
+            if window.generation == 0 and window.transform.type == "none"
+        ]
+    selected = _subsample_evenly(eligible[::primary_density], max_clips)
     if not selected:
         return PaidScanResult()
 
@@ -221,9 +274,7 @@ async def run_paid_clip_recognition(
     requests = 0
     cache_hits = 0
     billable_units = 0
-
-    async def _noop() -> None:
-        return None
+    reservation_exhausted = False
 
     for window in selected:
         query = _clip_query(media_key, window)
@@ -245,21 +296,52 @@ async def run_paid_clip_recognition(
         if response is None:
             wav = media_dir / window.wav_path
             requests += 1
+            admitted = False
+
+            async def _admit() -> None:
+                nonlocal admitted
+                if usd_admitter is not None:
+                    usd_admitter.admit()
+                admitted = True
+
             try:
-                response = await adapter.recognize_clip(wav, on_attempt=_noop)
+                response = await adapter.recognize_clip(wav, on_attempt=_admit)
+            except ReservationExhausted:
+                requests -= 1
+                reservation_exhausted = True
+                emit("audd primary stopped: USD reservation exhausted")
+                break
             except ProviderUnavailable as exc:
+                if admitted and usd_admitter is not None:
+                    lowered = str(exc).casefold()
+                    timed_out = any(word in lowered for word in ("timeout", "timed out"))
+                    usd_admitter.resolve("timeout_pre" if timed_out else "connect_error")
                 emit(f"audd clip error @{window.support_ms[0] // 1000}s: {type(exc).__name__}")
                 continue
             except AmbiguousProviderOutcome as exc:
+                if admitted and usd_admitter is not None:
+                    usd_admitter.resolve("timeout_post")
                 billable_units += 1
                 emit(f"audd clip error @{window.support_ms[0] // 1000}s: {type(exc).__name__}")
                 continue
             except (ProviderProtocolError, FileNotFoundError) as exc:
-                message = str(exc).casefold()
-                if not any(code in message for code in ("401", "402", "403", "429", "503")):
+                outcome = _protocol_outcome(exc) if isinstance(exc, ProviderProtocolError) else None
+                if admitted and usd_admitter is not None and outcome is not None:
+                    usd_admitter.resolve(outcome)  # type: ignore[arg-type]
+                if outcome in {"http_5xx", "malformed"}:
                     billable_units += 1
                 emit(f"audd clip error @{window.support_ms[0] // 1000}s: {type(exc).__name__}")
                 continue
+            except asyncio.CancelledError:
+                if admitted and usd_admitter is not None:
+                    usd_admitter.resolve("timeout_post")
+                raise
+            except Exception:
+                if admitted and usd_admitter is not None:
+                    usd_admitter.resolve("malformed")
+                raise
+            if usd_admitter is not None and not admitted:
+                raise RuntimeError("AudD adapter returned without invoking its on_attempt callback")
         try:
             observation = clip_response_to_observation(
                 response,
@@ -269,15 +351,28 @@ async def run_paid_clip_recognition(
                 raw_response_ref=raw_ref,
             )
         except ProviderProtocolError as exc:
-            if response is not None and not _error_body_is_free(response):
+            outcome = _error_body_outcome(response) if response is not None else "malformed"
+            if not was_cached and usd_admitter is not None:
+                usd_admitter.resolve(outcome)  # type: ignore[arg-type]
+            if outcome in {"http_5xx", "malformed"}:
                 billable_units += 1
             emit(f"audd clip parse error @{window.support_ms[0] // 1000}s: {exc}")
             continue
+        except asyncio.CancelledError:
+            if not was_cached and usd_admitter is not None:
+                usd_admitter.resolve("timeout_post")
+            raise
+        except Exception:
+            if not was_cached and usd_admitter is not None:
+                usd_admitter.resolve("malformed")
+            raise
         observations.append(observation)
         if not was_cached:
             # Parsing established a match/no-match state. Provider errors and malformed successes
             # never reach this content-addressed cache write.
             atomic_write_json(raw_path, canonicalize_provider_json(response))
+            if usd_admitter is not None:
+                usd_admitter.resolve(_cache_state(response))  # type: ignore[arg-type]
             billable_units += 1
 
     observations_out = tuple(sort_records(observations))
@@ -295,7 +390,9 @@ async def run_paid_clip_recognition(
         engines_run=("audd",),
         requests=requests,
         resolved=len(observations_out),
-        failures=len(selected) - len(observations_out),
+        # Windows never reached (an exhausted reservation stops the sweep) are not failures.
+        failures=requests + cache_hits - len(observations_out),
         cache_hits=cache_hits,
         billable_units=billable_units,
+        reservation_exhausted=reservation_exhausted,
     )

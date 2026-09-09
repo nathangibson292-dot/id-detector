@@ -112,6 +112,7 @@ class FakeAudD:
         self.script = _ScriptedProvider("audd", script)
         self.calls = 0
         self.billed_units = 0
+        self.paths: list[Path] = []
 
     @property
     def attempts(self) -> list[dict[str, object]]:
@@ -123,10 +124,13 @@ class FakeAudD:
         on_attempt: Callable[[], Awaitable[None]],
     ) -> dict[str, Any]:
         index = self.script.index_for_path(path)
+        # Production invokes this callback immediately before network I/O. A refused admission
+        # therefore must not appear as a provider call or scripted attempt in the fake either.
+        await _notify_attempt(on_attempt)
+        self.paths.append(path)
         outcome = self.script.next_outcome(index)
         self.calls += 1
         self.billed_units += int(outcome in _BILLABLE)
-        await _notify_attempt(on_attempt)
         if outcome == "timeout_pre":
             raise ProviderUnavailable("AudD timed out before receiving a response")
         if outcome == "timeout_post":

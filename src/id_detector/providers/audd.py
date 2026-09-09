@@ -449,7 +449,15 @@ class AudDAdapter:
                         data={"api_token": self.credentials.api_token},
                         files={"file": (path.name, handle, "application/octet-stream")},
                     )
-        except (httpx.TimeoutException, httpx.NetworkError) as exc:
+        except (httpx.ConnectTimeout, httpx.PoolTimeout) as exc:
+            # Distinct wording per §2.3.3: this is `timeout_pre`, not `connect_error`.  Both cost
+            # zero units, but 0b-i's retry policy and the attempt journal keep them apart.
+            raise ProviderUnavailable("AudD clip timeout before provider receipt") from exc
+        except httpx.ConnectError as exc:
+            raise ProviderUnavailable(
+                "AudD clip connection failed before provider receipt"
+            ) from exc
+        except httpx.TransportError as exc:
             raise AmbiguousProviderOutcome("AudD clip response was lost") from exc
         if result.status_code >= 400:
             raise ProviderProtocolError(f"AudD HTTP {result.status_code}")

@@ -54,6 +54,11 @@ lead_in_ms = 5000
 requests_per_minute = 45
 concurrency = 3
 
+# Deep scans use every frozen window by default.  Density 2 selects even-indexed windows and halves
+# AudD request volume; because density affects results it also produces a distinct recipe_id.
+[deep]
+primary_density = 1
+
 # Stage 4b transform hypotheses.  policy = "off" | "rescan_only" (default) | "global".
 [transforms]
 policy = "rescan_only"
@@ -133,6 +138,9 @@ def render_effective_config(config: AppConfig) -> str:
         else "# default_profile = (unset)",
         f"max_requests = {config.max_requests}",
         f"lead_in_ms = {config.lead_in_ms}",
+        "",
+        "[deep]",
+        f"primary_density = {config.deep_primary_density}",
         "",
         "[recognise]",
         f"requests_per_minute = {config.shazam_requests_per_minute}",

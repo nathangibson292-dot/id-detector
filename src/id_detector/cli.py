@@ -41,9 +41,9 @@ from id_detector.io import read_text, redact_text
 from id_detector.jobs import AsyncJobStore, ProcessLock
 from id_detector.journal import InvocationTimer, append_invocation
 from id_detector.local_index import run_local_index_recognition
+from id_detector.money import BudgetExhausted, UsdAdmitter, UsdSettlement, reserve_usd
 from id_detector.orchestrate import run_generation_loop
 from id_detector.paid_clip import (
-    DEFAULT_MAX_CLIPS,
     PAID_CLIP_ENGINES,
     PaidScanResult,
     run_paid_clip_recognition,
@@ -58,6 +58,7 @@ from id_detector.profiles import (
     profile_app_config,
 )
 from id_detector.providers.base import AppConfig
+from id_detector.recipes import Recipe, get_recipe
 from id_detector.recognise import recognise_generation
 from id_detector.rescan import DEFAULT_MAX_GENERATIONS
 from id_detector.scan import PAID_FILE_SCANNERS, run_paid_scanners
@@ -369,6 +370,37 @@ def _windows_in_spans(windows: WindowsResult, spans: tuple[tuple[int, int], ...]
     return WindowsResult(records=keep, record_path=windows.record_path, cached=windows.cached)
 
 
+def _settle_money(usd_admitter: UsdAdmitter | None) -> UsdSettlement:
+    """Terminal USD figures; a run that never reserved (Free, or refused) settles at zero."""
+
+    if usd_admitter is None:
+        return UsdSettlement(
+            usd_e6_reserved=0,
+            usd_e6_spent=0,
+            usd_e2_reserved=0,
+            usd_e2_spent=0,
+            usd_e6_released=0,
+        )
+    return usd_admitter.settle()
+
+
+def _money_journal_fields(
+    settlement: UsdSettlement,
+    recipe: Recipe,
+    app_config: AppConfig,
+) -> dict[str, int | str]:
+    return {
+        "usd_e6_reserved": settlement.usd_e6_reserved,
+        "usd_e6_spent": settlement.usd_e6_spent,
+        "usd_e2_reserved": settlement.usd_e2_reserved,
+        "usd_e2_spent": settlement.usd_e2_spent,
+        "requested_recipe_id": recipe.recipe_id,
+        "algorithm_version": recipe.algorithm_version,
+        "pricing_version": app_config.pricing_version,
+        "audd_usd_e6_per_request": app_config.audd_usd_e6_per_request,
+    }
+
+
 async def _analyse(
     url: str,
     *,
@@ -387,15 +419,26 @@ async def _analyse(
     enabled_engines: tuple[str, ...] = (),
     cli_confirmation: bool = False,
     primary_engine: str = "shazam",
+    recipe: Recipe | None = None,
     paid_scan_adapters: Mapping[str, object] | None = None,
     shazam_http_client: HTTPClientInterface | None = None,
-    max_paid_clips: int = DEFAULT_MAX_CLIPS,
     local_index_label: str | None = None,
     index_root: Path = Path("data/local/panako-db"),
     panako_tool_dir: Path = Path("data/local/panako"),
     progress: ProgressFn | None = None,
 ) -> int:
     app_config = app_config or AppConfig()
+    requested_recipe = recipe or get_recipe(
+        "deep" if primary_engine == "audd" else "free",
+        primary_density=app_config.deep_primary_density,
+    )
+    if requested_recipe.name == "free":
+        # The Free recipe's zero-dollar cap is structural: legacy --engine/profile state cannot
+        # smuggle a paid provider into this run while those options await removal in 0a-iii.
+        paid_engines = set(PAID_FILE_SCANNERS) | set(PAID_CLIP_ENGINES)
+        enabled_engines = tuple(engine for engine in enabled_engines if engine not in paid_engines)
+    elif "audd" not in enabled_engines:
+        enabled_engines = (*enabled_engines, "audd")
     run_id = uuid.uuid4().hex
     timer = InvocationTimer(run_id, ["analyse", url])
     media_dir: Path | None = None
@@ -403,6 +446,7 @@ async def _analyse(
     source_ids: list[str] = []
     source_lock: ProcessLock | None = None
     media_lock: ProcessLock | None = None
+    usd_admitter: UsdAdmitter | None = None
     counts = {
         "requests": 0,
         "physical_attempts": 0,
@@ -451,6 +495,39 @@ async def _analyse(
         timer.finish_stage("windows_ms")
         _report(progress, "windows", 1, 1, f"{len(windows.records)} windows")
 
+        if requested_recipe.name == "deep":
+            frozen_windows = [
+                window
+                for window in windows.records
+                if window.generation == 0 and window.transform.type == "none"
+            ]
+            planned = (
+                len(frozen_windows) + requested_recipe.primary_density - 1
+            ) // requested_recipe.primary_density
+            counts["paid_planned"] = planned
+            try:
+                reservation = reserve_usd(
+                    planned=planned,
+                    unit_usd_e6=app_config.audd_usd_e6_per_request,
+                    recipe_max_usd_e2=requested_recipe.max_usd_e2,
+                    configured_max_usd_e2=app_config.max_usd_e2,
+                )
+            except BudgetExhausted as exc:
+                entry = timer.entry(
+                    status="budget_exhausted",
+                    reason="reservation_exceeds_cap",
+                    exit_code=4,
+                    counts=counts,
+                    costs={"usd_e2": 0},
+                    source_ids=source_ids,
+                    ffmpeg_version=ffmpeg_version,
+                    **_money_journal_fields(_settle_money(None), requested_recipe, app_config),
+                )
+                _report(progress, "recognise", 0, planned, str(exc))
+                append_invocation(media_dir / "invocations.jsonl", entry)
+                return 4
+            usd_admitter = UsdAdmitter(reservation)
+
         timer.start_stage("recognise_ms")
 
         def _on_recognise_window(done: int, total: int) -> None:
@@ -478,7 +555,7 @@ async def _analyse(
         # Which engine identifies the WHOLE mix first (generation 0).  Free = the rate-limited free
         # engine.  Paid-first (max_accuracy) = the paid engine, which is ~4-6x faster and has no
         # rate limit, so it does the bulk and the free engine only fills the spans it left blank.
-        paid_first = primary_engine == "audd" and "audd" in enabled_engines
+        paid_first = requested_recipe.primary_engine == "audd" and "audd" in enabled_engines
         primary_clip = PaidScanResult()
         gen0_observations: tuple[object, ...] = ()
         gen0_observations_path: Path | None = None
@@ -499,6 +576,8 @@ async def _analyse(
                 refresh=refresh,
                 refresh_states=refresh_states,
                 max_clips=len(windows.records) + 1,  # the whole mix, no per-mix cap
+                primary_density=requested_recipe.primary_density,
+                usd_admitter=usd_admitter,
                 adapters=paid_scan_adapters,
                 log=lambda message: _report(progress, "recognise", 0, 1, message),
             )
@@ -511,7 +590,7 @@ async def _analyse(
                     "paid_billable_units": primary_clip.billable_units,
                 }
             )
-            if primary_clip.observations:
+            if primary_clip.observations or primary_clip.reservation_exhausted:
                 gen0_observations = primary_clip.observations
                 gen0_observations_path = primary_clip.observation_paths[0]
                 counts["matches"] = sum(
@@ -520,13 +599,16 @@ async def _analyse(
             else:
                 # A Deep request never silently turns into a Free request. The explicit local
                 # --allow-degrade restart belongs to 0a-iv; for now this is terminal and unspent.
+                settlement = _settle_money(usd_admitter)
                 entry = timer.entry(
                     status="provider_unavailable",
+                    reason=None,
                     exit_code=3,
                     counts=counts,
-                    costs={"usd_e2": 0},
+                    costs={"usd_e2": settlement.usd_e2_spent},
                     source_ids=source_ids,
                     ffmpeg_version=ffmpeg_version,
+                    **_money_journal_fields(settlement, requested_recipe, app_config),
                 )
                 append_invocation(media_dir / "invocations.jsonl", entry)
                 return 3
@@ -555,7 +637,10 @@ async def _analyse(
         # In paid-first mode the paid engine already scanned the whole mix as generation 0, so the
         # (consent-gated) whole-file scan would be redundant — skip it.
         paid_scan = PaidScanResult()
-        if enabled_engines and not paid_first:
+        # Gate on a PAID scanner being enabled, not on any engine being enabled: the free recipe
+        # keeps "shazam" in enabled_engines, and entering here would announce "cross-checking with
+        # paid engines" and time a scan stage for a run whose cap forbids every paid call.
+        if set(enabled_engines) & set(PAID_FILE_SCANNERS) and not paid_first:
             _report(progress, "scan", 0, 1, "cross-checking with paid engines")
             timer.start_stage("scan_ms")
             paid_scan = await run_paid_scanners(
@@ -688,7 +773,7 @@ async def _analyse(
             timer.finish_stage("refuse_ms")
             _report(progress, "fuse", 1, 1, f"{len(fused.episodes.episodes)} episodes")
 
-        if paid_first:
+        if paid_first and not primary_clip.reservation_exhausted:
             # The paid engine identified the whole mix; the free engine now fills only the spans
             # it left blank (typically the underground tracks no commercial catalogue holds), so it
             # runs over a handful of windows instead of all of them — the point of paid-first.
@@ -785,7 +870,6 @@ async def _analyse(
                     cli_confirmation=cli_confirmation,
                     refresh=refresh,
                     refresh_states=refresh_states,
-                    max_clips=max_paid_clips,
                     adapters=paid_scan_adapters,
                     log=lambda message: _report(progress, "scan", 0, 1, message),
                 )
@@ -852,37 +936,46 @@ async def _analyse(
                 f"(stop={orchestrated.stop_reason}); "
                 f"{len(fused.episodes.episodes)} episodes; tracklist={exported.json_path}"
             )
+        settlement = _settle_money(usd_admitter)
         entry = timer.entry(
-            status="succeeded",
+            status="partial" if primary_clip.reservation_exhausted else "succeeded",
+            reason="reservation_exhausted" if primary_clip.reservation_exhausted else None,
             exit_code=0,
             counts=counts,
-            costs={"usd_e2": 0},
+            costs={"usd_e2": settlement.usd_e2_spent},
             source_ids=source_ids,
             ffmpeg_version=ffmpeg_version,
+            **_money_journal_fields(settlement, requested_recipe, app_config),
         )
         append_invocation(media_dir / "invocations.jsonl", entry)
         return 0
     except asyncio.CancelledError:
         if media_dir is not None:
+            settlement = _settle_money(usd_admitter)
             entry = timer.entry(
                 status="cancelled",
+                reason=None,
                 exit_code=130,
                 counts=counts,
-                costs={"usd_e2": 0},
+                costs={"usd_e2": settlement.usd_e2_spent},
                 source_ids=source_ids,
                 ffmpeg_version=ffmpeg_version,
+                **_money_journal_fields(settlement, requested_recipe, app_config),
             )
             append_invocation(media_dir / "invocations.jsonl", entry)
         raise
     except Exception:
         if media_dir is not None:
+            settlement = _settle_money(usd_admitter)
             entry = timer.entry(
                 status="failed",
+                reason=None,
                 exit_code=1,
                 counts=counts,
-                costs={"usd_e2": 0},
+                costs={"usd_e2": settlement.usd_e2_spent},
                 source_ids=source_ids,
                 ffmpeg_version=ffmpeg_version,
+                **_money_journal_fields(settlement, requested_recipe, app_config),
             )
             append_invocation(media_dir / "invocations.jsonl", entry)
         raise
@@ -946,6 +1039,14 @@ def analyse(
             "a frozen artefact is rejected. Overrides --config's schedule/transform tables."
         ),
     ),
+    recipe: str | None = typer.Option(
+        None,
+        "--recipe",
+        help=(
+            "Select the scan recipe ('free' or 'deep'). Defaults to deep for the legacy "
+            "max_accuracy profile and free otherwise."
+        ),
+    ),
     confirm_mirror: list[str] | None = typer.Option(  # noqa: B008
         None,
         "--confirm-mirror",
@@ -997,16 +1098,6 @@ def analyse(
         "--fake-providers",
         hidden=True,
     ),
-    max_paid_clips: int = typer.Option(
-        DEFAULT_MAX_CLIPS,
-        "--max-paid-clips",
-        min=1,
-        help=(
-            "Per-mix budget of clips sent to a paid engine, spread evenly across the uncertain "
-            f"spans (default {DEFAULT_MAX_CLIPS} ≈ $0.75/mix at AudD's $5/1000). Raise to trade "
-            "cost for reach; only matters when a paid --engine is active."
-        ),
-    ),
     local_index: str | None = typer.Option(  # noqa: B008
         None,
         "--local-index",
@@ -1043,6 +1134,11 @@ def analyse(
             allow_third_party_upload=file_config.allow_third_party_upload,
             default_profile=file_config.default_profile,
             max_requests=file_config.max_requests,
+            pricing_version=file_config.pricing_version,
+            audd_usd_e6_per_request=file_config.audd_usd_e6_per_request,
+            bill_on_throttle=file_config.bill_on_throttle,
+            max_usd_e2=file_config.max_usd_e2,
+            deep_primary_density=file_config.deep_primary_density,
             lead_in_ms=file_config.lead_in_ms,
             cache_positive_max_age_days=file_config.cache_positive_max_age_days,
             cache_no_match_max_age_days=file_config.cache_no_match_max_age_days,
@@ -1125,6 +1221,28 @@ def analyse(
     if no_hints and (tracklist is not None or confirm_mirror):
         typer.echo("--tracklist/--confirm-mirror cannot be combined with --no-hints", err=True)
         raise typer.Exit(2)
+    # Recipe selection is the only thing that can start paid work. Without an explicit --recipe the
+    # legacy invocation keeps exactly the spend it had before recipes existed: max_accuracy went
+    # paid-first only when a paid clip engine was ALSO enabled (--engine audd). A bare
+    # `--profile max_accuracy` (or `default_profile = "max_accuracy"`) therefore never begins
+    # billing AudD on its own — `--recipe deep` is the explicit opt-in.
+    legacy_paid_first = selected_profile == "max_accuracy" and bool(
+        set(enabled_engines) & set(PAID_CLIP_ENGINES)
+    )
+    try:
+        requested_recipe = get_recipe(
+            recipe or ("deep" if legacy_paid_first else "free"),
+            primary_density=loaded_config.deep_primary_density,
+        )
+    except ValueError as exc:
+        typer.echo(redact_text(str(exc)), err=True)
+        raise typer.Exit(2) from None
+    if engine and requested_recipe.name == "free":
+        typer.echo(
+            "--engine is ignored by the free recipe (max_usd_e2 = 0); "
+            "pass --recipe deep to run a paid scan",
+            err=True,
+        )
     try:
         exit_code = asyncio.run(
             _analyse(
@@ -1147,12 +1265,10 @@ def analyse(
                 calibrator=calibrator,
                 enabled_engines=enabled_engines,
                 cli_confirmation=i_own_this_audio_or_have_permission,
-                # max_accuracy is now paid-first: the paid engine identifies the whole mix and the
-                # free engine only fills the gaps. Falls back to free-primary if audd isn't enabled.
-                primary_engine="audd" if selected_profile == "max_accuracy" else "shazam",
+                primary_engine=requested_recipe.primary_engine,
+                recipe=requested_recipe,
                 paid_scan_adapters=paid_scan_adapters,
                 shazam_http_client=shazam_http_client,
-                max_paid_clips=max_paid_clips,
                 local_index_label=local_index,
                 index_root=index_root,
                 panako_tool_dir=panako_tool_dir,
