@@ -524,25 +524,12 @@ _FORM_JS = """
     var f = input.form, parts = [];
     parts.push(f.querySelector('input[name=acquire]').checked
       ? 'download links on' : 'download links off');
-    if(f.querySelector('input[name=build_index]').checked) parts.push('reference index');
-    var uc = f.querySelector('input[name=upload_consent]');
-    if(uc && uc.checked) parts.push('whole-file upload');
     sum.textContent = parts.join(' · ');
-  }
-  var consent = document.getElementById('consent-row');
-  function gateConsent(){
-    if(!consent) return;
-    var prof = input.form.querySelector('input[name=profile]:checked');
-    var max = prof && prof.value === 'max_accuracy';
-    consent.hidden = !max;
-    if(!max){
-      var c = consent.querySelector('input[name=upload_consent]'); if(c) c.checked = false;
-    }
   }
   Array.prototype.forEach.call(input.form.querySelectorAll(
   'input[type=radio],input[type=checkbox]'),
-    function(el){ el.addEventListener('change', function(){ summary(); gateConsent(); }); });
-  summary(); gateConsent();
+    function(el){ el.addEventListener('change', summary); });
+  summary();
 })();
 """
 
@@ -825,8 +812,8 @@ def _form_html(prefill: str = "") -> str:
         "<span><b>Free</b><small>no key needed — identifies tracks and reads the crowd's "
         "comments</small></span></label>"
         '<label class="segopt"><input type="radio" name="profile" value="max_accuracy">'
-        "<span><b>Paid cross-check</b><small>a second recogniser confirms the uncertain tracks "
-        "(about $0.75 a mix)</small></span></label>"
+        "<span><b>Max accuracy</b><small>a paid engine leads and confirms the tracks "
+        "(about $2 a mix)</small></span></label>"
         "</div>"
         # Step 2 — everything else, collapsed. Download links default on for both modes; the rest is
         # power-user territory.
@@ -838,15 +825,6 @@ def _form_html(prefill: str = "") -> str:
         "<span><b>Buy / download links</b>"
         "<small>on by default — where to get each track (free download, buy, or gated) on the "
         "result page</small></span></label>"
-        '<label class="tog consent" id="consent-row" hidden>'
-        '<input type="checkbox" name="upload_consent" value="1"><span class="sw"></span>'
-        "<span><b>I own this audio — also send the whole file</b>"
-        "<small>Not needed for the paid cross-check, which already works clip-by-clip. Tick only "
-        "to additionally upload the full file, for a mix you own.</small></span></label>"
-        '<label class="tog"><input type="checkbox" name="build_index" value="1">'
-        '<span class="sw"></span><span><b>Build a reference index first</b>'
-        "<small>fingerprints this uploader's own tracks — only helps if the DJ plays their own "
-        "unreleased edits in the mix</small></span></label>"
         '<label class="tlbox"><span class="tlbox-h"><b>Know part of the tracklist?</b>'
         "<small>Paste anything you can already see — from 1001tracklists, a YouTube "
         "description, a comment — to guide the analysis. One track per line, ideally "
@@ -976,13 +954,13 @@ def _new_html(prefill: str = "") -> bytes:
         + "</header>"
         '<h2 class="sec">How it works</h2><div class="how">'
         '<div><span class="n">1</span><b>Paste a mix</b>'
-        "<small>A SoundCloud, YouTube or Mixcloud link — or an audio file on your machine.</small>"
+        "<small>A SoundCloud, YouTube or an audio file on your machine.</small>"
         "</div>"
         '<div><span class="n">2</span><b>It gets identified</b>'
-        "<small>The set is listened to track by track and cross-checked against what the crowd "
+        "<small>The set is analyzed track by track and also cross-checked against what the crowd "
         "says in the comments.</small></div>"
         '<div><span class="n">3</span><b>Your tracklist</b>'
-        "<small>Every track with its start time and an honest confidence rating — unknown "
+        "<small>Every track with its start time and an honest confidence rating. Unknown "
         "stretches stay marked ID.</small></div>"
         '<div><span class="n">4</span><b>Play &amp; grab it</b>'
         "<small>Click any track to jump the player there, then follow the buy / free-download "
