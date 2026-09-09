@@ -33,11 +33,20 @@ GATE_HOSTS = frozenset(
 
 
 def _search_query(artist: str, title: str) -> str:
+    """The store-search term: artist plus the BASE title only.
+
+    A version qualifier — ``(Extended Mix)``, ``[Chris Lake Remix]``, ``(feat. …)`` — makes a store
+    search over-specific and usually returns nothing (that is why "Jeno & Wempe In the Air (Extended
+    Mix)" found zero Bandcamp results), so search on the core artist + base title (``parse_title``
+    drops the parenthetical/version material) and let the store surface the right edition.
+    """
+
     base, _version = parse_title(title)
-    # Keep the raw artist and title words; drop only empties.  This mirrors the plan's `<artist
-    # title>` search term while staying deterministic.
-    parts = [part for part in (artist.strip(), title.strip()) if part]
-    return " ".join(parts) if parts else " ".join(base)
+    base_title = " ".join(base)
+    parts = [part for part in (artist.strip(), base_title.strip()) if part]
+    if parts:
+        return " ".join(parts)
+    return base_title or title.strip()
 
 
 def search_links(artist: str, title: str) -> list[dict[str, str]]:
