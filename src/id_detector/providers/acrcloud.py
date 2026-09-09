@@ -9,7 +9,11 @@ Anchor convention: when sample/database offsets are present, the paired anchor i
 from __future__ import annotations
 
 import asyncio
+import base64
+import hashlib
+import hmac
 import os
+import time
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
@@ -29,6 +33,7 @@ from id_detector.contracts import (
     ObservationRecord,
     QueryRecord,
     RawLabel,
+    WindowRecord,
     compose_natural_key,
     file_scan_cache_key,
     make_id,
@@ -101,6 +106,168 @@ class ACRCloudCredentials:
         if not urlsplit(value).scheme:
             value = "https://" + value
         return value if value.endswith("/api") else value + "/api"
+
+
+# --------------------------------------------------------------------------------------------------
+# Clip recognition (real-time identify API — the gate-free path, mirrors the AudD clip path)
+# --------------------------------------------------------------------------------------------------
+IDENTIFY_PATH = "/v1/identify"
+CLIP_CONFIG_VERSION = "acrcloud-identify-v1"
+
+
+def _identify_url(host: str) -> str:
+    value = host.rstrip("/")
+    if not urlsplit(value).scheme:
+        value = "https://" + value
+    return value + IDENTIFY_PATH
+
+
+def _sign(access_key: str, access_secret: str, timestamp: str) -> str:
+    string_to_sign = "\n".join(["POST", IDENTIFY_PATH, access_key, "audio", "1", timestamp])
+    digest = hmac.new(
+        access_secret.encode("utf-8"), string_to_sign.encode("utf-8"), hashlib.sha1
+    ).digest()
+    return base64.b64encode(digest).decode("ascii")
+
+
+@dataclass
+class ACRCloudClipAdapter:
+    """ACRCloud's real-time identify API for short clips (mirrors :class:`AudDAdapter` clips).
+
+    HMAC-signed with the project access key/secret; needs no whole-file upload or container — the
+    same shape as the Shazam/AudD clips we already send gate-free.
+    """
+
+    credentials: ACRCloudCredentials
+    transport: httpx.AsyncBaseTransport | None = None
+
+    async def recognize_clip(self, path: Path, on_attempt: AttemptCallback) -> dict[str, Any]:
+        if not path_is_file(path):
+            raise FileNotFoundError(path)
+        sample = Path(native_path(path)).read_bytes()
+        timestamp = str(int(time.time()))
+        data = {
+            "access_key": self.credentials.access_key,
+            "data_type": "audio",
+            "signature_version": "1",
+            "signature": _sign(
+                self.credentials.access_key, self.credentials.access_secret, timestamp
+            ),
+            "sample_bytes": str(len(sample)),
+            "timestamp": timestamp,
+        }
+        timeout = httpx.Timeout(connect=30, write=120, read=120, pool=30)
+        try:
+            await on_attempt()
+            async with httpx.AsyncClient(
+                transport=self.transport, timeout=timeout, follow_redirects=False
+            ) as client:
+                result = await client.post(
+                    _identify_url(self.credentials.host),
+                    data=data,
+                    files={"sample": (path.name, sample, "application/octet-stream")},
+                )
+        except (httpx.TimeoutException, httpx.NetworkError) as exc:
+            raise AmbiguousProviderOutcome("ACRCloud clip response was lost") from exc
+        if result.status_code >= 400:
+            raise ProviderProtocolError(f"ACRCloud HTTP {result.status_code}")
+        try:
+            payload = result.json()
+        except ValueError as exc:
+            raise ProviderProtocolError("ACRCloud returned a non-JSON response") from exc
+        if not isinstance(payload, dict):
+            raise ProviderProtocolError("ACRCloud response root is not an object")
+        return redact_value(payload)
+
+
+def _acrcloud_provider_ids(music: Mapping[str, Any]) -> dict[str, Any]:
+    ids: dict[str, Any] = {}
+    external_ids = music.get("external_ids")
+    if isinstance(external_ids, Mapping) and external_ids.get("isrc"):
+        ids["isrc"] = str(external_ids["isrc"])
+    external = music.get("external_metadata")
+    if isinstance(external, Mapping):
+        for platform in ("spotify", "deezer", "youtube"):
+            node = external.get(platform)
+            if node:  # the platform's own track id/url — feeds the "where to get it" links
+                ids[f"acrcloud_{platform}"] = canonicalize_provider_json(node)
+    return ids
+
+
+def acrcloud_clip_response_to_observation(
+    response: Mapping[str, Any],
+    *,
+    query: QueryRecord,
+    window: WindowRecord,
+    media_key: str,
+    raw_response_ref: str,
+) -> ObservationRecord:
+    """Turn one ACRCloud identify response into a positioned ``clip_recognizer`` observation."""
+
+    status_node = response.get("status")
+    code = status_node.get("code") if isinstance(status_node, Mapping) else None
+    music: Mapping[str, Any] | None = None
+    metadata = response.get("metadata")
+    if isinstance(metadata, Mapping):
+        songs = metadata.get("music")
+        if isinstance(songs, list) and songs and isinstance(songs[0], Mapping):
+            music = songs[0]
+    if music is None:
+        # code 0 = success, 1001 = no result; anything else is a real protocol/credential error.
+        if code not in (0, 1001, None):
+            raise ProviderProtocolError(f"ACRCloud identify error code {code}")
+        label = RawLabel(artist=None, title=None, album=None, label=None, release_date=None)
+        status = "no_match"
+        provider_ids: dict[str, Any] = {}
+        native: dict[str, Any] = {"music": None}
+    else:
+        status = "match"
+        artists = music.get("artists")
+        artist = None
+        if isinstance(artists, list):
+            names = [str(a["name"]) for a in artists if isinstance(a, Mapping) and a.get("name")]
+            artist = ", ".join(names) if names else None
+        album = music.get("album")
+        label = RawLabel(
+            artist=artist,
+            title=str(music["title"]) if music.get("title") else None,
+            album=str(album["name"]) if isinstance(album, Mapping) and album.get("name") else None,
+            label=str(music["label"]) if music.get("label") else None,
+            release_date=str(music["release_date"]) if music.get("release_date") else None,
+        )
+        provider_ids = _acrcloud_provider_ids(music)
+        native = {"music": canonicalize_provider_json(music)}
+    label_hash = sha256(canonical_json_bytes(label)).hexdigest()
+    natural = {
+        "query_id": query.id,
+        "mix_span_ms": list(window.support_ms),
+        "raw_label_hash": label_hash,
+        "native_index": 0,
+        "transform": window.transform.model_dump(mode="json"),
+    }
+    return ObservationRecord(
+        schema_version=SCHEMA_VERSION,
+        generated_by=GENERATED_BY,
+        id=make_id(media_key, "observation", compose_natural_key("observation", natural)),
+        generation=query.generation,
+        query_id=query.id,
+        provider=PROVIDER,
+        capability="clip_recognizer",
+        status=status,
+        is_final=True,
+        mix_span_ms=window.support_ms,
+        support_ms=window.support_ms,
+        transform=window.transform,
+        logical_trial_id=window.logical_trial_id,
+        raw_label=label,
+        provider_ids=provider_ids,
+        native=native,
+        anchor=None,
+        score_raw=None,
+        quality=None,
+        raw_response_ref=raw_response_ref,
+        source_ids=[f"query:{query.id}", f"window:{window.id}"],
+    )
 
 
 @dataclass(frozen=True)
