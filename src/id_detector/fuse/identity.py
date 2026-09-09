@@ -353,6 +353,32 @@ def build_identity_graph(
                 )
                 assertion_by_id[item.id] = item
 
+    # Two crowd IDs of the SAME track — "Entasia - Satalite" and "Entasia - Satalite (unreleased)",
+    # "…Pump It" and "…Pump It (Club Royalty 3)" — otherwise land in separate works and the track is
+    # listed twice.  Union hint text nodes with each OTHER on the same conservative word-set rule
+    # (subset with >=2 words, or a near-spelled long token), so a track named more than once in the
+    # comments is one identity.  Audio-matched hints are excluded — they already joined the audio
+    # work above, and a distinct node only ever merges the pair, never a wider chain.
+    unmatched = sorted(
+        (hint_id, node) for hint_id, node in hint_text.items() if node not in audio_text_nodes
+    )
+    for index, (hint_a, node_a) in enumerate(unmatched):
+        words_a = _words(node_a)
+        for _hint_b, node_b in unmatched[index + 1 :]:
+            if node_a == node_b or not _word_sets_corroborate(words_a, _words(node_b)):
+                continue
+            item = _assertion(
+                media_key,
+                a=node_a,
+                b=node_b,
+                relation="same_work",
+                source_kind="hint_text_match",
+                source_record_id=hint_a,
+                independent_of="hint:comment_answer",
+                confidence=6_000,
+            )
+            assertion_by_id[item.id] = item
+
     assertions = sorted(assertion_by_id.values(), key=lambda item: item.id)
     # Reuse the Stage 0 helper; this call is intentionally not duplicated below.
     merged = merge_recording_identities(
