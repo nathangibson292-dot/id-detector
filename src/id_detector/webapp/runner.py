@@ -163,6 +163,8 @@ def make_pipeline_runner(
                 calibrator=settings.calibrator,
                 enabled_engines=engines,
                 cli_confirmation=ctx.upload_consent,
+                # max_accuracy is paid-first: the paid engine leads, the free engine fills the gaps.
+                primary_engine="audd" if ctx.profile == "max_accuracy" else "shazam",
                 progress=progress,
             )
         )

@@ -58,6 +58,47 @@ def confident_coverage(episodes: list[EpisodeRecord] | tuple[EpisodeRecord, ...]
     return _merge(spans)
 
 
+def any_coverage(episodes: list[EpisodeRecord] | tuple[EpisodeRecord, ...]) -> list[Span]:
+    """The merged spans covered by ANY non-suppressed match, whatever its confidence."""
+
+    spans = [
+        (episode.best_start_ms, max(episode.best_start_ms, episode.best_end_ms))
+        for episode in episodes
+        if not episode.suppressed
+    ]
+    return _merge(spans)
+
+
+def _targets_from_coverage(
+    covered: list[Span],
+    duration_ms: int,
+    *,
+    min_target_ms: int,
+    bridge_ms: int,
+    pad_ms: int,
+) -> tuple[Span, ...]:
+    """Turn a covered set into padded, bridged target spans (its complement within the mix)."""
+
+    if duration_ms <= 0:
+        return ()
+    remaining: list[Span] = []
+    cursor = 0
+    for start, end in covered:
+        if start > cursor:
+            remaining.append((cursor, min(start, duration_ms)))
+        cursor = max(cursor, end)
+    if cursor < duration_ms:
+        remaining.append((cursor, duration_ms))
+    bridged: list[Span] = []
+    for start, end in remaining:
+        if bridged and start - bridged[-1][1] <= bridge_ms:
+            bridged[-1] = (bridged[-1][0], end)
+        else:
+            bridged.append((start, end))
+    padded = _merge([(max(0, s - pad_ms), min(duration_ms, e + pad_ms)) for s, e in bridged])
+    return tuple((s, e) for s, e in padded if e - s >= min_target_ms)
+
+
 def select_scan_targets(
     episodes: list[EpisodeRecord] | tuple[EpisodeRecord, ...],
     duration_ms: int,
@@ -74,29 +115,35 @@ def select_scan_targets(
     recognisable ~12 s chunk.  Returns () when the whole mix is already confident (skip paid).
     """
 
-    if duration_ms <= 0:
-        return ()
-    confident = confident_coverage(episodes)
-    # Complement of the confident cover within [0, duration_ms].
-    uncertain: list[Span] = []
-    cursor = 0
-    for start, end in confident:
-        if start > cursor:
-            uncertain.append((cursor, min(start, duration_ms)))
-        cursor = max(cursor, end)
-    if cursor < duration_ms:
-        uncertain.append((cursor, duration_ms))
-    # Bridge across thin confident slivers, then pad and clamp.
-    bridged: list[Span] = []
-    for start, end in uncertain:
-        if bridged and start - bridged[-1][1] <= bridge_ms:
-            bridged[-1] = (bridged[-1][0], end)
-        else:
-            bridged.append((start, end))
-    padded = _merge(
-        [(max(0, s - pad_ms), min(duration_ms, e + pad_ms)) for s, e in bridged]
+    return _targets_from_coverage(
+        confident_coverage(episodes),
+        duration_ms,
+        min_target_ms=min_target_ms,
+        bridge_ms=bridge_ms,
+        pad_ms=pad_ms,
     )
-    return tuple((s, e) for s, e in padded if e - s >= min_target_ms)
+
+
+def select_gap_targets(
+    episodes: list[EpisodeRecord] | tuple[EpisodeRecord, ...],
+    duration_ms: int,
+    *,
+    min_target_ms: int = 8_000,
+    bridge_ms: int = 4_000,
+    pad_ms: int = 3_000,
+) -> tuple[Span, ...]:
+    """The spans a paid-first primary left BLANK — no match of any confidence — for the free engine
+    to fill.  Same shape as :func:`select_scan_targets`, but the complement of ANY coverage rather
+    than only confident coverage, so the free pass only runs where the paid pass found nothing.
+    """
+
+    return _targets_from_coverage(
+        any_coverage(episodes),
+        duration_ms,
+        min_target_ms=min_target_ms,
+        bridge_ms=bridge_ms,
+        pad_ms=pad_ms,
+    )
 
 
 def targets_total_ms(targets: tuple[Span, ...] | list[Span]) -> int:

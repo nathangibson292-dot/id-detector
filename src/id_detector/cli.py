@@ -60,7 +60,7 @@ from id_detector.providers.base import AppConfig
 from id_detector.recognise import recognise_generation
 from id_detector.rescan import DEFAULT_MAX_GENERATIONS
 from id_detector.scan import PAID_FILE_SCANNERS, PaidScanResult, run_paid_scanners
-from id_detector.scan_targeting import select_scan_targets
+from id_detector.scan_targeting import select_gap_targets, select_scan_targets
 from id_detector.truth import (
     freeze_truth,
     resolve_truth,
@@ -69,7 +69,12 @@ from id_detector.truth import (
     verify_truth,
     write_draft_manifest,
 )
-from id_detector.windows import TransformGrid, WindowSchedule, generate_windows_async
+from id_detector.windows import (
+    TransformGrid,
+    WindowSchedule,
+    WindowsResult,
+    generate_windows_async,
+)
 
 #: A pipeline progress hook: ``(phase, done, total, message)``.  ``phase`` is one of ``ingest``,
 #: ``decode``, ``windows``, ``recognise``, ``hints``, ``fuse``, ``enrich`` or ``present``.  It is
@@ -347,6 +352,23 @@ def _validate_config_or_exit() -> None:
         temp_path.unlink(missing_ok=True)
 
 
+def _windows_in_spans(
+    windows: WindowsResult, spans: tuple[tuple[int, int], ...]
+) -> WindowsResult:
+    """A WindowsResult holding only the generation-0 windows whose start falls in one of ``spans``.
+
+    Used by the paid-first path to run the free engine over just the gap spans the paid engine left
+    blank, instead of the whole mix.
+    """
+
+    keep = tuple(
+        window
+        for window in windows.records
+        if any(lo <= window.support_ms[0] < hi for lo, hi in spans)
+    )
+    return WindowsResult(records=keep, record_path=windows.record_path, cached=windows.cached)
+
+
 async def _analyse(
     url: str,
     *,
@@ -363,6 +385,7 @@ async def _analyse(
     calibrator: object | None = None,
     enabled_engines: tuple[str, ...] = (),
     cli_confirmation: bool = False,
+    primary_engine: str = "shazam",
     paid_scan_adapters: Mapping[str, object] | None = None,
     max_paid_clips: int = DEFAULT_MAX_CLIPS,
     local_index_label: str | None = None,
@@ -448,27 +471,64 @@ async def _analyse(
                 on_window=_on_recognise_window if progress is not None else None,
             )
 
-        recognised = await recognise_windows(windows=windows, generation=0)
+        # Which engine identifies the WHOLE mix first (generation 0).  Free = the rate-limited free
+        # engine.  Paid-first (max_accuracy) = the paid engine, which is ~4-6x faster and has no
+        # rate limit, so it does the bulk and the free engine only fills the spans it left blank.
+        paid_first = primary_engine == "audd" and "audd" in enabled_engines
+        primary_clip = PaidScanResult()
+        gen0_observations: tuple[object, ...] = ()
+        gen0_observations_path: Path | None = None
+        gen0_requests = 0
+        gen0_physical = 0
+        if paid_first:
+            _report(progress, "recognise", 0, 1, "identifying the whole mix (paid)")
+            primary_clip = await run_paid_clip_recognition(
+                media_key=ingested.record.media_key,
+                media_dir=media_dir,
+                windows=windows,
+                targets=((0, decoded.record.pcm.duration_ms),),
+                run_id=run_id,
+                app_config=app_config,
+                enabled_engines=enabled_engines,
+                cli_confirmation=cli_confirmation,
+                refresh=refresh,
+                max_clips=len(windows.records) + 1,  # the whole mix, no per-mix cap
+                adapters=paid_scan_adapters,
+                log=lambda message: _report(progress, "recognise", 0, 1, message),
+            )
+            if primary_clip.observations:
+                gen0_observations = primary_clip.observations
+                gen0_observations_path = primary_clip.observation_paths[0]
+                counts["matches"] = sum(
+                    item.status == "match" for item in primary_clip.observations
+                )
+            else:  # no key / unavailable — fall back to the free engine as primary
+                paid_first = False
+        if not paid_first:
+            recognised = await recognise_windows(windows=windows, generation=0)
+            gen0_observations = recognised.observations
+            gen0_observations_path = recognised.observations_path
+            gen0_requests = recognised.requests
+            gen0_physical = recognised.physical_attempts
+            matches = [item for item in recognised.observations if item.status == "match"]
+            counts.update(
+                {
+                    "requests": recognised.requests,
+                    "physical_attempts": recognised.physical_attempts,
+                    "matches": len(matches),
+                    "failures": recognised.failures,
+                    "cache_hits": recognised.cache_hits,
+                }
+            )
         timer.finish_stage("recognise_ms")
-        matches = sorted(
-            (item for item in recognised.observations if item.status == "match"),
-            key=lambda item: (item.mix_span_ms[0], item.id),
-        )
-        counts.update(
-            {
-                "requests": recognised.requests,
-                "physical_attempts": recognised.physical_attempts,
-                "matches": len(matches),
-                "failures": recognised.failures,
-                "cache_hits": recognised.cache_hits,
-            }
-        )
 
         # Paid whole-file scanners (AudD/ACRCloud) run once here when the active profile enables
         # them AND credentials + upload consent are present; otherwise this is a no-op and the free
         # path is untouched.  Their observations join generation 0 as a static evidence set.
+        # In paid-first mode the paid engine already scanned the whole mix as generation 0, so the
+        # (consent-gated) whole-file scan would be redundant — skip it.
         paid_scan = PaidScanResult()
-        if enabled_engines:
+        if enabled_engines and not paid_first:
             _report(progress, "scan", 0, 1, "cross-checking with paid engines")
             timer.start_stage("scan_ms")
             paid_scan = await run_paid_scanners(
@@ -527,8 +587,8 @@ async def _analyse(
                 media_dir=media_dir,
                 decoded=decoded,
                 windows=windows,
-                observations=recognised.observations,
-                observations_path=recognised.observations_path,
+                observations=gen0_observations,
+                observations_path=gen0_observations_path,
                 recognise=recognise_windows,
                 app_config=app_config,
                 extra_observations=extra_observations,
@@ -538,8 +598,8 @@ async def _analyse(
                 max_generations=max_generations,
                 request_budget=max_requests,
                 novelty_enabled=novelty,
-                gen0_requests=recognised.requests,
-                gen0_physical_attempts=recognised.physical_attempts,
+                gen0_requests=gen0_requests,
+                gen0_physical_attempts=gen0_physical,
                 calibrator=calibrator,
             )
 
@@ -570,7 +630,9 @@ async def _analyse(
         # A no-op unless a lever is enabled and uncertain spans remain.
         clip_scan = PaidScanResult()
         index_scan = PaidScanResult()
-        want_clips = bool(set(enabled_engines) & set(PAID_CLIP_ENGINES))
+        # In paid-first mode the paid engine already covered the whole mix, so the paid CLIP lever
+        # is not a phase-2 step here; the free engine's gap-fill is.
+        want_clips = bool(set(enabled_engines) & set(PAID_CLIP_ENGINES)) and not paid_first
         want_index = local_index_label is not None
 
         async def _refuse_with(*scans: PaidScanResult) -> None:
@@ -594,7 +656,54 @@ async def _analyse(
             timer.finish_stage("refuse_ms")
             _report(progress, "fuse", 1, 1, f"{len(fused.episodes.episodes)} episodes")
 
-        if want_clips or want_index:
+        if paid_first:
+            # The paid engine identified the whole mix; the free engine now fills only the spans
+            # it left blank (typically the underground tracks no commercial catalogue holds), so it
+            # runs over a handful of windows instead of all of them — the point of paid-first.
+            gaps = select_gap_targets(fused.episodes.episodes, decoded.record.pcm.duration_ms)
+            gap_windows = _windows_in_spans(windows, gaps)
+            gap_scan = PaidScanResult()
+            if gap_windows.records:
+                _report(
+                    progress, "scan", 0, len(gap_windows.records), "filling the gaps (free engine)"
+                )
+                timer.start_stage("gapfill_ms")
+                gap_rec = await recognise_windows(windows=gap_windows, generation=0)
+                timer.finish_stage("gapfill_ms")
+                counts["gap_matches"] = sum(
+                    item.status == "match" for item in gap_rec.observations
+                )
+                counts["requests"] = counts.get("requests", 0) + gap_rec.requests
+                if any(item.status == "match" for item in gap_rec.observations):
+                    gap_scan = PaidScanResult(
+                        observations=tuple(gap_rec.observations),
+                        observation_paths=(gap_rec.observations_path,),
+                    )
+                    await _refuse_with(gap_scan)
+            # Panako can still recover the DJ's own unreleased edits in the still-uncertain spans.
+            if want_index:
+                idx_targets = select_scan_targets(
+                    fused.episodes.episodes, decoded.record.pcm.duration_ms
+                )
+                if idx_targets:
+                    index_scan = await run_local_index_recognition(
+                        media_key=ingested.record.media_key,
+                        media_dir=media_dir,
+                        windows=windows,
+                        targets=idx_targets,
+                        duration_ms=decoded.record.pcm.duration_ms,
+                        run_id=run_id,
+                        index_label=local_index_label,
+                        index_root=index_root,
+                        tool_dir=panako_tool_dir,
+                        log=lambda message: _report(progress, "scan", 0, 1, message),
+                    )
+                    counts["local_index_matches"] = sum(
+                        item.status == "match" for item in index_scan.observations
+                    )
+                    if any(item.status == "match" for item in index_scan.observations):
+                        await _refuse_with(gap_scan, index_scan)
+        elif want_clips or want_index:
             targets = select_scan_targets(fused.episodes.episodes, decoded.record.pcm.duration_ms)
             # Free lever first.
             if targets and want_index:
@@ -947,6 +1056,9 @@ def analyse(
                 calibrator=calibrator,
                 enabled_engines=enabled_engines,
                 cli_confirmation=i_own_this_audio_or_have_permission,
+                # max_accuracy is now paid-first: the paid engine identifies the whole mix and the
+                # free engine only fills the gaps. Falls back to free-primary if audd isn't enabled.
+                primary_engine="audd" if selected_profile == "max_accuracy" else "shazam",
                 max_paid_clips=max_paid_clips,
                 local_index_label=local_index,
                 index_root=index_root,

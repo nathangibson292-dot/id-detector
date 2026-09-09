@@ -52,6 +52,20 @@ def _run(**kwargs: object):
     return asyncio.run(run_paid_clip_recognition(**kwargs))  # type: ignore[arg-type]
 
 
+def test_windows_in_spans_subsets_gap_windows_for_the_free_engine_fill() -> None:
+    from id_detector.cli import _windows_in_spans
+
+    window = _golden_window()  # support_ms = (18000, 30000)
+    windows = WindowsResult(records=(window,), record_path=Path("w"), cached=True)
+    lo = window.support_ms[0]
+    # A span covering the window's start keeps it; one that doesn't drops it.
+    assert _windows_in_spans(windows, ((lo, lo + 1),)).records == (window,)
+    assert _windows_in_spans(windows, ((lo + 100_000, lo + 200_000),)).records == ()
+    # Metadata is carried through so the subset is a usable WindowsResult.
+    subset = _windows_in_spans(windows, ((lo, lo + 1),))
+    assert subset.record_path == windows.record_path and subset.cached == windows.cached
+
+
 def test_subsample_spreads_a_budget_evenly_across_the_timeline() -> None:
     items = list(range(100))
     # Under budget: everything is kept.

@@ -10,6 +10,7 @@ from types import SimpleNamespace
 from id_detector.scan_targeting import (
     remap_sliced_ms,
     remap_span,
+    select_gap_targets,
     select_scan_targets,
     slice_audio,
     targets_total_ms,
@@ -32,6 +33,27 @@ def test_targets_are_the_complement_of_confident_coverage() -> None:
     assert targets == ((0, 10_000), (25_000, 41_000), (44_000, 60_000))
     # We pay for the uncertain minutes only, not the whole hour.
     assert targets_total_ms(targets) < 60_000
+
+
+def test_gap_targets_are_the_complement_of_any_match_not_just_confident() -> None:
+    # Paid-first: the paid engine already ran the whole mix. The free engine should fill only the
+    # spans NOTHING matched — a merely "possible" match still counts as covered (unlike scan
+    # targets, which treat "possible" as uncertain and worth a paid cross-check).
+    episodes = [
+        ep("likely", 10_000, 25_000),  # covered both ways
+        ep("possible", 30_000, 40_000),  # a match exists -> a gap-fill SKIP, a scan-target HIT
+    ]
+    scan = select_scan_targets(episodes, 60_000, pad_ms=0, bridge_ms=0, min_target_ms=1_000)
+    gaps = select_gap_targets(episodes, 60_000, pad_ms=0, bridge_ms=0, min_target_ms=1_000)
+    # Scan (uncertain) includes the possible region; gaps exclude it.
+    assert scan == ((0, 10_000), (25_000, 60_000))
+    assert gaps == ((0, 10_000), (25_000, 30_000), (40_000, 60_000))
+
+
+def test_a_suppressed_match_leaves_a_gap() -> None:
+    # A suppressed episode is not real coverage, so its span is still a gap to fill.
+    episodes = [ep("possible", 20_000, 30_000, suppressed="buried")]
+    assert select_gap_targets(episodes, 60_000, pad_ms=0) == ((0, 60_000),)
 
 
 def test_all_confident_means_skip_paid_entirely() -> None:
