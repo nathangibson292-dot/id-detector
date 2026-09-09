@@ -62,6 +62,10 @@ HINT_CONNECTORS: tuple[str, ...] = (
     "tl1001",
     "pointer_import",
 )
+#: Connectors that stay off unless the ``[hints]`` table names them ``true``.  ``tl1001`` is
+#: default-disabled (plan 0a-iii): 1001tracklists is JS-gated, so its title search is dead weight
+#: and one more third party contacted per run.
+DEFAULT_DISABLED_HINT_CONNECTORS: frozenset[str] = frozenset({"tl1001"})
 
 
 class ProviderUnavailable(RuntimeError):
@@ -119,7 +123,7 @@ class AppConfig:
     cache_positive_max_age_days: int = DEFAULT_CACHE_POSITIVE_MAX_AGE_DAYS
     cache_no_match_max_age_days: int = DEFAULT_CACHE_NO_MATCH_MAX_AGE_DAYS
     hints_enabled: bool = True
-    disabled_hint_connectors: frozenset[str] = frozenset()
+    disabled_hint_connectors: frozenset[str] = DEFAULT_DISABLED_HINT_CONNECTORS
 
     @property
     def cache_positive_max_age_seconds(self) -> int:
@@ -310,14 +314,15 @@ def _hints_table(table: dict[str, object]) -> tuple[bool, frozenset[str]]:
     """Read the optional ``[hints]`` table: a global ``enabled`` plus per-connector switches.
 
     ``[hints] enabled = false`` turns every connector off (equivalent to ``--no-hints``); naming a
-    connector with ``false`` turns just that one off.  Unknown keys are rejected so a typo in a
-    connector name can never silently leave a connector running.
+    connector with ``false`` turns just that one off, and a default-disabled connector needs an
+    explicit ``true``.  Unknown keys are rejected so a typo in a connector name can never silently
+    leave a connector running.
     """
 
     enabled = table.get("enabled", True)
     if not isinstance(enabled, bool):
         raise ValueError("hints.enabled must be true or false")
-    disabled: set[str] = set()
+    disabled: set[str] = set(DEFAULT_DISABLED_HINT_CONNECTORS)
     for key, switch in table.items():
         if key == "enabled":
             continue
@@ -326,7 +331,9 @@ def _hints_table(table: dict[str, object]) -> tuple[bool, frozenset[str]]:
             raise ValueError(f"unknown hints connector {key!r}; known: {known}")
         if not isinstance(switch, bool):
             raise ValueError(f"hints.{key} must be true or false")
-        if not switch:
+        if switch:
+            disabled.discard(key)
+        else:
             disabled.add(key)
     return enabled, frozenset(disabled)
 

@@ -378,6 +378,23 @@ def _parse_counts(
     return hints, statuses
 
 
+#: The ``[hints]`` switch (``providers.base.HINT_CONNECTORS``) governing each pipeline connector
+#: whose name differs from its switch.  Without this map ``tl1001 = false`` never reached
+#: ``tl1001_search``, so the default-disabled connector would still have run — and ``mixcloud =
+#: false`` was the same silent no-op over both Mixcloud connectors.
+_CONNECTOR_SWITCHES: dict[str, str] = {
+    "tl1001_search": "tl1001",
+    "mixcloud_graphql": "mixcloud",
+    "mixcloud_description": "mixcloud",
+}
+
+
+def _connector_disabled(connector: str, disabled_connectors: frozenset[str]) -> bool:
+    return connector in disabled_connectors or (
+        _CONNECTOR_SWITCHES.get(connector) in disabled_connectors
+    )
+
+
 async def run_hints(
     *,
     source: SourceRecord,
@@ -423,7 +440,7 @@ async def run_hints(
         item_cap: int = 5_000,
         input_content_sha256: str = source_content_sha256,
     ) -> ConnectorOutput:
-        if connector in disabled_connectors:
+        if _connector_disabled(connector, disabled_connectors):
             disabled_output = ConnectorOutput()
             statuses.append(
                 {
@@ -438,6 +455,9 @@ async def run_hints(
                     "error": None,
                 }
             )
+            # ``_parse_counts`` zips statuses with outputs strictly; a status with no output
+            # would abort the whole hints stage the first time a switch was actually honoured.
+            status_outputs.append(disabled_output)
             return disabled_output
         output, status, result_path = await _execute(
             store=store,

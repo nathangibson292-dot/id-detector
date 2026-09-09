@@ -1,12 +1,11 @@
-"""AudD clip recognition for recipe-primary and legacy supplemental passes.
+"""AudD clip recognition — the Deep recipe's primary sweep.
 
-Recipe-primary deep scans sweep deterministic windows. Legacy supplemental scans send only clips
-in still-uncertain regions (see :func:`id_detector.scan_targeting.select_scan_targets`) to a
-paid recogniser's clip endpoint — the same ~12 s clips Shazam already sees, so there is no
-whole-file upload and no third-party-upload consent gate.  The resulting ``clip_recognizer``
-observations join the fuser and re-fuse alongside Shazam's: agreeing lifts a track's confidence,
-disagreeing lets a Shazam phantom be demoted, and a Shazam-blind (but catalogued) track is
-recovered.
+Recipe-primary deep scans sweep the frozen generation-0 windows at the recipe density and send
+each clip to a paid recogniser's clip endpoint — the same ~12 s clips Shazam already sees, so
+there is no whole-file upload and no third-party-upload consent gate.  The resulting
+``clip_recognizer`` observations are generation 0 for the fuser; the Shazam secondary
+(:mod:`id_detector.secondary_targeting`) then re-fuses alongside them: agreeing lifts a track's
+confidence, disagreeing lets a phantom be demoted, and a catalogue-blind track is recovered.
 
 Only validated match/no-match responses are cached by clip cache-key across runs. Matches are reused
 by default, while cached no-matches are re-queried by default and ``refresh_states`` controls that
@@ -38,6 +37,8 @@ from id_detector.contracts import (
 )
 from id_detector.io import atomic_write_json, path_is_file, read_text
 from id_detector.money import (
+    TERMINAL_PROVIDER_OUTCOMES,
+    UNREACHABLE_OUTCOMES,
     ReservationExhausted,
     UsdAdmitter,
 )
@@ -61,8 +62,9 @@ from id_detector.windows import WindowsResult
 #: Paid clip-recognition engines (only AudD for now; ACRCloud is whole-file-only in this codebase).
 PAID_CLIP_ENGINES: tuple[str, ...] = ("audd",)
 CLIP_CONFIG_VERSION = "audd-main-v1"
-#: Legacy supplemental selection ceiling; it is not the Deep recipe's dollar cap. Phase 0a-iv
-#: removes the call site when it installs the provisional secondary scheduler.
+#: Legacy selection ceiling kept as the parameter default; it is not the Deep recipe's dollar cap
+#: (the primary passes the whole window count), and the supplemental call site that used it was
+#: removed with the provisional secondary scheduler (0a-iv).
 DEFAULT_MAX_CLIPS = 150
 
 LogFn = Callable[[str], None]
@@ -84,10 +86,20 @@ class PaidScanResult:
     cache_hits: int = 0
     billable_units: int = 0
     reservation_exhausted: bool = False
+    #: Every live dispatch's frozen money outcome, in dispatch order (cache hits excluded).
+    outcomes: tuple[str, ...] = ()
+    #: The terminal-provider outcome (``auth_error`` / ``quota_error``) that stopped the sweep.
+    provider_stopped: str | None = None
 
     @property
     def ran(self) -> bool:
         return bool(self.engines_run)
+
+    @property
+    def unreachable(self) -> int:
+        """Dispatches the provider could not be reached for (``connect_error``/``timeout_pre``)."""
+
+        return sum(outcome in UNREACHABLE_OUTCOMES for outcome in self.outcomes)
 
 
 def _cache_state(response: Mapping[str, Any]) -> str | None:
@@ -275,6 +287,8 @@ async def run_paid_clip_recognition(
     cache_hits = 0
     billable_units = 0
     reservation_exhausted = False
+    outcomes: list[str] = []
+    provider_stopped: str | None = None
 
     for window in selected:
         query = _clip_query(media_key, window)
@@ -312,15 +326,18 @@ async def run_paid_clip_recognition(
                 emit("audd primary stopped: USD reservation exhausted")
                 break
             except ProviderUnavailable as exc:
+                lowered = str(exc).casefold()
+                timed_out = any(word in lowered for word in ("timeout", "timed out"))
+                outcome = "timeout_pre" if timed_out else "connect_error"
                 if admitted and usd_admitter is not None:
-                    lowered = str(exc).casefold()
-                    timed_out = any(word in lowered for word in ("timeout", "timed out"))
-                    usd_admitter.resolve("timeout_pre" if timed_out else "connect_error")
+                    usd_admitter.resolve(outcome)  # type: ignore[arg-type]
+                outcomes.append(outcome)
                 emit(f"audd clip error @{window.support_ms[0] // 1000}s: {type(exc).__name__}")
                 continue
             except AmbiguousProviderOutcome as exc:
                 if admitted and usd_admitter is not None:
                     usd_admitter.resolve("timeout_post")
+                outcomes.append("timeout_post")
                 billable_units += 1
                 emit(f"audd clip error @{window.support_ms[0] // 1000}s: {type(exc).__name__}")
                 continue
@@ -328,9 +345,17 @@ async def run_paid_clip_recognition(
                 outcome = _protocol_outcome(exc) if isinstance(exc, ProviderProtocolError) else None
                 if admitted and usd_admitter is not None and outcome is not None:
                     usd_admitter.resolve(outcome)  # type: ignore[arg-type]
+                if outcome is not None:
+                    outcomes.append(outcome)
                 if outcome in {"http_5xx", "malformed"}:
                     billable_units += 1
                 emit(f"audd clip error @{window.support_ms[0] // 1000}s: {type(exc).__name__}")
+                if outcome in TERMINAL_PROVIDER_OUTCOMES:
+                    # Plan §2.3.3: a refused credential or an exhausted quota will not change for
+                    # the next window, so the primary stops at once rather than burning the sweep.
+                    provider_stopped = outcome
+                    emit(f"audd primary stopped: {outcome}")
+                    break
                 continue
             except asyncio.CancelledError:
                 if admitted and usd_admitter is not None:
@@ -354,9 +379,15 @@ async def run_paid_clip_recognition(
             outcome = _error_body_outcome(response) if response is not None else "malformed"
             if not was_cached and usd_admitter is not None:
                 usd_admitter.resolve(outcome)  # type: ignore[arg-type]
+            if not was_cached:
+                outcomes.append(outcome)
             if outcome in {"http_5xx", "malformed"}:
                 billable_units += 1
             emit(f"audd clip parse error @{window.support_ms[0] // 1000}s: {exc}")
+            if outcome in TERMINAL_PROVIDER_OUTCOMES:
+                provider_stopped = outcome
+                emit(f"audd primary stopped: {outcome}")
+                break
             continue
         except asyncio.CancelledError:
             if not was_cached and usd_admitter is not None:
@@ -371,8 +402,10 @@ async def run_paid_clip_recognition(
             # Parsing established a match/no-match state. Provider errors and malformed successes
             # never reach this content-addressed cache write.
             atomic_write_json(raw_path, canonicalize_provider_json(response))
+            state = _cache_state(response)
             if usd_admitter is not None:
-                usd_admitter.resolve(_cache_state(response))  # type: ignore[arg-type]
+                usd_admitter.resolve(state)  # type: ignore[arg-type]
+            outcomes.append(str(state))
             billable_units += 1
 
     observations_out = tuple(sort_records(observations))
@@ -380,9 +413,10 @@ async def run_paid_clip_recognition(
     _write_jsonl(observation_path, list(observations_out))
     _write_jsonl(invocation_dir / "queries.gen0.jsonl", queries)
     matched = sum(item.status == "match" for item in observations_out)
+    not_sent = len(selected) - requests - cache_hits
     emit(
-        f"audd clips: {matched} match(es) across {len(observations_out)} uncertain windows "
-        f"({requests} requests, {len(selected) - requests} cached)"
+        f"audd clips: {matched} match(es) across {len(observations_out)} windows "
+        f"({requests} requests, {cache_hits} cached, {not_sent} not sent)"
     )
     return PaidScanResult(
         observations=observations_out,
@@ -395,4 +429,6 @@ async def run_paid_clip_recognition(
         cache_hits=cache_hits,
         billable_units=billable_units,
         reservation_exhausted=reservation_exhausted,
+        outcomes=tuple(outcomes),
+        provider_stopped=provider_stopped,
     )

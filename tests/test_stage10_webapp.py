@@ -52,6 +52,13 @@ def _no_worker_thread_alive() -> bool:
     return not any(t.name == "webapp-jobs" and t.is_alive() for t in threading.enumerate())
 
 
+def _csrf_headers(base_url: str) -> dict[str, str]:
+    """Every POST carries the server's token (loopback CSRF, 0a-iii)."""
+
+    token = httpx.get(base_url + "/csrf", timeout=TIMEOUT).json()["token"]
+    return {"X-CSRF-Token": token}
+
+
 def _fast_runner_factory(work_root: Path):
     """A runner that reports every phase, ends succeeded, and writes a real result file."""
 
@@ -362,6 +369,7 @@ def test_post_analyse_json_creates_job_and_status_shape(tmp_path: Path) -> None:
         created = httpx.post(
             running.base_url + "/analyse",
             json={"url": CLEAN_URL, "profile": "free", "acquire": True},
+            headers=_csrf_headers(running.base_url),
             timeout=TIMEOUT,
         )
         assert created.status_code == 200
@@ -395,6 +403,7 @@ def test_post_analyse_form_redirects_to_job_page(tmp_path: Path) -> None:
         resp = httpx.post(
             running.base_url + "/analyse",
             data={"url": CLEAN_URL, "profile": "free"},
+            headers=_csrf_headers(running.base_url),
             timeout=TIMEOUT,
             follow_redirects=False,
         )
@@ -413,14 +422,19 @@ def test_post_analyse_rejects_invalid_url(tmp_path: Path) -> None:
     manager = JobManager(tmp_path, _fast_runner_factory(tmp_path))
     running = serve_in_background(tmp_path, port=0, job_manager=manager)
     try:
+        headers = _csrf_headers(running.base_url)
         resp = httpx.post(
-            running.base_url + "/analyse", json={"url": "ftp://nope/x"}, timeout=TIMEOUT
+            running.base_url + "/analyse",
+            json={"url": "ftp://nope/x"},
+            headers=headers,
+            timeout=TIMEOUT,
         )
         assert resp.status_code == 400
         assert "error" in resp.json()
         bad_profile = httpx.post(
             running.base_url + "/analyse",
             json={"url": CLEAN_URL, "profile": "made_up"},
+            headers=headers,
             timeout=TIMEOUT,
         )
         assert bad_profile.status_code == 400
@@ -443,10 +457,15 @@ def test_cancel_route(tmp_path: Path) -> None:
     try:
         job_id = manager.submit(CLEAN_URL, "free")
         assert running_event.wait(timeout=5)
-        resp = httpx.post(f"{running.base_url}/jobs/{job_id}/cancel", timeout=TIMEOUT)
+        headers = _csrf_headers(running.base_url)
+        resp = httpx.post(
+            f"{running.base_url}/jobs/{job_id}/cancel", headers=headers, timeout=TIMEOUT
+        )
         assert resp.status_code == 200
         assert resp.json()["cancelled"] is True
-        unknown = httpx.post(f"{running.base_url}/jobs/{'f' * 32}/cancel", timeout=TIMEOUT)
+        unknown = httpx.post(
+            f"{running.base_url}/jobs/{'f' * 32}/cancel", headers=headers, timeout=TIMEOUT
+        )
         assert unknown.status_code == 404
     finally:
         gate.set()

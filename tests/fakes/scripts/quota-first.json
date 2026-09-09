@@ -1,0 +1,12 @@
+{
+  "audd": {
+    "default": "match",
+    "windows": {
+      "0": "quota_error"
+    }
+  },
+  "shazam": {
+    "default": "match",
+    "windows": {}
+  }
+}

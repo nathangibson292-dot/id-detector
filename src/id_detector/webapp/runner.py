@@ -19,6 +19,19 @@ from id_detector.webapp.jobs import JobContext
 
 #: The single paid engine the browser's max-accuracy tier uses (see the runner note below).
 WEB_PAID_ENGINE = "audd"
+#: Where the browser's "build index" step fingerprints the uploader's tracks, and the label the
+#: analysis then queries (D3: Panako kept; the index is built AND used).  Mirrors ``idea
+#: build-index`` / ``idea analyse --local-index default`` on their default roots.
+WEB_INDEX_LABEL = "default"
+WEB_INDEX_ROOT = Path("data/local/panako-db")
+WEB_PANAKO_TOOL_DIR = Path("data/local/panako")
+#: What each non-zero ``_analyse`` exit code means to a browser job (plan §2.3.5).
+_EXIT_STATUS = {
+    1: "failed",
+    3: "paid provider unavailable",
+    4: "budget exhausted",
+    5: "source changed",
+}
 
 
 @dataclass(frozen=True)
@@ -140,12 +153,10 @@ def make_pipeline_runner(
         settings = _resolve_settings(project, config_file, ctx.profile)
         tracklist_path = _materialise_tracklist(root, ctx.known_tracklist)
         # The browser's paid tier.  Choosing max_accuracy activates ONE paid engine (AudD — the
-        # broadest single catalogue; running both is mostly redundant spend) via its gate-free CLIP
-        # path: only the still-uncertain window clips are sent — the same ~12 s clips Shazam already
-        # saw — so it needs no whole-file upload and no ownership.  That is what lets us cross-check
-        # OTHER people's mixes.  It self-gates on its credentials, so a missing key simply skips.
-        # Ticking upload consent additionally permits the whole-file scan (only useful when the user
-        # owns the audio).  ACRCloud stays available for a deliberate comparison via `--engine`.
+        # broadest single catalogue) via its gate-free CLIP path: the Deep recipe sweeps the mix in
+        # the same ~12 s clips Shazam sees, so it needs no whole-file upload and no ownership.  That
+        # is what lets us cross-check OTHER people's mixes.  It self-gates on its credentials; a
+        # missing key ends the job as "paid provider unavailable" rather than silently going free.
         engines = settings.enabled_engines
         if ctx.profile == "max_accuracy":
             engines = tuple(dict.fromkeys([*engines, WEB_PAID_ENGINE]))
@@ -167,14 +178,19 @@ def make_pipeline_runner(
                 novelty=settings.novelty,
                 calibrator=settings.calibrator,
                 enabled_engines=engines,
-                cli_confirmation=ctx.upload_consent,
-                # max_accuracy is paid-first: the paid engine leads, the free engine fills the gaps.
+                # max_accuracy is paid-first: the paid engine leads, the free engine seconds it.
                 primary_engine="audd" if ctx.profile == "max_accuracy" else "shazam",
+                # The index this job just built (or one an earlier job built) is queried over the
+                # still-uncertain spans; without a label the build was paid for and never used.
+                local_index_label=WEB_INDEX_LABEL if ctx.build_index else None,
+                index_root=WEB_INDEX_ROOT,
+                panako_tool_dir=WEB_PANAKO_TOOL_DIR,
                 progress=progress,
             )
         )
-        if exit_code == 3:
-            raise RuntimeError("analysis failed: paid provider unavailable (exit code 3)")
+        if exit_code != 0:
+            meaning = _EXIT_STATUS.get(exit_code, "error")
+            raise RuntimeError(f"analysis failed: {meaning} (exit code {exit_code})")
 
         if ctx.acquire:
             ctx.check_cancel()
@@ -218,8 +234,8 @@ def _run_build_index(ctx: JobContext, target: str, *, project_root: Path) -> Non
         )
         from id_detector.providers.panako_setup import jar_path
 
-        tool_dir = Path("data/local/panako")
-        index_dir = Path("data/local/panako-db") / "default"
+        tool_dir = WEB_PANAKO_TOOL_DIR
+        index_dir = WEB_INDEX_ROOT / WEB_INDEX_LABEL
         candidates = asyncio.run(discover_candidates(set_url=target, artists=[], extra_urls=[]))
         candidates = deduplicate_candidates(list(candidates))
         ctx.log(f"reference candidates discovered: {len(candidates)}")

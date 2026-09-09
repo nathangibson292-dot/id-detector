@@ -41,7 +41,13 @@ from id_detector.io import read_text, redact_text
 from id_detector.jobs import AsyncJobStore, ProcessLock
 from id_detector.journal import InvocationTimer, append_invocation
 from id_detector.local_index import run_local_index_recognition
-from id_detector.money import BudgetExhausted, UsdAdmitter, UsdSettlement, reserve_usd
+from id_detector.money import (
+    UNREACHABLE_OUTCOMES,
+    BudgetExhausted,
+    UsdAdmitter,
+    UsdSettlement,
+    reserve_usd,
+)
 from id_detector.orchestrate import run_generation_loop
 from id_detector.paid_clip import (
     PAID_CLIP_ENGINES,
@@ -61,8 +67,14 @@ from id_detector.providers.base import AppConfig
 from id_detector.recipes import Recipe, get_recipe
 from id_detector.recognise import recognise_generation
 from id_detector.rescan import DEFAULT_MAX_GENERATIONS
-from id_detector.scan import PAID_FILE_SCANNERS, run_paid_scanners
-from id_detector.scan_targeting import select_gap_targets, select_scan_targets
+from id_detector.scan import PAID_FILE_SCANNERS
+from id_detector.scan_targeting import select_scan_targets
+from id_detector.secondary_targeting import (
+    frozen_windows,
+    schedule_secondary_windows,
+    secondary_capacity,
+    select_secondary_candidates,
+)
 from id_detector.shazam import HTTPClientInterface
 from id_detector.truth import (
     freeze_truth,
@@ -100,6 +112,8 @@ app.add_typer(truth_app, name="truth")
 app.add_typer(config_app, name="config")
 PROJECT_ROOT = Path.cwd()
 DEFAULT_WORK_ROOT = Path("work")
+#: Every engine that can cost money; the Free recipe strips them all (its cap is $0).
+_PAID_ENGINES = frozenset(PAID_FILE_SCANNERS) | frozenset(PAID_CLIP_ENGINES)
 
 
 def _load_dotenv(root: Path) -> None:
@@ -356,16 +370,20 @@ def _validate_config_or_exit() -> None:
 
 
 def _windows_in_spans(windows: WindowsResult, spans: tuple[tuple[int, int], ...]) -> WindowsResult:
-    """A WindowsResult holding only the generation-0 windows whose start falls in one of ``spans``.
+    """A WindowsResult holding only the frozen (generation-0, untransformed) windows whose start
+    falls in one of ``spans``.
 
-    Used by the paid-first path to run the free engine over just the gap spans the paid engine left
-    blank, instead of the whole mix.
+    A ``rescan_only`` transform policy never puts a transformed window in generation 0, but a
+    ``global`` policy does — and every sibling of a window shares its start, so keeping them would
+    multiply a span's request count by the size of the transform grid (E-M9).
     """
 
     keep = tuple(
         window
         for window in windows.records
-        if any(lo <= window.support_ms[0] < hi for lo, hi in spans)
+        if window.generation == 0
+        and window.transform.type == "none"
+        and any(lo <= window.support_ms[0] < hi for lo, hi in spans)
     )
     return WindowsResult(records=keep, record_path=windows.record_path, cached=windows.cached)
 
@@ -388,17 +406,69 @@ def _money_journal_fields(
     settlement: UsdSettlement,
     recipe: Recipe,
     app_config: AppConfig,
+    achieved: Recipe | None = None,
 ) -> dict[str, int | str]:
+    """``requested_recipe_id`` names what was asked for; ``algorithm_version`` describes the result
+    that was actually produced (the achieved recipe, when a degrade substituted one)."""
+
     return {
         "usd_e6_reserved": settlement.usd_e6_reserved,
         "usd_e6_spent": settlement.usd_e6_spent,
         "usd_e2_reserved": settlement.usd_e2_reserved,
         "usd_e2_spent": settlement.usd_e2_spent,
         "requested_recipe_id": recipe.recipe_id,
-        "algorithm_version": recipe.algorithm_version,
+        "algorithm_version": (achieved or recipe).algorithm_version,
         "pricing_version": app_config.pricing_version,
         "audd_usd_e6_per_request": app_config.audd_usd_e6_per_request,
     }
+
+
+def _achieved(resolved: int, planned: int, fraction: float) -> bool:
+    """``resolved >= fraction x planned`` in exact integer arithmetic; an empty plan is achieved."""
+
+    return resolved * 100 >= round(fraction * 100) * planned
+
+
+def _run_status(
+    *,
+    primary_resolved: int,
+    primary_planned: int,
+    primary_fraction: float,
+    secondary_resolved: int,
+    secondary_allocated: int,
+    secondary_fraction: float | None,
+    provider_stopped: str | None,
+    reservation_exhausted: bool,
+) -> tuple[str, str | None]:
+    """Plan §2.3.5: the terminal status and reason of a run that produced a result.
+
+    ``partial`` (the primary requirement was not met) outranks ``degraded`` (only the secondary
+    fell short); a terminal-provider stop after at least one resolved attempt is ``partial`` too.
+    """
+
+    if provider_stopped is not None:
+        return "partial", "provider_unavailable_midrun"
+    if reservation_exhausted:
+        return "partial", "reservation_exhausted"
+    if not _achieved(primary_resolved, primary_planned, primary_fraction):
+        return "partial", "primary_not_achieved"
+    if secondary_fraction is not None and not _achieved(
+        secondary_resolved, secondary_allocated, secondary_fraction
+    ):
+        return "degraded", "secondary_not_achieved"
+    return "complete", None
+
+
+def _tracklist_run_fields(media_dir: Path) -> dict[str, str | None]:
+    """The run outcome a previous export recorded, so a re-export (``acquire``) carries it on."""
+
+    try:
+        document = json.loads(read_text(media_dir / "present" / "tracklist.json"))
+    except (OSError, ValueError):
+        return {}
+    if not isinstance(document, dict):
+        return {}
+    return {key: document.get(key) for key in ("status", "reason", "achieved") if key in document}
 
 
 async def _analyse(
@@ -420,6 +490,7 @@ async def _analyse(
     cli_confirmation: bool = False,
     primary_engine: str = "shazam",
     recipe: Recipe | None = None,
+    allow_degrade: bool = False,
     paid_scan_adapters: Mapping[str, object] | None = None,
     shazam_http_client: HTTPClientInterface | None = None,
     local_index_label: str | None = None,
@@ -434,9 +505,8 @@ async def _analyse(
     )
     if requested_recipe.name == "free":
         # The Free recipe's zero-dollar cap is structural: legacy --engine/profile state cannot
-        # smuggle a paid provider into this run while those options await removal in 0a-iii.
-        paid_engines = set(PAID_FILE_SCANNERS) | set(PAID_CLIP_ENGINES)
-        enabled_engines = tuple(engine for engine in enabled_engines if engine not in paid_engines)
+        # smuggle a paid provider into this run.
+        enabled_engines = tuple(engine for engine in enabled_engines if engine not in _PAID_ENGINES)
     elif "audd" not in enabled_engines:
         enabled_engines = (*enabled_engines, "audd")
     run_id = uuid.uuid4().hex
@@ -474,6 +544,7 @@ async def _analyse(
         decoded = await decode(ingested)
         timer.finish_stage("decode_ms")
         ffmpeg_version = decoded.record.decoder.ffmpeg_version
+        duration_ms = decoded.record.pcm.duration_ms
         _report(progress, "decode", 1, 1, "audio decoded")
 
         _report(progress, "windows", 0, 1, "cutting windows")
@@ -495,15 +566,14 @@ async def _analyse(
         timer.finish_stage("windows_ms")
         _report(progress, "windows", 1, 1, f"{len(windows.records)} windows")
 
+        # The frozen generation-0 window set is what every recipe plans against (§2.3.1): the
+        # Deep reservation, both primaries' achieved fractions and the secondary's eligibility.
+        frozen_count = len(frozen_windows(windows.records))
+        primary_planned = (
+            frozen_count + requested_recipe.primary_density - 1
+        ) // requested_recipe.primary_density
         if requested_recipe.name == "deep":
-            frozen_windows = [
-                window
-                for window in windows.records
-                if window.generation == 0 and window.transform.type == "none"
-            ]
-            planned = (
-                len(frozen_windows) + requested_recipe.primary_density - 1
-            ) // requested_recipe.primary_density
+            planned = primary_planned
             counts["paid_planned"] = planned
             try:
                 reservation = reserve_usd(
@@ -553,10 +623,14 @@ async def _analyse(
             )
 
         # Which engine identifies the WHOLE mix first (generation 0).  Free = the rate-limited free
-        # engine.  Paid-first (max_accuracy) = the paid engine, which is ~4-6x faster and has no
-        # rate limit, so it does the bulk and the free engine only fills the spans it left blank.
+        # engine over every frozen window.  Deep = the paid engine, which is ~4-6x faster and has
+        # no rate limit, so it does the bulk and the free engine runs only as the bounded second
+        # opinion of plan §2.3.4 step 4.
         paid_first = requested_recipe.primary_engine == "audd" and "audd" in enabled_engines
+        achieved_recipe = requested_recipe
+        degrade_reason: str | None = None
         primary_clip = PaidScanResult()
+        primary_resolved = 0
         gen0_observations: tuple[object, ...] = ()
         gen0_observations_path: Path | None = None
         gen0_requests = 0
@@ -568,7 +642,7 @@ async def _analyse(
                 media_key=ingested.record.media_key,
                 media_dir=media_dir,
                 windows=windows,
-                targets=((0, decoded.record.pcm.duration_ms),),
+                targets=((0, duration_ms),),
                 run_id=run_id,
                 app_config=app_config,
                 enabled_engines=enabled_engines,
@@ -590,28 +664,68 @@ async def _analyse(
                     "paid_billable_units": primary_clip.billable_units,
                 }
             )
-            if primary_clip.observations or primary_clip.reservation_exhausted:
+            if primary_clip.resolved == 0 and (
+                not primary_clip.ran or primary_clip.provider_stopped or primary_clip.unreachable
+            ):
+                # Plan §2.3.5 row 1: the provider refused the credential, ran out of quota, was
+                # never configured or could not be reached before a single resolved attempt.  A
+                # Deep request never silently turns into a Free one: it stops here (exit 3) unless
+                # the local caller passed --allow-degrade, which restarts it as the Free recipe
+                # before any paid work — requested stays deep, achieved becomes free.
+                reason = primary_clip.provider_stopped or next(
+                    (item for item in primary_clip.outcomes if item in UNREACHABLE_OUTCOMES),
+                    "not_configured",
+                )
+                # "Before any paid work" is literal: an ambiguous-but-billable outcome
+                # (http_5xx / malformed / timeout_post) charges a unit without resolving
+                # anything, so once one has been billed the request may no longer be restarted
+                # as the Free recipe — that would report `degraded` (settled at 100 %, servable
+                # with accept_degraded) on top of money already spent.  Stop with the true spend.
+                if allow_degrade and primary_clip.billable_units:
+                    _report(
+                        progress,
+                        "recognise",
+                        0,
+                        1,
+                        f"--allow-degrade not applied: {primary_clip.billable_units} paid "
+                        f"request(s) were already billed before {reason}",
+                    )
+                if not allow_degrade or primary_clip.billable_units:
+                    settlement = _settle_money(usd_admitter)
+                    entry = timer.entry(
+                        status="provider_unavailable",
+                        reason=reason,
+                        exit_code=3,
+                        counts=counts,
+                        costs={"usd_e2": settlement.usd_e2_spent},
+                        source_ids=source_ids,
+                        ffmpeg_version=ffmpeg_version,
+                        **_money_journal_fields(settlement, requested_recipe, app_config),
+                    )
+                    append_invocation(media_dir / "invocations.jsonl", entry)
+                    return 3
+                _report(
+                    progress,
+                    "recognise",
+                    0,
+                    1,
+                    f"paid engine unavailable ({reason}); restarting as the free recipe",
+                )
+                achieved_recipe = get_recipe("free")
+                degrade_reason = "provider_unavailable"
+                paid_first = False
+                primary_clip = PaidScanResult()
+                primary_planned = frozen_count
+                enabled_engines = tuple(
+                    engine for engine in enabled_engines if engine not in _PAID_ENGINES
+                )
+            else:
                 gen0_observations = primary_clip.observations
                 gen0_observations_path = primary_clip.observation_paths[0]
+                primary_resolved = primary_clip.resolved
                 counts["matches"] = sum(
                     item.status == "match" for item in primary_clip.observations
                 )
-            else:
-                # A Deep request never silently turns into a Free request. The explicit local
-                # --allow-degrade restart belongs to 0a-iv; for now this is terminal and unspent.
-                settlement = _settle_money(usd_admitter)
-                entry = timer.entry(
-                    status="provider_unavailable",
-                    reason=None,
-                    exit_code=3,
-                    counts=counts,
-                    costs={"usd_e2": settlement.usd_e2_spent},
-                    source_ids=source_ids,
-                    ffmpeg_version=ffmpeg_version,
-                    **_money_journal_fields(settlement, requested_recipe, app_config),
-                )
-                append_invocation(media_dir / "invocations.jsonl", entry)
-                return 3
         if not paid_first:
             recognised = await recognise_windows(windows=windows, generation=0)
             gen0_observations = recognised.observations
@@ -628,47 +742,13 @@ async def _analyse(
                     "cache_hits": recognised.cache_hits,
                 }
             )
+            # A frozen window is resolved by a match or a no-match; an error observation is not.
+            primary_resolved = sum(
+                item.generation == 0 and item.transform.type == "none" and item.status != "error"
+                for item in recognised.observations
+            )
         matches = [item for item in gen0_observations if item.status == "match"]
         timer.finish_stage("recognise_ms")
-
-        # Paid whole-file scanners (AudD/ACRCloud) run once here when the active profile enables
-        # them AND credentials + upload consent are present; otherwise this is a no-op and the free
-        # path is untouched.  Their observations join generation 0 as a static evidence set.
-        # In paid-first mode the paid engine already scanned the whole mix as generation 0, so the
-        # (consent-gated) whole-file scan would be redundant — skip it.
-        paid_scan = PaidScanResult()
-        # Gate on a PAID scanner being enabled, not on any engine being enabled: the free recipe
-        # keeps "shazam" in enabled_engines, and entering here would announce "cross-checking with
-        # paid engines" and time a scan stage for a run whose cap forbids every paid call.
-        if set(enabled_engines) & set(PAID_FILE_SCANNERS) and not paid_first:
-            _report(progress, "scan", 0, 1, "cross-checking with paid engines")
-            timer.start_stage("scan_ms")
-            paid_scan = await run_paid_scanners(
-                media_key=ingested.record.media_key,
-                media_dir=media_dir,
-                asset_path=ingested.original_path,
-                asset_sha256=ingested.record.original.sha256,
-                asset_kind="original",
-                duration_ms=decoded.record.pcm.duration_ms,
-                source_path=ingested.source_path,
-                app_config=app_config,
-                enabled_engines=enabled_engines,
-                cli_confirmation=cli_confirmation,
-                refresh=refresh,
-                adapters=paid_scan_adapters,
-                log=lambda message: _report(progress, "scan", 0, 1, message),
-            )
-            timer.finish_stage("scan_ms")
-            counts["paid_matches"] = sum(item.status == "match" for item in paid_scan.observations)
-            for provider, reason in paid_scan.skipped:
-                _report(progress, "scan", 1, 1, f"{provider} skipped: {reason}")
-            summary = (
-                f"{len(paid_scan.engines_run)} engine(s), "
-                f"{len(paid_scan.observations)} observations"
-                if paid_scan.ran
-                else "no paid engine ran"
-            )
-            _report(progress, "scan", 1, 1, summary)
 
         hint_result = None
         if not no_hints:
@@ -676,7 +756,7 @@ async def _analyse(
             timer.start_stage("hints_ms")
             hint_result = await run_hints(
                 source=ingested.record,
-                duration_ms=decoded.record.pcm.duration_ms,
+                duration_ms=duration_ms,
                 media_dir=media_dir,
                 source_path=ingested.source_path,
                 project_root=PROJECT_ROOT,
@@ -716,7 +796,7 @@ async def _analyse(
 
         _report(progress, "fuse", 0, 1, "fusing episodes")
         timer.start_stage("fuse_ms")
-        orchestrated = await _fuse(paid_scan.observations, paid_scan.observation_paths)
+        orchestrated = await _fuse((), ())
         fused = orchestrated.fusion
         counts.update(
             {
@@ -729,40 +809,37 @@ async def _analyse(
         timer.finish_stage("fuse_ms")
         _report(progress, "fuse", 1, 1, f"{len(fused.episodes.episodes)} episodes")
 
-        # Phase 2 — cross-check the still-uncertain spans with the levers that see what Shazam
-        # can't.  The free fuse just told us which spans remain uncertain; each lever sends only
-        # those window clips (the same ~12 s clips Shazam saw — no whole-file upload, no consent
-        # gate) and re-fuses, so agreement lifts confidence, disagreement lets a Shazam phantom be
-        # demoted, and a Shazam-blind track is recovered:
-        #   • a local Panako index — the DJ's OWN unreleased uploads, in no public catalogue;
-        #   • the paid engine's CLIP path (AudD) — catalogued-but-Shazam-blind tracks.
-        # FREE-FIRST: Panako runs and re-fuses BEFORE AudD, so whatever it confidently identifies
-        # shrinks the uncertain region — we never pay AudD to check a span the free index nailed.
-        # A no-op unless a lever is enabled and uncertain spans remain.
-        clip_scan = PaidScanResult()
+        # Phase 2 — the second opinion.  The first fuse just said where the primary is weak; each
+        # lever below sends only window clips (the same ~12 s clips the engines already see — no
+        # whole-file upload, no consent gate) and re-fuses, so agreement lifts confidence,
+        # disagreement lets a phantom be demoted, and a primary-blind track is recovered:
+        #   • Deep: the Shazam secondary — the provisional ``targeting:0`` scheduler queues the
+        #     hint-only, not-confident, challengeable-suppressed and blank spans, capped at
+        #     ``secondary_clips_per_minute`` clips per minute of mix (plan §2.3.4 step 4);
+        #   • a local Panako index — the DJ's OWN unreleased uploads, in no public catalogue —
+        #     over whatever is still uncertain afterwards.
+        # The paid clip lever no longer runs here: the Deep primary already swept the whole mix
+        # and the Free recipe's cap forbids every paid call.
         index_scan = PaidScanResult()
+        secondary_scan = PaidScanResult()
+        secondary_allocated = 0
+        secondary_resolved = 0
         supplemental_requests = 0
         supplemental_physical_attempts = 0
-        # In paid-first mode the paid engine already covered the whole mix, so the paid CLIP lever
-        # is not a phase-2 step here; the free engine's gap-fill is.
-        want_clips = bool(set(enabled_engines) & set(PAID_CLIP_ENGINES)) and not paid_first
         want_index = local_index_label is not None
 
         async def _refuse_with(*scans: PaidScanResult) -> None:
             nonlocal fused, orchestrated
             _report(progress, "fuse", 0, 1, "re-fusing with cross-check evidence")
             timer.start_stage("refuse_ms")
-            extra_obs = (*paid_scan.observations, *(o for s in scans for o in s.observations))
-            extra_paths = (
-                *paid_scan.observation_paths,
-                *(p for s in scans for p in s.observation_paths),
-            )
+            extra_obs = tuple(o for s in scans for o in s.observations)
+            extra_paths = tuple(p for s in scans for p in s.observation_paths)
             orchestrated = await _fuse(extra_obs, extra_paths)
             fused = orchestrated.fusion
             counts.update(
                 {
                     # Re-fusion recomputes the generation-loop totals from generation zero. Keep
-                    # separately-run paid-first gap-fill work instead of overwriting it with zero.
+                    # the separately-run secondary work instead of overwriting it with zero.
                     "requests": orchestrated.requests + supplemental_requests,
                     "physical_attempts": (
                         orchestrated.physical_attempts + supplemental_physical_attempts
@@ -773,70 +850,72 @@ async def _analyse(
             timer.finish_stage("refuse_ms")
             _report(progress, "fuse", 1, 1, f"{len(fused.episodes.episodes)} episodes")
 
-        if paid_first and not primary_clip.reservation_exhausted:
-            # The paid engine identified the whole mix; the free engine now fills only the spans
-            # it left blank (typically the underground tracks no commercial catalogue holds), so it
-            # runs over a handful of windows instead of all of them — the point of paid-first.
-            gaps = select_gap_targets(fused.episodes.episodes, decoded.record.pcm.duration_ms)
-            gap_windows = _windows_in_spans(windows, gaps)
-            gap_scan = PaidScanResult()
-            if gap_windows.records:
-                _report(
-                    progress, "scan", 0, len(gap_windows.records), "filling the gaps (free engine)"
+        if paid_first:
+            hint_ids = (
+                frozenset(hint.id for hint in hint_result.hints)
+                if hint_result is not None
+                else frozenset()
+            )
+            candidates = select_secondary_candidates(
+                fused.episodes,
+                duration_ms=duration_ms,
+                suppressed_min_votes=requested_recipe.suppressed_min_votes or 0,
+                min_intersection_ms=requested_recipe.eligibility_min_intersection_ms or 0,
+                hint_ids=hint_ids,
+            )
+            capacity = secondary_capacity(
+                duration_ms, requested_recipe.secondary_clips_per_minute or 0
+            )
+            scheduled = schedule_secondary_windows(
+                windows.records,
+                candidates,
+                capacity=capacity,
+                min_intersection_ms=requested_recipe.eligibility_min_intersection_ms or 0,
+            )
+            secondary_allocated = len(scheduled)
+            counts["secondary_capacity"] = capacity
+            counts["secondary_allocated"] = secondary_allocated
+            if scheduled:
+                _report(progress, "scan", 0, len(scheduled), "second opinion (free engine)")
+                timer.start_stage("secondary_ms")
+                secondary = await recognise_windows(
+                    windows=WindowsResult(
+                        records=scheduled, record_path=windows.record_path, cached=windows.cached
+                    ),
+                    generation=0,
                 )
-                timer.start_stage("gapfill_ms")
-                gap_rec = await recognise_windows(windows=gap_windows, generation=0)
-                timer.finish_stage("gapfill_ms")
-                counts["gap_matches"] = sum(item.status == "match" for item in gap_rec.observations)
-                supplemental_requests += gap_rec.requests
-                supplemental_physical_attempts += gap_rec.physical_attempts
+                timer.finish_stage("secondary_ms")
+                secondary_resolved = len(scheduled) - secondary.failures
+                counts["secondary_resolved"] = secondary_resolved
+                counts["secondary_matches"] = sum(
+                    item.status == "match" for item in secondary.observations
+                )
+                supplemental_requests += secondary.requests
+                supplemental_physical_attempts += secondary.physical_attempts
                 counts["requests"] = orchestrated.requests + supplemental_requests
                 counts["physical_attempts"] = (
                     orchestrated.physical_attempts + supplemental_physical_attempts
                 )
-                counts["failures"] = free_failures + gap_rec.failures
-                counts["cache_hits"] += gap_rec.cache_hits
-                if any(item.status == "match" for item in gap_rec.observations):
-                    gap_scan = PaidScanResult(
-                        observations=tuple(gap_rec.observations),
-                        observation_paths=(gap_rec.observations_path,),
+                counts["failures"] = free_failures + secondary.failures
+                counts["cache_hits"] += secondary.cache_hits
+                if secondary.observations:
+                    secondary_scan = PaidScanResult(
+                        observations=tuple(secondary.observations),
+                        observation_paths=(secondary.observations_path,),
                     )
-                    await _refuse_with(gap_scan)
+                    await _refuse_with(secondary_scan)  # re-fuse once (§2.3.4 step 5)
+        if want_index:
             # Panako can still recover the DJ's own unreleased edits in the still-uncertain spans.
-            if want_index:
-                idx_targets = select_scan_targets(
-                    fused.episodes.episodes, decoded.record.pcm.duration_ms
-                )
-                if idx_targets:
-                    index_scan = await run_local_index_recognition(
-                        media_key=ingested.record.media_key,
-                        media_dir=media_dir,
-                        windows=windows,
-                        targets=idx_targets,
-                        duration_ms=decoded.record.pcm.duration_ms,
-                        run_id=run_id,
-                        index_label=local_index_label,
-                        index_root=index_root,
-                        tool_dir=panako_tool_dir,
-                        log=lambda message: _report(progress, "scan", 0, 1, message),
-                    )
-                    counts["local_index_matches"] = sum(
-                        item.status == "match" for item in index_scan.observations
-                    )
-                    if any(item.status == "match" for item in index_scan.observations):
-                        await _refuse_with(gap_scan, index_scan)
-        elif want_clips or want_index:
-            targets = select_scan_targets(fused.episodes.episodes, decoded.record.pcm.duration_ms)
-            # Free lever first.
-            if targets and want_index:
+            idx_targets = select_scan_targets(fused.episodes.episodes, duration_ms)
+            if idx_targets:
                 _report(progress, "scan", 0, 1, "querying the local reference index")
                 timer.start_stage("index_scan_ms")
                 index_scan = await run_local_index_recognition(
                     media_key=ingested.record.media_key,
                     media_dir=media_dir,
                     windows=windows,
-                    targets=targets,
-                    duration_ms=decoded.record.pcm.duration_ms,
+                    targets=idx_targets,
+                    duration_ms=duration_ms,
                     run_id=run_id,
                     index_label=local_index_label,
                     index_root=index_root,
@@ -850,38 +929,20 @@ async def _analyse(
                     item.status == "match" for item in index_scan.observations
                 )
                 if any(item.status == "match" for item in index_scan.observations):
-                    # Re-fuse so Panako's confident IDs recompute (and shrink) the uncertain region.
-                    await _refuse_with(index_scan)
-                    targets = select_scan_targets(
-                        fused.episodes.episodes, decoded.record.pcm.duration_ms
-                    )
-            # Paid lever next, only on what is still uncertain after the free lever.
-            if targets and want_clips:
-                _report(progress, "scan", 0, 1, "clip-checking uncertain spans with paid engine")
-                timer.start_stage("clip_scan_ms")
-                clip_scan = await run_paid_clip_recognition(
-                    media_key=ingested.record.media_key,
-                    media_dir=media_dir,
-                    windows=windows,
-                    targets=targets,
-                    run_id=run_id,
-                    app_config=app_config,
-                    enabled_engines=enabled_engines,
-                    cli_confirmation=cli_confirmation,
-                    refresh=refresh,
-                    refresh_states=refresh_states,
-                    adapters=paid_scan_adapters,
-                    log=lambda message: _report(progress, "scan", 0, 1, message),
-                )
-                timer.finish_stage("clip_scan_ms")
-                for name, reason in clip_scan.skipped:
-                    _report(progress, "scan", 1, 1, f"{name} skipped: {reason}")
-                counts["clip_matches"] = sum(
-                    item.status == "match" for item in clip_scan.observations
-                )
-                if any(item.status == "match" for item in clip_scan.observations):
-                    await _refuse_with(index_scan, clip_scan)
+                    await _refuse_with(secondary_scan, index_scan)
 
+        status, reason = _run_status(
+            primary_resolved=primary_resolved,
+            primary_planned=primary_planned,
+            primary_fraction=achieved_recipe.primary_achieved_fraction,
+            secondary_resolved=secondary_resolved,
+            secondary_allocated=secondary_allocated,
+            secondary_fraction=achieved_recipe.secondary_achieved_fraction,
+            provider_stopped=primary_clip.provider_stopped,
+            reservation_exhausted=primary_clip.reservation_exhausted,
+        )
+        if degrade_reason is not None and status == "complete":
+            status, reason = "degraded", degrade_reason
         _report(progress, "present", 0, 1, "writing result page")
         timer.start_stage("export_ms")
         exported = export_tracklist(
@@ -897,6 +958,9 @@ async def _analyse(
             collapse=app_config.collapse,
             same_track_bridge_ms=app_config.same_track_bridge_ms,
             min_track_ms=app_config.present_min_track_ms,
+            status=status,
+            reason=reason,
+            achieved=achieved_recipe.name,
         )
         generate_page(
             media_dir=media_dir,
@@ -929,8 +993,9 @@ async def _analyse(
             ]
             typer.echo(json.dumps(output, ensure_ascii=False, separators=(",", ":")))
         else:
+            outcome = status if reason is None else f"{status} ({reason})"
             typer.echo(
-                f"{len(matches)} matches; {counts['failures']} failures; "
+                f"{outcome}; {len(matches)} matches; {counts['failures']} failures; "
                 f"{counts['physical_attempts']} physical attempts; "
                 f"{orchestrated.final_generation + 1} generations "
                 f"(stop={orchestrated.stop_reason}); "
@@ -938,14 +1003,15 @@ async def _analyse(
             )
         settlement = _settle_money(usd_admitter)
         entry = timer.entry(
-            status="partial" if primary_clip.reservation_exhausted else "succeeded",
-            reason="reservation_exhausted" if primary_clip.reservation_exhausted else None,
+            status=status,
+            reason=reason,
+            achieved=achieved_recipe.name,
             exit_code=0,
             counts=counts,
             costs={"usd_e2": settlement.usd_e2_spent},
             source_ids=source_ids,
             ffmpeg_version=ffmpeg_version,
-            **_money_journal_fields(settlement, requested_recipe, app_config),
+            **_money_journal_fields(settlement, requested_recipe, app_config, achieved_recipe),
         )
         append_invocation(media_dir / "invocations.jsonl", entry)
         return 0
@@ -1047,6 +1113,15 @@ def analyse(
             "max_accuracy profile and free otherwise."
         ),
     ),
+    allow_degrade: bool = typer.Option(
+        False,
+        "--allow-degrade",
+        help=(
+            "If the paid engine is unavailable before any paid work has been done (refused "
+            "credential, exhausted quota, unreachable), restart this request as the free recipe "
+            "and report it as degraded instead of stopping with exit code 3. Local only."
+        ),
+    ),
     confirm_mirror: list[str] | None = typer.Option(  # noqa: B008
         None,
         "--confirm-mirror",
@@ -1077,20 +1152,18 @@ def analyse(
     i_own_this_audio_or_have_permission: bool = typer.Option(
         False,
         "--i-own-this-audio-or-have-permission",
-        help=(
-            "Per-run consent to upload this audio to a paid engine (AudD/ACRCloud). Required, "
-            "together with allow_third_party_upload = true in config, before a profile's paid "
-            "file_scanner engines run; otherwise they are skipped and only the free engine is used."
-        ),
+        # Retired with the whole-file upload scan (0a-iii): a clip to a paid recogniser needs no
+        # ownership.  Still accepted so old command lines keep working, but it changes nothing.
+        hidden=True,
     ),
     engine: list[str] | None = typer.Option(  # noqa: B008
         None,
         "--engine",
         help=(
-            "Add a paid file_scanner engine ('audd' or 'acrcloud') for this run, on top of the "
-            "profile's engines; repeatable.  The engine still runs only with its credentials set "
-            "and upload consent given.  Use this to try a paid cross-check without re-freezing a "
-            "profile (a frozen profile lists paid engines only once benchmarked with credentials)."
+            "Add a paid clip engine ('audd') for this run; repeatable. Only --recipe deep can "
+            "start paid work, and Deep already uses AudD, so this is a legacy no-op kept for "
+            "old command lines. 'acrcloud' is refused: ACRCloud was retired (same catalogue "
+            "family as AudD)."
         ),
     ),
     fake_providers: str | None = typer.Option(
@@ -1167,13 +1240,24 @@ def analyse(
     # not a bypass of the safety gates.
     if engine:
         requested = [name.strip().lower() for name in engine if name.strip()]
-        unknown = [name for name in requested if name not in PAID_FILE_SCANNERS]
-        if unknown:
+        if "acrcloud" in requested:
             typer.echo(
-                f"unknown --engine: {', '.join(unknown)} (choose audd or acrcloud)", err=True
+                "--engine acrcloud is refused: ACRCloud was retired in v2 (it is the same "
+                "catalogue family as AudD and recovered almost nothing AudD missed)",
+                err=True,
             )
             raise typer.Exit(2)
+        unknown = [name for name in requested if name not in PAID_CLIP_ENGINES]
+        if unknown:
+            typer.echo(f"unknown --engine: {', '.join(unknown)} (choose audd)", err=True)
+            raise typer.Exit(2)
         enabled_engines = tuple(dict.fromkeys([*enabled_engines, *requested]))
+    if i_own_this_audio_or_have_permission:
+        typer.echo(
+            "--i-own-this-audio-or-have-permission has no effect: the whole-file upload scan "
+            "was removed; paid clips need no ownership",
+            err=True,
+        )
     if fake_providers is not None:
         if os.environ.get("IDEA_TEST_MODE") != "1":
             typer.echo("--fake-providers is available only when IDEA_TEST_MODE=1", err=True)
@@ -1267,6 +1351,7 @@ def analyse(
                 cli_confirmation=i_own_this_audio_or_have_permission,
                 primary_engine=requested_recipe.primary_engine,
                 recipe=requested_recipe,
+                allow_degrade=allow_degrade,
                 paid_scan_adapters=paid_scan_adapters,
                 shazam_http_client=shazam_http_client,
                 local_index_label=local_index,
@@ -1337,6 +1422,7 @@ async def _acquire(
         collapse=acquire_config.collapse,
         same_track_bridge_ms=acquire_config.same_track_bridge_ms,
         min_track_ms=acquire_config.present_min_track_ms,
+        **_tracklist_run_fields(media_dir),
     )
     generate_page(
         media_dir=media_dir,

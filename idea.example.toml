@@ -81,13 +81,15 @@ no_match_max_age_days = 30
 
 # Text-hint connectors.  enabled = false is the same as --no-hints.  Set any connector below to
 # false to turn just that one off.  Known connectors: sc_comments, mixesdb, yt_comments, mixcloud, tl1001, pointer_import.
+# tl1001 (the 1001tracklists title search) is off by default: the site is JS-gated, so the search
+# rarely yields anything and contacts one more third party per run.  Set it to true to opt in.
 [hints]
 enabled = true
 sc_comments = true
 mixesdb = true
 yt_comments = true
 mixcloud = true
-tl1001 = true
+tl1001 = false
 pointer_import = true
 
 # Presentation.  collapse = true (the default, or --collapse) folds a contiguous run of competing

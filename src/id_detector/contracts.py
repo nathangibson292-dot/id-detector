@@ -925,7 +925,8 @@ class InvocationJournalEntry(Record):
     finished_at: str | None
     status: Literal[
         "running",
-        "succeeded",
+        "complete",
+        "degraded",
         "partial",
         "provider_unavailable",
         "budget_exhausted",
@@ -933,6 +934,9 @@ class InvocationJournalEntry(Record):
         "cancelled",
     ]
     reason: str | None
+    #: The recipe whose pipeline produced the shown result (a local ``--allow-degrade`` restart
+    #: achieves ``free`` for a ``deep`` request); ``None`` when the run produced no result.
+    achieved: Literal["free", "deep"] | None
     exit_code: int | None
     duration_ms: NonNegativeInt | None
     tool_versions: dict[str, str]

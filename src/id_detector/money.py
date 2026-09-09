@@ -31,6 +31,10 @@ ZERO_COST_OUTCOMES = frozenset(
         "quota_error",
     }
 )
+#: Plan §2.3.3 terminal-provider outcomes: cost 0, never retried, and the primary stops at once.
+TERMINAL_PROVIDER_OUTCOMES = frozenset({"auth_error", "quota_error"})
+#: Pre-receipt transport failures — the provider could not be reached at all (cost 0).
+UNREACHABLE_OUTCOMES = frozenset({"connect_error", "timeout_pre"})
 
 
 class BudgetExhausted(RuntimeError):

@@ -363,7 +363,17 @@ def export_tracklist(
     collapse: bool = True,
     same_track_bridge_ms: int | None = None,
     min_track_ms: int = 0,
+    status: str | None = None,
+    reason: str | None = None,
+    achieved: str | None = None,
 ) -> ExportResult:
+    """Write the flattened exports.
+
+    ``status`` / ``reason`` / ``achieved`` are the run's plan §2.3.5 outcome (``complete``,
+    ``degraded`` or ``partial``, why, and which recipe produced it); a re-export that does not know
+    them (``acquire``, the benchmark) carries the previous values forward or leaves them null.
+    """
+
     entries = flatten_tracklist(
         episodes,
         identities,
@@ -382,6 +392,9 @@ def export_tracklist(
             "media_key": media_key,
             "duration_ms": duration_ms,
             "generation": episodes.generation,
+            "status": status,
+            "reason": reason,
+            "achieved": achieved,
             "entries": list(entries),
         },
     )

@@ -69,6 +69,7 @@ class InvocationTimer:
         source_ids: list[str],
         ffmpeg_version: str | None,
         reason: str | None = None,
+        achieved: str | None = None,
         usd_e6_reserved: int = 0,
         usd_e6_spent: int = 0,
         usd_e2_reserved: int = 0,
@@ -87,6 +88,7 @@ class InvocationTimer:
             finished_at=timestamp(),
             status=status,
             reason=reason,
+            achieved=achieved,  # type: ignore[arg-type]
             exit_code=exit_code,
             duration_ms=round((time.monotonic() - self.started_monotonic) * 1000),
             tool_versions=tool_versions(ffmpeg_version),

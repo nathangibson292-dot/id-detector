@@ -131,7 +131,7 @@ def test_paid_primary_success_completes_without_the_branch_local_crash(tmp_path:
 
     media_dir, entry = _entry(tmp_path / "work")
     assert exit_code == 0
-    assert entry["status"] == "succeeded"
+    assert entry["status"] == "complete"
     assert entry["counts"]["paid_resolved"] == 7  # type: ignore[index]
     assert entry["counts"]["paid_billable_units"] == 7  # type: ignore[index]
     assert audd.calls == audd.billed_units == 7
@@ -148,8 +148,11 @@ def test_paid_no_match_is_resolved_cached_and_gap_counts_accumulate(tmp_path: Pa
     assert len(cached) == 7
     assert all(item == {"status": "success", "result": None} for item in cached)
     assert entry["counts"]["paid_resolved"] == 7  # type: ignore[index]
-    assert entry["counts"]["requests"] == shazam.requests == 7  # type: ignore[index]
-    assert entry["counts"]["physical_attempts"] == 7  # type: ignore[index]
+    # Seven AudD no-matches leave the whole mix blank, so the targeting:0 secondary sends the
+    # capacity of C = ceil(1 min x 2) = 2 Shazam clips to it (plan §2.3.4 step 4).
+    assert entry["counts"]["requests"] == shazam.requests == 2  # type: ignore[index]
+    assert entry["counts"]["physical_attempts"] == 2  # type: ignore[index]
+    assert entry["counts"]["secondary_allocated"] == 2  # type: ignore[index]
     assert audd.billed_units == 7
 
     # The user-facing default refreshes cached no-match states, but preserves Shazam matches.
@@ -200,12 +203,16 @@ def test_identity_less_audd_result_is_malformed_and_never_cached(tmp_path: Path)
 
     media_dir, entry = _entry(tmp_path / "work")
     raw_dir = media_dir / "recognise" / "invocations" / "live-audd-clip-v1" / "raw"
-    assert exit_code == 3
-    assert entry["status"] == "provider_unavailable"
+    # Plan §2.3.5: ``malformed`` is billable and ambiguous, not a terminal-provider outcome, so a
+    # sweep of them is a primary that resolved 0 of 7 (< 95 %): ``partial``, exit 0, spent.
+    assert exit_code == 0
+    assert entry["status"] == "partial"
+    assert entry["reason"] == "primary_not_achieved"
     assert entry["counts"]["paid_resolved"] == 0  # type: ignore[index]
     assert entry["counts"]["paid_billable_units"] == 7  # type: ignore[index]
+    assert entry["usd_e6_spent"] == 35_000
     assert audd.calls == audd.billed_units == 7
-    assert shazam.requests == 0
+    assert shazam.requests == 2  # the secondary probes the blank mix, nothing more
     assert not _raw_payloads(raw_dir)
 
 
@@ -219,15 +226,18 @@ def test_all_http_401_is_provider_unavailable_unspent_and_never_cached(tmp_path:
     raw_dir = media_dir / "recognise" / "invocations" / "live-audd-clip-v1" / "raw"
     assert exit_code == 3
     assert entry["status"] == "provider_unavailable"
+    assert entry["reason"] == "auth_error"
+    assert entry["achieved"] is None
     assert entry["exit_code"] == 3
     assert entry["costs"] == {"usd_e2": 0}
     assert entry["counts"]["paid_billable_units"] == 0  # type: ignore[index]
     assert entry["counts"]["paid_resolved"] == 0  # type: ignore[index]
-    assert audd.calls == 7 and audd.billed_units == 0
+    # A terminal-provider outcome stops the primary at once (§2.3.3): one dispatch, six not sent.
+    assert audd.calls == 1 and audd.billed_units == 0
     assert shazam.requests == 0
     assert not _raw_payloads(raw_dir)
     assert not (media_dir / "present" / "index.html").exists()
-    assert any("(7 requests, 0 cached)" in message for message in progress_messages)
+    assert any("(1 requests, 0 cached, 6 not sent)" in message for message in progress_messages)
     assert all("billable" not in message for message in progress_messages)
 
 

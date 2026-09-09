@@ -1,0 +1,13 @@
+{
+  "audd": {
+    "default": "match",
+    "windows": {}
+  },
+  "shazam": {
+    "default": "match",
+    "windows": {
+      "0": "malformed",
+      "1": "malformed"
+    }
+  }
+}

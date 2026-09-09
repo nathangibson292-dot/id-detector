@@ -14,6 +14,7 @@ from __future__ import annotations
 import html
 import json
 import re
+import secrets
 import threading
 from dataclasses import dataclass
 from http import HTTPStatus
@@ -50,6 +51,10 @@ from id_detector.webapp.jobs import TERMINAL_STATES, Job, JobManager, TargetVali
 
 _SHA = re.compile(r"^[0-9a-f]{64}$")
 _JOB_ID = re.compile(r"^[0-9a-f]{32}$")
+#: Loopback CSRF (U-F5): every POST must come from this server's own pages.  The per-server
+#: token is served by ``GET /csrf`` and travels back as a form field or a request header.
+_CSRF_HEADER = "X-CSRF-Token"
+_CSRF_FIELD = "csrf_token"
 _PROFILES = ("free", "max_accuracy")
 _MANUAL_TRIGGERS = {"gap", "edge", "contested", "long_episode", "novelty", "hint_cluster"}
 _CONTENT_TYPES = {
@@ -759,7 +764,8 @@ setInterval(function(){ if(LAST && !LAST.terminal && LAST.started_at){
 setInterval(rotateFlavour, 7000);
 document.getElementById('cancel').addEventListener('click', function(){
   if(!confirm('Stop this analysis?')) return;
-  fetch('/jobs/' + JOB_ID + '/cancel', {method: 'POST'}).then(tick);
+  fetch('/jobs/' + JOB_ID + '/cancel', {method: 'POST',
+    headers: {'X-CSRF-Token': CSRF_TOKEN}}).then(tick);
 });
 tick();
 """
@@ -794,11 +800,12 @@ def _footer_html() -> str:
     )
 
 
-def _form_html(prefill: str = "") -> str:
+def _form_html(prefill: str = "", csrf_token: str = "") -> str:
     """The drop-a-link form: a hero input with platform detection and a collapsible options tray."""
 
     return (
         '<form method="post" action="/analyse" class="dropform" autocomplete="off">'
+        f'<input type="hidden" name="{_CSRF_FIELD}" value="{html.escape(csrf_token)}">'
         '<div class="urlbox">'
         '<span class="plat-ind" id="plat"><span class="pd"></span>'
         '<span id="plat-name">Paste a link</span></span>'
@@ -914,7 +921,7 @@ def _activity_item_html(job: Job) -> str:
     )
 
 
-def _home_html(sets: list[AnalysedSet], jobs: list[Job]) -> bytes:
+def _home_html(sets: list[AnalysedSet], jobs: list[Job], csrf_token: str = "") -> bytes:
     """The home: a drop-a-link hero, anything in flight, and the library of analysed mixes."""
 
     active = [job for job in jobs if job.status != "succeeded"]
@@ -929,7 +936,7 @@ def _home_html(sets: list[AnalysedSet], jobs: list[Job]) -> bytes:
         '<p class="lede">Paste a SoundCloud, YouTube or Mixcloud link. It listens to the set in '
         "short windows, asks the recognition engines what is playing, and hands you a "
         "click-to-jump tracklist with honest confidence for every track.</p>"
-        + _form_html()
+        + _form_html(csrf_token=csrf_token)
         + "</header>"
         + activity
         + '<h2 class="sec">Your mixes</h2>'
@@ -941,7 +948,7 @@ def _home_html(sets: list[AnalysedSet], jobs: list[Job]) -> bytes:
     return _page_shell("IDea — your mixes", body, _FORM_JS + _HOME_JS)
 
 
-def _new_html(prefill: str = "") -> bytes:
+def _new_html(prefill: str = "", csrf_token: str = "") -> bytes:
     """The New-mix page: the analyse form on its own (also the "try again" landing)."""
 
     body = (
@@ -950,7 +957,7 @@ def _new_html(prefill: str = "") -> bytes:
         '<h1>What is in <span class="grad">this one</span>?</h1>'
         '<p class="lede">Paste a mix link or a local audio file path, pick your options, and '
         "hit Analyse. You can leave the page while it runs — it keeps going on this machine.</p>"
-        + _form_html(prefill)
+        + _form_html(prefill, csrf_token)
         + "</header>"
         '<h2 class="sec">How it works</h2><div class="how">'
         '<div><span class="n">1</span><b>Paste a mix</b>'
@@ -1070,7 +1077,7 @@ def _job_player_html(plan: EmbedPlan, job: Job) -> str:
     )
 
 
-def _job_page_html(job: Job) -> bytes:
+def _job_page_html(job: Job, csrf_token: str = "") -> bytes:
     label = html.escape(job.display)
     plan = plan_embed_from_url(job.target)
     platform = plan.kind if plan.kind in ("soundcloud", "youtube", "mixcloud") else "file"
@@ -1109,7 +1116,9 @@ def _job_page_html(job: Job) -> bytes:
     )
     script = (
         f"var JOB_ID={json.dumps(job.id)};var DISPLAY={json.dumps(job.display)};"
-        f"var STEPS={json.dumps(steps)};" + _JOB_JS + _PLAYER_JS
+        f"var STEPS={json.dumps(steps)};var CSRF_TOKEN={json.dumps(csrf_token)};"
+        + _JOB_JS
+        + _PLAYER_JS
     )
     return _page_shell("Analysing — IDea", body, script)
 
@@ -1120,9 +1129,63 @@ class _Handler(BaseHTTPRequestHandler):
     config: AppConfig | None = None
     job_manager: JobManager | None = None
     analyse_enabled: bool = False
+    csrf_token: str = ""
+    #: Whether this request's body has already been taken off the socket (see ``_drain_body``).
+    #: Reset per request because one handler instance serves a whole keep-alive connection.
+    _body_read: bool = False
 
     def log_message(self, *args: object) -> None:  # noqa: D401 - silence default stderr logging
         return
+
+    def _loopback_authorities(self) -> frozenset[str]:
+        port = self.server.server_address[1]
+        return frozenset({f"127.0.0.1:{port}", f"localhost:{port}", f"[::1]:{port}"})
+
+    def _cross_site(self) -> str | None:
+        """Why a POST must be refused: a non-loopback ``Host`` or a foreign ``Origin`` (U-F5).
+
+        Browsers send ``Origin`` on every cross-site POST, so a page on any other site cannot
+        reach ``/analyse`` even from the owner's own browser; the ``Host`` check defeats DNS
+        rebinding.  The token check on the app routes covers what these headers cannot.
+        """
+
+        allowed = self._loopback_authorities()
+        host = (self.headers.get("Host") or "").strip().casefold()
+        if host not in allowed:
+            return "host"
+        origin = (self.headers.get("Origin") or "").strip()
+        if origin:
+            parts = urlsplit(origin)
+            if parts.scheme != "http" or (parts.netloc or "").casefold() not in allowed:
+                return "origin"
+        return None
+
+    def _csrf_ok(self, presented: str | None) -> bool:
+        token = (self.headers.get(_CSRF_HEADER) or presented or "").strip()
+        return bool(token) and secrets.compare_digest(token, self.csrf_token)
+
+    def _drain_body(self, limit: int = 1 << 20) -> None:
+        """Consume a refused request's body (bounded) so the client reads the answer, not a reset.
+
+        Closing the socket with unread bytes in flight makes Windows report the refusal as an
+        aborted connection instead of delivering the response, so every POST that answers without
+        reading its body (403, 404, "bad length") drains first.  Draining twice would block on a
+        keep-alive connection waiting for the *next* request's bytes, so it happens at most once
+        per request.
+        """
+
+        if self._body_read:
+            return
+        self._body_read = True
+        try:
+            remaining = min(max(int(self.headers.get("Content-Length") or 0), 0), limit)
+        except ValueError:
+            return
+        while remaining > 0:
+            chunk = self.rfile.read(min(65536, remaining))
+            if not chunk:
+                break
+            remaining -= len(chunk)
 
     def _send(self, status: HTTPStatus, body: bytes, content_type: str) -> None:
         self.send_response(status)
@@ -1237,10 +1300,16 @@ class _Handler(BaseHTTPRequestHandler):
         if route == "/healthz":
             self._send_json(HTTPStatus.OK, {"ok": True})
             return
+        if route == "/csrf":
+            # Readable only by this origin's own scripts (no CORS header is ever sent).
+            self._send_json(HTTPStatus.OK, {"token": self.csrf_token})
+            return
         if route in ("/", "/index.html"):
             if self._app_active():
                 assert self.job_manager is not None
-                body = _home_html(_discover_sets(self.work_root), self.job_manager.recent())
+                body = _home_html(
+                    _discover_sets(self.work_root), self.job_manager.recent(), self.csrf_token
+                )
             else:
                 body = _index_html(_discover_sets(self.work_root))
             self._send(HTTPStatus.OK, body, _CONTENT_TYPES[".html"])
@@ -1248,7 +1317,8 @@ class _Handler(BaseHTTPRequestHandler):
         if self._app_active() and route == "/new":
             query = parse_qs(urlsplit(self.path).query)
             prefill = (query.get("url") or [""])[0][:2048]
-            self._send(HTTPStatus.OK, _new_html(prefill), _CONTENT_TYPES[".html"])
+            body = _new_html(prefill, self.csrf_token)
+            self._send(HTTPStatus.OK, body, _CONTENT_TYPES[".html"])
             return
         if self._app_active() and route.startswith("/jobs/"):
             self._handle_job_get(route)
@@ -1278,7 +1348,8 @@ class _Handler(BaseHTTPRequestHandler):
             if job is None:
                 self._send(HTTPStatus.NOT_FOUND, b"unknown job", "text/plain; charset=utf-8")
                 return
-            self._send(HTTPStatus.OK, _job_page_html(job), _CONTENT_TYPES[".html"])
+            body = _job_page_html(job, self.csrf_token)
+            self._send(HTTPStatus.OK, body, _CONTENT_TYPES[".html"])
             return
         if len(segments) == 3 and _JOB_ID.match(segments[1]) and segments[2] == "status":
             job = self.job_manager.get(segments[1])
@@ -1303,6 +1374,14 @@ class _Handler(BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:  # noqa: N802
         route = self.path.split("?", 1)[0]
+        self._body_read = False
+        refusal = self._cross_site()
+        if refusal is not None:
+            self._drain_body()
+            self._send_json(
+                HTTPStatus.FORBIDDEN, {"error": f"cross-site request refused ({refusal})"}
+            )
+            return
         if self._app_active() and route == "/analyse":
             self._handle_analyse()
             return
@@ -1310,12 +1389,17 @@ class _Handler(BaseHTTPRequestHandler):
             self._handle_job_cancel(route)
             return
         if route != "/rescan":
+            # A read-only server (no job manager) answers /analyse here; drain first so the 404
+            # reaches the client instead of an aborted connection.
+            self._drain_body()
             self._send(HTTPStatus.NOT_FOUND, b"not found", "text/plain; charset=utf-8")
             return
         length = int(self.headers.get("Content-Length") or 0)
         if length <= 0 or length > 8192:
+            self._drain_body()
             self._send(HTTPStatus.BAD_REQUEST, b'{"error":"bad length"}', _CONTENT_TYPES[".json"])
             return
+        self._body_read = True
         try:
             payload = json.loads(self.rfile.read(length).decode("utf-8"))
             media_key = str(payload["media_key"])
@@ -1359,16 +1443,20 @@ class _Handler(BaseHTTPRequestHandler):
         length = int(self.headers.get("Content-Length") or 0)
         if length < 0 or length > limit:
             return None
+        self._body_read = True
         return self.rfile.read(length) if length else b""
 
     def _handle_analyse(self) -> None:
         assert self.job_manager is not None
         raw = self._read_body()
         if raw is None:
+            self._drain_body()
             self._send_json(HTTPStatus.BAD_REQUEST, {"error": "bad length"})
             return
         content_type = (self.headers.get("Content-Type") or "").split(";", 1)[0].strip().lower()
         wants_json = content_type == "application/json"
+        # ``upload_consent`` is no longer read from any body (E-H8): the whole-file scan it used
+        # to unlock is gone, so no client-controlled field can start a second, larger charge.
         try:
             if wants_json:
                 payload = json.loads(raw.decode("utf-8")) if raw else {}
@@ -1378,7 +1466,7 @@ class _Handler(BaseHTTPRequestHandler):
                 acquire = bool(payload.get("acquire"))
                 build_index = bool(payload.get("build_index"))
                 known_tracklist = payload.get("known_tracklist")
-                upload_consent = bool(payload.get("upload_consent"))
+                presented_token = payload.get(_CSRF_FIELD)
             else:
                 form = parse_qs(raw.decode("utf-8"), keep_blank_values=True)
                 url = (form.get("url") or [""])[0]
@@ -1386,9 +1474,15 @@ class _Handler(BaseHTTPRequestHandler):
                 acquire = bool(form.get("acquire"))
                 build_index = bool(form.get("build_index"))
                 known_tracklist = (form.get("known_tracklist") or [""])[0]
-                upload_consent = bool(form.get("upload_consent"))
+                presented_token = (form.get(_CSRF_FIELD) or [None])[0]
         except (ValueError, UnicodeDecodeError):
             self._send_json(HTTPStatus.BAD_REQUEST, {"error": "bad request"})
+            return
+        if not self._csrf_ok(presented_token if isinstance(presented_token, str) else None):
+            self._send_json(
+                HTTPStatus.FORBIDDEN,
+                {"error": f"missing or invalid CSRF token (GET /csrf, then send {_CSRF_HEADER})"},
+            )
             return
         if profile is not None and profile not in _PROFILES:
             self._send_json(HTTPStatus.BAD_REQUEST, {"error": "unknown profile"})
@@ -1406,7 +1500,6 @@ class _Handler(BaseHTTPRequestHandler):
                 acquire=acquire,
                 build_index=build_index,
                 known_tracklist=known_tracklist,
-                upload_consent=upload_consent,
             )
         except TargetValidationError as exc:
             self._send_json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
@@ -1422,9 +1515,16 @@ class _Handler(BaseHTTPRequestHandler):
 
     def _handle_job_cancel(self, route: str) -> None:
         assert self.job_manager is not None
+        self._drain_body()  # cancel carries no body, but a client's is never left on the socket
         segments = route.strip("/").split("/")
         if len(segments) != 3 or not _JOB_ID.match(segments[1]) or segments[2] != "cancel":
             self._send(HTTPStatus.NOT_FOUND, b"not found", "text/plain; charset=utf-8")
+            return
+        if not self._csrf_ok(None):
+            self._send_json(
+                HTTPStatus.FORBIDDEN,
+                {"error": f"missing or invalid CSRF token (GET /csrf, then send {_CSRF_HEADER})"},
+            )
             return
         cancelled = self.job_manager.cancel(segments[1])
         if self.job_manager.get(segments[1]) is None:
@@ -1458,6 +1558,7 @@ def make_server(
             "config": config,
             "job_manager": job_manager,
             "analyse_enabled": job_manager is not None,
+            "csrf_token": secrets.token_urlsafe(32),
         },
     )
     server = ThreadingHTTPServer((host, port), handler)

@@ -1,0 +1,10 @@
+{
+  "audd": {
+    "default": "timeout_pre",
+    "windows": {}
+  },
+  "shazam": {
+    "default": "match",
+    "windows": {}
+  }
+}

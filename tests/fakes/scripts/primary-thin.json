@@ -1,0 +1,12 @@
+{
+  "audd": {
+    "default": "match",
+    "windows": {
+      "3": "http_500"
+    }
+  },
+  "shazam": {
+    "default": "match",
+    "windows": {}
+  }
+}

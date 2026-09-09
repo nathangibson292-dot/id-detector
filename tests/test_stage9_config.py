@@ -28,7 +28,7 @@ def test_packaged_template_parses_to_the_documented_defaults() -> None:
     assert config.cache_positive_max_age_days == 180
     assert config.cache_no_match_max_age_days == 30
     assert config.hints_enabled is True
-    assert config.disabled_hint_connectors == frozenset()
+    assert config.disabled_hint_connectors == frozenset({"tl1001"})  # default-disabled (0a-iii)
     # A template that parses to defaults must equal a fresh AppConfig on every runtime field.
     assert config == AppConfig()
 
@@ -75,7 +75,7 @@ def test_hints_table_toggles_individual_connectors(tmp_path: Path) -> None:
     config.write_text("[hints]\nmixesdb = false\nyt_comments = false\n", encoding="utf-8")
     loaded = AppConfig.load(config)
     assert loaded.hints_enabled is True
-    assert loaded.disabled_hint_connectors == frozenset({"mixesdb", "yt_comments"})
+    assert loaded.disabled_hint_connectors == frozenset({"mixesdb", "yt_comments", "tl1001"})
 
 
 def test_hints_enabled_false_is_recorded(tmp_path: Path) -> None:

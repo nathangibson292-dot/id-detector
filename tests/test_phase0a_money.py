@@ -355,8 +355,12 @@ def test_reservation_over_effective_cap_exits_four_without_provider_attempts(
 
 def test_paid_outcome_costs_refund_zero_cost_units_and_bill_ambiguous(tmp_path: Path) -> None:
     code, audd, _shazam, entry, _media_dir = _run_deep(tmp_path, "money-refunds.json")
-    assert code == 0 and audd.calls == 7
+    # 429, 503 and timeout_pre refund; timeout_post and no_match bill; the 401 on the sixth window
+    # is terminal-provider (cost 0) and stops the sweep, so the seventh is never dispatched.
+    assert code == 0 and audd.calls == 6
     assert audd.billed_units == 2
+    assert entry["status"] == "partial"
+    assert entry["reason"] == "provider_unavailable_midrun"
     assert entry["usd_e6_reserved"] == 36_750
     assert entry["usd_e6_spent"] == 10_000
     assert entry["usd_e2_spent"] == 1
@@ -416,7 +420,7 @@ def test_primary_stops_and_journals_partial_when_admission_cannot_dispatch(
     code, audd, shazam, entry, _media_dir = _run_deep(tmp_path, "gate0a-deep.json")
     assert code == 0
     assert audd.calls == 1
-    assert shazam.requests == 0
+    assert shazam.requests == 2  # the Deep secondary still probes the blank remainder
     assert entry["status"] == "partial"
     assert entry["reason"] == "reservation_exhausted"
     assert entry["usd_e6_reserved"] == 5_250
@@ -486,14 +490,18 @@ def test_pricing_loader_refuses_unknown_or_malformed_fields(tmp_path: Path) -> N
 
 
 def test_throttled_run_refunds_every_unit_and_bills_nothing(tmp_path: Path) -> None:
-    """A 429 storm resolves nothing, so the Deep run is terminal and completely unspent."""
+    """A 429 storm resolves nothing and bills nothing: plan §2.3.5 makes it a ``partial`` Deep run
+    (AudD 0 of 7 < 95 %), not a silent Free one."""
 
     code, audd, shazam, entry, media_dir = _run_deep(tmp_path, "all-http-429.json")
-    assert code == 3
-    assert entry["status"] == "provider_unavailable"
+    assert code == 0
+    assert entry["status"] == "partial"
+    assert entry["reason"] == "primary_not_achieved"
+    assert entry["achieved"] == "deep"
+    assert entry["algorithm_version"] == "targeting:0,fusion:1"
     assert audd.calls == 7  # every planned dispatch was admitted; none was refused
     assert audd.billed_units == 0
-    assert shazam.requests == 0  # a Deep request never silently degrades to the free engine
+    assert shazam.requests == 2  # only the Deep recipe's own bounded secondary, never a free sweep
     assert entry["usd_e6_reserved"] == 36_750
     assert entry["usd_e2_reserved"] == 4
     assert entry["usd_e6_spent"] == entry["usd_e2_spent"] == 0
@@ -563,7 +571,7 @@ def test_free_recipe_reaches_no_paid_call_path_even_with_consent_and_engines_ope
     def forbidden(*_args: object, **_kwargs: object):
         raise AssertionError("the free recipe reached a paid engine")
 
-    monkeypatch.setattr(cli, "run_paid_scanners", forbidden)
+    assert not hasattr(cli, "run_paid_scanners")  # the whole-file call site is gone (0a-iii)
     monkeypatch.setattr(cli, "run_paid_clip_recognition", forbidden)
     script = SCRIPTS / "all-no-match.json"
     audd = FakeAudD(script)
