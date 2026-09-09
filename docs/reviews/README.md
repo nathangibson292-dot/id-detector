@@ -47,3 +47,16 @@ same prompt and read-only discipline, still with reviewer and builder as separat
 
 Stages **4d, 6, 7 and 9** had no separate code-review round (Codex unavailable); their verification is
 in each stage report, and Stage 9 re-ran the full lint/format/audit/test gates for the whole tree.
+
+## v2 plan review rounds (2026-09-09, Codex gpt-5.6-sol xhigh, read-only)
+
+Object under review: `docs/PLAN-v2.md`. Sources: `v2-review-engines.md`, `v2-review-ui.md`,
+`v2-review-hosting.md`, `../research/05-market-2026-09.md`.
+
+| Round | Plan rev | Verdict | P0/P1/P2 | Outcome |
+|---|---|---|---|---|
+| [1](plan-v2-review-round-1.md) | 1 | CHANGES_REQUESTED | 9/7/2 | rev 2: qualified findings, Deep scan v2, recipes/ledgers, pricing recomputed; P0 #2 (remove Shazam from hosted defaults) declined by the owner (D1) |
+| [2](plan-v2-review-round-2.md) | 2 | CHANGES_REQUESTED | 8/9/1 | rev 3: two frozen recipes, reservation semantics, bundles in Phase 1, Deep-on-Free = AudD sweep, sidecar pruning, ledgers, status table, 24 cycles |
+| [3](plan-v2-review-round-3.md) | 3 | CHANGES_REQUESTED | 6/9/1 | rev 4: explicit `serves()` table, attempt state machine, `bundle_id`, lots + allocations, `provider_attempts`, fenced backups, M1/M2 milestones |
+| [4](plan-v2-review-round-4.md) | 4 | CHANGES_REQUESTED | 6/8/1 | rev 5: overlap rule fixed, status matrix, per-dispatch USD admission, intake job, scope in `analysis_key`, executable smoke/readiness gates, 29 + 6 cycles |
+| [5](plan-v2-review-round-5.md) | 5 | CHANGES_REQUESTED | 7/8/1 | final round (owner cap); rev 6 applies all seven P0s and the cheap P1/P2s (auth/quota outcomes, `/healthz` in 0a-i, provisional `targeting:0`, density rule fixed, provisional subscriber reservations + payer transfer, `BUILD_ID` readiness, lock-before-snapshot backups) without a further review; 33 M1 + 6 M2 cycles; build starts at 0a-i |
