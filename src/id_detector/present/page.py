@@ -45,7 +45,7 @@ UNRESOLVED_CAP_MS = 120_000
 #: Bump when the page's look or behaviour changes: ``present.refresh.ensure_fresh_page`` re-renders
 #: any written page whose ``<meta name="id-detector-page">`` stamp is older, so already-analysed
 #: mixes pick up the new page the next time they are opened (no re-analysis).
-PAGE_VERSION = 16
+PAGE_VERSION = 17
 
 
 # --------------------------------------------------------------------------------------------------
@@ -419,7 +419,7 @@ def _tags_html(entry: dict[str, Any], hidden: str | None = None) -> str:
         tags.append('<span class="hint" title="supported by a text hint">hint</span>')
     if entry.get("engine_corroborated"):
         tags.append(
-            '<span class="hint engine" title="a second recognizer (e.g. AudD) independently '
+            '<span class="hint engine" title="a second recogniser independently '
             'matched this track here">cross-checked</span>'
         )
     if hidden == "short":

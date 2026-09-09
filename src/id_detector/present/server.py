@@ -339,14 +339,7 @@ font:12px/1.55 var(--mono);outline:none;transition:border-color .12s,box-shadow 
 .tlbox textarea:focus{border-color:var(--accent);box-shadow:0 0 0 3px rgba(167,139,250,.18)}
 .tlbox textarea::placeholder{color:var(--dim)}
 .opt-grid>.tog{grid-column:1/-1}
-.adv{grid-column:1/-1;margin-top:2px}
-.adv>summary{list-style:none;cursor:pointer;font-size:12px;color:var(--dim);padding:4px 2px;
-display:inline-flex;align-items:center;gap:6px}
-.adv>summary::-webkit-details-marker{display:none}
-.adv>summary::before{content:"▸";font-size:10px;transition:transform .15s}
-.adv[open]>summary::before{transform:rotate(90deg)}
-.adv>summary:hover{color:var(--fg)}
-.adv .tog,.adv .tlbox{margin-top:8px;grid-column:auto}
+.modes{margin-top:14px}
 .consent{grid-column:1/-1;border-color:rgba(251,191,36,.38);background:rgba(251,191,36,.06)}
 .consent[hidden]{display:none}
 /* library */
@@ -529,10 +522,11 @@ _FORM_JS = """
   function summary(){
     if(!sum) return;
     var f = input.form, parts = [];
-    var prof = f.querySelector('input[name=profile]:checked');
-    parts.push(prof && prof.value === 'max_accuracy' ? 'Paid cross-check' : 'Free');
-    if(f.querySelector('input[name=acquire]').checked) parts.push('with download links');
+    parts.push(f.querySelector('input[name=acquire]').checked
+      ? 'download links on' : 'download links off');
     if(f.querySelector('input[name=build_index]').checked) parts.push('reference index');
+    var uc = f.querySelector('input[name=upload_consent]');
+    if(uc && uc.checked) parts.push('whole-file upload');
     sum.textContent = parts.join(' · ');
   }
   var consent = document.getElementById('consent-row');
@@ -593,7 +587,7 @@ var FLAVOUR = {
   decode: ['Decoding to raw audio so every window sounds the same to the engines.'],
   windows: ['Slicing the set into short, overlapping windows.'],
   recognise: ['Every window is one question: what\\'s playing right now?',
-    'Shazam allows 18 asks a minute — we\\'re being polite, hence the wait.',
+    'Working through the set clip by clip — a long mix takes a few minutes.',
     'A window that matches nothing stays honest: it becomes an ID, never a guess.',
     'Overlapping windows are how a track start gets pinned — only as far as evidence proves.',
     'The same track heard across several windows gets stitched into one episode later.',
@@ -825,30 +819,30 @@ def _form_html(prefill: str = "") -> str:
         f'value="{html.escape(prefill)}" '
         'placeholder="https://soundcloud.com/… — or a local audio file path">'
         '<button class="btn primary big" type="submit">Analyse</button></div>'
-        '<details class="opts"><summary><span>Options</span>'
-        '<span class="opt-sum" id="opt-sum">Free · with download links</span></summary>'
-        '<div class="opt-grid"><div class="seg" role="radiogroup" aria-label="Mode">'
+        # Step 1 — the only choice most people make, always visible above the fold: Free or Paid.
+        '<div class="seg modes" role="radiogroup" aria-label="Mode">'
         '<label class="segopt"><input type="radio" name="profile" value="free" checked>'
-        "<span><b>Free</b><small>Shazam + crowd comments — no key needed</small></span></label>"
+        "<span><b>Free</b><small>no key needed — identifies tracks and reads the crowd's "
+        "comments</small></span></label>"
         '<label class="segopt"><input type="radio" name="profile" value="max_accuracy">'
-        "<span><b>Paid cross-check</b><small>adds AudD to confirm uncertain tracks "
-        "(~$0.75/mix)</small></span></label>"
+        "<span><b>Paid cross-check</b><small>a second recogniser confirms the uncertain tracks "
+        "(about $0.75 a mix)</small></span></label>"
         "</div>"
-        # Download links are part of the normal result now (default on); a normal user always wants
-        # them, so it is a prominent pre-ticked toggle rather than a buried opt-in.
+        # Step 2 — everything else, collapsed. Download links default on for both modes; the rest is
+        # power-user territory.
+        '<details class="opts"><summary><span>More options</span>'
+        '<span class="opt-sum" id="opt-sum">download links on</span></summary>'
+        '<div class="opt-grid">'
         '<label class="tog"><input type="checkbox" name="acquire" value="1" checked>'
         '<span class="sw"></span>'
-        "<span><b>Include buy / download links</b>"
-        "<small>where to get each track — free download, buy, or gated — on the result page"
-        "</small></span></label>"
-        # Everything below is power-user territory: kept, but collapsed so the common path stays two
-        # choices (Free/Paid + links).
-        '<details class="adv"><summary>Advanced</summary>'
+        "<span><b>Buy / download links</b>"
+        "<small>on by default — where to get each track (free download, buy, or gated) on the "
+        "result page</small></span></label>"
         '<label class="tog consent" id="consent-row" hidden>'
         '<input type="checkbox" name="upload_consent" value="1"><span class="sw"></span>'
-        "<span><b>I own this audio (allow whole-file upload)</b>"
-        "<small>Paid cross-check already works clip-by-clip without this. Tick only to also send "
-        "the whole file to a paid engine — for a mix you own.</small></span></label>"
+        "<span><b>I own this audio — also send the whole file</b>"
+        "<small>Not needed for the paid cross-check, which already works clip-by-clip. Tick only "
+        "to additionally upload the full file, for a mix you own.</small></span></label>"
         '<label class="tog"><input type="checkbox" name="build_index" value="1">'
         '<span class="sw"></span><span><b>Build a reference index first</b>'
         "<small>fingerprints this uploader's own tracks — only helps if the DJ plays their own "
@@ -859,7 +853,7 @@ def _form_html(prefill: str = "") -> str:
         '"12:34 Artist - Title". Leave blank to analyse from the audio only.</small></span>'
         '<textarea name="known_tracklist" rows="4" spellcheck="false" '
         'placeholder="12:34 Artist - Title&#10;19:20 Another Artist - Another Title">'
-        "</textarea></label></details></div></details></form>"
+        "</textarea></label></div></details></form>"
     )
 
 
@@ -981,17 +975,19 @@ def _new_html(prefill: str = "") -> bytes:
         + _form_html(prefill)
         + "</header>"
         '<h2 class="sec">How it works</h2><div class="how">'
-        '<div><span class="n">1</span><b>Fetch &amp; slice</b>'
-        "<small>The audio is downloaded once and cut into short overlapping windows.</small></div>"
-        '<div><span class="n">2</span><b>Listen</b>'
-        "<small>Each window is sent to the recognition engines — politely, at their rate "
-        "limit.</small></div>"
-        '<div><span class="n">3</span><b>Stitch</b>'
-        "<small>Matches are fused into track episodes with honest confidence tiers; unknown "
+        '<div><span class="n">1</span><b>Paste a mix</b>'
+        "<small>A SoundCloud, YouTube or Mixcloud link — or an audio file on your machine.</small>"
+        "</div>"
+        '<div><span class="n">2</span><b>It gets identified</b>'
+        "<small>The set is listened to track by track and cross-checked against what the crowd "
+        "says in the comments.</small></div>"
+        '<div><span class="n">3</span><b>Your tracklist</b>'
+        "<small>Every track with its start time and an honest confidence rating — unknown "
         "stretches stay marked ID.</small></div>"
-        '<div><span class="n">4</span><b>Play</b>'
-        "<small>You get a page where clicking any track jumps the player to that moment.</small>"
-        "</div></div>" + _footer_html() + "</main>"
+        '<div><span class="n">4</span><b>Play &amp; grab it</b>'
+        "<small>Click any track to jump the player there, then follow the buy / free-download "
+        "links to get the ones you want.</small></div>"
+        "</div>" + _footer_html() + "</main>"
     )
     return _page_shell("IDea — new mix", body, _FORM_JS)
 
