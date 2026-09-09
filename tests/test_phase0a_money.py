@@ -36,7 +36,7 @@ from id_detector.providers.base import (
     ProviderUnavailable,
 )
 from id_detector.recipes import DEEP_RECIPE, FREE_RECIPE, Recipe, get_recipe
-from tests.fakes.providers import FakeAudD, FakeShazamHTTP
+from tests.fakes.providers import FakeAudD, FakeShazamHTTP, no_backoff
 
 ROOT = Path(__file__).resolve().parents[1]
 AUDIO = ROOT / "tests" / "fixtures" / "audio" / "tone-60s.wav"
@@ -74,12 +74,14 @@ def _run_deep(
                 transforms_policy="off",
                 recognise_concurrency=1,
                 shazam_requests_per_minute=1_000_000,
+                audd_requests_per_minute=1_000_000,
             ),
             max_generations=0,
             novelty=False,
             recipe=recipe,
             paid_scan_adapters={"audd": audd},
             shazam_http_client=shazam,
+            paid_sleep=no_backoff,
         )
     )
     media_dir, entry = _entry(work_root)
@@ -104,6 +106,7 @@ def _run_free(tmp_path: Path) -> tuple[FakeAudD, FakeShazamHTTP, dict[str, objec
                 transforms_policy="off",
                 recognise_concurrency=1,
                 shazam_requests_per_minute=1_000_000,
+                audd_requests_per_minute=1_000_000,
             ),
             max_generations=0,
             novelty=False,
@@ -111,6 +114,7 @@ def _run_free(tmp_path: Path) -> tuple[FakeAudD, FakeShazamHTTP, dict[str, objec
             recipe=FREE_RECIPE,
             paid_scan_adapters={"audd": audd},
             shazam_http_client=shazam,
+            paid_sleep=no_backoff,
         )
     )
     assert code == 0
@@ -355,9 +359,13 @@ def test_reservation_over_effective_cap_exits_four_without_provider_attempts(
 
 def test_paid_outcome_costs_refund_zero_cost_units_and_bill_ambiguous(tmp_path: Path) -> None:
     code, audd, _shazam, entry, _media_dir = _run_deep(tmp_path, "money-refunds.json")
-    # 429, 503 and timeout_pre refund; timeout_post and no_match bill; the 401 on the sixth window
-    # is terminal-provider (cost 0) and stops the sweep, so the seventh is never dispatched.
-    assert code == 0 and audd.calls == 6
+    # 429, 503 and timeout_pre refund (and are retried until the 401 halts the sweep — how many
+    # retries land before that depends on the four workers' interleaving); timeout_post and
+    # no_match bill; the 401 on the sixth window is terminal-provider (cost 0) and stops the
+    # sweep, so the seventh is never dispatched.
+    assert code == 0
+    assert entry["counts"]["paid_requests"] == 6  # type: ignore[index]
+    assert entry["counts"]["paid_attempts"] == audd.calls >= 6  # type: ignore[index]
     assert audd.billed_units == 2
     assert entry["status"] == "partial"
     assert entry["reason"] == "provider_unavailable_midrun"
@@ -499,7 +507,8 @@ def test_throttled_run_refunds_every_unit_and_bills_nothing(tmp_path: Path) -> N
     assert entry["reason"] == "primary_not_achieved"
     assert entry["achieved"] == "deep"
     assert entry["algorithm_version"] == "targeting:0,fusion:1"
-    assert audd.calls == 7  # every planned dispatch was admitted; none was refused
+    # Every planned dispatch and each of its three bounded retries was admitted; none was refused.
+    assert audd.calls == 28
     assert audd.billed_units == 0
     assert shazam.requests == 2  # only the Deep recipe's own bounded secondary, never a free sweep
     assert entry["usd_e6_reserved"] == 36_750

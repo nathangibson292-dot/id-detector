@@ -51,7 +51,9 @@ from id_detector.money import (
 from id_detector.orchestrate import run_generation_loop
 from id_detector.paid_clip import (
     PAID_CLIP_ENGINES,
+    CancelToken,
     PaidScanResult,
+    SleepFn,
     run_paid_clip_recognition,
 )
 from id_detector.present import export_tracklist, generate_page
@@ -63,6 +65,7 @@ from id_detector.profiles import (
     load_profile,
     profile_app_config,
 )
+from id_detector.providers.audd import DEFAULT_ANCHOR_MAX_MS, DEFAULT_ANCHOR_SLACK_MS
 from id_detector.providers.base import AppConfig
 from id_detector.recipes import Recipe, get_recipe
 from id_detector.recognise import recognise_generation
@@ -497,7 +500,16 @@ async def _analyse(
     index_root: Path = Path("data/local/panako-db"),
     panako_tool_dir: Path = Path("data/local/panako"),
     progress: ProgressFn | None = None,
+    cancel_token: CancelToken | None = None,
+    paid_sleep: SleepFn | None = None,
 ) -> int:
+    """Run one analysis and return its exit code (plan §2.3.5).
+
+    ``cancel_token`` is polled by the paid sweep before every dispatch (the web app passes its
+    job's cancel event); when it fires the run ends ``cancelled`` once the clips in flight have
+    resolved.  ``paid_sleep`` injects the AudD retry-backoff sleeper (tests pass a no-op).
+    """
+
     app_config = app_config or AppConfig()
     requested_recipe = recipe or get_recipe(
         "deep" if primary_engine == "audd" else "free",
@@ -599,9 +611,16 @@ async def _analyse(
             usd_admitter = UsdAdmitter(reservation)
 
         timer.start_stage("recognise_ms")
+        # The latest per-window tick, so a log line in the same phase repeats the real
+        # done/total instead of resetting the web app's ETA to "1 window" (review H4).
+        recognise_progress = [0, 1]
 
         def _on_recognise_window(done: int, total: int) -> None:
+            recognise_progress[:] = [done, total]
             _report(progress, "recognise", done, total, "recognising windows")
+
+        def _recognise_log(message: str) -> None:
+            _report(progress, "recognise", recognise_progress[0], recognise_progress[1], message)
 
         async def recognise_windows(*, windows: object, generation: int) -> object:
             return await recognise_generation(
@@ -637,7 +656,7 @@ async def _analyse(
         gen0_physical = 0
         free_failures = 0
         if paid_first:
-            _report(progress, "recognise", 0, 1, "identifying the whole mix (paid)")
+            audd_retry = requested_recipe.retry_policy.get("audd")
             primary_clip = await run_paid_clip_recognition(
                 media_key=ingested.record.media_key,
                 media_dir=media_dir,
@@ -653,17 +672,33 @@ async def _analyse(
                 primary_density=requested_recipe.primary_density,
                 usd_admitter=usd_admitter,
                 adapters=paid_scan_adapters,
-                log=lambda message: _report(progress, "recognise", 0, 1, message),
+                log=_recognise_log,
+                # Plan §2.3.1: the recipe fixes the concurrency, the bounded retry policy and
+                # the anchor validity bounds; the token-bucket ceiling is a config knob.
+                concurrency=requested_recipe.audd_concurrency or 1,
+                retry_policy=audd_retry,
+                anchor_max_ms=requested_recipe.anchor_max_ms or DEFAULT_ANCHOR_MAX_MS,
+                anchor_slack_ms=requested_recipe.anchor_slack_ms or DEFAULT_ANCHOR_SLACK_MS,
+                cancel_token=cancel_token,
+                on_window=_on_recognise_window if progress is not None else None,
+                sleep=paid_sleep,
             )
             counts.update(
                 {
                     "paid_requests": primary_clip.requests,
+                    "paid_attempts": primary_clip.attempts,
                     "paid_resolved": primary_clip.resolved,
                     "paid_failures": primary_clip.failures,
                     "paid_cache_hits": primary_clip.cache_hits,
                     "paid_billable_units": primary_clip.billable_units,
+                    "paid_resumed_ambiguous": primary_clip.resumed_ambiguous,
+                    "paid_resumed_reissued": primary_clip.resumed_reissued,
                 }
             )
+            if primary_clip.cancelled:
+                # The cancel token fired (or the progress hook raised) inside the sweep; the
+                # clips in flight resolved first, so the journal below carries their spend.
+                raise asyncio.CancelledError("paid sweep cancelled")
             if primary_clip.resolved == 0 and (
                 not primary_clip.ran or primary_clip.provider_stopped or primary_clip.unreachable
             ):
@@ -1212,6 +1247,7 @@ def analyse(
             bill_on_throttle=file_config.bill_on_throttle,
             max_usd_e2=file_config.max_usd_e2,
             deep_primary_density=file_config.deep_primary_density,
+            audd_requests_per_minute=file_config.audd_requests_per_minute,
             lead_in_ms=file_config.lead_in_ms,
             cache_positive_max_age_days=file_config.cache_positive_max_age_days,
             cache_no_match_max_age_days=file_config.cache_no_match_max_age_days,

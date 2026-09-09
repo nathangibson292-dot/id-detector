@@ -50,6 +50,11 @@ DEFAULT_MAX_REQUESTS = 2_000
 #: Historic behaviour was 18/min, strictly serial; these defaults are a safe ~2-3x speed-up.
 DEFAULT_SHAZAM_REQUESTS_PER_MINUTE = 45
 DEFAULT_RECOGNISE_CONCURRENCY = 3
+#: Ceiling of the Deep primary's AudD token bucket (plan §2.3.1: concurrency 4 + token bucket; the
+#: concurrency itself is recipe data).  AudD has no published per-token rate for the clip
+#: endpoint, so this is a courtesy ceiling that the AIMD bucket lowers on a 429/503; 400 windows
+#: at 120/min is the ~4 min primary of plan §2.3.6.  Speed only, never results.
+DEFAULT_AUDD_REQUESTS_PER_MINUTE = 120
 #: Cache TTLs (plan): a positive match is trusted for 180 days, a ``no_match`` for 30 days.
 DEFAULT_CACHE_POSITIVE_MAX_AGE_DAYS = 180
 DEFAULT_CACHE_NO_MATCH_MAX_AGE_DAYS = 30
@@ -114,6 +119,7 @@ class AppConfig:
     bill_on_throttle: bool = False
     max_usd_e2: int | None = None
     deep_primary_density: int = 1
+    audd_requests_per_minute: int = DEFAULT_AUDD_REQUESTS_PER_MINUTE
     shazam_requests_per_minute: int = DEFAULT_SHAZAM_REQUESTS_PER_MINUTE
     recognise_concurrency: int = DEFAULT_RECOGNISE_CONCURRENCY
     lead_in_ms: int = DEFAULT_LEAD_IN_MS
@@ -178,12 +184,17 @@ class AppConfig:
             raise ValueError("present must be a TOML table")
         if not isinstance(deep, dict):
             raise ValueError("deep must be a TOML table")
-        unknown_deep = sorted(set(deep) - {"primary_density"})
+        unknown_deep = sorted(set(deep) - {"primary_density", "audd_requests_per_minute"})
         if unknown_deep:
             raise ValueError(f"unknown deep setting: {', '.join(unknown_deep)}")
         deep_primary_density = deep.get("primary_density", 1)
         if isinstance(deep_primary_density, bool) or deep_primary_density not in {1, 2}:
             raise ValueError("deep.primary_density must be 1 or 2")
+        audd_requests_per_minute = _positive_integer(
+            deep.get("audd_requests_per_minute", DEFAULT_AUDD_REQUESTS_PER_MINUTE),
+            "deep",
+            "audd_requests_per_minute",
+        )
         policy = transforms.get("policy", "rescan_only")
         if policy not in {"off", "rescan_only", "global"}:
             raise ValueError("transforms.policy must be off, rescan_only, or global")
@@ -286,6 +297,7 @@ class AppConfig:
             bill_on_throttle=pricing.bill_on_throttle,
             max_usd_e2=pricing.max_usd_e2,
             deep_primary_density=deep_primary_density,
+            audd_requests_per_minute=audd_requests_per_minute,
             shazam_requests_per_minute=requests_per_minute,
             recognise_concurrency=recognise_concurrency,
             lead_in_ms=lead_in_ms,

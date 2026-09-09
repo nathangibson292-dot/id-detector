@@ -954,6 +954,57 @@ class InvocationJournalEntry(Record):
     source_ids: list[str]
 
 
+#: The frozen money outcome of one provider request (plan §2.3.2–2.3.3).
+ProviderOutcome = Literal[
+    "match",
+    "no_match",
+    "timeout_post",
+    "http_5xx",
+    "malformed",
+    "connect_error",
+    "timeout_pre",
+    "http_429",
+    "http_503",
+    "auth_error",
+    "quota_error",
+]
+AttemptEventKind = Literal["prepared", "dispatched", "resolved"]
+#: ``seq`` of each attempt event: the three events of one attempt are strictly ordered.
+ATTEMPT_EVENT_SEQ: dict[str, int] = {"prepared": 0, "dispatched": 1, "resolved": 2}
+
+
+class ProviderAttemptEvent(Record):
+    """One line of ``recognise/attempts.jsonl`` — the durable attempt state machine (§2.3.3).
+
+    Every event repeats the attempt's identity so that any single surviving line reconstructs it:
+    ``prepared`` → ``dispatched`` (written before network I/O) → ``resolved(outcome)``.
+    """
+
+    event: AttemptEventKind
+    seq: NonNegativeInt
+    at: str
+    attempt_id: Sha256
+    #: The clip cache key: the same audio asked of the same provider shares one query id.
+    query_id: Sha256
+    run_id: str
+    provider: str
+    window_id: Sha1
+    #: 0 for a window's first attempt in this run; ``n`` for its ``n``-th retry.
+    ordinal: NonNegativeInt
+    #: The retried attempt, or the earlier run's unresolved attempt this one re-issues.
+    parent_attempt_id: Sha256 | None
+    unit_usd_e6: NonNegativeInt
+    outcome: ProviderOutcome | None
+
+    @model_validator(mode="after")
+    def outcome_only_on_resolved(self) -> ProviderAttemptEvent:
+        if self.seq != ATTEMPT_EVENT_SEQ[self.event]:
+            raise ValueError("seq must match the event kind")
+        if (self.outcome is None) == (self.event == "resolved"):
+            raise ValueError("outcome is present exactly on resolved events")
+        return self
+
+
 class RawIndexEntry(Record):
     id: Sha1
     cache_key: Sha256
@@ -1393,6 +1444,7 @@ SCHEMA_MODELS: dict[str, type[BaseModel]] = {
     "benchmark_report": BenchmarkReportRecord,
     "shortlist_report": ShortlistReportRecord,
     "invocation_journal_entry": InvocationJournalEntry,
+    "provider_attempt_event": ProviderAttemptEvent,
     "raw_index_entry": RawIndexEntry,
     "provider_config": ProviderConfigRecord,
     "profile": ProfileRecord,
@@ -1431,6 +1483,7 @@ NATURAL_KEY_FIELDS: dict[str, tuple[str, ...]] = {
     "ground_truth": ("set_id",),
     "benchmark_report": ("corpus_version", "profile", "config_hash"),
     "invocation_journal_entry": ("invocation_id",),
+    "provider_attempt_event": ("run_id", "query_id", "ordinal"),
     "raw_index_entry": ("cache_key",),
     "provider_config": ("provider", "version"),
     "profile": ("name", "version"),

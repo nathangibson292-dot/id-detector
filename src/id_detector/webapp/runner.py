@@ -77,6 +77,7 @@ def _resolve_settings(project_root: Path, config_path: Path, profile: str | None
                 bill_on_throttle=file_config.bill_on_throttle,
                 max_usd_e2=file_config.max_usd_e2,
                 deep_primary_density=file_config.deep_primary_density,
+                audd_requests_per_minute=file_config.audd_requests_per_minute,
                 lead_in_ms=file_config.lead_in_ms,
                 cache_positive_max_age_days=file_config.cache_positive_max_age_days,
                 cache_no_match_max_age_days=file_config.cache_no_match_max_age_days,
@@ -186,6 +187,9 @@ def make_pipeline_runner(
                 index_root=WEB_INDEX_ROOT,
                 panako_tool_dir=WEB_PANAKO_TOOL_DIR,
                 progress=progress,
+                # The paid sweep polls this before each dispatch so a cancel stops new AudD
+                # requests while the clips in flight resolve (their spend is journalled).
+                cancel_token=ctx.cancel_token,
             )
         )
         if exit_code != 0:

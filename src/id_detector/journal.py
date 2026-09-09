@@ -3,15 +3,18 @@
 from __future__ import annotations
 
 import importlib.metadata
+import os
 import time
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import Any
 
 from id_detector.contracts import GENERATED_BY, SCHEMA_VERSION, InvocationJournalEntry
 from id_detector.io import (
     atomic_write_bytes,
     canonical_json_bytes,
+    native_path,
     path_is_file,
     read_bytes,
     redact_command_argument,
@@ -38,6 +41,22 @@ def tool_versions(ffmpeg_version: str | None = None) -> dict[str, str]:
 def append_invocation(path: Path, entry: InvocationJournalEntry) -> None:
     existing = read_bytes(path) if path_is_file(path) else b""
     atomic_write_bytes(path, existing + canonical_json_bytes(entry) + b"\n")
+
+
+def append_line(path: Path, record: Any) -> None:
+    """Append one canonical JSON line and fsync it before returning.
+
+    The attempt journal (plan §2.3.3) needs every event on disk *before* the next step — most
+    importantly ``dispatched`` before network I/O — so this is a true append with a flush and an
+    ``fsync``, not the read-and-replace :func:`append_invocation` uses for its one line per run.
+    """
+
+    path = path.resolve()
+    os.makedirs(native_path(path.parent), exist_ok=True)
+    with open(native_path(path), "ab") as handle:
+        handle.write(canonical_json_bytes(record) + b"\n")
+        handle.flush()
+        os.fsync(handle.fileno())
 
 
 @dataclass

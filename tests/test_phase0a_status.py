@@ -24,7 +24,7 @@ from id_detector.secondary_targeting import (
     secondary_capacity,
     select_secondary_candidates,
 )
-from tests.fakes.providers import FakeAudD, FakeShazamHTTP
+from tests.fakes.providers import FakeAudD, FakeShazamHTTP, no_backoff
 
 ROOT = Path(__file__).resolve().parents[1]
 AUDIO = ROOT / "tests" / "fixtures" / "audio" / "tone-60s.wav"
@@ -69,6 +69,7 @@ def _run(
                 transforms_policy="off",
                 recognise_concurrency=1,
                 shazam_requests_per_minute=1_000_000,
+                audd_requests_per_minute=1_000_000,
             ),
             max_generations=0,
             novelty=False,
@@ -76,6 +77,7 @@ def _run(
             allow_degrade=allow_degrade,
             paid_scan_adapters={"audd": audd},
             shazam_http_client=shazam,
+            paid_sleep=no_backoff,
             progress=(
                 (lambda _phase, _done, _total, message: progress_messages.append(message))
                 if progress_messages is not None
@@ -95,7 +97,8 @@ def _run(
     [
         ("all-http-401.json", "auth_error", 1),
         ("quota-first.json", "quota_error", 1),
-        ("all-timeout-pre.json", "timeout_pre", 7),
+        # 0b-i: an unreachable provider is retried per window (1 + 3 bounded retries).
+        ("all-timeout-pre.json", "timeout_pre", 28),
     ],
 )
 def test_provider_unavailable_before_any_resolved_attempt_is_exit_3_unspent_and_unstored(
@@ -108,7 +111,7 @@ def test_provider_unavailable_before_any_resolved_attempt_is_exit_3_unspent_and_
     assert entry["achieved"] is None
     assert entry["exit_code"] == 3
     # A terminal-provider outcome stops the sweep at once; an unreachable provider is retried per
-    # window (0b-i adds the bounded retries) but resolves nothing either way.
+    # window (the 0b-i bounded retries) but resolves nothing either way.
     assert audd.calls == audd_calls and audd.billed_units == 0
     assert entry["usd_e6_reserved"] == 36_750 and entry["usd_e6_spent"] == 0
     assert entry["costs"] == {"usd_e2": 0}
@@ -160,7 +163,8 @@ def test_deep_primary_resolving_nothing_without_a_terminal_outcome_is_partial_un
     code, audd, shazam, entry, _media_dir = _run(tmp_path, "all-http-429.json")
     assert code == 0
     assert (entry["status"], entry["reason"]) == ("partial", "primary_not_achieved")
-    assert audd.calls == 7 and audd.billed_units == 0
+    # Every window is retried to the recipe's bound (1 + 3) and refunded each time.
+    assert audd.calls == 28 and audd.billed_units == 0
     assert entry["usd_e6_spent"] == 0
     assert shazam.requests == 2  # the whole mix is blank: the secondary probes its capacity
 
@@ -265,7 +269,7 @@ def test_allow_degrade_restarts_as_the_free_recipe_before_any_paid_work(
     # Zero further AudD attempts after the refusal; the free sweep covers every frozen window.
     assert audd.billed_units == 0
     assert shazam.requests == 7
-    assert entry["counts"]["paid_requests"] == audd.calls  # type: ignore[index]
+    assert entry["counts"]["paid_attempts"] == audd.calls  # type: ignore[index]
     assert entry["usd_e6_spent"] == 0 and entry["costs"] == {"usd_e2": 0}
     assert entry["usd_e6_reserved"] == 36_750  # reserved, then released in full
     assert any("restarting as the free recipe" in message for message in messages)

@@ -56,8 +56,11 @@ concurrency = 3
 
 # Deep scans use every frozen window by default.  Density 2 selects even-indexed windows and halves
 # AudD request volume; because density affects results it also produces a distinct recipe_id.
+# audd_requests_per_minute is the ceiling of the paid sweep's token bucket (4 clips in flight, per
+# the recipe); it backs off by itself on a 429/503.  Speed only, never results.
 [deep]
 primary_density = 1
+audd_requests_per_minute = 120
 
 # Stage 4b transform hypotheses.  policy = "off" | "rescan_only" (default) | "global".
 [transforms]
@@ -143,6 +146,7 @@ def render_effective_config(config: AppConfig) -> str:
         "",
         "[deep]",
         f"primary_density = {config.deep_primary_density}",
+        f"audd_requests_per_minute = {config.audd_requests_per_minute}",
         "",
         "[recognise]",
         f"requests_per_minute = {config.shazam_requests_per_minute}",

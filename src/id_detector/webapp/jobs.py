@@ -211,6 +211,16 @@ class JobContext:
     def work_root(self) -> Path:
         return self._manager.work_root
 
+    @property
+    def cancel_token(self) -> threading.Event:
+        """The job's cancel flag, polled by the paid sweep before every dispatch (0b-iii).
+
+        A progress tick raises to cancel; the token lets a sweep with several clips in flight
+        stop *dispatching* while those clips resolve, so their spend is recorded, not lost.
+        """
+
+        return self._job.cancel_event
+
     def check_cancel(self) -> None:
         if self._job.cancel_event.is_set():
             raise JobCancelled(self._job.id)

@@ -7,6 +7,13 @@ there is no whole-file upload and no third-party-upload consent gate.  The resul
 (:mod:`id_detector.secondary_targeting`) then re-fuses alongside them: agreeing lifts a track's
 confidence, disagreeing lets a phantom be demoted, and a catalogue-blind track is recovered.
 
+The sweep (plan §2.3.1–2.3.3) runs ``audd_concurrency`` clips at once behind a token bucket,
+retries only the recipe's zero-cost transient outcomes with its backoff, stops at once on a
+terminal-provider outcome, and records every request in the durable attempt journal
+(:mod:`id_detector.attempts`): ``prepared`` → ``dispatched`` (on disk before network I/O) →
+``resolved``.  A cancel token — or a progress hook that raises — stops new dispatches while the
+clips already in flight are allowed to resolve, so their spend is never lost.
+
 Only validated match/no-match responses are cached by clip cache-key across runs. Matches are reused
 by default, while cached no-matches are re-queried by default and ``refresh_states`` controls that
 selection. Dollar admission bounds live calls before dispatch; only the live call needs a
@@ -18,11 +25,13 @@ from __future__ import annotations
 import asyncio
 import json
 import re
-from collections.abc import Callable, Mapping
-from dataclasses import dataclass
+from collections import deque
+from collections.abc import Awaitable, Callable, Mapping
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Protocol
 
+from id_detector.attempts import AttemptJournal, attempts_path, load_attempt_ledger
 from id_detector.contracts import (
     GENERATED_BY,
     SCHEMA_VERSION,
@@ -37,12 +46,15 @@ from id_detector.contracts import (
 )
 from id_detector.io import atomic_write_json, path_is_file, read_text
 from id_detector.money import (
+    BILLABLE_OUTCOMES,
     TERMINAL_PROVIDER_OUTCOMES,
     UNREACHABLE_OUTCOMES,
     ReservationExhausted,
     UsdAdmitter,
 )
 from id_detector.providers.audd import (
+    DEFAULT_ANCHOR_MAX_MS,
+    DEFAULT_ANCHOR_SLACK_MS,
     AudDAdapter,
     AudDCredentials,
     clip_response_to_observation,
@@ -54,9 +66,10 @@ from id_detector.providers.base import (
     ProviderProtocolError,
     ProviderUnavailable,
 )
+from id_detector.recipes import RetryPolicy
 from id_detector.recognise import _write_jsonl
 from id_detector.scan_targeting import Span
-from id_detector.shazam import canonicalize_provider_json
+from id_detector.shazam import TokenBucket, canonicalize_provider_json
 from id_detector.windows import WindowsResult
 
 #: Paid clip-recognition engines (only AudD for now; ACRCloud is whole-file-only in this codebase).
@@ -66,8 +79,18 @@ CLIP_CONFIG_VERSION = "audd-main-v1"
 #: (the primary passes the whole window count), and the supplemental call site that used it was
 #: removed with the provisional secondary scheduler (0a-iv).
 DEFAULT_MAX_CLIPS = 150
+#: Throttle outcomes that also slow the token bucket (the AIMD cut), besides being retried.
+THROTTLE_OUTCOMES = frozenset({"http_429", "http_503"})
 
 LogFn = Callable[[str], None]
+WindowProgressFn = Callable[[int, int], None]
+SleepFn = Callable[[float], Awaitable[None]]
+
+
+class CancelToken(Protocol):
+    """Anything with ``is_set()`` — a ``threading.Event`` from the web app, or a test flag."""
+
+    def is_set(self) -> bool: ...
 
 
 @dataclass(frozen=True)
@@ -80,20 +103,35 @@ class PaidScanResult:
     #: ``(provider, reason)`` for every requested engine that did not run.
     skipped: tuple[tuple[str, str], ...] = ()
     usd_e2: int = 0
+    #: Windows sent to the provider at least once (cache hits excluded).
     requests: int = 0
     resolved: int = 0
     failures: int = 0
     cache_hits: int = 0
     billable_units: int = 0
     reservation_exhausted: bool = False
-    #: Every live dispatch's frozen money outcome, in dispatch order (cache hits excluded).
+    #: Every live dispatch's frozen money outcome, in resolution order (cache hits excluded).
     outcomes: tuple[str, ...] = ()
     #: The terminal-provider outcome (``auth_error`` / ``quota_error``) that stopped the sweep.
     provider_stopped: str | None = None
+    #: Live dispatches including retries; ``attempts - requests`` is the retry count.
+    attempts: int = 0
+    #: The cancel token fired or the progress hook raised: nothing further was dispatched and the
+    #: clips already in flight were allowed to resolve.  The caller ends the run ``cancelled``.
+    cancelled: bool = False
+    #: Attempts an earlier run left unresolved that this sweep re-ran (plan §2.3.3 resume rule):
+    #: ``dispatched`` without ``resolved`` is ambiguous (counted as spent by that run);
+    #: ``prepared`` without ``dispatched`` was never sent and is simply re-issued.
+    resumed_ambiguous: int = 0
+    resumed_reissued: int = 0
 
     @property
     def ran(self) -> bool:
         return bool(self.engines_run)
+
+    @property
+    def retries(self) -> int:
+        return self.attempts - self.requests
 
     @property
     def unreachable(self) -> int:
@@ -115,6 +153,12 @@ def _cache_state(response: Mapping[str, Any]) -> str | None:
     return None
 
 
+#: AudD's own error codes inside an HTTP 200 body: 900 = wrong token, 901 = the token's request
+#: limit is reached (https://docs.audd.io/#common-errors).  Both are terminal for the sweep.
+_AUDD_AUTH_CODES = frozenset({401, 403, 900})
+_AUDD_QUOTA_CODES = frozenset({402, 901})
+
+
 def _error_body_outcome(response: Mapping[str, Any]) -> str:
     """Classify an AudD error body into the frozen money outcomes."""
 
@@ -129,10 +173,13 @@ def _error_body_outcome(response: Mapping[str, Any]) -> str:
         status_code = int(code)
     except (TypeError, ValueError):
         status_code = 0
-    lowered = message.casefold()
-    if status_code in {401, 403} or "auth" in lowered:
+    # An explicit code always outranks the message words below: AudD words its throttle bodies
+    # "…limit reached", and reading that as a terminal `quota_error` would stop the whole primary
+    # on an outcome the recipe retries (plan §2.3.1/§2.3.3).  The words are only a fallback for a
+    # body that carries no code we know.
+    if status_code in _AUDD_AUTH_CODES:
         return "auth_error"
-    if status_code == 402 or any(word in lowered for word in ("quota", "credit")):
+    if status_code in _AUDD_QUOTA_CODES:
         return "quota_error"
     if status_code == 429:
         return "http_429"
@@ -140,6 +187,11 @@ def _error_body_outcome(response: Mapping[str, Any]) -> str:
         return "http_503"
     if 500 <= status_code <= 599:
         return "http_5xx"
+    lowered = message.casefold()
+    if "auth" in lowered:
+        return "auth_error"
+    if any(word in lowered for word in ("quota", "credit", "limit reached")):
+        return "quota_error"
     return "malformed"
 
 
@@ -155,9 +207,11 @@ def _protocol_outcome(error: ProviderProtocolError) -> str:
     message = str(error).casefold()
     found = _HTTP_STATUS.search(message)
     status_code = int(found.group(1)) if found is not None else 0
-    if status_code in {401, 403} or "auth" in message:
+    # Same precedence as `_error_body_outcome`: the status code decides, the words only fill in
+    # for a transport error that carries none.
+    if status_code in {401, 403}:
         return "auth_error"
-    if status_code == 402 or any(word in message for word in ("quota", "credit")):
+    if status_code == 402:
         return "quota_error"
     if status_code == 429:
         return "http_429"
@@ -165,7 +219,19 @@ def _protocol_outcome(error: ProviderProtocolError) -> str:
         return "http_503"
     if 500 <= status_code <= 599:
         return "http_5xx"
+    if "auth" in message:
+        return "auth_error"
+    if any(word in message for word in ("quota", "credit")):
+        return "quota_error"
     return "malformed"
+
+
+def _unavailable_outcome(error: ProviderUnavailable) -> str:
+    """``timeout_pre`` or ``connect_error`` — both pre-receipt and free, retried apart."""
+
+    lowered = str(error).casefold()
+    timed_out = any(word in lowered for word in ("timeout", "timed out"))
+    return "timeout_pre" if timed_out else "connect_error"
 
 
 def _subsample_evenly(items: list[WindowRecord], budget: int) -> list[WindowRecord]:
@@ -225,6 +291,52 @@ def _windows_in_targets(windows: WindowsResult, targets: tuple[Span, ...]) -> li
     return selected
 
 
+def _read_cached(raw_path: Path, refresh_states: frozenset[str]) -> dict[str, Any] | None:
+    """A cached match/no-match body unless its state is one the caller wants re-queried."""
+
+    if not path_is_file(raw_path):
+        return None
+    try:
+        cached = json.loads(read_text(raw_path))
+    except (ValueError, OSError):
+        return None
+    state = _cache_state(cached) if isinstance(cached, dict) else None
+    if state is None or state in refresh_states:
+        return None
+    return cached
+
+
+@dataclass
+class _Sweep:
+    """Mutable state shared by the worker tasks; only ever touched between awaits."""
+
+    total: int
+    observations: list[ObservationRecord] = field(default_factory=list)
+    #: One query per window the sweep touched, keyed by window id: the workers interleave, so the
+    #: artefact is emitted in window order rather than in whichever order they happened to finish.
+    queries: dict[str, QueryRecord] = field(default_factory=dict)
+    outcomes: list[str] = field(default_factory=list)
+    requests: int = 0
+    attempts: int = 0
+    cache_hits: int = 0
+    billable_units: int = 0
+    done: int = 0
+    reservation_exhausted: bool = False
+    provider_stopped: str | None = None
+    resumed_ambiguous: int = 0
+    resumed_reissued: int = 0
+    #: No further dispatch (terminal outcome, exhausted reservation, or a cancel).
+    halted: bool = False
+    cancelled: bool = False
+
+    def stop(self) -> None:
+        self.halted = True
+
+    def cancel(self) -> None:
+        self.halted = True
+        self.cancelled = True
+
+
 async def run_paid_clip_recognition(
     *,
     media_key: str,
@@ -242,15 +354,25 @@ async def run_paid_clip_recognition(
     usd_admitter: UsdAdmitter | None = None,
     adapters: Mapping[str, Any] | None = None,
     log: LogFn | None = None,
+    concurrency: int = 1,
+    retry_policy: RetryPolicy | None = None,
+    anchor_max_ms: int = DEFAULT_ANCHOR_MAX_MS,
+    anchor_slack_ms: int = DEFAULT_ANCHOR_SLACK_MS,
+    cancel_token: CancelToken | None = None,
+    on_window: WindowProgressFn | None = None,
+    sleep: SleepFn | None = None,
 ) -> PaidScanResult:
     """Recognise the uncertain-region window clips with the paid engine and return observations.
 
     Gated on the engine being enabled and its credentials being present — NOT on upload consent
     (a clip is the same shape as the free Shazam clip).  ``adapters`` injects a fake adapter for
-    tests.  Never raises for an unavailable engine; it is skipped and recorded.
+    tests; ``sleep`` injects the retry backoff sleeper.  ``concurrency``, ``retry_policy`` and the
+    anchor bounds come from the recipe; ``on_window`` is ticked once per finished clip and, like
+    ``log``, may raise ``asyncio.CancelledError`` to cancel the sweep.  Never raises for an
+    unavailable engine; it is skipped and recorded.
     """
 
-    emit: LogFn = log or (lambda _message: None)
+    emit_raw: LogFn = log or (lambda _message: None)
     if "audd" not in enabled_engines or not targets:
         return PaidScanResult()
     override = adapters.get("audd") if adapters else None
@@ -261,11 +383,13 @@ async def run_paid_clip_recognition(
             else AudDAdapter(AudDCredentials.from_env(), app_config, cli_confirmation)
         )
     except ProviderUnavailable as exc:
-        emit(f"paid clip engine audd skipped: {exc}")
+        emit_raw(f"paid clip engine audd skipped: {exc}")
         return PaidScanResult(skipped=((("audd"), str(exc)),))
 
     if primary_density <= 0:
         raise ValueError("primary_density must be positive")
+    if concurrency <= 0:
+        raise ValueError("concurrency must be positive")
     eligible = _windows_in_targets(windows, tuple(targets))
     if usd_admitter is not None:
         # Recipe reservations are calculated from the frozen generation-zero window set. Keep
@@ -279,156 +403,271 @@ async def run_paid_clip_recognition(
     if not selected:
         return PaidScanResult()
 
+    policy = retry_policy if retry_policy is not None and retry_policy.mode == "bounded" else None
+    retryable = frozenset(policy.retryable_outcomes) if policy is not None else frozenset()
+    max_retries = policy.max_retries if policy is not None else 0
+    backoff = tuple(policy.backoff_seconds) if policy is not None else ()
+    pause: SleepFn = sleep or asyncio.sleep
+
     cache_dir = media_dir / "recognise" / "invocations" / "live-audd-clip-v1" / "raw"
     invocation_dir = media_dir / "recognise" / "invocations" / f"live-audd-clip-{run_id[:12]}"
-    observations: list[ObservationRecord] = []
-    queries: list[QueryRecord] = []
-    requests = 0
-    cache_hits = 0
-    billable_units = 0
-    reservation_exhausted = False
-    outcomes: list[str] = []
-    provider_stopped: str | None = None
+    ledger = load_attempt_ledger(attempts_path(media_dir))
+    journal = AttemptJournal(
+        attempts_path(media_dir),
+        run_id=run_id,
+        provider="audd",
+        unit_usd_e6=app_config.audd_usd_e6_per_request,
+    )
+    limiter = TokenBucket(rate_per_minute=app_config.audd_requests_per_minute, capacity=concurrency)
+    sweep = _Sweep(total=len(selected))
+    queue: deque[WindowRecord] = deque(selected)
 
-    for window in selected:
-        query = _clip_query(media_key, window)
-        queries.append(query)
-        raw_path = cache_dir / f"{query.cache_key}.json"
-        raw_ref = raw_path.relative_to(media_dir).as_posix()
-        response: dict[str, Any] | None = None
-        was_cached = False
-        if not refresh and path_is_file(raw_path):
-            try:
-                cached = json.loads(read_text(raw_path))
-                state = _cache_state(cached) if isinstance(cached, dict) else None
-                if state is not None and state not in refresh_states:
-                    response = cached
-                    was_cached = True
-                    cache_hits += 1
-            except (ValueError, OSError):
-                response = None
-        if response is None:
-            wav = media_dir / window.wav_path
-            requests += 1
-            admitted = False
+    def _guard(call: Callable[[], None]) -> None:
+        """Run a progress/log callback; a ``CancelledError`` it raises is a cancel request.
 
-            async def _admit() -> None:
-                nonlocal admitted
-                if usd_admitter is not None:
-                    usd_admitter.admit()
-                admitted = True
+        The web app's progress hook raises to cancel a job.  Raising it straight out of a worker
+        would tear down the sibling requests in flight — requests the provider may already have
+        billed — so the sweep records the request, stops dispatching and lets them resolve.
+        """
 
-            try:
-                response = await adapter.recognize_clip(wav, on_attempt=_admit)
-            except ReservationExhausted:
-                requests -= 1
-                reservation_exhausted = True
-                emit("audd primary stopped: USD reservation exhausted")
-                break
-            except ProviderUnavailable as exc:
-                lowered = str(exc).casefold()
-                timed_out = any(word in lowered for word in ("timeout", "timed out"))
-                outcome = "timeout_pre" if timed_out else "connect_error"
-                if admitted and usd_admitter is not None:
-                    usd_admitter.resolve(outcome)  # type: ignore[arg-type]
-                outcomes.append(outcome)
-                emit(f"audd clip error @{window.support_ms[0] // 1000}s: {type(exc).__name__}")
-                continue
-            except AmbiguousProviderOutcome as exc:
-                if admitted and usd_admitter is not None:
-                    usd_admitter.resolve("timeout_post")
-                outcomes.append("timeout_post")
-                billable_units += 1
-                emit(f"audd clip error @{window.support_ms[0] // 1000}s: {type(exc).__name__}")
-                continue
-            except (ProviderProtocolError, FileNotFoundError) as exc:
-                outcome = _protocol_outcome(exc) if isinstance(exc, ProviderProtocolError) else None
-                if admitted and usd_admitter is not None and outcome is not None:
-                    usd_admitter.resolve(outcome)  # type: ignore[arg-type]
-                if outcome is not None:
-                    outcomes.append(outcome)
-                if outcome in {"http_5xx", "malformed"}:
-                    billable_units += 1
-                emit(f"audd clip error @{window.support_ms[0] // 1000}s: {type(exc).__name__}")
-                if outcome in TERMINAL_PROVIDER_OUTCOMES:
-                    # Plan §2.3.3: a refused credential or an exhausted quota will not change for
-                    # the next window, so the primary stops at once rather than burning the sweep.
-                    provider_stopped = outcome
-                    emit(f"audd primary stopped: {outcome}")
-                    break
-                continue
-            except asyncio.CancelledError:
-                if admitted and usd_admitter is not None:
-                    usd_admitter.resolve("timeout_post")
-                raise
-            except Exception:
-                if admitted and usd_admitter is not None:
-                    usd_admitter.resolve("malformed")
-                raise
-            if usd_admitter is not None and not admitted:
-                raise RuntimeError("AudD adapter returned without invoking its on_attempt callback")
         try:
-            observation = clip_response_to_observation(
-                response,
-                query=query,
-                window=window,
-                media_key=media_key,
-                raw_response_ref=raw_ref,
-            )
-        except ProviderProtocolError as exc:
-            outcome = _error_body_outcome(response) if response is not None else "malformed"
-            if not was_cached and usd_admitter is not None:
-                usd_admitter.resolve(outcome)  # type: ignore[arg-type]
-            if not was_cached:
-                outcomes.append(outcome)
-            if outcome in {"http_5xx", "malformed"}:
-                billable_units += 1
-            emit(f"audd clip parse error @{window.support_ms[0] // 1000}s: {exc}")
-            if outcome in TERMINAL_PROVIDER_OUTCOMES:
-                provider_stopped = outcome
-                emit(f"audd primary stopped: {outcome}")
-                break
-            continue
+            call()
         except asyncio.CancelledError:
-            if not was_cached and usd_admitter is not None:
+            sweep.cancel()
+
+    def emit(message: str) -> None:
+        _guard(lambda: emit_raw(message))
+
+    def _tick() -> None:
+        if on_window is not None:
+            _guard(lambda: on_window(sweep.done, sweep.total))
+
+    def _halt_requested() -> bool:
+        if cancel_token is not None and cancel_token.is_set():
+            sweep.cancel()
+        return sweep.halted
+
+    async def _attempt(
+        wav: Path, attempt_id: str, start_s: int
+    ) -> tuple[str | None, dict[str, Any] | None, bool]:
+        """One dispatch: ``(outcome, body, admitted)``.
+
+        ``outcome`` is ``None`` when the adapter failed without reaching the provider at all; the
+        caller settles that as ambiguous whenever the unit was already admitted, so an admitted
+        unit is never left outstanding.
+        """
+
+        admitted = False
+
+        async def _admit() -> None:
+            nonlocal admitted
+            if admitted:
+                # One dispatch is one attempt: a second callback would journal a second
+                # `dispatched` for this attempt id and admit a second unit for one request.
+                raise RuntimeError("AudD adapter invoked its on_attempt callback twice")
+            if usd_admitter is not None:
+                usd_admitter.admit()
+            # Plan §2.3.3: `dispatched` is durable before the request enters network I/O, so a
+            # crash from here on leaves an attempt the resume rule treats as ambiguous (spent).
+            journal.dispatched(attempt_id)
+            admitted = True
+            sweep.attempts += 1
+
+        try:
+            response = await adapter.recognize_clip(wav, on_attempt=_admit)
+        except ReservationExhausted:
+            raise
+        except ProviderUnavailable as exc:
+            emit(f"audd clip error @{start_s}s: {type(exc).__name__}")
+            return _unavailable_outcome(exc), None, admitted
+        except AmbiguousProviderOutcome as exc:
+            emit(f"audd clip error @{start_s}s: {type(exc).__name__}")
+            return "timeout_post", None, admitted
+        except ProviderProtocolError as exc:
+            emit(f"audd clip error @{start_s}s: {type(exc).__name__}")
+            return _protocol_outcome(exc), None, admitted
+        except FileNotFoundError as exc:
+            emit(f"audd clip error @{start_s}s: {type(exc).__name__}")
+            return None, None, admitted
+        except asyncio.CancelledError:
+            # Real task cancellation (Ctrl-C) mid-request: the journal keeps `dispatched` without
+            # `resolved` — ambiguous on resume — and the admitted unit settles as spent.
+            if admitted and usd_admitter is not None:
                 usd_admitter.resolve("timeout_post")
             raise
         except Exception:
-            if not was_cached and usd_admitter is not None:
+            if admitted and usd_admitter is not None:
                 usd_admitter.resolve("malformed")
             raise
-        observations.append(observation)
-        if not was_cached:
-            # Parsing established a match/no-match state. Provider errors and malformed successes
-            # never reach this content-addressed cache write.
-            atomic_write_json(raw_path, canonicalize_provider_json(response))
-            state = _cache_state(response)
-            if usd_admitter is not None:
-                usd_admitter.resolve(state)  # type: ignore[arg-type]
-            outcomes.append(str(state))
-            billable_units += 1
+        if not admitted:
+            raise RuntimeError("AudD adapter returned without invoking its on_attempt callback")
+        state = _cache_state(response)
+        if state is None:
+            return _error_body_outcome(response), None, admitted
+        return state, response, admitted
 
-    observations_out = tuple(sort_records(observations))
+    async def _process(window: WindowRecord) -> None:
+        query = _clip_query(media_key, window)
+        sweep.queries[window.id] = query
+        raw_path = cache_dir / f"{query.cache_key}.json"
+        raw_ref = raw_path.relative_to(media_dir).as_posix()
+        start_s = window.support_ms[0] // 1000
+        response = None if refresh else _read_cached(raw_path, refresh_states)
+        was_cached = response is not None
+        if was_cached:
+            sweep.cache_hits += 1
+        else:
+            wav = media_dir / window.wav_path
+            # Plan §2.3.3 resume rule: an earlier run's unresolved attempt on this clip becomes
+            # this run's parent — ambiguous if it was dispatched (that run charged it), a plain
+            # re-issue if it was only prepared.
+            dangling = ledger.dangling(query.cache_key)
+            parent: str | None = dangling.attempt_id if dangling is not None else None
+            ordinal = 0
+            sent = False
+            while True:
+                await limiter.acquire()
+                if _halt_requested():
+                    break
+                attempt_id = journal.prepare(
+                    query_id=query.cache_key,
+                    window_id=window.id,
+                    ordinal=ordinal,
+                    parent_attempt_id=parent,
+                )
+                try:
+                    outcome, response, admitted = await _attempt(wav, attempt_id, start_s)
+                except ReservationExhausted:
+                    sweep.reservation_exhausted = True
+                    sweep.stop()
+                    emit("audd primary stopped: USD reservation exhausted")
+                    break
+                if not admitted:
+                    break  # never sent: the `prepared` line is re-issued by a later run
+                if outcome is None:
+                    # The adapter admitted the unit — its `dispatched` line is already on disk —
+                    # and then failed without a provider outcome.  Settle it as ambiguous (spent,
+                    # never retried) rather than breaking: an unresolved admission would hold a
+                    # unit of the reservation for the rest of the run and leave a dangling
+                    # `dispatched` that the next run re-bills.
+                    outcome = "timeout_post"
+                if not sent:
+                    sent = True
+                    sweep.requests += 1
+                    if dangling is not None and dangling.classification == "ambiguous":
+                        sweep.resumed_ambiguous += 1
+                    elif dangling is not None:
+                        sweep.resumed_reissued += 1
+                journal.resolved(attempt_id, outcome)  # type: ignore[arg-type]
+                if usd_admitter is not None:
+                    usd_admitter.resolve(outcome)  # type: ignore[arg-type]
+                sweep.outcomes.append(outcome)
+                if outcome in BILLABLE_OUTCOMES:
+                    sweep.billable_units += 1
+                if response is not None:
+                    limiter.recover()
+                    break
+                if outcome in TERMINAL_PROVIDER_OUTCOMES:
+                    # Plan §2.3.3: a refused credential or an exhausted quota will not change for
+                    # the next window, so the primary stops at once rather than burning the sweep.
+                    sweep.provider_stopped = outcome
+                    sweep.stop()
+                    emit(f"audd primary stopped: {outcome}")
+                    break
+                if outcome in THROTTLE_OUTCOMES:
+                    limiter.penalize()
+                if outcome not in retryable or ordinal >= max_retries or _halt_requested():
+                    break
+                delay = backoff[min(ordinal, len(backoff) - 1)] if backoff else 0
+                emit(
+                    f"audd clip retry {ordinal + 1}/{max_retries} @{start_s}s "
+                    f"after {outcome} in {delay}s"
+                )
+                await pause(delay)
+                parent = attempt_id
+                ordinal += 1
+            if not sent:
+                return
+        if response is not None:
+            try:
+                observation = clip_response_to_observation(
+                    response,
+                    query=query,
+                    window=window,
+                    media_key=media_key,
+                    raw_response_ref=raw_ref,
+                    anchor_max_ms=anchor_max_ms,
+                    anchor_slack_ms=anchor_slack_ms,
+                )
+            except ProviderProtocolError as exc:
+                # Only a cached body can fail here: a live body was classified before it was
+                # accepted as match/no-match.  The cache entry is stale; the window is unresolved.
+                emit(f"audd clip parse error @{start_s}s: {exc}")
+            else:
+                sweep.observations.append(observation)
+                if not was_cached:
+                    # Parsing established a match/no-match state. Provider errors and malformed
+                    # successes never reach this content-addressed cache write.
+                    atomic_write_json(raw_path, canonicalize_provider_json(response))
+        sweep.done += 1
+        _tick()
+
+    async def _worker() -> None:
+        while queue and not _halt_requested():
+            await _process(queue.popleft())
+
+    emit(f"identifying the whole mix (paid): {len(selected)} clips")
+    _tick()
+    workers = [asyncio.create_task(_worker()) for _ in range(min(concurrency, len(selected)))]
+    try:
+        await asyncio.gather(*workers)
+    except BaseException:
+        # Ctrl-C (CancelledError) or an unexpected worker error: cancel the siblings, let them
+        # unwind, then re-raise.  Their in-flight requests stay `dispatched` in the journal.
+        for worker in workers:
+            worker.cancel()
+        await asyncio.gather(*workers, return_exceptions=True)
+        raise
+
+    observations_out = tuple(sort_records(sweep.observations))
     observation_path = invocation_dir / "observations.gen0.jsonl"
     _write_jsonl(observation_path, list(observations_out))
-    _write_jsonl(invocation_dir / "queries.gen0.jsonl", queries)
-    matched = sum(item.status == "match" for item in observations_out)
-    not_sent = len(selected) - requests - cache_hits
-    emit(
-        f"audd clips: {matched} match(es) across {len(observations_out)} windows "
-        f"({requests} requests, {cache_hits} cached, {not_sent} not sent)"
+    _write_jsonl(
+        invocation_dir / "queries.gen0.jsonl",
+        [sweep.queries[window.id] for window in selected if window.id in sweep.queries],
     )
+    matched = sum(item.status == "match" for item in observations_out)
+    not_sent = len(selected) - sweep.requests - sweep.cache_hits
+    retries = sweep.attempts - sweep.requests
+    summary = (
+        f"audd clips: {matched} match(es) across {len(observations_out)} windows "
+        f"({sweep.requests} requests, {sweep.cache_hits} cached, {not_sent} not sent)"
+    )
+    if retries:
+        summary += f"; {retries} retries"
+    if sweep.resumed_ambiguous or sweep.resumed_reissued:
+        summary += (
+            f"; resumed {sweep.resumed_ambiguous} ambiguous, "
+            f"{sweep.resumed_reissued} re-issued attempt(s) from an earlier run"
+        )
+    if sweep.cancelled:
+        summary += "; cancelled"
+    emit(summary)
     return PaidScanResult(
         observations=observations_out,
         observation_paths=(observation_path,),
         engines_run=("audd",),
-        requests=requests,
+        requests=sweep.requests,
         resolved=len(observations_out),
-        # Windows never reached (an exhausted reservation stops the sweep) are not failures.
-        failures=requests + cache_hits - len(observations_out),
-        cache_hits=cache_hits,
-        billable_units=billable_units,
-        reservation_exhausted=reservation_exhausted,
-        outcomes=tuple(outcomes),
-        provider_stopped=provider_stopped,
+        # Windows never reached (a stopped or cancelled sweep) are not failures.
+        failures=sweep.requests + sweep.cache_hits - len(observations_out),
+        cache_hits=sweep.cache_hits,
+        billable_units=sweep.billable_units,
+        reservation_exhausted=sweep.reservation_exhausted,
+        outcomes=tuple(sweep.outcomes),
+        provider_stopped=sweep.provider_stopped,
+        attempts=sweep.attempts,
+        cancelled=sweep.cancelled,
+        resumed_ambiguous=sweep.resumed_ambiguous,
+        resumed_reissued=sweep.resumed_reissued,
     )

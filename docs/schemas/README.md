@@ -30,6 +30,7 @@ canonical JSON array before being passed to `make_id(media_key, record_type, nat
 | ground truth | `set_id` |
 | benchmark report | `corpus_version`, profile, `config_hash` |
 | invocation journal entry | invocation id supplied by the orchestrator |
+| provider attempt event | `run_id`, `query_id` (the clip cache key), `ordinal`; the three events of one attempt share its id |
 | raw-index entry | `cache_key` |
 | provider config | provider, immutable version filename |
 | profile | profile name, immutable version filename |

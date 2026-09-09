@@ -4,21 +4,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from threading import Lock
-from typing import Literal
 
-ProviderOutcome = Literal[
-    "match",
-    "no_match",
-    "timeout_post",
-    "http_5xx",
-    "malformed",
-    "connect_error",
-    "timeout_pre",
-    "http_429",
-    "http_503",
-    "auth_error",
-    "quota_error",
-]
+from id_detector.contracts import ProviderOutcome
 
 BILLABLE_OUTCOMES = frozenset({"match", "no_match", "timeout_post", "http_5xx", "malformed"})
 ZERO_COST_OUTCOMES = frozenset(

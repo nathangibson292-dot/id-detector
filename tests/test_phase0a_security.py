@@ -34,7 +34,7 @@ from id_detector.webapp.runner import (
     make_pipeline_runner,
 )
 from id_detector.windows import WindowsResult
-from tests.fakes.providers import FakeAudD, FakeShazamHTTP
+from tests.fakes.providers import FakeAudD, FakeShazamHTTP, no_backoff
 
 ROOT = Path(__file__).resolve().parents[1]
 AUDIO = ROOT / "tests" / "fixtures" / "audio" / "tone-60s.wav"
@@ -77,6 +77,7 @@ def _analyse(tmp_path: Path, *, recipe: Recipe, **overrides: object):
             transforms_policy="off",
             recognise_concurrency=1,
             shazam_requests_per_minute=1_000_000,
+            audd_requests_per_minute=1_000_000,
             allow_third_party_upload=True,
         ),
         "max_generations": 0,
@@ -87,6 +88,7 @@ def _analyse(tmp_path: Path, *, recipe: Recipe, **overrides: object):
         "recipe": recipe,
         "paid_scan_adapters": {"audd": audd},
         "shazam_http_client": FakeShazamHTTP(script),
+        "paid_sleep": no_backoff,
     }
     kwargs.update(overrides)
     code = asyncio.run(cli._analyse(str(AUDIO), **kwargs))  # type: ignore[arg-type]

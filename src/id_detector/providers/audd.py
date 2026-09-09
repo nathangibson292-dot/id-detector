@@ -1,8 +1,11 @@
-"""AudD enterprise whole-file scanner with a single durable synchronous submission.
+"""AudD adapters: the clip recogniser the Deep recipe sweeps with, and the legacy enterprise
+whole-file scanner (no live caller since 0a-iii; tagged for M2 deletion).
 
-Anchor convention: the mix anchor is the start of AudD's 12-second chunk (``offset``), while
-the reference anchor is the matched recording position (``timecode``). ``start_offset`` and
-``end_offset`` localise the evidence span inside that chunk but do not move either anchor.
+Anchor convention: the mix anchor is where the sent audio starts in the mix (a clip's window
+start, or an enterprise chunk's ``offset``), while the reference anchor is the matched recording
+position (``timecode``).  For clips the plan's validity rule (§2.3.4 step 2) decides whether the
+timecode is trusted at all; ``start_offset`` / ``end_offset`` localise enterprise evidence inside
+a chunk but do not move either anchor.
 """
 
 from __future__ import annotations
@@ -60,6 +63,19 @@ MAIN_ENDPOINT = "https://api.audd.io/"
 CHUNK_MS = 12_000
 PRICE_PER_HOUR_USD_E2 = 150
 CAPABILITY = ProviderCapability(PROVIDER, "file_scanner", True, "enterprise whole-file scan")
+#: Plan §2.3.1 anchor validity bounds (the Deep recipe carries the authoritative values; these
+#: mirror them for callers that have no recipe).  A clip timecode is trusted only when it is
+#: numeric, within ``[0, anchor_max_ms]`` and — when the match carries the recording's duration —
+#: no later than ``duration + anchor_slack_ms``.
+DEFAULT_ANCHOR_MAX_MS = 86_400_000
+DEFAULT_ANCHOR_SLACK_MS = 12_000
+#: AudD reports the timecode at whole-second resolution.
+CLIP_ANCHOR_UNCERTAINTY_MS = 1_000
+CLIP_ANCHOR_METHOD = "audd_clip_timecode"
+#: The clip observation's trial source (plan §2.3.4 step 2; review E-C3): the fuser keeps one
+#: selected observation per ``(logical_trial_id, source)``, so AudD and Shazam matches on the same
+#: window are both selected instead of AudD's anchorless one evicting Shazam's.
+CLIP_SIMULTANEOUS_SOURCE = "audd"
 
 AttemptCallback = Callable[[], Awaitable[None]]
 FailureHook = Callable[[str], None]
@@ -187,6 +203,70 @@ def _logical_trial_id(chunk_index: int) -> str:
     return scanner_logical_trial_id(PROVIDER, chunk_index)
 
 
+def clip_match_duration_ms(result: Mapping[str, Any]) -> int | None:
+    """The matched recording's duration when the main-endpoint result carries one.
+
+    The bare result has no duration; the ``return=`` extras do (``spotify.duration_ms``,
+    ``apple_music.durationInMillis``).  A top-level ``duration_ms`` is accepted for the same
+    reason.  Anything unparseable means "unknown", never an error.
+    """
+
+    candidates: list[Any] = [result.get("duration_ms")]
+    spotify = result.get("spotify")
+    if isinstance(spotify, Mapping):
+        candidates.append(spotify.get("duration_ms"))
+    apple = result.get("apple_music")
+    if isinstance(apple, Mapping):
+        candidates.append(apple.get("durationInMillis"))
+    for value in candidates:
+        if isinstance(value, bool) or value is None:
+            continue
+        try:
+            duration = _milliseconds(value)
+        except Exception:  # noqa: BLE001 - provider-native junk is "unknown", not a failure
+            continue
+        if duration >= 0:
+            return duration
+    return None
+
+
+def clip_anchor(
+    result: Mapping[str, Any],
+    *,
+    mix_anchor_ms: int,
+    anchor_max_ms: int = DEFAULT_ANCHOR_MAX_MS,
+    anchor_slack_ms: int = DEFAULT_ANCHOR_SLACK_MS,
+) -> Anchor | None:
+    """Plan §2.3.4 step 2: an anchor from ``timecode`` iff it passes the validity rule.
+
+    ``timecode`` must be present and numeric (a number of seconds, or ``[hh:]mm:ss``), lie in
+    ``[0, anchor_max_ms]`` and, when the match carries a duration, be no later than
+    ``duration + anchor_slack_ms``.  Otherwise the observation is positioned by its window alone
+    (``anchor=None``) rather than by a timecode that cannot be right.
+    """
+
+    timecode = result.get("timecode")
+    if timecode is None or isinstance(timecode, bool):
+        return None
+    try:
+        ref_anchor_ms = _timecode_ms(timecode)
+    except ProviderProtocolError:
+        return None
+    if ref_anchor_ms < 0 or ref_anchor_ms > anchor_max_ms:
+        return None
+    duration_ms = clip_match_duration_ms(result)
+    if duration_ms is not None and ref_anchor_ms > duration_ms + anchor_slack_ms:
+        return None
+    return Anchor(
+        mix_anchor_ms=mix_anchor_ms,
+        ref_anchor_ms=ref_anchor_ms,
+        uncertainty_ms=CLIP_ANCHOR_UNCERTAINTY_MS,
+        reliable=True,
+        method=CLIP_ANCHOR_METHOD,
+        bias_applied_ms=0,
+    )
+
+
 def parse_response(
     response: Mapping[str, Any],
     *,
@@ -312,11 +392,14 @@ def clip_response_to_observation(
     window: WindowRecord,
     media_key: str,
     raw_response_ref: str,
+    anchor_max_ms: int = DEFAULT_ANCHOR_MAX_MS,
+    anchor_slack_ms: int = DEFAULT_ANCHOR_SLACK_MS,
 ) -> ObservationRecord:
     """Turn one AudD main-endpoint clip response into a positioned ``clip_recognizer`` observation.
 
     The clip is a window already cut for the free engine, so the observation is positioned on that
-    window's span and competes in the fuser exactly like a Shazam clip observation.
+    window's span and competes in the fuser exactly like a Shazam clip observation — from its own
+    trial source, and with a reference anchor whenever the timecode passes the validity rule.
     """
 
     if response.get("status") != "success":
@@ -329,9 +412,16 @@ def clip_response_to_observation(
     label = _empty_label()
     status = "no_match"
     provider_ids: dict[str, Any] = {}
-    native: dict[str, Any] = {"result": None}
+    native: dict[str, Any] = {"result": None, "simultaneous_source": CLIP_SIMULTANEOUS_SOURCE}
+    anchor: Anchor | None = None
     if isinstance(result, Mapping):
         status = "match"
+        anchor = clip_anchor(
+            result,
+            mix_anchor_ms=window.support_ms[0],
+            anchor_max_ms=anchor_max_ms,
+            anchor_slack_ms=anchor_slack_ms,
+        )
         label = RawLabel(
             artist=str(result["artist"]) if result.get("artist") is not None else None,
             title=str(result["title"]) if result.get("title") is not None else None,
@@ -345,7 +435,7 @@ def clip_response_to_observation(
             provider_ids["isrc"] = str(result["isrc"])
         if result.get("song_link") is not None:
             provider_ids["audd_song_link"] = str(result["song_link"])
-        native = {"result": canonicalize_provider_json(result)}
+        native["result"] = canonicalize_provider_json(result)
     label_hash = sha256(canonical_json_bytes(label)).hexdigest()
     natural = {
         "query_id": query.id,
@@ -371,7 +461,7 @@ def clip_response_to_observation(
         raw_label=label,
         provider_ids=provider_ids,
         native=native,
-        anchor=None,
+        anchor=anchor,
         score_raw=None,
         quality=None,
         raw_response_ref=raw_response_ref,

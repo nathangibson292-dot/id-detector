@@ -1,7 +1,14 @@
-"""Scripted offline fakes matching the production provider boundaries."""
+"""Scripted offline fakes matching the production provider boundaries.
+
+A script section may carry ``"latency_ms"`` so several fake requests are genuinely in flight at
+once (the concurrency and cancellation gates); ``FakeAudD`` also reports the peak number of
+concurrent calls it saw.  :func:`no_backoff` is the retry sleeper tests inject so the recipe's
+1/2/4 s backoff costs nothing but still yields to the event loop.
+"""
 
 from __future__ import annotations
 
+import asyncio
 import inspect
 import json
 from collections.abc import Awaitable, Callable, Mapping, Sequence
@@ -55,8 +62,12 @@ class _ScriptedProvider:
             raise ValueError(f"unsupported {provider} default outcome: {default!r}")
         if not isinstance(windows, Mapping):
             raise ValueError(f"fake-provider {provider}.windows must be an object")
+        latency_ms = section.get("latency_ms", 0)
+        if isinstance(latency_ms, bool) or not isinstance(latency_ms, int) or latency_ms < 0:
+            raise ValueError(f"fake-provider {provider}.latency_ms must be a non-negative integer")
         self.provider = provider
         self.default = default
+        self.latency_s = latency_ms / 1000
         self.windows: dict[int, tuple[str, ...]] = {}
         for key, value in windows.items():
             try:
@@ -105,14 +116,23 @@ async def _notify_attempt(callback: Callable[[], Awaitable[None]] | object) -> N
         await result
 
 
+async def no_backoff(_seconds: float) -> None:
+    """Retry sleeper for tests: the recipe's backoff schedule costs no wall time but yields."""
+
+    await asyncio.sleep(0)
+
+
 class FakeAudD:
     """Scripted ``AudDAdapter.recognize_clip`` replacement."""
 
-    def __init__(self, script: Path | Mapping[str, Any]) -> None:
+    def __init__(self, script: Path | Mapping[str, Any], *, latency_s: float | None = None) -> None:
         self.script = _ScriptedProvider("audd", script)
+        self.latency_s = self.script.latency_s if latency_s is None else latency_s
         self.calls = 0
         self.billed_units = 0
         self.paths: list[Path] = []
+        self.in_flight = 0
+        self.max_in_flight = 0
 
     @property
     def attempts(self) -> list[dict[str, object]]:
@@ -131,6 +151,13 @@ class FakeAudD:
         outcome = self.script.next_outcome(index)
         self.calls += 1
         self.billed_units += int(outcome in _BILLABLE)
+        if self.latency_s:
+            self.in_flight += 1
+            self.max_in_flight = max(self.max_in_flight, self.in_flight)
+            try:
+                await asyncio.sleep(self.latency_s)
+            finally:
+                self.in_flight -= 1
         if outcome == "timeout_pre":
             raise ProviderUnavailable("AudD timed out before receiving a response")
         if outcome == "timeout_post":
@@ -191,6 +218,8 @@ class FakeShazamHTTP(HTTPClientInterface):
         index = self.script.index_for_path(self._path.get())
         outcome = self.script.next_outcome(index)
         self.requests += 1
+        if self.script.latency_s:
+            await asyncio.sleep(self.script.latency_s)
         if outcome.startswith("http_"):
             status = int(outcome.removeprefix("http_"))
             raise ShazamHTTPError(status, f"scripted Shazam HTTP {status}")

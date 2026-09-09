@@ -23,7 +23,7 @@ from id_detector.providers.base import AppConfig
 from id_detector.shazam import CircuitBreaker, InjectedHTTPClient, TokenBucket
 from id_detector.windows import generation_zero_schedule
 from scripts.make_audio_fixtures import generate
-from tests.fakes.providers import FakeAudD, FakeShazamHTTP
+from tests.fakes.providers import FakeAudD, FakeShazamHTTP, no_backoff
 
 ROOT = Path(__file__).resolve().parents[1]
 AUDIO = ROOT / "tests" / "fixtures" / "audio" / "tone-60s.wav"
@@ -71,6 +71,7 @@ def _run_analysis(
                 transforms_policy="off",
                 recognise_concurrency=1,
                 shazam_requests_per_minute=1_000_000,
+                audd_requests_per_minute=1_000_000,
             ),
             max_generations=0,
             novelty=False,
@@ -78,6 +79,7 @@ def _run_analysis(
             primary_engine="audd",
             paid_scan_adapters={"audd": audd},
             shazam_http_client=shazam,
+            paid_sleep=no_backoff,
             progress=(
                 (lambda _phase, _done, _total, message: progress_messages.append(message))
                 if progress_messages is not None

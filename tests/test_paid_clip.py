@@ -44,6 +44,7 @@ class _FakeAdapter:
         self.calls = 0
 
     async def recognize_clip(self, path: Path, on_attempt: object) -> dict[str, object]:
+        await on_attempt()  # type: ignore[operator]  # production: right before network I/O
         self.calls += 1
         return self.response
 
