@@ -4,6 +4,13 @@ A script section may carry ``"latency_ms"`` so several fake requests are genuine
 once (the concurrency and cancellation gates); ``FakeAudD`` also reports the peak number of
 concurrent calls it saw.  :func:`no_backoff` is the retry sleeper tests inject so the recipe's
 1/2/4 s backoff costs nothing but still yields to the event loop.
+
+A script's ``"windows"`` table is keyed by the window's position in the mix (``"3"`` = the fourth
+window): a clip is ranked among the ``.wav`` files of its directory, which are named
+``<start_ms:010d>-<variant>.wav`` and all written before the first request, so the mapping does
+not depend on the order a worker pool happens to dispatch in (Shazam leases are ordered by
+creation time then id, which is not stable run to run; that stability is what the Local Free
+golden relies on).
 """
 
 from __future__ import annotations
@@ -11,6 +18,7 @@ from __future__ import annotations
 import asyncio
 import inspect
 import json
+import os
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from contextvars import ContextVar
 from pathlib import Path
@@ -18,6 +26,7 @@ from typing import Any
 
 from shazamio.interfaces.client import HTTPClientInterface
 
+from id_detector.io import native_path
 from id_detector.providers.base import (
     AmbiguousProviderOutcome,
     ProviderProtocolError,
@@ -82,13 +91,24 @@ class _ScriptedProvider:
                 raise ValueError(f"unsupported {provider} window {index} outcome")
             self.windows[index] = outcomes
         self._path_indices: dict[str, int] = {}
+        self._first_seen = 0
         self._outcome_counts: dict[int, int] = {}
         self.attempts: list[dict[str, object]] = []
 
     def index_for_path(self, path: Path | None) -> int:
-        key = str(path.resolve()) if path is not None else f"request:{len(self._path_indices)}"
+        """The window ordinal a script's ``windows`` table refers to (see the module note).
+
+        A clip that is not one of a directory's ``.wav`` files (a synthetic path in a unit test,
+        or no path at all) keeps the historical first-seen numbering.
+        """
+
+        key = str(path.resolve()) if path is not None else f"request:{self._first_seen}"
         if key not in self._path_indices:
-            self._path_indices[key] = len(self._path_indices)
+            ordinal = _directory_ordinal(path) if path is not None else None
+            if ordinal is None:
+                ordinal = self._first_seen
+                self._first_seen += 1
+            self._path_indices[key] = ordinal
         return self._path_indices[key]
 
     def next_outcome(self, index: int) -> str:
@@ -98,6 +118,18 @@ class _ScriptedProvider:
         outcome = sequence[min(offset, len(sequence) - 1)]
         self.attempts.append({"provider": self.provider, "window": index, "outcome": outcome})
         return outcome
+
+
+def _directory_ordinal(path: Path) -> int | None:
+    """``path``'s rank among the ``.wav`` files beside it (window order), or ``None``."""
+
+    try:
+        names = sorted(
+            name for name in os.listdir(native_path(path.parent)) if name.endswith(".wav")
+        )
+        return names.index(path.name)
+    except (OSError, ValueError):
+        return None
 
 
 def _tone_label(index: int) -> tuple[str, str, int]:

@@ -347,6 +347,12 @@ def test_provider_http_clients_ignore_proxy_environment(tmp_path: Path, monkeypa
         def json() -> dict[str, object]:
             return {"status": "success", "result": None}
 
+    class ShazamResponse(Response):
+        # The Shazam client (0b-ii) accepts only a recognition body: one with a ``matches`` list.
+        @staticmethod
+        def json() -> dict[str, object]:
+            return {"matches": []}
+
     class Client:
         def __init__(self, **kwargs: object) -> None:
             options.append(kwargs)
@@ -361,7 +367,7 @@ def test_provider_http_clients_ignore_proxy_environment(tmp_path: Path, monkeypa
             return Response()
 
         async def request(self, *args: object, **kwargs: object) -> Response:
-            return Response()
+            return ShazamResponse()
 
     monkeypatch.setattr(audd_module.httpx, "AsyncClient", Client)
     clip = tmp_path / "clip.wav"
@@ -378,10 +384,7 @@ def test_provider_http_clients_ignore_proxy_environment(tmp_path: Path, monkeypa
             limiter=TokenBucket(rate_per_minute=60),
             breaker=CircuitBreaker(),
         )
-        assert await client.request("GET", "https://fixture.invalid") == {
-            "status": "success",
-            "result": None,
-        }
+        assert await client.request("GET", "https://fixture.invalid") == {"matches": []}
 
     asyncio.run(scenario())
     assert len(options) == 2

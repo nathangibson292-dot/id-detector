@@ -5,14 +5,17 @@
 #
 # Precedence, highest wins:
 #   1. command-line flags (e.g. --max-requests, --profile, --max-generations, --no-hints)
-#   2. a frozen --profile: fixes the engines and the transform/schedule/rescan geometry and the
-#      hint/novelty toggles (but this file still supplies lead_in_ms, max_requests, cache and the
-#      per-connector hint switches)
+#   2. a frozen --profile (or default_profile below): fixes the engines, the transform/schedule/
+#      rescan geometry and the hint/novelty toggles.  EVERYTHING ELSE in this file still applies
+#      under a profile -- max_requests, lead_in_ms, [recognise], [deep], [cache], [hints] and the
+#      [present] dials (min_track_ms, collapse, same_track_bridge_ms).
 #   3. the values in THIS file
 #   4. built-in defaults (what you see below)
 #
-# Copy this to idea.toml (that name is git-ignored) and edit.  `idea config show`
-# prints the effective, resolved configuration; `idea config init` writes this template.
+# Copy this to idea.toml (that name is git-ignored) and edit.  `idea config show` prints the
+# effective, resolved configuration and `idea config show --profile free` shows exactly what a run
+# under that profile uses, marking the lines the profile fixes; `idea config init` writes this
+# template.
 
 # Uploading third-party audio to AudD/ACRCloud requires BOTH this flag AND a per-command
 # confirmation (--i-own-this-audio-or-have-permission).  Leave it false unless you own the audio

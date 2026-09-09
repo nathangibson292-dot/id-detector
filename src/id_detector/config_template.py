@@ -8,6 +8,8 @@ belongs in this file — provider credentials are read only from environment var
 
 from __future__ import annotations
 
+from collections.abc import Mapping, Sequence
+
 from id_detector.providers.base import HINT_CONNECTORS, AppConfig
 
 CONFIG_TEMPLATE = """\
@@ -18,14 +20,17 @@ CONFIG_TEMPLATE = """\
 #
 # Precedence, highest wins:
 #   1. command-line flags (e.g. --max-requests, --profile, --max-generations, --no-hints)
-#   2. a frozen --profile: fixes the engines and the transform/schedule/rescan geometry and the
-#      hint/novelty toggles (but this file still supplies lead_in_ms, max_requests, cache and the
-#      per-connector hint switches)
+#   2. a frozen --profile (or default_profile below): fixes the engines, the transform/schedule/
+#      rescan geometry and the hint/novelty toggles.  EVERYTHING ELSE in this file still applies
+#      under a profile -- max_requests, lead_in_ms, [recognise], [deep], [cache], [hints] and the
+#      [present] dials (min_track_ms, collapse, same_track_bridge_ms).
 #   3. the values in THIS file
 #   4. built-in defaults (what you see below)
 #
-# Copy this to idea.toml (that name is git-ignored) and edit.  `idea config show`
-# prints the effective, resolved configuration; `idea config init` writes this template.
+# Copy this to idea.toml (that name is git-ignored) and edit.  `idea config show` prints the
+# effective, resolved configuration and `idea config show --profile free` shows exactly what a run
+# under that profile uses, marking the lines the profile fixes; `idea config init` writes this
+# template.
 
 # Uploading third-party audio to AudD/ACRCloud requires BOTH this flag AND a per-command
 # confirmation (--i-own-this-audio-or-have-permission).  Leave it false unless you own the audio
@@ -130,60 +135,101 @@ def _toml_list(values: tuple[int, ...]) -> str:
     return "[" + ", ".join(str(value) for value in values) + "]"
 
 
-def render_effective_config(config: AppConfig) -> str:
-    """Render the fully-resolved :class:`AppConfig` as readable TOML for ``config show``."""
+def render_effective_config(
+    config: AppConfig,
+    *,
+    fixed_by: Mapping[str, str] | None = None,
+    trailer: Sequence[str] = (),
+) -> str:
+    """Render the fully-resolved :class:`AppConfig` as readable TOML for ``config show``.
+
+    ``fixed_by`` maps an :class:`AppConfig` field name to a short note (``fixed by profile
+    "free"``) appended as a comment on that field's line, so a reader sees at a glance which
+    values the profile decided and which the file did; ``trailer`` lines are appended verbatim
+    (as comments) for what a profile fixes that no config line controls.  The output stays valid
+    TOML: a test round-trips it through the loader.
+    """
+
+    fixed = dict(fixed_by or {})
+
+    def line(field: str | None, text: str) -> str:
+        note = fixed.get(field) if field is not None else None
+        return f"{text}  # {note}" if note else text
 
     disabled = sorted(config.disabled_hint_connectors)
     lines = [
         "# Effective IDea configuration (resolved: file + profile + defaults).",
         "# Secrets are never shown here; they come only from environment variables.",
-        f"allow_third_party_upload = {str(config.allow_third_party_upload).lower()}",
+        line(
+            "allow_third_party_upload",
+            f"allow_third_party_upload = {str(config.allow_third_party_upload).lower()}",
+        ),
         f"default_profile = {config.default_profile!r}"
         if config.default_profile
         else "# default_profile = (unset)",
-        f"max_requests = {config.max_requests}",
-        f"lead_in_ms = {config.lead_in_ms}",
+        line("max_requests", f"max_requests = {config.max_requests}"),
+        line("lead_in_ms", f"lead_in_ms = {config.lead_in_ms}"),
         "",
         "[deep]",
-        f"primary_density = {config.deep_primary_density}",
-        f"audd_requests_per_minute = {config.audd_requests_per_minute}",
+        line("deep_primary_density", f"primary_density = {config.deep_primary_density}"),
+        line(
+            "audd_requests_per_minute",
+            f"audd_requests_per_minute = {config.audd_requests_per_minute}",
+        ),
         "",
         "[recognise]",
-        f"requests_per_minute = {config.shazam_requests_per_minute}",
-        f"concurrency = {config.recognise_concurrency}",
+        line(
+            "shazam_requests_per_minute",
+            f"requests_per_minute = {config.shazam_requests_per_minute}",
+        ),
+        line("recognise_concurrency", f"concurrency = {config.recognise_concurrency}"),
         "",
         "[transforms]",
-        f'policy = "{config.transforms_policy}"',
-        f"rate_e4 = {_toml_list(config.transform_rates_e4)}",
-        f"semitones = {_toml_list(config.transform_semitones)}",
+        line("transforms_policy", f'policy = "{config.transforms_policy}"'),
+        line("transform_rates_e4", f"rate_e4 = {_toml_list(config.transform_rates_e4)}"),
+        line("transform_semitones", f"semitones = {_toml_list(config.transform_semitones)}"),
         "",
         "[schedule]",
-        f"window_ms = {config.window_ms}",
-        f"hop_ms = {config.hop_ms}",
-        f"phase_ms = {config.phase_ms}",
+        line("window_ms", f"window_ms = {config.window_ms}"),
+        line("hop_ms", f"hop_ms = {config.hop_ms}"),
+        line("phase_ms", f"phase_ms = {config.phase_ms}"),
         "",
         "[rescan]",
-        f"window_ms = {config.rescan_window_ms}",
-        f"hop_ms = {config.rescan_hop_ms}",
-        f"phase_ms = {config.rescan_phase_ms}",
-        f"max_generations = {config.rescan_max_generations}",
+        line("rescan_window_ms", f"window_ms = {config.rescan_window_ms}"),
+        line("rescan_hop_ms", f"hop_ms = {config.rescan_hop_ms}"),
+        line("rescan_phase_ms", f"phase_ms = {config.rescan_phase_ms}"),
+        line("rescan_max_generations", f"max_generations = {config.rescan_max_generations}"),
         "",
         "[cache]",
-        f"positive_max_age_days = {config.cache_positive_max_age_days}",
-        f"no_match_max_age_days = {config.cache_no_match_max_age_days}",
+        line(
+            "cache_positive_max_age_days",
+            f"positive_max_age_days = {config.cache_positive_max_age_days}",
+        ),
+        line(
+            "cache_no_match_max_age_days",
+            f"no_match_max_age_days = {config.cache_no_match_max_age_days}",
+        ),
         "",
         "[hints]",
-        f"enabled = {str(config.hints_enabled).lower()}",
+        line("hints_enabled", f"enabled = {str(config.hints_enabled).lower()}"),
     ]
     for connector in HINT_CONNECTORS:
-        lines.append(f"{connector} = {str(connector not in disabled).lower()}")
+        lines.append(
+            line(
+                "disabled_hint_connectors",
+                f"{connector} = {str(connector not in disabled).lower()}",
+            )
+        )
     lines.extend(
         [
             "",
             "[present]",
-            f"collapse = {str(config.collapse).lower()}",
-            f"same_track_bridge_ms = {config.same_track_bridge_ms}",
-            f"min_track_ms = {config.present_min_track_ms}",
+            line("collapse", f"collapse = {str(config.collapse).lower()}"),
+            line("same_track_bridge_ms", f"same_track_bridge_ms = {config.same_track_bridge_ms}"),
+            line("present_min_track_ms", f"min_track_ms = {config.present_min_track_ms}"),
         ]
     )
+    if trailer:
+        lines.append("")
+        lines.extend(trailer)
     return "\n".join(lines) + "\n"

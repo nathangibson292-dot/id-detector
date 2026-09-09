@@ -10,7 +10,7 @@ pluggable: tests inject a fake runner instead and never touch the network.
 from __future__ import annotations
 
 import asyncio
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from hashlib import sha256
 from pathlib import Path
 
@@ -49,14 +49,15 @@ class _RunSettings:
 def _resolve_settings(project_root: Path, config_path: Path, profile: str | None) -> _RunSettings:
     """Mirror the ``analyse`` command's config+profile precedence (file prefs, profile geometry).
 
-    Kept in lock-step with ``id_detector.cli.analyse``: the file config supplies preferences
-    (budget, lead-in, cache TTLs, hint switches); a frozen profile is the authority on engines,
-    transform/schedule/rescan geometry and the novelty/hints toggles, and supplies a calibrator when
-    a frozen artefact exists.
+    Shares ``profiles.effective_app_config`` with ``id_detector.cli.analyse`` so the two cannot
+    drift: the file config supplies every preference (budget, lead-in, cache TTLs, hint switches,
+    ``[recognise]``, ``[deep]``, ``[present]``); a frozen profile is the authority on engines,
+    transform/schedule/rescan geometry and the novelty/hints toggles, and supplies a calibrator
+    when a frozen artefact exists.
     """
 
     from id_detector.calibrate.model import load_calibration
-    from id_detector.profiles import UnknownProfile, load_profile, profile_app_config
+    from id_detector.profiles import UnknownProfile, effective_app_config, load_profile
 
     file_config = AppConfig.load(config_path)
     no_hints = not file_config.hints_enabled
@@ -67,28 +68,10 @@ def _resolve_settings(project_root: Path, config_path: Path, profile: str | None
         except UnknownProfile:
             frozen = None
         if frozen is not None:
-            loaded = replace(
-                profile_app_config(frozen),
-                allow_third_party_upload=file_config.allow_third_party_upload,
-                default_profile=file_config.default_profile,
-                max_requests=file_config.max_requests,
-                pricing_version=file_config.pricing_version,
-                audd_usd_e6_per_request=file_config.audd_usd_e6_per_request,
-                bill_on_throttle=file_config.bill_on_throttle,
-                max_usd_e2=file_config.max_usd_e2,
-                deep_primary_density=file_config.deep_primary_density,
-                audd_requests_per_minute=file_config.audd_requests_per_minute,
-                lead_in_ms=file_config.lead_in_ms,
-                cache_positive_max_age_days=file_config.cache_positive_max_age_days,
-                cache_no_match_max_age_days=file_config.cache_no_match_max_age_days,
-                hints_enabled=file_config.hints_enabled,
-                disabled_hint_connectors=file_config.disabled_hint_connectors,
-                # Config rescan ceiling caps the profile (default 0 = rescans off; they cost hours
-                # and add only phantoms on real mixes).  Raise [rescan] max_generations to opt in.
-                rescan_max_generations=min(
-                    frozen.rescan.max_generations, file_config.rescan_max_generations
-                ),
-            )
+            # The same resolver `idea analyse` and `config show` use (review H6): the profile
+            # fixes the geometry, every file preference is carried, and the config rescan ceiling
+            # caps the profile (default 0 = rescans off; raise [rescan] max_generations to opt in).
+            loaded = effective_app_config(file_config, frozen)
             return _RunSettings(
                 config=loaded,
                 calibrator=load_calibration(project_root, frozen.name),

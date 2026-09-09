@@ -203,12 +203,33 @@ class InjectedHTTPClient(HTTPClientInterface):
         try:
             payload = response.json()
         except ValueError as exc:
-            self.breaker.failure()
+            self._malformed()
             raise ShazamHTTPError(response.status_code, "Shazam response was not JSON") from exc
+        if not isinstance(payload, dict) or not isinstance(payload.get("matches"), list):
+            # A JSON body that is not a recognition (no ``matches`` list: a bare error object, an
+            # array, a string) is what the throttle looks like past its 429s.  Treating it as a
+            # no-match would cache the throttle for 30 days.
+            self._malformed()
+            raise ShazamHTTPError(
+                response.status_code, "Shazam response is not a recognition (no matches list)"
+            )
         self.breaker.success()
         # A clean response earns a little rate back toward the ceiling.
         self.limiter.recover()
         return payload
+
+    def _malformed(self) -> None:
+        """A body we cannot decode counts as a throttle: breaker failure AND limiter penalty.
+
+        Under sustained load Shazam's free endpoint stops answering 429 and returns HTML or empty
+        bodies with a 200; before, those only tripped the breaker while the admission rate stayed
+        at the ceiling and every following window failed the same way (review S1).  They are
+        failed windows either way — never retried, never cached — and count against the free
+        primary's achieved fraction.
+        """
+
+        self.breaker.failure()
+        self.limiter.penalize()
 
 
 def _fixed_ms(value: Any) -> int:

@@ -48,7 +48,11 @@ from id_detector.money import (
     UsdSettlement,
     reserve_usd,
 )
-from id_detector.orchestrate import run_generation_loop
+from id_detector.orchestrate import (
+    compute_novelty_change_points,
+    run_generation_loop,
+    scanned_windows,
+)
 from id_detector.paid_clip import (
     PAID_CLIP_ENGINES,
     CancelToken,
@@ -61,9 +65,10 @@ from id_detector.present.server import consume_rescan_queue, read_rescan_queue
 from id_detector.process import run_process
 from id_detector.profiles import (
     UnknownProfile,
+    effective_app_config,
     freeze_profiles,
     load_profile,
-    profile_app_config,
+    profile_fixed_fields,
 )
 from id_detector.providers.audd import DEFAULT_ANCHOR_MAX_MS, DEFAULT_ANCHOR_SLACK_MS
 from id_detector.providers.base import AppConfig
@@ -327,15 +332,63 @@ def config_show(
         "--config",
         help="TOML config to resolve (missing file is fine: built-in defaults are shown).",
     ),
+    profile: str | None = typer.Option(
+        None,
+        "--profile",
+        help=(
+            "Show what a run under this frozen profile ('free' or 'max_accuracy') actually "
+            "uses, marking the lines the profile fixes. Without it, the file's default_profile "
+            "applies when set."
+        ),
+    ),
 ) -> None:
-    """Print the effective, resolved configuration (file + defaults). No secrets are shown."""
+    """Print the effective, resolved configuration (file + profile + defaults). No secrets."""
 
-    loaded = _load_app_config(config)
-    source = (
+    file_config = _load_app_config(config)
+    selected = profile if profile is not None else file_config.default_profile
+    if selected is None:
+        source = (
+            f"{config} + defaults"
+            if config.is_file()
+            else f"built-in defaults ({config} not found)"
+        )
+        typer.echo(f"# source: {source}")
+        typer.echo(render_effective_config(file_config), nl=False)
+        return
+    frozen = _load_profile_or_exit(selected)
+    chosen_by = "--profile" if profile is not None else f"default_profile in {config}"
+    file_part = (
         f"{config} + defaults" if config.is_file() else f"built-in defaults ({config} not found)"
     )
-    typer.echo(f"# source: {source}")
-    typer.echo(render_effective_config(loaded), nl=False)
+    effective = effective_app_config(file_config, frozen)
+    engines = ", ".join(frozen.enabled_engines) or "none"
+    trailer = [
+        f'# Profile "{frozen.name}" also fixes what no config line controls:',
+        f"#   engines = {engines}  (--recipe deep adds the paid AudD sweep)",
+        f"#   novelty change points = {'on' if frozen.novelty_enabled else 'off'}  "
+        "(rescan triggers; computed only when max_generations > 0)",
+        f"#   hints = {'on' if frozen.hints_enabled else 'off'}",
+    ]
+    typer.echo(f'# source: {file_part} + profile "{frozen.name}" (chosen by {chosen_by})')
+    typer.echo(
+        f'# Lines marked "fixed by profile" come from the frozen profile "{frozen.name}"; the '
+        "file's value is ignored for those."
+    )
+    typer.echo("# Every other line is exactly what a run under this profile uses.")
+    typer.echo(
+        render_effective_config(
+            effective,
+            fixed_by=profile_fixed_fields(
+                file_config,
+                frozen,
+                # Match the header: with no config file on disk the ceiling that caps the
+                # profile's rescans is the built-in default, not "this file".
+                capped_by="this file" if config.is_file() else "the built-in default",
+            ),
+            trailer=trailer,
+        ),
+        nl=False,
+    )
 
 
 @config_app.command("init")
@@ -782,6 +835,29 @@ async def _analyse(
                 item.generation == 0 and item.transform.type == "none" and item.status != "error"
                 for item in recognised.observations
             )
+            # Past its 429s Shazam's throttle looks like empty or non-JSON bodies; each leaves a
+            # planned window with no answer, and too few answers end the run `partial` (review
+            # S1).  The count is over the planned frozen windows the status rule itself uses --
+            # `recognised.failures` also counts transform siblings, so under
+            # `[transforms] policy = "global"` it can exceed the window count and read as
+            # nonsense ("15 of 7 windows").  The verdict is this run's, not a general rule.
+            unanswered = primary_planned - primary_resolved
+            if unanswered > 0:
+                needed = round(achieved_recipe.primary_achieved_fraction * 100)
+                verdict = (
+                    f"still at or above the {needed} % this recipe needs"
+                    if _achieved(
+                        primary_resolved,
+                        primary_planned,
+                        achieved_recipe.primary_achieved_fraction,
+                    )
+                    else f"below the {needed} % this recipe needs, so the run ends partial"
+                )
+                _recognise_log(
+                    f"{unanswered} of {primary_planned} windows got no usable answer from "
+                    f"Shazam (throttled or malformed reply): {primary_resolved} of "
+                    f"{primary_planned} resolved, {verdict}"
+                )
         matches = [item for item in gen0_observations if item.status == "match"]
         timer.finish_stage("recognise_ms")
 
@@ -804,6 +880,18 @@ async def _analyse(
             counts["hints"] = len(hint_result.hints)
             _report(progress, "hints", 1, 1, f"{len(hint_result.hints)} hints")
 
+        _report(progress, "fuse", 0, 1, "fusing episodes")
+        timer.start_stage("fuse_ms")
+        # Novelty change points only ever feed rescan triggers, so they are computed here once
+        # for every fuse of this run, and not at all with rescans off — the full log-mel pass
+        # over the PCM (~0.7 GB per hour of mix) was paid on every re-fuse for nothing before
+        # (review M2).  ``max_generations`` is the config-capped value the caller resolved.
+        # Computed BEFORE ``_fuse`` closes over it: the closure reads the name at call time, so
+        # defining it afterwards would make any future reordering a NameError at run time.
+        novelty_points = compute_novelty_change_points(
+            decoded, enabled=novelty and max_generations > 0
+        )
+
         async def _fuse(
             extra_observations: tuple[object, ...],
             extra_observation_paths: tuple[Path, ...],
@@ -824,13 +912,20 @@ async def _analyse(
                 max_generations=max_generations,
                 request_budget=max_requests,
                 novelty_enabled=novelty,
+                novelty_change_points_ms=novelty_points,
+                # Only the windows an engine actually answered for count as scanned (review
+                # M10): under Deep the AudD sweep may skip every other window (density 2) and
+                # the Shazam secondary probes a handful, so the coverage figures and the gap
+                # evidence must not describe a free-engine pass over the whole mix that never
+                # happened.
+                scanned_windows=scanned_windows(
+                    windows.records, (*gen0_observations, *extra_observations)
+                ),
                 gen0_requests=gen0_requests,
                 gen0_physical_attempts=gen0_physical,
                 calibrator=calibrator,
             )
 
-        _report(progress, "fuse", 0, 1, "fusing episodes")
-        timer.start_stage("fuse_ms")
         orchestrated = await _fuse((), ())
         fused = orchestrated.fusion
         counts.update(
@@ -922,6 +1017,11 @@ async def _analyse(
                 timer.finish_stage("secondary_ms")
                 secondary_resolved = len(scheduled) - secondary.failures
                 counts["secondary_resolved"] = secondary_resolved
+                if secondary.failures:
+                    _recognise_log(
+                        f"{secondary.failures} of {len(scheduled)} second-opinion windows got "
+                        "no usable answer from Shazam (throttled or malformed reply)"
+                    )
                 counts["secondary_matches"] = sum(
                     item.status == "match" for item in secondary.observations
                 )
@@ -1237,29 +1337,11 @@ def analyse(
     selected_profile = profile if profile is not None else file_config.default_profile
     if selected_profile is not None:
         frozen = _load_profile_or_exit(selected_profile)
-        loaded_config = replace(
-            profile_app_config(frozen),
-            allow_third_party_upload=file_config.allow_third_party_upload,
-            default_profile=file_config.default_profile,
-            max_requests=file_config.max_requests,
-            pricing_version=file_config.pricing_version,
-            audd_usd_e6_per_request=file_config.audd_usd_e6_per_request,
-            bill_on_throttle=file_config.bill_on_throttle,
-            max_usd_e2=file_config.max_usd_e2,
-            deep_primary_density=file_config.deep_primary_density,
-            audd_requests_per_minute=file_config.audd_requests_per_minute,
-            lead_in_ms=file_config.lead_in_ms,
-            cache_positive_max_age_days=file_config.cache_positive_max_age_days,
-            cache_no_match_max_age_days=file_config.cache_no_match_max_age_days,
-            hints_enabled=file_config.hints_enabled,
-            disabled_hint_connectors=file_config.disabled_hint_connectors,
-            # The config's rescan ceiling caps the profile's rescan generations.  The default
-            # ceiling is 0 (rescans off) because on real mixes they cost hours and add only
-            # phantoms; set [rescan] max_generations in config (or --max-generations) to opt in.
-            rescan_max_generations=min(
-                frozen.rescan.max_generations, file_config.rescan_max_generations
-            ),
-        )
+        # One resolver shared with the web runner and `config show`: the profile fixes the
+        # transform/schedule/rescan geometry, every other file preference is carried (review H6),
+        # and the config's rescan ceiling caps the profile's rescan generations (default 0 =
+        # rescans off; set [rescan] max_generations or --max-generations to opt in).
+        loaded_config = effective_app_config(file_config, frozen)
         # A frozen profile is the authority on its feature toggles and its engine set (only
         # max_accuracy lists paid file_scanner engines).
         enabled_engines = tuple(frozen.enabled_engines)

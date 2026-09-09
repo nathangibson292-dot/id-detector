@@ -22,7 +22,7 @@ from __future__ import annotations
 
 import json
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, fields, replace
 from importlib.resources import files
 from pathlib import Path
 from typing import Any
@@ -751,6 +751,74 @@ def profile_app_config(profile: ProfileRecord) -> AppConfig:
         rescan_phase_ms=profile.rescan.phase_ms,
         rescan_max_generations=profile.rescan.max_generations,
     )
+
+
+#: The :class:`AppConfig` fields a frozen profile is the authority on: the transform hypotheses
+#: and the generation-0 / rescan window geometry.  Every other field is a runtime preference the
+#: owner's ``idea.toml`` keeps supplying under a profile (plan 0b-ii, review H6) — before, the
+#: ``[recognise]`` pacing and the ``[present]`` dials (``min_track_ms`` above all) were silently
+#: dropped whenever a profile was active, while ``config show`` still printed them as effective.
+PROFILE_FIXED_FIELDS: frozenset[str] = frozenset(
+    {
+        "transforms_policy",
+        "transform_rates_e4",
+        "transform_semitones",
+        "window_ms",
+        "hop_ms",
+        "phase_ms",
+        "rescan_window_ms",
+        "rescan_hop_ms",
+        "rescan_phase_ms",
+    }
+)
+
+
+def effective_app_config(file_config: AppConfig, profile: ProfileRecord) -> AppConfig:
+    """The configuration a run under ``profile`` actually uses.
+
+    This is the one resolver both ``idea analyse`` and the web runner call, so the two can never
+    drift.  The profile fixes :data:`PROFILE_FIXED_FIELDS`; everything else — budget, pricing,
+    lead-in, cache TTLs, hint switches, ``[recognise]``, ``[deep]`` and ``[present]`` — is carried
+    from the owner's file field by field, so a knob added later cannot be dropped again.  Two
+    fields combine: the file's ``[rescan] max_generations`` caps the profile's rescan generations
+    (its default 0 keeps rescans off: on real mixes they cost hours and add only phantoms), and a
+    profile that turns hints off does so on top of the file's ``[hints] enabled``.
+    """
+
+    carried = {
+        field.name: getattr(file_config, field.name)
+        for field in fields(AppConfig)
+        if field.name not in PROFILE_FIXED_FIELDS
+    }
+    carried["rescan_max_generations"] = min(
+        profile.rescan.max_generations, file_config.rescan_max_generations
+    )
+    carried["hints_enabled"] = file_config.hints_enabled and profile.hints_enabled
+    return replace(profile_app_config(profile), **carried)
+
+
+def profile_fixed_fields(
+    file_config: AppConfig, profile: ProfileRecord, *, capped_by: str = "this file"
+) -> dict[str, str]:
+    """Which effective fields the profile decided, with a plain-English note for ``config show``.
+
+    ``capped_by`` names whatever supplied the rescan ceiling, so the note matches the header
+    ``config show`` printed: with no ``idea.toml`` on disk the ceiling is the built-in default,
+    and saying "capped by this file" would point the reader at a file that does not exist.
+    """
+
+    label = f'fixed by profile "{profile.name}"'
+    notes = dict.fromkeys(sorted(PROFILE_FIXED_FIELDS), label)
+    if profile.rescan.max_generations <= file_config.rescan_max_generations:
+        notes["rescan_max_generations"] = label
+    else:
+        notes["rescan_max_generations"] = (
+            f'capped by {capped_by} (profile "{profile.name}" allows '
+            f"{profile.rescan.max_generations})"
+        )
+    if file_config.hints_enabled and not profile.hints_enabled:
+        notes["hints_enabled"] = f'turned off by profile "{profile.name}"'
+    return notes
 
 
 def profile_canonical_bytes(profile: ProfileRecord) -> bytes:

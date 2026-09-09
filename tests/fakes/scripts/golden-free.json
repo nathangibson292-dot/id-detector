@@ -1,0 +1,8 @@
+{
+  "shazam": {
+    "default": "match",
+    "windows": {
+      "3": "no_match"
+    }
+  }
+}

@@ -9,6 +9,7 @@ first of: no requests, ``max_generations`` (default 3), or an exhausted budget.
 
 from __future__ import annotations
 
+from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Protocol
@@ -111,10 +112,40 @@ def rescan_transform_grid(config: AppConfig) -> list[Transform]:
 def compute_novelty_change_points(
     decoded: DecodeResult, *, enabled: bool = True
 ) -> tuple[int, ...]:
+    """Spectral-novelty change points, the rescan ``novelty`` trigger's input.
+
+    This reads the whole PCM and runs a full log-mel/flux pass (~0.7 GB and seconds per hour of
+    mix), so a caller computes it once per run and only when rescans can use it — see
+    :func:`run_generation_loop` (review M2).
+    """
+
     if not enabled:
         return ()
     events = novelty_change_points(decoded.pcm_path, duration_ms=decoded.record.pcm.duration_ms)
     return tuple(item.at_ms for item in events)
+
+
+def scanned_windows(
+    windows: Iterable[WindowRecord], observations: Iterable[Any]
+) -> list[WindowRecord]:
+    """The windows some engine actually answered for, in the given order (review M10).
+
+    A window is scanned when a resolved clip observation (``match`` or ``no_match``, from any
+    provider) names it in ``source_ids`` as ``window:<id>``; an ``error`` observation means no
+    engine answered.  Under the Deep recipe only the windows AudD swept (every other one at
+    density 2) plus the ones the Shazam secondary probed count, so the fuser's coverage figures
+    and gap evidence describe the pass that really happened instead of a free-engine sweep of the
+    whole mix.
+    """
+
+    answered = {
+        source_id.removeprefix("window:")
+        for observation in observations
+        if getattr(observation, "status", "error") != "error"
+        for source_id in getattr(observation, "source_ids", ())
+        if source_id.startswith("window:")
+    }
+    return [window for window in windows if window.id in answered]
 
 
 async def run_generation_loop(
@@ -135,17 +166,32 @@ async def run_generation_loop(
     max_generations: int = DEFAULT_MAX_GENERATIONS,
     request_budget: int = DEFAULT_REQUEST_BUDGET,
     novelty_enabled: bool = True,
+    novelty_change_points_ms: Sequence[int] | None = None,
+    scanned_windows: Sequence[WindowRecord] | None = None,
     gen0_requests: int = 0,
     gen0_physical_attempts: int = 0,
     calibrator: object | None = None,
 ) -> OrchestrationResult:
-    """Run generation 0's fusion and every budgeted rescan generation after it."""
+    """Run generation 0's fusion and every budgeted rescan generation after it.
+
+    ``novelty_change_points_ms`` lets a caller that fuses more than once (the Deep re-fuse) pass
+    the points it computed a single time; when absent they are computed here, and only if
+    ``max_generations`` allows a rescan to consume them (review M2).  ``scanned_windows`` is the
+    subset of ``windows.records`` an engine actually answered for (:func:`scanned_windows`);
+    it defaults to every window, the free-recipe truth.
+    """
 
     duration_ms = decoded.record.pcm.duration_ms
-    novelty_points = compute_novelty_change_points(decoded, enabled=novelty_enabled)
+    if novelty_change_points_ms is None:
+        novelty_change_points_ms = compute_novelty_change_points(
+            decoded, enabled=novelty_enabled and max_generations > 0
+        )
+    novelty_points = tuple(novelty_change_points_ms)
     transforms = rescan_transform_grid(app_config)
 
-    all_windows: list[WindowRecord] = list(windows.records)
+    all_windows: list[WindowRecord] = list(
+        windows.records if scanned_windows is None else scanned_windows
+    )
     # Paid whole-file scanner observations (AudD/ACRCloud) join generation 0 as a static set: they
     # are never re-run per rescan generation, so they simply persist through the loop and fuse
     # alongside every generation's clip observations.  Empty on the free path.
@@ -153,8 +199,13 @@ async def run_generation_loop(
     window_paths: list[Path] = [windows.record_path]
     observation_paths: list[Path] = [observations_path, *extra_observation_paths]
     prior_keys: set[str] = set()
-    spent_windows = len(all_windows)
-    budget = max(request_budget, len(all_windows))
+    # The request budget is spent per window *generated*, not per window an engine answered:
+    # restricting the fused set to the answered ones (review M10) must not quietly widen the
+    # rescan allowance ``request_budget`` (``--max-requests``) bounds.  Under a Deep density-2
+    # sweep half the windows go unanswered by design, which would otherwise hand the loop half a
+    # mix's worth of extra Shazam requests.
+    spent_windows = len(windows.records)
+    budget = max(request_budget, len(windows.records))
 
     fusion = fuse_generation(
         media_key=media_key,

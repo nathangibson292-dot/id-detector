@@ -3,6 +3,26 @@
 *Consolidated at Stage 9 (final v1 stage). Plan: [PLAN.md](PLAN.md) rev 5.2. This file is the honest,
 one-page answer to "what actually works, and what is only claimed?"*
 
+## v2 (hosted product) — where the build stands
+
+*Updated 2026-09-10. Plan: [PLAN-v2.md](PLAN-v2.md) rev 6; cycle log: [reviews/README.md](reviews/README.md).*
+
+**Phase 0 is complete and committed; the build is paused here by the owner's decision so the tool can be
+tested locally.** What Phase 0 delivered (cycles 0a-i, 0a-ii, 0a-iv+0a-iii, 0b-i+0b-iii, 0b-ii): the paid
+(Deep) path no longer crashes after spending; AudD error bodies are never cached; spend is reserved,
+admitted per request against a hard cap and settled/journaled honestly; every run ends with an explicit
+status (`complete / degraded / partial / provider_unavailable / budget_exhausted / source_changed`) and exit
+code; `--recipe free|deep` (Deep is explicit opt-in; `pricing.toml` is the single pricing authority);
+AudD observations carry a validated anchor and their own vote; the paid pass is concurrent, rate-limited,
+retried, cancellable, and journals every attempt durably before network I/O; a provisional Shazam second
+pass makes a Deep run finish end-to-end; config knobs are effective under profiles and `idea config show`
+explains them; novelty only runs when rescans are on; malformed Shazam replies count as failures, never as
+"no match"; a semantic Local-Free golden pins Free-scan output; loopback CSRF/Origin protects the local
+server; dead paid paths are unreachable. Test suite: 756 passed offline.
+
+**Not started:** Phase 1 (recipes' result bundles, analysis keys, compatibility serving, targeting v2,
+corroboration) and everything after — see PLAN-v2 §5. Do not start Phase 1 without the owner.
+
 ## Acceptance status at a glance
 
 Legend: **met** = the stage's plan gate is satisfied as written · **met (controlled only)** = proven
