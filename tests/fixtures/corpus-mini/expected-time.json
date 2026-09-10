@@ -13,7 +13,11 @@
       "correct": 4,
       "predicted": 5
     },
-    "listed": null,
+    "listed": {
+      "correct": 4,
+      "predicted": 7,
+      "truth": 6
+    },
     "mixes": 2,
     "range_claims": 0,
     "timing": {
@@ -22,8 +26,7 @@
     "work": {
       "correct": 4,
       "predicted": 7,
-      "truth": 6,
-      "truth_matched": 4
+      "truth": 6
     }
   },
   "generated_by": "id-detector/0.1.0 scripts/score_corpus.py",
@@ -34,12 +37,12 @@
       "listed_precision_e4": 8000,
       "work_recall_e4": 7500
     },
-    "thresholds_met": null
+    "thresholds_met": false
   },
   "likely_precision_e4": 8000,
-  "listed_precision_e4": null,
-  "match_mode": "work",
-  "match_requested": "auto",
+  "listed_precision_e4": 5714,
+  "match_mode": "time",
+  "match_requested": "time",
   "mixes": [
     {
       "counts": {
@@ -47,12 +50,15 @@
           "correct": 3,
           "predicted": 3
         },
-        "listed": null,
+        "listed": {
+          "correct": 3,
+          "predicted": 5,
+          "truth": 3
+        },
         "work": {
           "correct": 3,
           "predicted": 5,
-          "truth": 3,
-          "truth_matched": 3
+          "truth": 3
         }
       },
       "episodes": "mini-a/fuse/episodes.json",
@@ -63,12 +69,12 @@
         "short": 1
       },
       "likely_precision_e4": 10000,
-      "listed_precision_e4": null,
-      "match_mode": "work",
+      "listed_precision_e4": 6000,
+      "match_mode": "time",
       "min_track_ms": 30000,
       "mix_id": "mini-a",
       "range_claims": 0,
-      "report": null,
+      "report": "out-mixes/mini-a/report.json",
       "set_id": "mini-a",
       "timing": "order-only",
       "truth": "mini-a/ground_truth.json",
@@ -121,12 +127,15 @@
           "correct": 1,
           "predicted": 2
         },
-        "listed": null,
+        "listed": {
+          "correct": 1,
+          "predicted": 2,
+          "truth": 3
+        },
         "work": {
           "correct": 1,
           "predicted": 2,
-          "truth": 3,
-          "truth_matched": 1
+          "truth": 3
         }
       },
       "episodes": "mini-b/fuse/episodes.json",
@@ -136,12 +145,12 @@
         "short": 1
       },
       "likely_precision_e4": 5000,
-      "listed_precision_e4": null,
-      "match_mode": "work",
+      "listed_precision_e4": 5000,
+      "match_mode": "time",
       "min_track_ms": 30000,
       "mix_id": "mini-b",
       "range_claims": 0,
-      "report": null,
+      "report": "out-mixes/mini-b/report.json",
       "set_id": "mini-b",
       "timing": "order-only",
       "truth": "mini-b/ground_truth.json",

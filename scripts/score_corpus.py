@@ -3,7 +3,7 @@
 Usage::
 
     uv run python scripts/score_corpus.py --run-list data/corpus/release-1/runs-deep.json \\
-        --out docs/accuracy/release-1-deep.json [--print]
+        --out docs/accuracy/release-1-deep.json [--print] [--match auto|time|work]
 
 The run list is ``{"recipe": "deep" | "free", "runs": [{"mix_id", "truth", "episodes",
 "min_track_ms": 30000}, ...]}``; ``truth`` is a ``ground_truth.json`` (or the directory holding
@@ -20,19 +20,43 @@ loudly instead of quietly publishing a number for a different mix.
 Per mix, the episodes are first pre-filtered with the **presentation floor** —
 :func:`id_detector.present.exports.hidden_reason`, the one predicate the page and the exports drop
 rows by (the on-air floor ``min_track_ms`` and fusion's ``suppressed`` reasons) — so the score is
-of what a reader is actually shown.  What remains goes to the existing benchmark scorer
-(:func:`id_detector.benchmark.scorer.score_corpus_detailed`, the function behind ``idea benchmark
-score``) and that mix's full report is written next to ``--out``.  Across mixes the counts are
-**pooled**: numerators and denominators are summed before any ratio is taken, never a mean of
-per-mix ratios, so a forty-track mix weighs forty times a one-track mix.  Three e4 integers come
-out of the pooled metrics:
+of what a reader is actually shown.  What remains is matched to the truth one of two ways
+(``--match``, default ``auto``):
 
-- ``likely_precision_e4`` — ``empirical_tier_precision_e4["likely"]``: of the listed predictions
-  whose work tier is ``likely`` or better, the share that named a track really played there;
-- ``listed_precision_e4`` — ``selective_precision_e4`` after the floor: of every listed
-  prediction, the share associated with a truth occurrence;
-- ``work_recall_e4`` — ``identification_work.recall_e4``: of the distinct works in the truth,
-  the share the listed predictions named.
+- ``time`` — the existing benchmark scorer (``benchmark.scorer.score_corpus_detailed``, the
+  function behind ``idea benchmark score``): a listed prediction is right when its support
+  overlaps the truth occurrence it names, and that mix's full report is written next to
+  ``--out``.  Needs truth with start times.  Three e4 integers come out of the pooled metrics:
+  ``likely_precision_e4`` (``empirical_tier_precision_e4["likely"]``: of the listed predictions
+  whose work tier is ``likely`` or better, the share that named a track really played there),
+  ``listed_precision_e4`` (``selective_precision_e4`` after the floor: of every listed prediction,
+  the share associated with a truth occurrence) and ``work_recall_e4``
+  (``identification_work.recall_e4``: of the distinct works in the truth, the share the listed
+  predictions named); ``work_precision_e4`` (``identification_work.precision_e4``) rides along.
+- ``work`` — time-agnostic (:func:`match_works`): each listed prediction is matched to at most one
+  truth row by normalised work identity alone, through the one normaliser fusion uses to decide two
+  crowd hints name the same track (``hints.relations._normalise``: a parenthesised mix descriptor
+  such as "(Extended Mix)", "(Original Mix)" or "(Edit)" dropped, case and punctuation folded) and
+  its order-independent word-set rule (``fuse.identity._word_sets_corroborate``: swapped
+  artist/title, "feat." clauses and extra collaborators never block a match).  It reports
+  ``work_precision_e4`` (of the distinct works listed, the share really played),
+  ``work_recall_e4`` (of the distinct works played, the share listed) and ``likely_precision_e4``
+  (a ``likely`` row is right iff it names any truth row); ``listed_precision_e4`` and every timing
+  number are ``null``, and so is ``l3.thresholds_met`` — the listed-precision bar needs timed truth.
+- ``auto`` picks ``time`` only for **fully timed** truth and ``work`` for anything still carrying
+  ``idea truth seed``'s placeholder equal-slice timings (:func:`truth_timing`) — a whole file of
+  them (``order-only``, as the rekordbox-playlist drafts under ``data/corpus/release-1/`` are) or
+  just some rows (``partial``, a half-finished verify pass).  A run list mixing both pools the
+  work-only numbers (the only ones every mix has) and keeps each timed mix's time numbers on its
+  own row.
+
+Whatever the mode, every mix also gets the work-only numbers under ``work_only`` (pooled at the
+top level too) and a ``work-match.json`` beside its ``predictions.json`` listing every assignment,
+so a timed corpus and an order-only one stay comparable; the per-mix rows name the truth works no
+prediction matched (what was missed) and the listed labels no truth row matched (what was wrong).
+
+Across mixes the counts are **pooled**: numerators and denominators are summed before any ratio is
+taken, never a mean of per-mix ratios, so a forty-track mix weighs forty times a one-track mix.
 
 A crowd ID (fusion's ``hint_only`` episode) claims a position *range* rather than engine-proved
 bounds, which the benchmark's ``ScoredEpisode`` contract cannot express; :func:`proved_bounds`
@@ -42,7 +66,7 @@ re-states those two bounds in the contract's convention and the output counts th
 Draft truth (rows with ``draft: true`` — e.g. the seeded ``data/corpus/release-1/`` files with
 their placeholder equal-slice timings) is accepted, but the output is labelled ``"truth_status":
 "draft"``; only truth covered by a frozen, hash-checked ``corpus-version.json`` with every row
-verified reads ``"verified"``, and only that can back the L3 numbers.
+verified reads ``"verified"``, and only that, matched by time, can back the L3 numbers.
 """
 
 from __future__ import annotations
@@ -53,7 +77,7 @@ import re
 import sys
 import tempfile
 from collections import Counter
-from dataclasses import dataclass
+from dataclasses import dataclass, fields
 from hashlib import sha256
 from pathlib import Path
 from typing import Any, Literal
@@ -62,10 +86,12 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_valida
 
 from id_detector.benchmark.corpus import prediction_set_from_fusion
 from id_detector.benchmark.scorer import (
+    TIER_ORDER,
     PredictionDocument,
     ScoreState,
     ScoringConfigSnapshot,
     SetScore,
+    _ratio_e4,
     load_truth_directory,
     pooled_metrics,
     score_corpus_detailed,
@@ -76,7 +102,13 @@ from id_detector.contracts import (
     EpisodesFile,
     GroundTruthRecord,
     IdentitiesRecord,
+    TruthWork,
 )
+
+# The work-only matcher must be fusion's own notion of "the same track", not a second normaliser:
+# these two private helpers are exactly what attaches a crowd hint to an audio match.
+from id_detector.fuse.identity import _word_sets_corroborate
+from id_detector.hints.relations import _normalise
 from id_detector.io import (
     atomic_write_json,
     canonical_json_bytes,
@@ -103,6 +135,11 @@ _UPSTREAM_IDENTITIES = re.compile(r"^fuse/identities\.gen\d+\.json$")
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _TRUTH_RANK = {"draft": 0, "unverified": 1, "verified": 2}
 TruthStatus = Literal["draft", "unverified", "verified"]
+MatchChoice = Literal["auto", "time", "work"]
+MatchMode = Literal["time", "work"]
+Timing = Literal["timed", "partial", "order-only"]
+#: What ``idea truth seed`` writes on every row it cannot time (``truth.py``).
+SEED_AUDIBLE_RULE = "manual annotation required"
 #: Plan §6.3 L3 also asks for a corpus shape these three numbers cannot judge; named in ``--print``.
 L3_CORPUS_NOTE = (
     "L3 also needs >= 5 owner-verified mixes, >= 3 DJs, >= 2 platforms and >= 4 h of audio, "
@@ -151,18 +188,88 @@ class RunList(BaseModel):
         return self
 
 
+@dataclass
+class WorkCounts:
+    """Numerators and denominators of the work-only match (:func:`match_works`); pooled by sum."""
+
+    #: Listed rows that named a truth row, of all listed rows.
+    rows_correct: int = 0
+    rows: int = 0
+    #: Listed rows whose work tier is ``likely`` or better that named a truth row, of those rows.
+    likely_correct: int = 0
+    likely: int = 0
+    #: Distinct listed works (the identity graph's) with a matched row, of all distinct listed
+    #: works.
+    works_correct: int = 0
+    works: int = 0
+    #: Distinct truth works some row named, of all distinct truth works.
+    truth_matched: int = 0
+    truth: int = 0
+
+    def add(self, other: WorkCounts) -> None:
+        for item in fields(self):
+            setattr(self, item.name, getattr(self, item.name) + getattr(other, item.name))
+
+    def headline(self) -> dict[str, int]:
+        return {
+            "likely_precision_e4": _ratio_e4(self.likely_correct, self.likely),
+            "work_precision_e4": _ratio_e4(self.works_correct, self.works),
+            "work_recall_e4": _ratio_e4(self.truth_matched, self.truth),
+        }
+
+    def as_dict(self) -> dict[str, dict[str, int]]:
+        return {
+            "rows": {"correct": self.rows_correct, "predicted": self.rows},
+            "likely": {"correct": self.likely_correct, "predicted": self.likely},
+            "works": {"correct": self.works_correct, "predicted": self.works},
+            "truth_works": {"matched": self.truth_matched, "total": self.truth},
+        }
+
+
+@dataclass(frozen=True)
+class ListedWork:
+    """A listed prediction as the work-only matcher sees it."""
+
+    episode_id: str
+    artist: str
+    title: str
+    #: The episode's ``tiers.work``.
+    tier: str
+    #: The identity graph's work: the unit "distinct listed works" are counted in.
+    work_id: str
+
+
+@dataclass(frozen=True)
+class WorkMatch:
+    """One mix's listed predictions matched to its truth rows by work identity alone."""
+
+    #: Listed index -> truth row index.  A prediction matches at most one row; a row may be named
+    #: by any number of predictions (a track the tool lists twice is not a wrong ID).
+    assignments: dict[int, int]
+    counts: WorkCounts
+    #: Distinct truth works no prediction named (what was missed), in truth order.
+    unmatched_truth: list[dict[str, Any]]
+    #: Distinct listed labels that named no truth row (what was wrong), in listing order.
+    unmatched_predictions: list[dict[str, Any]]
+
+
 @dataclass(frozen=True)
 class MixScore:
     entry: RunEntry
     truth: GroundTruthRecord
     truth_status: TruthStatus
+    timing: Timing
+    match_mode: MatchMode
     episodes_total: int
     hidden_by_reason: dict[str, int]
     #: Listed rows whose bounds were a position range, not engine-proved (see `proved_bounds`).
     range_claims: int
-    score: SetScore
-    metrics: BenchmarkMetrics
-    report_path: Path
+    work_match: WorkMatch
+    work_match_path: Path
+    #: The benchmark scorer's result; ``None`` when the mix was matched by work.
+    score: SetScore | None
+    metrics: BenchmarkMetrics | None
+    report_path: Path | None
 
 
 def load_run_list(path: Path) -> RunList:
@@ -300,6 +407,128 @@ def truth_status(truth_path: Path, truth: GroundTruthRecord) -> TruthStatus:
     return "unverified"
 
 
+def truth_timing(truth: GroundTruthRecord) -> Timing:
+    """How much of a truth is really timed, read from its content rather than from a flag.
+
+    An order-only tracklist (a rekordbox playlist) gives the tracks and their order but no start
+    times, so the seed splits the mix into equal slices — row *i* of *n* runs from the single point
+    ``i * duration // n`` to the next slice point — and marks every row ``audible_rule: "manual
+    annotation required"``.  A row that still looks exactly like that holds no timing to score
+    against.  Both bounds are checked, not just the start: a *timed* tracklist whose first track
+    begins at 0:00 has row 0 sitting on the first slice point by arithmetic, and only its end range
+    says that it was really timed.
+
+    - ``timed`` — no row is a placeholder any more (a timestamped tracklist, or every row listened
+      to); only this can be matched by time.
+    - ``order-only`` — every row is still a placeholder, as the committed ``data/corpus/release-1/``
+      drafts are, and as a verifier who leaves the placeholders in place (the corpus README's
+      "work-only scoring" option) leaves them.
+    - ``partial`` — SOME rows are timed and some are not, which is what a half-finished
+      ``idea truth verify`` pass leaves behind (it keeps the seed's ``audible_rule`` and, on a blank
+      answer, the seed's range, and it clears ``draft`` either way).  Time-matching such a file
+      scores the untimed rows against an arbitrary equal-slice point, i.e. as misses, so it is
+      matched by work like an order-only file, not by time.
+    """
+
+    count = len(truth.episodes)
+    duration = truth.source.duration_ms
+    placeholders = sum(
+        episode.audible_rule == SEED_AUDIBLE_RULE
+        and tuple(episode.start_ms_range) == (index * duration // count,) * 2
+        and tuple(episode.end_ms_range) == ((index + 1) * duration // count,) * 2
+        for index, episode in enumerate(truth.episodes)
+    )
+    if placeholders == 0:
+        return "timed"
+    return "order-only" if placeholders == count else "partial"
+
+
+def work_identity(artist: str, title: str) -> tuple[tuple[str, str], frozenset[str]]:
+    """Fusion's normalised work identity: the (artist, title) key and its word set.
+
+    ``hints.relations._normalise`` is the normaliser fusion applies to decide two crowd hints name
+    the same track: NFKC, casefold, a parenthesised mix descriptor ("(Extended Mix)", "(Original
+    Mix)", "(Edit)", "(VIP)", "(Club Dub)") dropped, everything non-alphanumeric a space.  The word
+    set of both fields together is what ``fuse.identity`` compares order-independently to attach a
+    hint to an audio match, so a "feat." clause, an extra collaborator or a swapped artist/title
+    never blocks a match.  Nothing else is stripped here: the scorer is not a second normaliser.
+    """
+
+    artist_key, title_key = _normalise(artist), _normalise(title)
+    return (artist_key, title_key), frozenset(f"{artist_key} {title_key}".split())
+
+
+def match_works(truth_works: list[TruthWork], listed: list[ListedWork]) -> WorkMatch:
+    """Match each listed prediction to at most one truth row by normalised work identity.
+
+    Exact first (the normalised artist and title are both equal *and* both non-empty, as fusion's
+    own ``hints.relations._identity_key`` requires — two labels that normalise away to nothing, an
+    unnamed "ID" row against a prediction whose whole title was a mix descriptor, name no work and
+    must not count as an identification), else fusion's word-set rule
+    (:func:`~id_detector.fuse.identity._word_sets_corroborate`: one word set contains the other
+    with at least two words, or they differ by a single near-spelled long token); among several
+    candidate rows the closest word set wins, ties to the earlier row.  Time is never consulted.
+    """
+
+    truth_rows = [work_identity(work.artist, work.title) for work in truth_works]
+    assignments: dict[int, int] = {}
+    for index, item in enumerate(listed):
+        key, words = work_identity(item.artist, item.title)
+        exact = (
+            [row for row, (truth_key, _) in enumerate(truth_rows) if truth_key == key]
+            if all(key)
+            else []
+        )
+        candidates = exact or [
+            row
+            for row, (_, truth_words) in enumerate(truth_rows)
+            if _word_sets_corroborate(words, truth_words)
+        ]
+        if candidates:
+            assignments[index] = min(
+                candidates, key=lambda row: (len(words ^ truth_rows[row][1]), row)
+            )
+
+    truth_keys = [key for key, _ in truth_rows]
+    matched_keys = {truth_keys[row] for row in assignments.values()}
+    first_row_by_key: dict[tuple[str, str], TruthWork] = {}
+    for key, work in zip(truth_keys, truth_works, strict=True):
+        first_row_by_key.setdefault(key, work)
+    likely_rows = [
+        index for index, item in enumerate(listed) if TIER_ORDER[item.tier] >= TIER_ORDER["likely"]
+    ]
+    wrong: dict[tuple[str, str], dict[str, Any]] = {}
+    for index, item in enumerate(listed):
+        if index in assignments:
+            continue
+        label = wrong.setdefault(
+            (item.artist, item.title),
+            {"artist": item.artist, "title": item.title, "tier": item.tier, "rows": 0},
+        )
+        label["rows"] += 1
+        if TIER_ORDER[item.tier] > TIER_ORDER[label["tier"]]:
+            label["tier"] = item.tier
+    return WorkMatch(
+        assignments=assignments,
+        counts=WorkCounts(
+            rows_correct=len(assignments),
+            rows=len(listed),
+            likely_correct=sum(index in assignments for index in likely_rows),
+            likely=len(likely_rows),
+            works_correct=len({listed[index].work_id for index in assignments}),
+            works=len({item.work_id for item in listed}),
+            truth_matched=len(matched_keys),
+            truth=len(first_row_by_key),
+        ),
+        unmatched_truth=[
+            {"artist": work.artist, "title": work.title}
+            for key, work in first_row_by_key.items()
+            if key not in matched_keys
+        ],
+        unmatched_predictions=list(wrong.values()),
+    )
+
+
 def listed_episodes(
     episodes: EpisodesFile, identities: IdentitiesRecord, min_track_ms: int
 ) -> tuple[EpisodesFile, dict[str, int]]:
@@ -366,8 +595,56 @@ def proved_bounds(episodes: list[dict[str, Any]]) -> tuple[list[dict[str, Any]],
     return normalised, claims
 
 
-def score_mix(entry: RunEntry, *, recipe: str, artefact_dir: Path) -> MixScore:
-    """Pre-filter one mix's episodes, score them with the benchmark scorer, keep the raw counts."""
+def _work_match_document(
+    mix: RunEntry,
+    truth: GroundTruthRecord,
+    *,
+    timing: Timing,
+    match_mode: MatchMode,
+    listed: list[ListedWork],
+    work_match: WorkMatch,
+) -> dict[str, Any]:
+    """Every assignment of one mix, for the owner to audit beside ``predictions.json``."""
+
+    named_by: dict[int, list[str]] = {}
+    for index, row in work_match.assignments.items():
+        named_by.setdefault(row, []).append(listed[index].episode_id)
+    return {
+        "schema_version": "1.0.0",
+        "generated_by": GENERATED_BY,
+        "mix_id": mix.mix_id,
+        "set_id": truth.set_id,
+        "timing": timing,
+        "match_mode": match_mode,
+        "truth": [
+            {
+                "index": index,
+                "artist": episode.work.artist,
+                "title": episode.work.title,
+                "occurrence_index": episode.occurrence_index,
+                "named_by": named_by.get(index, []),
+            }
+            for index, episode in enumerate(truth.episodes)
+        ],
+        "predictions": [
+            {
+                "episode_id": item.episode_id,
+                "artist": item.artist,
+                "title": item.title,
+                "tier": item.tier,
+                "work_id": item.work_id,
+                "truth_index": work_match.assignments.get(index),
+            }
+            for index, item in enumerate(listed)
+        ],
+        "counts": work_match.counts.as_dict(),
+    }
+
+
+def score_mix(
+    entry: RunEntry, *, recipe: str, artefact_dir: Path, match: MatchChoice = "auto"
+) -> MixScore:
+    """Pre-filter one mix's episodes, match them to the truth by time or by work, keep counts."""
 
     truths = load_truth_directory(entry.truth)
     if len(truths) != 1:
@@ -380,6 +657,10 @@ def score_mix(entry: RunEntry, *, recipe: str, artefact_dir: Path) -> MixScore:
     assert_identities_cover(episodes, identities, graph_path, entry.mix_id)
     listed, hidden_by_reason = listed_episodes(episodes, identities, entry.min_track_ms)
     status = truth_status(entry.truth, truth)
+    timing = truth_timing(truth)
+    # Only a fully timed truth can be matched by time; a partly timed one would score its
+    # still-placeholder rows against an equal-slice point, i.e. as misses.
+    mode: MatchMode = ("time" if timing == "timed" else "work") if match == "auto" else match
     prediction_set = prediction_set_from_fusion(truth.set_id, identities, listed)
     prediction_set["episodes"], range_claims = proved_bounds(prediction_set["episodes"])
     snapshot = ScoringConfigSnapshot(
@@ -396,8 +677,11 @@ def score_mix(entry: RunEntry, *, recipe: str, artefact_dir: Path) -> MixScore:
             "episodes_listed": len(listed.episodes),
             "hidden_by_reason": hidden_by_reason,
             "range_claims": range_claims,
+            "timing": timing,
+            "match_mode": mode,
         },
     )
+    # Built in both modes: the contract check on the run's artefacts is worth having either way.
     document = PredictionDocument(
         corpus_version=truth.corpus_version,
         profile=recipe,
@@ -409,29 +693,69 @@ def score_mix(entry: RunEntry, *, recipe: str, artefact_dir: Path) -> MixScore:
     mix_dir = artefact_dir / entry.mix_id
     predictions_path = mix_dir / "predictions.json"
     atomic_write_json(predictions_path, document)
-    report_path = mix_dir / "report.json"
-    report, scores = score_corpus_detailed(entry.truth, predictions_path, out_path=report_path)
-    (score,) = scores
+    candidates = {item.canonical_id: item for item in identities.candidates}
+    listed_works = [
+        ListedWork(
+            episode_id=episode.id,
+            artist=prediction["work"]["artist"],
+            title=prediction["work"]["title"],
+            tier=prediction["tiers"].work,
+            work_id=candidates[prediction["candidate_id"]].work_id,
+        )
+        for episode, prediction in zip(listed.episodes, prediction_set["episodes"], strict=True)
+    ]
+    work_match = match_works([episode.work for episode in truth.episodes], listed_works)
+    work_match_path = mix_dir / "work-match.json"
+    atomic_write_json(
+        work_match_path,
+        _work_match_document(
+            entry, truth, timing=timing, match_mode=mode, listed=listed_works, work_match=work_match
+        ),
+    )
+    score: SetScore | None = None
+    metrics: BenchmarkMetrics | None = None
+    report_path: Path | None = None
+    if mode == "time":
+        report_path = mix_dir / "report.json"
+        report, scores = score_corpus_detailed(entry.truth, predictions_path, out_path=report_path)
+        (score,) = scores
+        metrics = report.overall
     return MixScore(
         entry=entry,
         truth=truth,
         truth_status=status,
+        timing=timing,
+        match_mode=mode,
         episodes_total=len(episodes.episodes),
         hidden_by_reason=hidden_by_reason,
         range_claims=range_claims,
+        work_match=work_match,
+        work_match_path=work_match_path,
         score=score,
-        metrics=report.overall,
+        metrics=metrics,
         report_path=report_path,
     )
 
 
 def _headline(metrics: BenchmarkMetrics) -> dict[str, int]:
-    """The three L3 numbers, read from the scorer's own field names."""
+    """The L3 numbers of a time-matched score, read from the scorer's own field names."""
 
     return {
         "likely_precision_e4": metrics.empirical_tier_precision_e4["likely"],
         "listed_precision_e4": metrics.selective_precision_e4,
+        "work_precision_e4": metrics.identification_work.precision_e4,
         "work_recall_e4": metrics.identification_work.recall_e4,
+    }
+
+
+def _work_headline(counts: WorkCounts) -> dict[str, int | None]:
+    """The same four keys for a work-matched score; listed precision has no time to stand on."""
+
+    return {
+        "likely_precision_e4": counts.headline()["likely_precision_e4"],
+        "listed_precision_e4": None,
+        "work_precision_e4": counts.headline()["work_precision_e4"],
+        "work_recall_e4": counts.headline()["work_recall_e4"],
     }
 
 
@@ -454,6 +778,30 @@ def _counts(state: ScoreState) -> dict[str, dict[str, int]]:
     }
 
 
+def _work_counts(counts: WorkCounts) -> dict[str, dict[str, int] | None]:
+    """The raw counts behind :func:`_work_headline`; ``listed`` is ``None`` (no time to match by).
+
+    ``work.correct`` counts the listed side (distinct listed works that named a truth row — the
+    precision numerator) and ``work.truth_matched`` the truth side (distinct truth works some row
+    named — the recall numerator); two listed works naming one truth row inflate neither.
+    """
+
+    return {
+        "likely": {"correct": counts.likely_correct, "predicted": counts.likely},
+        "listed": None,
+        "work": {
+            "correct": counts.works_correct,
+            "predicted": counts.works,
+            "truth": counts.truth,
+            "truth_matched": counts.truth_matched,
+        },
+    }
+
+
+def _work_only(counts: WorkCounts) -> dict[str, Any]:
+    return {**counts.headline(), "counts": counts.as_dict()}
+
+
 def _relative(path: Path, base: Path) -> str:
     try:
         return path.resolve().relative_to(base.resolve()).as_posix()
@@ -462,14 +810,19 @@ def _relative(path: Path, base: Path) -> str:
 
 
 def score_run_list(
-    run_list: RunList, *, run_list_dir: Path, artefact_dir: Path, out_dir: Path
+    run_list: RunList,
+    *,
+    run_list_dir: Path,
+    artefact_dir: Path,
+    out_dir: Path,
+    match: MatchChoice = "auto",
 ) -> dict[str, Any]:
     """Score every mix, pool the counts, and build the output document."""
 
     mixes: list[MixScore] = []
     scored_by_set: dict[str, str] = {}
     for entry in run_list.runs:
-        mix = score_mix(entry, recipe=run_list.recipe, artefact_dir=artefact_dir)
+        mix = score_mix(entry, recipe=run_list.recipe, artefact_dir=artefact_dir, match=match)
         first = scored_by_set.setdefault(mix.truth.set_id, entry.mix_id)
         if first != entry.mix_id:
             # Pooling one mix twice double-weights it and inflates every headline number.
@@ -478,12 +831,29 @@ def score_run_list(
                 "one mix may appear in a run list once"
             )
         mixes.append(mix)
-    pooled_state = ScoreState()
+    # One order-only mix has no time numbers to pool, so the run pools the work-only numbers —
+    # the only ones every mix has; a timed mix keeps its own time numbers on its row.
+    mode: MatchMode = "work" if any(mix.match_mode == "work" for mix in mixes) else "time"
+    work_only = WorkCounts()
     for mix in mixes:
-        pooled_state.add(mix.score.state)
-    pooled = pooled_metrics([pooled_state])
-    headline = _headline(pooled)
+        work_only.add(mix.work_match.counts)
     thresholds = L3_THRESHOLDS[run_list.recipe]
+    headline: dict[str, int | None]
+    if mode == "time":
+        pooled_state = ScoreState()
+        for mix in mixes:
+            assert mix.score is not None
+            pooled_state.add(mix.score.state)
+        headline = dict(_headline(pooled_metrics([pooled_state])))
+        counts_by_mode = _counts(pooled_state)
+        thresholds_met: bool | None = all(
+            (headline[key] or 0) >= value for key, value in thresholds.items()
+        )
+    else:
+        headline = _work_headline(work_only)
+        counts_by_mode = _work_counts(work_only)
+        # The listed-precision bar needs timed truth; a work-only score cannot judge L3.
+        thresholds_met = None
     status = min((mix.truth_status for mix in mixes), key=_TRUTH_RANK.__getitem__)
     hidden_total: Counter[str] = Counter()
     for mix in mixes:
@@ -493,16 +863,20 @@ def score_run_list(
         "generated_by": GENERATED_BY,
         "recipe": run_list.recipe,
         "truth_status": status,
+        "match_requested": match,
+        "match_mode": mode,
         **headline,
+        "work_only": _work_only(work_only),
         "l3": {
             "thresholds": thresholds,
             # The three thresholds only. L3 also asks for a corpus shape (mixes, DJs, platforms,
             # hours, two-pass truth) that these numbers cannot judge — see L3_CORPUS_NOTE.
-            "thresholds_met": all(headline[key] >= value for key, value in thresholds.items()),
-            "certifiable": status == "verified",
+            "thresholds_met": thresholds_met,
+            "certifiable": status == "verified" and mode == "time",
         },
         "counts": {
             "mixes": len(mixes),
+            "timing": dict(sorted(Counter(mix.timing for mix in mixes).items())),
             "episodes": {
                 "total": sum(mix.episodes_total for mix in mixes),
                 "listed": sum(
@@ -512,13 +886,15 @@ def score_run_list(
             },
             "hidden_by_reason": dict(sorted(hidden_total.items())),
             "range_claims": sum(mix.range_claims for mix in mixes),
-            **_counts(pooled_state),
+            **counts_by_mode,
         },
         "mixes": [
             {
                 "mix_id": mix.entry.mix_id,
                 "set_id": mix.truth.set_id,
                 "truth_status": mix.truth_status,
+                "timing": mix.timing,
+                "match_mode": mix.match_mode,
                 "truth": _relative(mix.entry.truth, run_list_dir),
                 "episodes": _relative(mix.entry.episodes, run_list_dir),
                 "min_track_ms": mix.entry.min_track_ms,
@@ -526,9 +902,23 @@ def score_run_list(
                 "episodes_listed": mix.episodes_total - sum(mix.hidden_by_reason.values()),
                 "hidden_by_reason": mix.hidden_by_reason,
                 "range_claims": mix.range_claims,
-                **_headline(mix.metrics),
-                "counts": _counts(mix.score.state),
-                "report": _relative(mix.report_path, out_dir),
+                **(
+                    _headline(mix.metrics)
+                    if mix.metrics is not None
+                    else _work_headline(mix.work_match.counts)
+                ),
+                "counts": (
+                    _counts(mix.score.state)
+                    if mix.score is not None
+                    else _work_counts(mix.work_match.counts)
+                ),
+                "work_only": _work_only(mix.work_match.counts),
+                "unmatched_truth": mix.work_match.unmatched_truth,
+                "unmatched_predictions": mix.work_match.unmatched_predictions,
+                "report": (
+                    None if mix.report_path is None else _relative(mix.report_path, out_dir)
+                ),
+                "work_match": _relative(mix.work_match_path, out_dir),
             }
             for mix in mixes
         ],
@@ -537,6 +927,51 @@ def score_run_list(
 
 def _pct(e4: int) -> str:
     return f"{e4 / 100:.1f}%"
+
+
+def _matching_note(document: dict[str, Any]) -> str:
+    """Which matching ran, and why (``--print``)."""
+
+    mixes = document["mixes"]
+    order_only = sum(mix["timing"] == "order-only" for mix in mixes)
+    partial = sum(mix["timing"] == "partial" for mix in mixes)
+    requested = document["match_requested"]
+    if document["match_mode"] == "work":
+        if partial:
+            # A half-verified file is the dangerous case: it looks finished but its untimed rows
+            # would score as misses, so say how many files are in which state.
+            untimed = (
+                f"{order_only + partial} of the {len(mixes)} truth file(s) still carry the seed's "
+                f"placeholder equal-slice timings on some or all rows ({order_only} order-only, "
+                f"{partial} only partly timed)"
+            )
+        else:
+            untimed = (
+                f"{order_only} of the {len(mixes)} truth file(s) are order-only (a tracklist still "
+                "carrying the seed's placeholder equal-slice timings)"
+            )
+        why = untimed if requested == "auto" else "--match work was given"
+        return (
+            f"Matching is WORK-ONLY (time-agnostic) because {why}: each listed track is matched to "
+            "the tracklist by normalised artist and title alone (mix suffixes, case, word order "
+            "and featured artists ignored), never by when it played"
+        )
+    if order_only or partial:
+        state = (
+            f"{order_only + partial} of the {len(mixes)} truth file(s) still carry placeholder "
+            "timings on some or all rows"
+            if partial
+            else f"{order_only} of the {len(mixes)} truth file(s) are order-only (placeholder "
+            "timings)"
+        )
+        return (
+            f"Matching is by TIME because --match time was given, although {state}, so their "
+            "time-based numbers are not meaningful; read the work-only line instead"
+        )
+    return (
+        "Matching is by TIME: every truth file has start times, so a listed track is right only "
+        "when it overlaps the occurrence it names"
+    )
 
 
 def summary(document: dict[str, Any], out: Path | None) -> str:
@@ -554,18 +989,11 @@ def summary(document: dict[str, Any], out: Path | None) -> str:
         "verified": "frozen, verified truth",
     }[status]
     thresholds = document["l3"]["thresholds"]
-    shortfalls = [
-        f"{name.removesuffix('_e4').replace('_', ' ')} {_pct(document[name])} < {_pct(target)}"
-        for name, target in thresholds.items()
-        if document[name] < target
-    ]
-    verdict = (
-        f"all three thresholds are met on these numbers ({L3_CORPUS_NOTE})"
-        if not shortfalls
-        else "the L3 bar is not met (" + "; ".join(shortfalls) + ")"
+    bar = (
+        f"likely >= {_pct(thresholds['likely_precision_e4'])}, listed >= "
+        f"{_pct(thresholds['listed_precision_e4'])} and recall >= "
+        f"{_pct(thresholds['work_recall_e4'])} for {document['recipe']}"
     )
-    if status != "verified":
-        verdict += ", and a non-verified score cannot clear L3 either way"
     floor = counts["hidden_by_reason"]
     hidden_note = (
         "the presentation floor hid " + ", ".join(f"{n} as {reason}" for reason, n in floor.items())
@@ -573,20 +1001,110 @@ def summary(document: dict[str, Any], out: Path | None) -> str:
         else "the presentation floor hid nothing"
     )
     where = f" Full numbers: {out.as_posix()}." if out is not None else ""
+    if document["match_mode"] == "work":
+        work = counts["work"]
+        seen = [
+            f"{name.removesuffix('_e4').replace('_', ' ')} {_pct(document[name])} "
+            f"{'>=' if document[name] >= thresholds[name] else '<'} {_pct(thresholds[name])}"
+            for name in ("likely_precision_e4", "work_recall_e4")
+        ]
+        numbers = (
+            f"it named {work['truth_matched']} of the {work['truth']} distinct tracks actually "
+            f"played (work recall {_pct(document['work_recall_e4'])}); {work['correct']} of the "
+            f"{work['predicted']} distinct tracks it listed were really played (work precision "
+            f"{_pct(document['work_precision_e4'])}); and {counts['likely']['correct']} of the "
+            f"{counts['likely']['predicted']} it marked 'likely' or better were right (likely "
+            f"precision {_pct(document['likely_precision_e4'])})"
+        )
+        verdict = (
+            f"L3 asks for {bar}; listed precision and every timing number need timed truth "
+            "(reported as null), so the L3 bar cannot be judged from a work-only score, and the "
+            "two numbers it can see are indicative only (a work-only match is looser than a "
+            f"timed one): {'; '.join(seen)}"
+        )
+    else:
+        shortfalls = [
+            f"{name.removesuffix('_e4').replace('_', ' ')} {_pct(document[name])} < {_pct(target)}"
+            for name, target in thresholds.items()
+            if document[name] < target
+        ]
+        numbers = (
+            f"{counts['listed']['correct']} of the {counts['listed']['predicted']} scored were "
+            f"tracks really played there (listed precision "
+            f"{_pct(document['listed_precision_e4'])}); {counts['likely']['correct']} of the "
+            f"{counts['likely']['predicted']} it marked 'likely' or better were right (likely "
+            f"precision {_pct(document['likely_precision_e4'])}); and it named "
+            f"{counts['work']['correct']} of the {counts['work']['truth']} distinct tracks "
+            f"actually played (work recall {_pct(document['work_recall_e4'])})"
+        )
+        verdict = f"L3 asks for {bar}: " + (
+            f"all three thresholds are met on these numbers ({L3_CORPUS_NOTE})"
+            if not shortfalls
+            else "the L3 bar is not met (" + "; ".join(shortfalls) + ")"
+        )
+        if status != "verified":
+            verdict += ", and a non-verified score cannot clear L3 either way"
     return (
         f"The {document['recipe']} recipe was scored over {counts['mixes']} mix(es) ({mix_ids}) "
-        f"against {truth_note}. Of the {counts['episodes']['total']} tracks the tool found, "
-        f"{hidden_note}, leaving {counts['episodes']['listed']} listed; "
-        f"{counts['listed']['correct']} of the {counts['listed']['predicted']} scored were tracks "
-        f"really played there (listed precision {_pct(document['listed_precision_e4'])}); "
-        f"{counts['likely']['correct']} of the {counts['likely']['predicted']} it marked "
-        f"'likely' or better were right (likely precision "
-        f"{_pct(document['likely_precision_e4'])}); and it named "
-        f"{counts['work']['correct']} of the {counts['work']['truth']} distinct tracks actually "
-        f"played (work recall {_pct(document['work_recall_e4'])}). L3 asks for likely >= "
-        f"{_pct(thresholds['likely_precision_e4'])}, listed >= "
-        f"{_pct(thresholds['listed_precision_e4'])} and recall >= "
-        f"{_pct(thresholds['work_recall_e4'])} for {document['recipe']}: {verdict}.{where}"
+        f"against {truth_note}. {_matching_note(document)}. Of the "
+        f"{counts['episodes']['total']} tracks the tool found, {hidden_note}, leaving "
+        f"{counts['episodes']['listed']} listed; {numbers}. {verdict}.{where}"
+    )
+
+
+def work_only_line(document: dict[str, Any]) -> str:
+    """The time-agnostic numbers of a time-matched run, so the two kinds of run compare."""
+
+    work_only = document["work_only"]
+    counts = work_only["counts"]
+    return (
+        "Work-only (time-agnostic) numbers for comparison: it named "
+        f"{counts['truth_works']['matched']} of the {counts['truth_works']['total']} distinct "
+        f"tracks actually played (work recall {_pct(work_only['work_recall_e4'])}); "
+        f"{counts['works']['correct']} of the {counts['works']['predicted']} distinct tracks it "
+        f"listed were really played (work precision {_pct(work_only['work_precision_e4'])}); "
+        f"{counts['likely']['correct']} of the {counts['likely']['predicted']} it marked 'likely' "
+        f"or better named a played track (likely precision "
+        f"{_pct(work_only['likely_precision_e4'])})."
+    )
+
+
+def mix_line(mix: dict[str, Any]) -> str:
+    """One line per mix: its numbers, what was missed and what was wrong."""
+
+    work_only = mix["work_only"]
+    counts = work_only["counts"]
+    by_time = ""
+    if mix["match_mode"] == "time":
+        timed = mix["counts"]
+        by_time = (
+            f"by time: likely {timed['likely']['correct']}/{timed['likely']['predicted']} "
+            f"({_pct(mix['likely_precision_e4'])}), listed {timed['listed']['correct']}/"
+            f"{timed['listed']['predicted']} ({_pct(mix['listed_precision_e4'])}), recall "
+            f"{timed['work']['correct']}/{timed['work']['truth']} "
+            f"({_pct(mix['work_recall_e4'])}); "
+        )
+    by_work = (
+        f"work-only: recall {counts['truth_works']['matched']}/{counts['truth_works']['total']} "
+        f"({_pct(work_only['work_recall_e4'])}), precision {counts['works']['correct']}/"
+        f"{counts['works']['predicted']} ({_pct(work_only['work_precision_e4'])}), likely "
+        f"{counts['likely']['correct']}/{counts['likely']['predicted']} "
+        f"({_pct(work_only['likely_precision_e4'])})"
+    )
+    missed = (
+        "; ".join(f"{item['artist']} - {item['title']}" for item in mix["unmatched_truth"])
+        or "nothing"
+    )
+    wrong = (
+        "; ".join(
+            f"{item['artist']} - {item['title']} [{item['tier']}]"
+            for item in mix["unmatched_predictions"]
+        )
+        or "nothing"
+    )
+    return (
+        f"- {mix['mix_id']} [{mix['timing']}; matched by {mix['match_mode']}]: {by_time}{by_work}. "
+        f"Missed: {missed}. Wrong: {wrong}."
     )
 
 
@@ -601,7 +1119,19 @@ def main(argv: list[str] | None = None) -> int:
         help="Output JSON; per-mix predictions and reports go to <out stem>-mixes/ beside it.",
     )
     parser.add_argument(
-        "--print", action="store_true", help="Print a one-paragraph plain-English summary."
+        "--print",
+        action="store_true",
+        help="Print a plain-English paragraph, then one line per mix (missed / wrong tracks).",
+    )
+    parser.add_argument(
+        "--match",
+        choices=("auto", "time", "work"),
+        default="auto",
+        help=(
+            "How a listed track is matched to the truth: by time overlap (the benchmark scorer), "
+            "by normalised work identity alone, or (default) work for order-only truth and time "
+            "otherwise."
+        ),
     )
     args = parser.parse_args(argv)
     if args.out is None and not args.print:
@@ -620,6 +1150,7 @@ def main(argv: list[str] | None = None) -> int:
                 run_list_dir=args.run_list.resolve().parent,
                 artefact_dir=artefact_dir,
                 out_dir=out.parent,
+                match=args.match,
             )
             atomic_write_json(out, document)
         else:
@@ -629,6 +1160,7 @@ def main(argv: list[str] | None = None) -> int:
                     run_list_dir=args.run_list.resolve().parent,
                     artefact_dir=Path(scratch),
                     out_dir=Path(scratch),
+                    match=args.match,
                 )
             out = None
     # KeyError/StopIteration: a fuse artefact whose identity graph is inconsistent beyond the
@@ -637,12 +1169,22 @@ def main(argv: list[str] | None = None) -> int:
         print(f"scoring failed: {exc if str(exc) else exc!r}", file=sys.stderr)
         return 1
     if args.print:
+        # The per-mix lines carry arbitrary track titles; a narrow console encoding must not turn
+        # a finished score into a UnicodeEncodeError.
+        if hasattr(sys.stdout, "reconfigure"):
+            sys.stdout.reconfigure(errors="backslashreplace")
         print(summary(document, out))
+        if document["match_mode"] == "time":
+            print(work_only_line(document))
+        for mix in document["mixes"]:
+            print(mix_line(mix))
     elif out is not None:
+        listed = document["listed_precision_e4"]
         print(
-            f"scored {document['counts']['mixes']} mix(es) [{document['truth_status']} truth]: "
+            f"scored {document['counts']['mixes']} mix(es) [{document['truth_status']} truth, "
+            f"matched by {document['match_mode']}]: "
             f"likely {document['likely_precision_e4']}/10000, "
-            f"listed {document['listed_precision_e4']}/10000, "
+            f"listed {'n/a' if listed is None else f'{listed}/10000'}, "
             f"recall {document['work_recall_e4']}/10000; report={out}"
         )
     return 0

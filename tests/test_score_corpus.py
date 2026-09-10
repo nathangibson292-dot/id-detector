@@ -20,7 +20,15 @@ their per-mix numbers, so a macro average cannot pass by accident:
   listed 2, correct 1 -> 5000; likely 1/2; works recalled 1/3
 
 Pooled: listed 4/7 = 5714 (the mean would be 5500), likely 4/5 = 8000 (mean 7500), work recall
-4/6 = 6667 (from 3/3 + 1/3).  ``expected.json`` is the script's exact output for the fixture.
+4/6 = 6667 (from 3/3 + 1/3).
+
+Both truths still carry ``idea truth seed``'s placeholder equal-slice timings, exactly like the
+rekordbox-playlist drafts under ``data/corpus/release-1/``, so the default run matches by WORK
+(scorer part ii, time-agnostic); ``--match time`` runs the committed time path.  The fixture is
+built so that both modes give the same numbers (every time association in it is also a work
+match): 8000 / 5714 / 6667 either way, with ``listed_precision_e4`` null in work mode.
+``expected.json`` is the script's exact output for the default run and ``expected-time.json`` for
+``--match time``.
 """
 
 from __future__ import annotations
@@ -35,25 +43,35 @@ import pytest
 
 from id_detector.benchmark.corpus import _prediction_set, prediction_set_from_fusion
 from id_detector.benchmark.scorer import pooled_metrics
-from id_detector.contracts import EpisodesFile, IdentitiesRecord
+from id_detector.contracts import EpisodesFile, GroundTruthRecord, IdentitiesRecord, TruthWork
 from id_detector.io import canonical_json_bytes
 from scripts.score_corpus import (
     L3_THRESHOLDS,
+    ListedWork,
     RunEntry,
+    WorkCounts,
     identities_path,
     listed_episodes,
     load_run_list,
     main,
+    match_works,
+    mix_line,
     proved_bounds,
     run_media_key,
     score_mix,
     summary,
+    truth_timing,
+    work_identity,
+    work_only_line,
 )
 
 FIXTURE = Path(__file__).resolve().parent / "fixtures" / "corpus-mini"
 RUN_LIST = FIXTURE / "run-list.json"
 EXPECTED = json.loads((FIXTURE / "expected.json").read_text("utf-8"))
-HEADLINE = ("likely_precision_e4", "listed_precision_e4", "work_recall_e4")
+EXPECTED_TIME = json.loads((FIXTURE / "expected-time.json").read_text("utf-8"))
+HEADLINE = ("likely_precision_e4", "listed_precision_e4", "work_precision_e4", "work_recall_e4")
+L3_KEYS = ("likely_precision_e4", "listed_precision_e4", "work_recall_e4")
+WORK_KEYS = ("likely_precision_e4", "work_precision_e4", "work_recall_e4")
 
 
 def _episode_id(key: str) -> str:
@@ -63,6 +81,11 @@ def _episode_id(key: str) -> str:
 def _episodes(mix_id: str) -> EpisodesFile:
     path = FIXTURE / mix_id / "fuse" / "episodes.json"
     return EpisodesFile.model_validate_json(path.read_text("utf-8"))
+
+
+def _truth(mix_id: str, root: Path = FIXTURE) -> GroundTruthRecord:
+    path = root / mix_id / "ground_truth.json"
+    return GroundTruthRecord.model_validate_json(path.read_text("utf-8"))
 
 
 def _entry(mix_id: str, run_list: Path = RUN_LIST) -> RunEntry:
@@ -77,6 +100,10 @@ def _run(tmp_path: Path, run_list: Path = RUN_LIST, *extra: str) -> tuple[int, d
     out = tmp_path / "out.json"
     code = main(["--run-list", str(run_list), "--out", str(out), *extra])
     return code, (json.loads(out.read_text("utf-8")) if out.is_file() else None)
+
+
+def _run_time(tmp_path: Path, run_list: Path = RUN_LIST, *extra: str) -> tuple[int, dict | None]:
+    return _run(tmp_path, run_list, "--match", "time", *extra)
 
 
 def _write_json(path: Path, value: object) -> None:
@@ -132,49 +159,156 @@ def _freeze(root: Path, set_ids: list[str]) -> None:
     )
 
 
+def _order_only_truth(truth: dict, works: list[tuple[str, str]]) -> dict:
+    """Re-seed a truth's rows exactly as ``idea truth seed`` does from an order-only tracklist:
+    row *i* of *n* starts at the point ``i * duration // n`` and is flagged for annotation."""
+
+    duration = truth["source"]["duration_ms"]
+    template = truth["episodes"][0]
+    occurrences: dict[tuple[str, str], int] = {}
+    episodes = []
+    for index, (artist, title) in enumerate(works):
+        start = index * duration // len(works)
+        end = (index + 1) * duration // len(works)
+        key = (artist.casefold(), title.casefold())
+        occurrence = occurrences.get(key, 0)
+        occurrences[key] = occurrence + 1
+        episodes.append(
+            {
+                **template,
+                "work": {"artist": artist, "title": title},
+                "start_ms_range": [start, start],
+                "end_ms_range": [end, end],
+                "audible_rule": "manual annotation required",
+                "role_segments": [{"from_ms": start, "to_ms": end, "role": "uncertain"}],
+                "occurrence_index": occurrence,
+            }
+        )
+    return {**truth, "episodes": episodes}
+
+
+def _timed_truth(truth: dict, spans: list[tuple[int, int, int, int]]) -> dict:
+    """Give each truth row real start / end ranges, as a verifier who listened would."""
+
+    episodes = []
+    for episode, (start_lo, start_hi, end_lo, end_hi) in zip(truth["episodes"], spans, strict=True):
+        episodes.append(
+            {
+                **episode,
+                "start_ms_range": [start_lo, start_hi],
+                "end_ms_range": [end_lo, end_hi],
+                "audible_rule": "first beat audible",
+                "role_segments": [{"from_ms": start_lo, "to_ms": end_hi, "role": "uncertain"}],
+            }
+        )
+    return {**truth, "episodes": episodes}
+
+
+def _make_mini_b_timed(root: Path) -> None:
+    truth_path = root / "mini-b" / "ground_truth.json"
+    truth = json.loads(truth_path.read_text("utf-8"))
+    _write_json(
+        truth_path,
+        _timed_truth(
+            truth,
+            [
+                (0, 10_000, 60_000, 70_000),
+                (100_000, 105_000, 190_000, 200_000),
+                (200_000, 210_000, 290_000, 300_000),
+            ],
+        ),
+    )
+
+
 # --- the gate ---------------------------------------------------------------------------------
 
 
 def test_corpus_mini_reproduces_expected_exactly(tmp_path: Path) -> None:
+    """The default run: placeholder-timed truth is matched by work."""
+
     code, document = _run(tmp_path)
     assert code == 0
     assert document == EXPECTED
+    assert document["match_requested"] == "auto"
+    assert document["match_mode"] == "work"
+    for mix in document["mixes"]:
+        assert mix["match_mode"] == "work"
+        # No time-based report exists in work mode; the assignment audit and the contract-checked
+        # prediction document do.
+        assert mix["report"] is None
+        assert (tmp_path / mix["work_match"]).is_file()
+        assert (tmp_path / mix["work_match"]).with_name("predictions.json").is_file()
+
+
+def test_time_mode_numbers_on_corpus_mini_are_unchanged(tmp_path: Path) -> None:
+    """Regression for part ii: the committed time path did not move by a single count."""
+
+    code, document = _run_time(tmp_path)
+    assert code == 0
+    assert document == EXPECTED_TIME
+    assert document["match_requested"] == "time"
+    assert document["match_mode"] == "time"
+    assert [document[key] for key in L3_KEYS] == [8_000, 5_714, 6_667]
+    assert document["counts"]["likely"] == {"correct": 4, "predicted": 5}
+    assert document["counts"]["listed"] == {"correct": 4, "predicted": 7, "truth": 6}
+    assert document["counts"]["work"] == {"correct": 4, "predicted": 7, "truth": 6}
+    assert document["l3"] == {
+        "thresholds": L3_THRESHOLDS["deep"],
+        "thresholds_met": False,
+        "certifiable": False,
+    }
+    by_mix = {mix["mix_id"]: mix for mix in document["mixes"]}
+    assert [by_mix["mini-a"][key] for key in L3_KEYS] == [10_000, 6_000, 10_000]
+    assert [by_mix["mini-b"][key] for key in L3_KEYS] == [5_000, 5_000, 3_333]
     # The per-mix artefacts the plan's `idea benchmark score` step would have written.
     for mix in document["mixes"]:
         assert (tmp_path / mix["report"]).is_file()
         assert (tmp_path / mix["report"]).with_name("predictions.json").is_file()
 
 
-def test_headline_numbers_are_pooled_counts_not_a_mean_of_ratios() -> None:
-    counts = EXPECTED["counts"]
+@pytest.mark.parametrize("document", [EXPECTED, EXPECTED_TIME], ids=["work", "time"])
+def test_headline_numbers_are_pooled_counts_not_a_mean_of_ratios(document: dict) -> None:
+    counts = document["counts"]
     assert counts["likely"] == {"correct": 4, "predicted": 5}
-    assert counts["listed"] == {"correct": 4, "predicted": 7, "truth": 6}
-    assert counts["work"] == {"correct": 4, "predicted": 7, "truth": 6}
-    assert EXPECTED["likely_precision_e4"] == _ratio_e4(4, 5) == 8_000
-    assert EXPECTED["listed_precision_e4"] == _ratio_e4(4, 7) == 5_714
-    assert EXPECTED["work_recall_e4"] == _ratio_e4(4, 6) == 6_667
-    by_mix = {mix["mix_id"]: mix for mix in EXPECTED["mixes"]}
-    assert [by_mix["mini-a"][key] for key in HEADLINE] == [10_000, 6_000, 10_000]
-    assert [by_mix["mini-b"][key] for key in HEADLINE] == [5_000, 5_000, 3_333]
+    if document["match_mode"] == "time":
+        assert counts["listed"] == {"correct": 4, "predicted": 7, "truth": 6}
+        assert counts["work"] == {"correct": 4, "predicted": 7, "truth": 6}
+        assert document["listed_precision_e4"] == _ratio_e4(4, 7) == 5_714
+    else:
+        assert counts["listed"] is None
+        assert counts["work"] == {"correct": 4, "predicted": 7, "truth": 6, "truth_matched": 4}
+        assert document["listed_precision_e4"] is None
+    assert document["likely_precision_e4"] == _ratio_e4(4, 5) == 8_000
+    assert document["work_precision_e4"] == _ratio_e4(4, 7) == 5_714
+    assert document["work_recall_e4"] == _ratio_e4(4, 6) == 6_667
+    by_mix = {mix["mix_id"]: mix for mix in document["mixes"]}
+    assert [by_mix["mini-a"][key] for key in WORK_KEYS] == [10_000, 6_000, 10_000]
+    assert [by_mix["mini-b"][key] for key in WORK_KEYS] == [5_000, 5_000, 3_333]
     # A macro average of the per-mix ratios would have said 7500 / 5500 / 6667 (recall by luck).
-    assert EXPECTED["listed_precision_e4"] != (6_000 + 5_000) // 2
-    assert EXPECTED["likely_precision_e4"] != (10_000 + 5_000) // 2
-    # Every per-mix count sums to the pooled count.
-    for metric in ("likely", "listed", "work"):
+    assert document["work_precision_e4"] != (6_000 + 5_000) // 2
+    assert document["likely_precision_e4"] != (10_000 + 5_000) // 2
+    # Every per-mix count sums to the pooled count, in the mode's counts and in `work_only`.
+    for metric in ("likely", "work"):
         for field, total in counts[metric].items():
-            assert sum(mix["counts"][metric][field] for mix in EXPECTED["mixes"]) == total
+            assert sum(mix["counts"][metric][field] for mix in document["mixes"]) == total
+    for group, values in document["work_only"]["counts"].items():
+        for field, total in values.items():
+            assert sum(mix["work_only"]["counts"][group][field] for mix in document["mixes"]) == (
+                total
+            )
 
 
 def test_headline_fields_come_from_the_scorer_report_by_name(tmp_path: Path) -> None:
-    """The three numbers are read from the real benchmark report under the plan's field names."""
+    """The time numbers are read from the real benchmark report under the plan's field names."""
 
-    code, document = _run(tmp_path)
+    code, document = _run_time(tmp_path)
     assert code == 0
     for mix in document["mixes"]:
         report = json.loads((tmp_path / mix["report"]).read_text("utf-8"))
         overall = report["overall"]
         assert mix["likely_precision_e4"] == overall["empirical_tier_precision_e4"]["likely"]
         assert mix["listed_precision_e4"] == overall["selective_precision_e4"]
+        assert mix["work_precision_e4"] == overall["identification_work"]["precision_e4"]
         assert mix["work_recall_e4"] == overall["identification_work"]["recall_e4"]
         assert [item["set_id"] for item in report["sets"]] == [mix["set_id"]]
         assert report["profile"] == "deep"
@@ -184,15 +318,18 @@ def test_headline_fields_come_from_the_scorer_report_by_name(tmp_path: Path) -> 
             (tmp_path / mix["report"]).with_name("predictions.json").read_text()
         )
         assert len(predictions["sets"][0]["episodes"]) == mix["episodes_listed"]
-        assert (
-            predictions["config_snapshot"]["run_config"]["hidden_by_reason"]
-            == (mix["hidden_by_reason"])
-        )
+        run_config = predictions["config_snapshot"]["run_config"]
+        assert run_config["hidden_by_reason"] == mix["hidden_by_reason"]
+        assert run_config["timing"] == "order-only"
+        assert run_config["match_mode"] == "time"
 
 
 def test_pooled_metrics_sums_states_before_taking_ratios(tmp_path: Path) -> None:
     run_list = load_run_list(RUN_LIST)
-    scored = [score_mix(entry, recipe="deep", artefact_dir=tmp_path) for entry in run_list.runs]
+    scored = [
+        score_mix(entry, recipe="deep", artefact_dir=tmp_path, match="time")
+        for entry in run_list.runs
+    ]
     states = [mix.score.state for mix in scored]
     assert [mix.metrics.selective_precision_e4 for mix in scored] == [6_000, 5_000]
     pooled = pooled_metrics(states)
@@ -227,19 +364,31 @@ def test_presentation_floor_drops_short_and_suppressed_rows_only() -> None:
     assert len(unfloored.episodes) == 6
 
 
-def test_min_track_ms_zero_lists_the_short_rows_and_moves_listed_precision(tmp_path: Path) -> None:
+def test_min_track_ms_zero_lists_the_short_rows_and_moves_the_precisions(tmp_path: Path) -> None:
     root = _copy_fixture(tmp_path)
     run_list = json.loads((root / "run-list.json").read_text("utf-8"))
     for run in run_list["runs"]:
         run["min_track_ms"] = 0
     _write_json(root / "run-list.json", run_list)
-    code, document = _run(tmp_path, root / "run-list.json")
+    code, document = _run_time(tmp_path / "time", root / "run-list.json")
     assert code == 0
     assert document["counts"]["hidden_by_reason"] == {"buried": 1}
     assert document["counts"]["episodes"] == {"total": 10, "listed": 9, "hidden": 1}
     assert document["counts"]["listed"] == {"correct": 4, "predicted": 9, "truth": 6}
     assert document["listed_precision_e4"] == _ratio_e4(4, 9) == 4_444
     # The short rows were `possible`, so the likely tier and the recall are untouched.
+    assert document["likely_precision_e4"] == 8_000
+    assert document["work_recall_e4"] == 6_667
+    # Matched by work, the two extra rows are two more distinct wrong works.
+    code, document = _run(tmp_path / "work", root / "run-list.json")
+    assert code == 0
+    assert document["counts"]["work"] == {
+        "correct": 4,
+        "predicted": 9,
+        "truth": 6,
+        "truth_matched": 4,
+    }
+    assert document["work_precision_e4"] == 4_444
     assert document["likely_precision_e4"] == 8_000
     assert document["work_recall_e4"] == 6_667
 
@@ -261,36 +410,49 @@ def test_min_track_ms_defaults_to_the_thirty_second_floor(tmp_path: Path) -> Non
 
 
 def test_draft_truth_is_scored_but_labelled_draft() -> None:
-    assert EXPECTED["truth_status"] == "draft"
-    assert [mix["truth_status"] for mix in EXPECTED["mixes"]] == ["draft", "draft"]
-    assert EXPECTED["l3"] == {
-        "thresholds": L3_THRESHOLDS["deep"],
-        # The three thresholds only: L3's corpus shape (mixes, DJs, platforms, hours) is not judged
-        # here, so `thresholds_met` never reads as "L3 passed".
-        "thresholds_met": False,
-        "certifiable": False,
-    }
+    for document in (EXPECTED, EXPECTED_TIME):
+        assert document["truth_status"] == "draft"
+        assert [mix["truth_status"] for mix in document["mixes"]] == ["draft", "draft"]
+        assert document["l3"]["thresholds"] == L3_THRESHOLDS["deep"]
+        assert document["l3"]["certifiable"] is False
+    # The three thresholds only: L3's corpus shape (mixes, DJs, platforms, hours) is not judged
+    # here, so `thresholds_met` never reads as "L3 passed"; matched by work it cannot be judged at
+    # all, because the listed-precision bar needs timed truth.
+    assert EXPECTED_TIME["l3"]["thresholds_met"] is False
+    assert EXPECTED["l3"]["thresholds_met"] is None
 
 
 def test_truth_status_unverified_then_verified_under_a_frozen_manifest(tmp_path: Path) -> None:
     root = _copy_fixture(tmp_path)
     for set_id in ("mini-a", "mini-b"):
         _mark_verified(root / set_id / "ground_truth.json")
-    code, document = _run(tmp_path / "unfrozen", root / "run-list.json")
+    code, document = _run_time(tmp_path / "unfrozen", root / "run-list.json")
     assert code == 0
     assert document["truth_status"] == "unverified"
     assert document["l3"]["certifiable"] is False
     # Same numbers either way: verification changes the label, never the score.
-    assert {key: document[key] for key in HEADLINE} == {key: EXPECTED[key] for key in HEADLINE}
+    assert {key: document[key] for key in HEADLINE} == {key: EXPECTED_TIME[key] for key in HEADLINE}
 
     _freeze(root, ["mini-a", "mini-b"])
-    code, document = _run(tmp_path / "frozen", root / "run-list.json")
+    code, document = _run_time(tmp_path / "frozen", root / "run-list.json")
     assert code == 0
     assert document["truth_status"] == "verified"
     assert [mix["truth_status"] for mix in document["mixes"]] == ["verified", "verified"]
     assert document["l3"]["certifiable"] is True
     report = json.loads((tmp_path / "frozen" / document["mixes"][0]["report"]).read_text("utf-8"))
     assert report["unverified_seed_comparison"] is False
+
+    # Verified rows that kept the placeholder timings are still order-only, so the default run
+    # matches by work — and a work-only score can never certify L3, verified or not.
+    code, document = _run(tmp_path / "frozen-work", root / "run-list.json")
+    assert code == 0
+    assert document["truth_status"] == "verified"
+    assert document["match_mode"] == "work"
+    assert document["l3"] == {
+        "thresholds": L3_THRESHOLDS["deep"],
+        "thresholds_met": None,
+        "certifiable": False,
+    }
 
     # One draft mix drags the whole run back to draft.
     truth_b = json.loads((root / "mini-b" / "ground_truth.json").read_text("utf-8"))
@@ -303,7 +465,7 @@ def test_truth_status_unverified_then_verified_under_a_frozen_manifest(tmp_path:
             verified_against=None,
         )
     _write_json(root / "mini-b" / "ground_truth.json", truth_b)
-    code, document = _run(tmp_path / "mixed", root / "run-list.json")
+    code, document = _run_time(tmp_path / "mixed", root / "run-list.json")
     assert code == 0
     assert [mix["truth_status"] for mix in document["mixes"]] == ["verified", "draft"]
     assert document["truth_status"] == "draft"
@@ -312,18 +474,24 @@ def test_truth_status_unverified_then_verified_under_a_frozen_manifest(tmp_path:
 # --- --print ----------------------------------------------------------------------------------
 
 
-def test_print_mode_gives_one_plain_english_paragraph(
+def test_print_mode_gives_one_plain_english_paragraph_then_one_line_per_mix(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    code, document = _run(tmp_path, RUN_LIST, "--print")
+    code, document = _run_time(tmp_path, RUN_LIST, "--print")
     assert code == 0
-    text = capsys.readouterr().out.strip()
-    assert text == summary(document, (tmp_path / "out.json").resolve())
-    assert "\n" not in text
+    lines = capsys.readouterr().out.strip().splitlines()
+    assert lines[0] == summary(document, (tmp_path / "out.json").resolve())
+    # Time mode also prints the work-only numbers as a secondary line, so the two kinds of run
+    # compare; then one line per mix.
+    assert lines[1] == work_only_line(document)
+    assert lines[2:] == [mix_line(mix) for mix in document["mixes"]]
     for fragment in (
         "deep recipe",
         "2 mix(es) (mini-a, mini-b)",
         "DRAFT truth",
+        # `--print` says which matching ran and why.
+        "Matching is by TIME because --match time was given, although 2 of the 2 truth file(s) "
+        "are order-only",
         "hid 1 as buried, 2 as short, leaving 7 listed",
         "4 of the 7 scored were tracks really played there (listed precision 57.1%)",
         "4 of the 5 it marked 'likely' or better were right (likely precision 80.0%)",
@@ -332,7 +500,48 @@ def test_print_mode_gives_one_plain_english_paragraph(
         "not met",
         "non-verified score cannot clear L3",
     ):
-        assert fragment in text, fragment
+        assert fragment in lines[0], fragment
+    assert lines[1].startswith(
+        "Work-only (time-agnostic) numbers for comparison: it named 4 of the 6 distinct tracks "
+        "actually played (work recall 66.7%); 4 of the 7 distinct tracks it listed were really "
+        "played (work precision 57.1%)"
+    )
+    assert lines[2] == (
+        "- mini-a [order-only; matched by time]: by time: likely 3/3 (100.0%), listed 3/5 (60.0%), "
+        "recall 3/3 (100.0%); work-only: recall 3/3 (100.0%), precision 3/5 (60.0%), likely 3/3 "
+        "(100.0%). Missed: nothing. Wrong: Mini Artist - Delta [possible]; Mini Artist - Eta "
+        "[unclear]."
+    )
+
+
+def test_print_in_work_mode_explains_the_mode_and_lists_missed_and_wrong(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    code, document = _run(tmp_path, RUN_LIST, "--print")
+    assert code == 0
+    lines = capsys.readouterr().out.strip().splitlines()
+    assert lines[0] == summary(document, (tmp_path / "out.json").resolve())
+    # The headline already is the work-only score: no secondary line, straight to the mixes.
+    assert lines[1:] == [mix_line(mix) for mix in document["mixes"]]
+    for fragment in (
+        "Matching is WORK-ONLY (time-agnostic) because 2 of the 2 truth file(s) are order-only "
+        "(a tracklist still carrying the seed's placeholder equal-slice timings)",
+        "matched to the tracklist by normalised artist and title alone (mix suffixes, case, word "
+        "order and featured artists ignored), never by when it played",
+        "it named 4 of the 6 distinct tracks actually played (work recall 66.7%)",
+        "4 of the 7 distinct tracks it listed were really played (work precision 57.1%)",
+        "4 of the 5 it marked 'likely' or better were right (likely precision 80.0%)",
+        "listed precision and every timing number need timed truth (reported as null)",
+        "the L3 bar cannot be judged from a work-only score",
+        "likely precision 80.0% < 90.0%; work recall 66.7% < 75.0%",
+    ):
+        assert fragment in lines[0], fragment
+    assert "listed precision 57.1%" not in lines[0]
+    assert lines[2] == (
+        "- mini-b [order-only; matched by work]: work-only: recall 1/3 (33.3%), precision 1/2 "
+        "(50.0%), likely 1/2 (50.0%). Missed: Mini Artist - Iota; Mini Artist - Mu. Wrong: "
+        "Mini Artist - Kappa [likely]."
+    )
 
 
 def test_print_without_out_scores_into_a_scratch_directory(
@@ -340,7 +549,7 @@ def test_print_without_out_scores_into_a_scratch_directory(
 ) -> None:
     assert main(["--run-list", str(RUN_LIST), "--print"]) == 0
     text = capsys.readouterr().out
-    assert "listed precision 57.1%" in text
+    assert "work precision 57.1%" in text
     assert "Full numbers" not in text
     assert not (FIXTURE / "out-mixes").exists()
 
@@ -349,8 +558,11 @@ def test_free_recipe_uses_its_own_recall_threshold_and_can_meet_the_bar() -> Non
     document = {
         "recipe": "free",
         "truth_status": "verified",
+        "match_requested": "auto",
+        "match_mode": "time",
         "likely_precision_e4": 9_500,
         "listed_precision_e4": 8_200,
+        "work_precision_e4": 7_100,
         "work_recall_e4": 7_100,
         "l3": {"thresholds": L3_THRESHOLDS["free"]},
         "counts": {
@@ -361,15 +573,419 @@ def test_free_recipe_uses_its_own_recall_threshold_and_can_meet_the_bar() -> Non
             "listed": {"correct": 41, "predicted": 50, "truth": 60},
             "work": {"correct": 71, "predicted": 100, "truth": 100},
         },
-        "mixes": [{"mix_id": "only"}],
+        "mixes": [{"mix_id": "only", "timing": "timed"}],
     }
     text = summary(document, None)
     assert "frozen, verified truth" in text
+    assert "Matching is by TIME: every truth file has start times" in text
     assert "the presentation floor hid nothing" in text
     assert "recall >= 70.0% for free: all three thresholds are met on these numbers" in text
     # Meeting the three numbers is not clearing L3: the corpus shape it also asks for is named.
     assert ">= 5 owner-verified mixes, >= 3 DJs, >= 2 platforms and >= 4 h of audio" in text
     assert "cannot clear" not in text
+
+
+# --- work-only matching (part ii) -------------------------------------------------------------
+
+
+def test_order_only_truth_is_detected_from_the_seeds_placeholders(tmp_path: Path) -> None:
+    """The seed's fingerprint — every row ``manual annotation required`` at the equal-slice point
+    ``i * duration // n`` — is what makes a truth order-only; a file with SOME real timings is
+    ``partial`` and only a file with none left is ``timed``."""
+
+    assert truth_timing(_truth("mini-a")) == "order-only"
+    assert truth_timing(_truth("mini-b")) == "order-only"
+    raw = json.loads((FIXTURE / "mini-a" / "ground_truth.json").read_text("utf-8"))
+    # One row given a real start range by a verifier: partly timed, NOT timed — the other two rows
+    # still hold nothing to score against.
+    edited = json.loads(json.dumps(raw))
+    edited["episodes"][1]["start_ms_range"] = [205_000, 215_000]
+    edited["episodes"][1]["role_segments"][0]["from_ms"] = 205_000
+    assert truth_timing(GroundTruthRecord.model_validate(edited)) == "partial"
+    # A row annotated with a real audibility rule: partial, even at the placeholder point.
+    edited = json.loads(json.dumps(raw))
+    edited["episodes"][0]["audible_rule"] = "first beat audible"
+    assert truth_timing(GroundTruthRecord.model_validate(edited)) == "partial"
+    # Every row listened to: timed.
+    every_row = _timed_truth(
+        raw,
+        [
+            (0, 10_000, 60_000, 70_000),
+            (205_000, 215_000, 260_000, 270_000),
+            (450_000, 460_000, 590_000, 600_000),
+        ],
+    )
+    assert truth_timing(GroundTruthRecord.model_validate(every_row)) == "timed"
+    # Regression (review): a TIMED tracklist whose first track begins at 0:00 has row 0 sitting on
+    # the first slice point by arithmetic, so the start alone cannot tell — the seeded Mall Grab set
+    # is exactly this.  Both bounds are checked, so the file stays fully timed.
+    from_zero = json.loads(json.dumps(every_row))
+    from_zero["episodes"][0]["start_ms_range"] = [0, 0]
+    from_zero["episodes"][0]["audible_rule"] = "manual annotation required"
+    assert truth_timing(GroundTruthRecord.model_validate(from_zero)) == "timed"
+    # Verification alone does not add timing: a verifier who kept the placeholders (the corpus
+    # README's work-only option) leaves the truth order-only.
+    root = _copy_fixture(tmp_path)
+    _mark_verified(root / "mini-a" / "ground_truth.json")
+    assert truth_timing(_truth("mini-a", root)) == "order-only"
+    # Re-seeded from a different tracklist, the placeholders move with the row count.
+    reseeded = _order_only_truth(raw, [("A", "One"), ("B", "Two"), ("C", "Three"), ("D", "Four")])
+    assert [episode["start_ms_range"] for episode in reseeded["episodes"]] == [
+        [0, 0],
+        [150_000, 150_000],
+        [300_000, 300_000],
+        [450_000, 450_000],
+    ]
+    assert truth_timing(GroundTruthRecord.model_validate(reseeded)) == "order-only"
+
+
+def test_a_half_verified_truth_is_matched_by_work_not_by_its_placeholder_slices(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Regression (review, P0): ``idea truth verify`` keeps the seed's ``audible_rule`` and, on a
+    blank answer, the seed's range, while clearing ``draft`` — so an interrupted pass leaves a truth
+    with SOME real start times and the rest on placeholders.  Time-matching such a file scores every
+    untimed row as a miss: here mini-a's real work-only score is 3/4 recall and the time path sees
+    0.  ``auto`` must therefore match it by work, and say so."""
+
+    root = _copy_fixture(tmp_path)
+    truth_path = root / "mini-a" / "ground_truth.json"
+    reseeded = _order_only_truth(
+        json.loads(truth_path.read_text("utf-8")),
+        [
+            ("Mini Artist feat. Guest", "GAMMA"),
+            ("Mini Artist", "Alpha (Extended Mix)"),
+            ("Mini Artist", "Omega"),
+            ("mini artist", "Beta (Original Mix)"),
+        ],
+    )
+    # The verifier listened to row 1 (Alpha, really 10 s - 70 s) and stopped there.
+    reseeded["episodes"][0]["end_ms_range"] = [9_000, 9_000]
+    reseeded["episodes"][0]["role_segments"] = [{"from_ms": 0, "to_ms": 9_000, "role": "uncertain"}]
+    reseeded["episodes"][1]["start_ms_range"] = [9_000, 11_000]
+    reseeded["episodes"][1]["end_ms_range"] = [69_000, 71_000]
+    reseeded["episodes"][1]["audible_rule"] = "first beat audible"
+    reseeded["episodes"][1]["role_segments"] = [
+        {"from_ms": 9_000, "to_ms": 71_000, "role": "uncertain"}
+    ]
+    _write_json(truth_path, reseeded)
+    assert truth_timing(_truth("mini-a", root)) == "partial"
+
+    code, document = _run(tmp_path / "auto", root / "run-list.json", "--print")
+    assert code == 0
+    mini_a = next(mix for mix in document["mixes"] if mix["mix_id"] == "mini-a")
+    assert mini_a["timing"] == "partial"
+    assert mini_a["match_mode"] == "work"
+    assert [mini_a[key] for key in HEADLINE] == [10_000, None, 6_000, 7_500]
+    assert document["counts"]["timing"] == {"order-only": 1, "partial": 1}
+    # The paragraph names the half-finished file rather than calling it timed.
+    paragraph = capsys.readouterr().out.splitlines()[0]
+    assert (
+        "2 of the 2 truth file(s) still carry the seed's placeholder equal-slice timings on some "
+        "or all rows (1 order-only, 1 only partly timed)" in paragraph
+    )
+
+    # What the old detector did: forced onto the time path, the untimed rows score as misses.
+    code, document = _run_time(tmp_path / "time", root / "run-list.json", "--print")
+    assert code == 0
+    mini_a = next(mix for mix in document["mixes"] if mix["mix_id"] == "mini-a")
+    assert [mini_a[key] for key in HEADLINE] == [0, 0, 0, 0]
+    assert mini_a["work_only"]["work_recall_e4"] == 7_500
+    assert (
+        "2 of the 2 truth file(s) still carry placeholder timings on some or all rows"
+        in capsys.readouterr().out.splitlines()[0]
+    )
+
+
+def test_work_identity_is_fusions_normaliser_not_a_second_one() -> None:
+    """Mix descriptors, case and punctuation fold exactly as ``hints.relations._normalise`` folds
+    them; the word set is what ``fuse.identity`` compares order-independently."""
+
+    assert work_identity("Bushbaby", "Whine Up (Extended Mix)") == work_identity(
+        "bushbaby", "WHINE UP"
+    )
+    assert work_identity("Bakey", "Senses (Original Mix)")[0] == ("bakey", "senses")
+    assert work_identity("Beau James", "4 Raws Edit (Edit)")[0] == ("beau james", "4 raws edit")
+    key, words = work_identity("Old Sport & Loboski", "Tell Me Wagwan (ft. Flowdan)")
+    assert key == ("old sport loboski", "tell me wagwan ft flowdan")
+    assert words == {"old", "sport", "loboski", "tell", "me", "wagwan", "ft", "flowdan"}
+    # A bare "(Extended)" is not a descriptor the shared normaliser strips: the scorer does not
+    # strip it either (the word-set rule absorbs it as an extra word instead).
+    assert work_identity("Bushbaby", "Whine Up (Extended)")[1] == {
+        "bushbaby",
+        "whine",
+        "up",
+        "extended",
+    }
+    # Swapped artist/title is the same word set.
+    assert work_identity("Senses", "Bakey")[1] == work_identity("Bakey", "Senses")[1]
+
+
+def test_match_works_ignores_time_mix_suffix_case_order_and_featured_artists() -> None:
+    truth = [
+        TruthWork(artist="Bushbaby", title="Whine Up (Extended Mix)"),
+        TruthWork(artist="Old Sport & Loboski", title="Tell Me Wagwan (ft. Flowdan)"),
+        TruthWork(artist="Bakey", title="Senses (Original Mix)"),
+        TruthWork(artist="MPH", title="Raw (Extended Mix)"),
+        TruthWork(artist="MPH", title="Raw Dub"),
+        TruthWork(artist="Prozak", title="Clubgirls"),
+        TruthWork(artist="Faster Horses", title="Get On Ya Knees"),
+    ]
+    listed = [
+        # case + mix suffix: equal once normalised
+        ListedWork("e1", "bushbaby", "WHINE UP", "likely", "w1"),
+        # "&" vs "," and a "(ft. …)" clause: the listed word set is contained in the truth's
+        ListedWork("e2", "Old Sport, Loboski", "Tell Me Wagwan", "likely", "w2"),
+        # artist and title swapped: same word set
+        ListedWork("e3", "Senses", "Bakey", "possible", "w3"),
+        # two candidate rows: the exact normalised key ("Raw") beats the word-set one ("Raw Dub")
+        ListedWork("e4", "MPH", "Raw", "likely", "w4"),
+        # a single near-spelled long token (fusion's "clubgrls" / "clubgirls" rule)
+        ListedWork("e5", "Prozak", "Clubgrls", "possible", "w5"),
+        # wrong: shares the artist only
+        ListedWork("e6", "MPH", "Fiesta", "likely", "w6"),
+        # the same work listed a second time under another version label: one distinct work,
+        # not a wrong row
+        ListedWork("e7", "Bushbaby", "Whine Up (Original Mix)", "possible", "w1"),
+    ]
+    match = match_works(truth, listed)
+    assert match.assignments == {0: 0, 1: 1, 2: 2, 3: 3, 4: 5, 6: 0}
+    assert match.counts == WorkCounts(
+        rows_correct=6,
+        rows=7,
+        likely_correct=3,
+        likely=4,
+        works_correct=5,
+        works=6,
+        truth_matched=5,
+        truth=7,
+    )
+    assert match.counts.headline() == {
+        "likely_precision_e4": 7_500,
+        "work_precision_e4": 8_333,
+        "work_recall_e4": 7_143,
+    }
+    assert match.unmatched_truth == [
+        {"artist": "MPH", "title": "Raw Dub"},
+        {"artist": "Faster Horses", "title": "Get On Ya Knees"},
+    ]
+    assert match.unmatched_predictions == [
+        {"artist": "MPH", "title": "Fiesta", "tier": "likely", "rows": 1}
+    ]
+
+
+def test_match_works_counts_distinct_works_on_both_sides() -> None:
+    # A track the DJ played twice is one truth work; naming it once recalls it.
+    twice = [TruthWork(artist="X", title="Y"), TruthWork(artist="X", title="Y")]
+    match = match_works(twice, [ListedWork("e1", "X", "Y", "likely", "w1")])
+    assert match.counts.truth == 1 and match.counts.truth_matched == 1
+    assert match.counts.headline()["work_recall_e4"] == 10_000
+    # A track the tool listed twice (two rows of one identity work) is one listed work, and the
+    # second row is not a wrong ID.
+    once = [TruthWork(artist="X", title="Y")]
+    match = match_works(
+        once,
+        [ListedWork("e1", "X", "Y", "likely", "w1"), ListedWork("e2", "X", "Y", "possible", "w1")],
+    )
+    assert match.assignments == {0: 0, 1: 0}
+    assert match.counts == WorkCounts(2, 2, 1, 1, 1, 1, 1, 1)
+    assert match.unmatched_predictions == []
+    # Two wrong rows of one label collapse into one "wrong" entry carrying the higher tier.
+    match = match_works(
+        once,
+        [ListedWork("e1", "A", "B", "possible", "w2"), ListedWork("e2", "A", "B", "likely", "w2")],
+    )
+    assert match.unmatched_predictions == [
+        {"artist": "A", "title": "B", "tier": "likely", "rows": 2}
+    ]
+    assert match.counts.headline() == {
+        "likely_precision_e4": 0,
+        "work_precision_e4": 0,
+        "work_recall_e4": 0,
+    }
+    # Nothing listed: zero, never a division error.
+    assert match_works(once, []).counts.headline() == {
+        "likely_precision_e4": 0,
+        "work_precision_e4": 0,
+        "work_recall_e4": 0,
+    }
+
+
+def test_labels_that_normalise_away_to_nothing_never_match() -> None:
+    """Regression (review, P1): the exact-key branch compared normalised keys with no emptiness
+    guard, so any two labels that fold to ``("", "")`` — an unnamed truth row against a prediction
+    whose whole title was a mix descriptor — scored as a correct identification and inflated both
+    precision and recall.  Fusion's own ``hints.relations._identity_key`` refuses an empty artist or
+    title and its word-set rule needs two words, so the scorer must not be looser."""
+
+    assert work_identity("???", "(Original Mix)") == (("", ""), frozenset())
+    truth = [
+        TruthWork(artist="???", title="(Original Mix)"),
+        TruthWork(artist="Real", title="Song"),
+    ]
+    match = match_works(truth, [ListedWork("e1", "!!!", "(Extended Mix)", "likely", "w1")])
+    assert match.assignments == {}
+    assert match.counts == WorkCounts(0, 1, 0, 1, 0, 1, 0, 2)
+    assert match.unmatched_predictions == [
+        {"artist": "!!!", "title": "(Extended Mix)", "tier": "likely", "rows": 1}
+    ]
+    # An empty artist with a real multi-word title still matches, through the word-set rule.
+    titled = [TruthWork(artist="", title="Long Season Intro Edit")]
+    match = match_works(titled, [ListedWork("e1", "", "long season intro", "likely", "w1")])
+    assert match.assignments == {0: 0}
+
+
+def test_work_mode_fixture_titles_differ_only_by_suffix_case_and_feat(tmp_path: Path) -> None:
+    """The cycle's fixture: ``mini-a``'s truth re-seeded as an order-only tracklist whose titles
+    differ from the tool's labels only by mix suffix, case and a featured artist, listed in a
+    different order (so a time association would be wrong even if the titles agreed), plus a track
+    the tool never listed.  Exact counts."""
+
+    root = _copy_fixture(tmp_path)
+    truth_path = root / "mini-a" / "ground_truth.json"
+    _write_json(
+        truth_path,
+        _order_only_truth(
+            json.loads(truth_path.read_text("utf-8")),
+            [
+                ("Mini Artist feat. Guest", "GAMMA"),
+                ("Mini Artist", "Alpha (Extended Mix)"),
+                ("Mini Artist", "Omega"),
+                ("mini artist", "Beta (Original Mix)"),
+            ],
+        ),
+    )
+    assert truth_timing(_truth("mini-a", root)) == "order-only"
+
+    code, document = _run(tmp_path / "work", root / "run-list.json")
+    assert code == 0
+    assert document["match_mode"] == "work"
+    mini_a = next(mix for mix in document["mixes"] if mix["mix_id"] == "mini-a")
+    assert mini_a["counts"] == {
+        "likely": {"correct": 3, "predicted": 3},
+        "listed": None,
+        "work": {"correct": 3, "predicted": 5, "truth": 4, "truth_matched": 3},
+    }
+    assert [mini_a[key] for key in HEADLINE] == [10_000, None, 6_000, 7_500]
+    assert mini_a["unmatched_truth"] == [{"artist": "Mini Artist", "title": "Omega"}]
+    assert mini_a["unmatched_predictions"] == [
+        {"artist": "Mini Artist", "title": "Delta", "tier": "possible", "rows": 1},
+        {"artist": "Mini Artist", "title": "Eta", "tier": "unclear", "rows": 1},
+    ]
+    # Pooled with mini-b (1/2 likely, 1 of 2 works, 1 of 3 truth works).
+    assert document["counts"]["likely"] == {"correct": 4, "predicted": 5}
+    assert document["counts"]["work"] == {
+        "correct": 4,
+        "predicted": 7,
+        "truth": 7,
+        "truth_matched": 4,
+    }
+    assert [document[key] for key in HEADLINE] == [8_000, None, 5_714, 5_714]
+    # The assignment audit names each listed row's truth row.
+    audit = json.loads((tmp_path / "work" / mini_a["work_match"]).read_text("utf-8"))
+    by_episode = {item["episode_id"]: item["truth_index"] for item in audit["predictions"]}
+    assert by_episode == {
+        _episode_id("a1"): 1,
+        _episode_id("a2"): 3,
+        _episode_id("a3"): None,
+        _episode_id("a5"): 0,
+        _episode_id("a7"): None,
+    }
+    assert audit["truth"][2] == {
+        "index": 2,
+        "artist": "Mini Artist",
+        "title": "Omega",
+        "occurrence_index": 0,
+        "named_by": [],
+    }
+    assert audit["counts"] == mini_a["work_only"]["counts"]
+
+    # The time path cannot see any of them: the strict work key differs and the slices are in the
+    # wrong places — which is why order-only truth is matched by work.
+    code, document = _run_time(tmp_path / "time", root / "run-list.json")
+    assert code == 0
+    mini_a = next(mix for mix in document["mixes"] if mix["mix_id"] == "mini-a")
+    assert mini_a["work_recall_e4"] == 0
+    assert mini_a["listed_precision_e4"] == 0
+    assert mini_a["work_only"]["work_recall_e4"] == 7_500
+
+
+def test_a_timed_truth_is_matched_by_time_and_still_gets_work_only_numbers(tmp_path: Path) -> None:
+    root = _copy_fixture(tmp_path)
+    _make_mini_b_timed(root)
+    assert truth_timing(_truth("mini-b", root)) == "timed"
+    run_list = json.loads((root / "run-list.json").read_text("utf-8"))
+    run_list["runs"] = [run for run in run_list["runs"] if run["mix_id"] == "mini-b"]
+    _write_json(root / "run-list.json", run_list)
+    code, document = _run(tmp_path, root / "run-list.json")
+    assert code == 0
+    assert document["match_requested"] == "auto"
+    assert document["match_mode"] == "time"
+    assert document["counts"]["timing"] == {"timed": 1}
+    assert [document[key] for key in HEADLINE] == [5_000, 5_000, 5_000, 3_333]
+    assert document["l3"]["thresholds_met"] is False
+    (mix,) = document["mixes"]
+    assert mix["match_mode"] == "time"
+    assert (tmp_path / mix["report"]).is_file()
+    assert mix["work_only"] == {
+        "likely_precision_e4": 5_000,
+        "work_precision_e4": 5_000,
+        "work_recall_e4": 3_333,
+        "counts": {
+            "rows": {"correct": 1, "predicted": 2},
+            "likely": {"correct": 1, "predicted": 2},
+            "works": {"correct": 1, "predicted": 2},
+            "truth_works": {"matched": 1, "total": 3},
+        },
+    }
+    assert mix["unmatched_truth"] == [
+        {"artist": "Mini Artist", "title": "Iota"},
+        {"artist": "Mini Artist", "title": "Mu"},
+    ]
+
+
+def test_a_mixed_run_list_pools_work_only_and_keeps_the_timed_mixs_time_numbers(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """One order-only mix and one timed mix: the pooled headline is the work-only score (the only
+    one both have), the timed mix keeps its own time numbers on its row."""
+
+    root = _copy_fixture(tmp_path)
+    _make_mini_b_timed(root)
+    code, document = _run(tmp_path / "auto", root / "run-list.json", "--print")
+    assert code == 0
+    assert document["match_mode"] == "work"
+    assert document["counts"]["timing"] == {"order-only": 1, "timed": 1}
+    assert [document[key] for key in HEADLINE] == [8_000, None, 5_714, 6_667]
+    assert document["l3"]["thresholds_met"] is None
+    by_mix = {mix["mix_id"]: mix for mix in document["mixes"]}
+    assert by_mix["mini-a"]["match_mode"] == "work"
+    assert by_mix["mini-a"]["report"] is None
+    assert by_mix["mini-b"]["match_mode"] == "time"
+    assert (tmp_path / "auto" / by_mix["mini-b"]["report"]).is_file()
+    assert [by_mix["mini-b"][key] for key in HEADLINE] == [5_000, 5_000, 5_000, 3_333]
+    assert by_mix["mini-b"]["counts"]["listed"] == {"correct": 1, "predicted": 2, "truth": 3}
+    lines = capsys.readouterr().out.strip().splitlines()
+    assert "because 1 of the 2 truth file(s) are order-only" in lines[0]
+    assert lines[1].startswith("- mini-a [order-only; matched by work]: work-only:")
+    assert lines[2].startswith("- mini-b [timed; matched by time]: by time: likely 1/2 (50.0%)")
+
+    # Forced modes apply to every mix and say so.
+    code, document = _run(tmp_path / "work", root / "run-list.json", "--match", "work", "--print")
+    assert code == 0
+    assert document["match_requested"] == "work"
+    assert [mix["match_mode"] for mix in document["mixes"]] == ["work", "work"]
+    assert "WORK-ONLY (time-agnostic) because --match work was given" in capsys.readouterr().out
+    code, document = _run_time(tmp_path / "time", root / "run-list.json", "--print")
+    assert code == 0
+    assert [mix["match_mode"] for mix in document["mixes"]] == ["time", "time"]
+    assert "although 1 of the 2 truth file(s) are order-only" in capsys.readouterr().out
+
+
+def test_an_unknown_match_choice_is_a_usage_error() -> None:
+    with pytest.raises(SystemExit) as raised:
+        main(["--run-list", str(RUN_LIST), "--print", "--match", "fuzzy"])
+    assert raised.value.code == 2
 
 
 # --- run list ---------------------------------------------------------------------------------
@@ -674,7 +1290,7 @@ def test_a_crowd_row_is_scored_instead_of_failing_the_prediction_contract(tmp_pa
     episodes = json.loads(episodes_path.read_text("utf-8"))
     episodes["episodes"].append(_crowd_episode(episodes["episodes"][-1], 250_000, 260_000))
     _write_json(episodes_path, episodes)
-    code, document = _run(tmp_path / "crowd", root / "run-list.json")
+    code, document = _run_time(tmp_path / "crowd", root / "run-list.json")
     assert code == 0
     mini_b = next(mix for mix in document["mixes"] if mix["mix_id"] == "mini-b")
     assert mini_b["episodes_total"] == 4
@@ -683,3 +1299,9 @@ def test_a_crowd_row_is_scored_instead_of_failing_the_prediction_contract(tmp_pa
     assert mini_b["range_claims"] == 1
     assert document["counts"]["range_claims"] == 1
     assert mini_b["counts"]["listed"]["predicted"] == 3
+    # The contract check runs in work mode too, and the crowd row is a listed row there as well.
+    code, document = _run(tmp_path / "crowd-work", root / "run-list.json")
+    assert code == 0
+    mini_b = next(mix for mix in document["mixes"] if mix["mix_id"] == "mini-b")
+    assert mini_b["range_claims"] == 1
+    assert mini_b["work_only"]["counts"]["rows"]["predicted"] == 3
