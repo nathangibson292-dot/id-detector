@@ -1,0 +1,281 @@
+{
+  "note": "30 candidates, C=12, R=3 -> A=9: nine first-round picks in span order, nothing left for (ii).",
+  "duration_ms": 360000,
+  "clips_per_minute": 2,
+  "reserve_fraction": 0.25,
+  "min_intersection_ms": 4000,
+  "windows": {
+    "hop_ms": 12000,
+    "window_ms": 12000
+  },
+  "energy": {},
+  "candidates": [
+    {
+      "priority": "listed_not_confident",
+      "span": [
+        0,
+        12000
+      ],
+      "episode_id": "0000000000000000000000000000000000000000"
+    },
+    {
+      "priority": "listed_not_confident",
+      "span": [
+        12000,
+        24000
+      ],
+      "episode_id": "0000000000000000000000000000000000000001"
+    },
+    {
+      "priority": "listed_not_confident",
+      "span": [
+        24000,
+        36000
+      ],
+      "episode_id": "0000000000000000000000000000000000000002"
+    },
+    {
+      "priority": "listed_not_confident",
+      "span": [
+        36000,
+        48000
+      ],
+      "episode_id": "0000000000000000000000000000000000000003"
+    },
+    {
+      "priority": "listed_not_confident",
+      "span": [
+        48000,
+        60000
+      ],
+      "episode_id": "0000000000000000000000000000000000000004"
+    },
+    {
+      "priority": "listed_not_confident",
+      "span": [
+        60000,
+        72000
+      ],
+      "episode_id": "0000000000000000000000000000000000000005"
+    },
+    {
+      "priority": "listed_not_confident",
+      "span": [
+        72000,
+        84000
+      ],
+      "episode_id": "0000000000000000000000000000000000000006"
+    },
+    {
+      "priority": "listed_not_confident",
+      "span": [
+        84000,
+        96000
+      ],
+      "episode_id": "0000000000000000000000000000000000000007"
+    },
+    {
+      "priority": "listed_not_confident",
+      "span": [
+        96000,
+        108000
+      ],
+      "episode_id": "0000000000000000000000000000000000000008"
+    },
+    {
+      "priority": "listed_not_confident",
+      "span": [
+        108000,
+        120000
+      ],
+      "episode_id": "0000000000000000000000000000000000000009"
+    },
+    {
+      "priority": "listed_not_confident",
+      "span": [
+        120000,
+        132000
+      ],
+      "episode_id": "000000000000000000000000000000000000000a"
+    },
+    {
+      "priority": "listed_not_confident",
+      "span": [
+        132000,
+        144000
+      ],
+      "episode_id": "000000000000000000000000000000000000000b"
+    },
+    {
+      "priority": "listed_not_confident",
+      "span": [
+        144000,
+        156000
+      ],
+      "episode_id": "000000000000000000000000000000000000000c"
+    },
+    {
+      "priority": "listed_not_confident",
+      "span": [
+        156000,
+        168000
+      ],
+      "episode_id": "000000000000000000000000000000000000000d"
+    },
+    {
+      "priority": "listed_not_confident",
+      "span": [
+        168000,
+        180000
+      ],
+      "episode_id": "000000000000000000000000000000000000000e"
+    },
+    {
+      "priority": "listed_not_confident",
+      "span": [
+        180000,
+        192000
+      ],
+      "episode_id": "000000000000000000000000000000000000000f"
+    },
+    {
+      "priority": "listed_not_confident",
+      "span": [
+        192000,
+        204000
+      ],
+      "episode_id": "0000000000000000000000000000000000000010"
+    },
+    {
+      "priority": "listed_not_confident",
+      "span": [
+        204000,
+        216000
+      ],
+      "episode_id": "0000000000000000000000000000000000000011"
+    },
+    {
+      "priority": "listed_not_confident",
+      "span": [
+        216000,
+        228000
+      ],
+      "episode_id": "0000000000000000000000000000000000000012"
+    },
+    {
+      "priority": "listed_not_confident",
+      "span": [
+        228000,
+        240000
+      ],
+      "episode_id": "0000000000000000000000000000000000000013"
+    },
+    {
+      "priority": "listed_not_confident",
+      "span": [
+        240000,
+        252000
+      ],
+      "episode_id": "0000000000000000000000000000000000000014"
+    },
+    {
+      "priority": "listed_not_confident",
+      "span": [
+        252000,
+        264000
+      ],
+      "episode_id": "0000000000000000000000000000000000000015"
+    },
+    {
+      "priority": "listed_not_confident",
+      "span": [
+        264000,
+        276000
+      ],
+      "episode_id": "0000000000000000000000000000000000000016"
+    },
+    {
+      "priority": "listed_not_confident",
+      "span": [
+        276000,
+        288000
+      ],
+      "episode_id": "0000000000000000000000000000000000000017"
+    },
+    {
+      "priority": "listed_not_confident",
+      "span": [
+        288000,
+        300000
+      ],
+      "episode_id": "0000000000000000000000000000000000000018"
+    },
+    {
+      "priority": "listed_not_confident",
+      "span": [
+        300000,
+        312000
+      ],
+      "episode_id": "0000000000000000000000000000000000000019"
+    },
+    {
+      "priority": "listed_not_confident",
+      "span": [
+        312000,
+        324000
+      ],
+      "episode_id": "000000000000000000000000000000000000001a"
+    },
+    {
+      "priority": "listed_not_confident",
+      "span": [
+        324000,
+        336000
+      ],
+      "episode_id": "000000000000000000000000000000000000001b"
+    },
+    {
+      "priority": "listed_not_confident",
+      "span": [
+        336000,
+        348000
+      ],
+      "episode_id": "000000000000000000000000000000000000001c"
+    },
+    {
+      "priority": "listed_not_confident",
+      "span": [
+        348000,
+        360000
+      ],
+      "episode_id": "000000000000000000000000000000000000001d"
+    }
+  ],
+  "expect": {
+    "capacity": 12,
+    "reserve": 3,
+    "allocation": 9,
+    "starts": [
+      0,
+      12000,
+      24000,
+      36000,
+      48000,
+      60000,
+      72000,
+      84000,
+      96000
+    ],
+    "rounds": [
+      "first",
+      "first",
+      "first",
+      "first",
+      "first",
+      "first",
+      "first",
+      "first",
+      "first"
+    ]
+  }
+}

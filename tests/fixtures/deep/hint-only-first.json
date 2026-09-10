@@ -1,0 +1,44 @@
+{
+  "note": "The short, late hint-only span gets the first pick ahead of the long, early blank; energy breaks the blank's intersection tie.",
+  "duration_ms": 60000,
+  "clips_per_minute": 2,
+  "reserve_fraction": 0.25,
+  "min_intersection_ms": 4000,
+  "windows": {
+    "hop_ms": 9000,
+    "window_ms": 12000
+  },
+  "energy": {
+    "9000": 0.9
+  },
+  "candidates": [
+    {
+      "priority": "blank",
+      "span": [
+        0,
+        30000
+      ]
+    },
+    {
+      "priority": "hint_only",
+      "span": [
+        45000,
+        60000
+      ],
+      "episode_id": "hhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhh"
+    }
+  ],
+  "expect": {
+    "capacity": 2,
+    "reserve": 0,
+    "allocation": 2,
+    "starts": [
+      45000,
+      9000
+    ],
+    "rounds": [
+      "first",
+      "first"
+    ]
+  }
+}

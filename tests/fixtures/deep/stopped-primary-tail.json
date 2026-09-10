@@ -1,0 +1,14 @@
+{
+  "note": "AudD stops on a quota error after two matches; the 21-60 s tail is blank, not a gap.",
+  "audio_s": 60,
+  "audd": {
+    "default": "match",
+    "windows": {
+      "2": "quota_error"
+    }
+  },
+  "shazam": {
+    "default": "match",
+    "windows": {}
+  }
+}

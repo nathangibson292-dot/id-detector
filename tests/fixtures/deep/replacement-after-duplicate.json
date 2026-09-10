@@ -1,0 +1,45 @@
+{
+  "note": "Window 18 s is the loudest and ranks first for both overlapping spans; the second span takes its next-ranked window instead.",
+  "duration_ms": 60000,
+  "clips_per_minute": 2,
+  "reserve_fraction": 0.25,
+  "min_intersection_ms": 4000,
+  "windows": {
+    "hop_ms": 9000,
+    "window_ms": 12000
+  },
+  "energy": {
+    "18000": 0.9
+  },
+  "candidates": [
+    {
+      "priority": "listed_not_confident",
+      "span": [
+        0,
+        30000
+      ],
+      "episode_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    },
+    {
+      "priority": "suppressed_challengeable",
+      "span": [
+        18000,
+        48000
+      ],
+      "episode_id": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+    }
+  ],
+  "expect": {
+    "capacity": 2,
+    "reserve": 0,
+    "allocation": 2,
+    "starts": [
+      18000,
+      27000
+    ],
+    "rounds": [
+      "first",
+      "first"
+    ]
+  }
+}

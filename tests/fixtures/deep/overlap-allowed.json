@@ -1,0 +1,12 @@
+{
+  "note": "Both engines match everywhere; the secondary's picks may land on AudD's windows.",
+  "audio_s": 60,
+  "audd": {
+    "default": "match",
+    "windows": {}
+  },
+  "shazam": {
+    "default": "match",
+    "windows": {}
+  }
+}

@@ -1,0 +1,27 @@
+{
+  "note": "120 min -> C=240, R=60, A=180 over a single blank; 240 windows at a 30 s hop, none picked twice.",
+  "duration_ms": 7200000,
+  "clips_per_minute": 2,
+  "reserve_fraction": 0.25,
+  "min_intersection_ms": 4000,
+  "windows": {
+    "hop_ms": 30000,
+    "window_ms": 12000
+  },
+  "energy": {},
+  "candidates": [
+    {
+      "priority": "blank",
+      "span": [
+        0,
+        7200000
+      ]
+    }
+  ],
+  "expect": {
+    "capacity": 240,
+    "reserve": 60,
+    "allocation": 180,
+    "picks": 180
+  }
+}

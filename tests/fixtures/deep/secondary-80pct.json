@@ -1,0 +1,17 @@
+{
+  "note": "C=2: the A-span probe (window 0 or 1) resolves, the B-span probe is malformed -> 1/2 < 80 %.",
+  "audio_s": 60,
+  "audd": {
+    "default": "match",
+    "windows": {
+      "3": "no_match"
+    }
+  },
+  "shazam": {
+    "default": "malformed",
+    "windows": {
+      "0": "match",
+      "1": "match"
+    }
+  }
+}

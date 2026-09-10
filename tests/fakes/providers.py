@@ -77,6 +77,17 @@ class _ScriptedProvider:
         self.provider = provider
         self.default = default
         self.latency_s = latency_ms / 1000
+        # Optional ``"labels": {"<index>": "D"}`` — the tone letter a window's match names instead
+        # of the position-derived default (A/B/C by index), so a script can make one provider
+        # find a track the other never reported (the secondary's reserve confirmations).
+        labels = section.get("labels", {})
+        if not isinstance(labels, Mapping):
+            raise ValueError(f"fake-provider {provider}.labels must be an object")
+        self.labels: dict[int, str] = {}
+        for key, letter in labels.items():
+            if not isinstance(letter, str) or letter not in _LETTER_TONES:
+                raise ValueError(f"unsupported {provider} label for window {key!r}: {letter!r}")
+            self.labels[int(key)] = letter
         self.windows: dict[int, tuple[str, ...]] = {}
         for key, value in windows.items():
             try:
@@ -132,12 +143,14 @@ def _directory_ordinal(path: Path) -> int | None:
         return None
 
 
-def _tone_label(index: int) -> tuple[str, str, int]:
-    if index < 2:
-        return "Fixture Artist A", "Tone 440", 440
-    if index < 5:
-        return "Fixture Artist B", "Tone 554", 554
-    return "Fixture Artist C", "Tone 659", 659
+_LETTER_TONES = {"A": 440, "B": 554, "C": 659, "D": 880, "E": 1046, "F": 1318, "G": 1568}
+
+
+def _tone_label(index: int, letter: str | None = None) -> tuple[str, str, int]:
+    if letter is None:
+        letter = "A" if index < 2 else "B" if index < 5 else "C"
+    frequency = _LETTER_TONES[letter]
+    return f"Fixture Artist {letter}", f"Tone {frequency}", frequency
 
 
 async def _notify_attempt(callback: Callable[[], Awaitable[None]] | object) -> None:
@@ -212,7 +225,7 @@ class FakeAudD:
             return {"status": "success", "result": {}}
         if outcome == "no_match":
             return {"status": "success", "result": None}
-        artist, title, frequency = _tone_label(index)
+        artist, title, frequency = _tone_label(index, self.script.labels.get(index))
         return {
             "status": "success",
             "result": {
@@ -263,7 +276,7 @@ class FakeShazamHTTP(HTTPClientInterface):
             raise ShazamHTTPError(200, "scripted malformed Shazam response")
         if outcome == "no_match":
             return {"matches": [], "track": None}
-        artist, title, frequency = _tone_label(index)
+        artist, title, frequency = _tone_label(index, self.script.labels.get(index))
         return {
             "matches": [
                 {

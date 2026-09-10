@@ -8,7 +8,7 @@ import os
 import sys
 import tomllib
 import uuid
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import replace
 from decimal import Decimal
 from hashlib import sha256
@@ -78,10 +78,17 @@ from id_detector.rescan import DEFAULT_MAX_GENERATIONS
 from id_detector.scan import PAID_FILE_SCANNERS
 from id_detector.scan_targeting import select_scan_targets
 from id_detector.secondary_targeting import (
+    SecondaryPick,
+    allocate_secondary_windows,
+    distribute_secondary_windows,
+    energy_reader,
     frozen_windows,
-    schedule_secondary_windows,
+    listed_text_keys,
+    new_identity_discoveries,
     secondary_capacity,
+    secondary_reserve,
     select_secondary_candidates,
+    serve_confirmations,
 )
 from id_detector.shazam import HTTPClientInterface
 from id_detector.truth import (
@@ -675,13 +682,19 @@ async def _analyse(
         def _recognise_log(message: str) -> None:
             _report(progress, "recognise", recognise_progress[0], recognise_progress[1], message)
 
-        async def recognise_windows(*, windows: object, generation: int) -> object:
+        async def recognise_windows(
+            *, windows: object, generation: int, run_label: str | None = None
+        ) -> object:
+            # ``run_label`` keys a further Shazam pass of the same generation (the secondary's
+            # confirmations) to its own invocation directory: the recognition artefacts are
+            # immutable per invocation and generation, so a second pass over new windows must
+            # not try to rewrite the first pass's files.
             return await recognise_generation(
                 media_key=ingested.record.media_key,
                 media_dir=media_dir,
                 windows=windows,  # type: ignore[arg-type]
                 project_root=PROJECT_ROOT,
-                run_id=run_id,
+                run_id=run_id if run_label is None else f"{run_id}:{run_label}",
                 generation=generation,
                 refresh=refresh,
                 max_requests=max_requests,
@@ -943,9 +956,10 @@ async def _analyse(
         # lever below sends only window clips (the same ~12 s clips the engines already see — no
         # whole-file upload, no consent gate) and re-fuses, so agreement lifts confidence,
         # disagreement lets a phantom be demoted, and a primary-blind track is recovered:
-        #   • Deep: the Shazam secondary — the provisional ``targeting:0`` scheduler queues the
-        #     hint-only, not-confident, challengeable-suppressed and blank spans, capped at
-        #     ``secondary_clips_per_minute`` clips per minute of mix (plan §2.3.4 step 4);
+        #   • Deep: the Shazam secondary — the ``targeting:1`` scheduler spends ``C − R`` clips
+        #     over the hint-only, not-confident, challengeable-suppressed and blank spans, keeps
+        #     the reserve ``R`` to confirm a new identity a blank probe turns up, and hands any
+        #     unused reserve back to the spans (plan §2.3.4 step 4);
         #   • a local Panako index — the DJ's OWN unreleased uploads, in no public catalogue —
         #     over whatever is still uncertain afterwards.
         # The paid clip lever no longer runs here: the Deep primary already swept the whole mix
@@ -986,57 +1000,135 @@ async def _analyse(
                 if hint_result is not None
                 else frozenset()
             )
+            min_intersection_ms = requested_recipe.eligibility_min_intersection_ms or 0
             candidates = select_secondary_candidates(
                 fused.episodes,
                 duration_ms=duration_ms,
                 suppressed_min_votes=requested_recipe.suppressed_min_votes or 0,
-                min_intersection_ms=requested_recipe.eligibility_min_intersection_ms or 0,
+                min_intersection_ms=min_intersection_ms,
                 hint_ids=hint_ids,
             )
             capacity = secondary_capacity(
                 duration_ms, requested_recipe.secondary_clips_per_minute or 0
             )
-            scheduled = schedule_secondary_windows(
-                windows.records,
-                candidates,
-                capacity=capacity,
-                min_intersection_ms=requested_recipe.eligibility_min_intersection_ms or 0,
+            reserve = secondary_reserve(
+                capacity, requested_recipe.secondary_reserve_fraction or 0.0
             )
-            secondary_allocated = len(scheduled)
+            energy = energy_reader(media_dir)
+            picks: list[SecondaryPick] = list(
+                allocate_secondary_windows(
+                    windows.records,
+                    candidates,
+                    allocation=capacity - reserve,
+                    min_intersection_ms=min_intersection_ms,
+                    energy=energy,
+                )
+            )
+            picked_ids = {pick.window.id for pick in picks}
             counts["secondary_capacity"] = capacity
-            counts["secondary_allocated"] = secondary_allocated
-            if scheduled:
-                _report(progress, "scan", 0, len(scheduled), "second opinion (free engine)")
-                timer.start_stage("secondary_ms")
-                secondary = await recognise_windows(
+            counts["secondary_reserve"] = reserve
+            counts["secondary_allocated"] = len(picks)
+            secondary_passes: list[object] = []
+
+            async def _probe(batch: Sequence[SecondaryPick], label: str, run_label: str | None):
+                _report(progress, "scan", 0, len(batch), label)
+                result = await recognise_windows(
                     windows=WindowsResult(
-                        records=scheduled, record_path=windows.record_path, cached=windows.cached
+                        records=[pick.window for pick in batch],
+                        record_path=windows.record_path,
+                        cached=windows.cached,
                     ),
                     generation=0,
+                    run_label=run_label,
                 )
-                timer.finish_stage("secondary_ms")
-                secondary_resolved = len(scheduled) - secondary.failures
-                counts["secondary_resolved"] = secondary_resolved
-                if secondary.failures:
-                    _recognise_log(
-                        f"{secondary.failures} of {len(scheduled)} second-opinion windows got "
-                        "no usable answer from Shazam (throttled or malformed reply)"
+                secondary_passes.append(result)
+                return result
+
+            if picks:
+                timer.start_stage("secondary_ms")
+                first_pass = await _probe(picks, "second opinion (free engine)", None)
+                # The reserve: a blank probe that names a track no listed episode carries gets
+                # two confirmation clips around it (first-come until R is gone); whatever is
+                # left of R goes back to the spans proportionally.  One further Shazam pass.
+                discoveries = new_identity_discoveries(
+                    first_pass.observations,
+                    picks,
+                    listed_text_keys(fused.episodes, fused.identities.record),
+                )
+                served, unused_reserve = serve_confirmations(
+                    windows.records,
+                    [
+                        (item.observation.support_ms, item.pick.window.id, item.pick.candidate.span)
+                        for item in discoveries
+                    ],
+                    reserve=reserve,
+                    picked=picked_ids,
+                    search_ms=requested_recipe.reserve_search_ms or 0,
+                    min_separation_ms=requested_recipe.reserve_min_separation_ms or 0,
+                    min_intersection_ms=min_intersection_ms,
+                )
+                follow_up: list[SecondaryPick] = [
+                    SecondaryPick(window, item.pick.candidate, "confirmation")
+                    for item, chosen in zip(discoveries, served, strict=True)
+                    for window in chosen
+                ]
+                picked_ids.update(pick.window.id for pick in follow_up)
+                follow_up.extend(
+                    distribute_secondary_windows(
+                        windows.records,
+                        candidates,
+                        quota=unused_reserve,
+                        min_intersection_ms=min_intersection_ms,
+                        energy=energy,
+                        picked=picked_ids,
                     )
-                counts["secondary_matches"] = sum(
-                    item.status == "match" for item in secondary.observations
                 )
-                supplemental_requests += secondary.requests
-                supplemental_physical_attempts += secondary.physical_attempts
+                counts["secondary_discoveries"] = len(discoveries)
+                counts["secondary_confirmed"] = sum(1 for chosen in served if chosen)
+                counts["secondary_uncorroborated"] = sum(1 for chosen in served if not chosen)
+                counts["secondary_confirmation_clips"] = sum(len(chosen) for chosen in served)
+                if discoveries:
+                    _recognise_log(
+                        f"{len(discoveries)} new track(s) found in blank stretches; "
+                        f"{counts['secondary_confirmed']} confirmed from the reserve, "
+                        f"{counts['secondary_uncorroborated']} listed uncorroborated"
+                    )
+                if follow_up:
+                    picks.extend(follow_up)
+                    counts["secondary_allocated"] = len(picks)
+                    await _probe(follow_up, "confirming new finds (free engine)", "secondary-2")
+                timer.finish_stage("secondary_ms")
+                secondary_allocated = len(picks)
+                secondary_failures = sum(item.failures for item in secondary_passes)
+                secondary_resolved = secondary_allocated - secondary_failures
+                counts["secondary_resolved"] = secondary_resolved
+                if secondary_failures:
+                    _recognise_log(
+                        f"{secondary_failures} of {secondary_allocated} second-opinion windows "
+                        "got no usable answer from Shazam (throttled or malformed reply)"
+                    )
+                secondary_observations = tuple(
+                    observation for item in secondary_passes for observation in item.observations
+                )
+                counts["secondary_matches"] = sum(
+                    item.status == "match" for item in secondary_observations
+                )
+                supplemental_requests += sum(item.requests for item in secondary_passes)
+                supplemental_physical_attempts += sum(
+                    item.physical_attempts for item in secondary_passes
+                )
                 counts["requests"] = orchestrated.requests + supplemental_requests
                 counts["physical_attempts"] = (
                     orchestrated.physical_attempts + supplemental_physical_attempts
                 )
-                counts["failures"] = free_failures + secondary.failures
-                counts["cache_hits"] += secondary.cache_hits
-                if secondary.observations:
+                counts["failures"] = free_failures + secondary_failures
+                counts["cache_hits"] += sum(item.cache_hits for item in secondary_passes)
+                if secondary_observations:
                     secondary_scan = PaidScanResult(
-                        observations=tuple(secondary.observations),
-                        observation_paths=(secondary.observations_path,),
+                        observations=secondary_observations,
+                        observation_paths=tuple(
+                            item.observations_path for item in secondary_passes
+                        ),
                     )
                     await _refuse_with(secondary_scan)  # re-fuse once (§2.3.4 step 5)
         if want_index:

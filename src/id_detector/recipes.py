@@ -137,7 +137,7 @@ DEEP_RECIPE = Recipe(
     ),
     max_usd_e2=900,
     adapter_versions=MappingProxyType({"audd_clip": 2, "shazam": 1}),
-    algorithm_version="targeting:0,fusion:1",
+    algorithm_version="targeting:1,fusion:1",
     requires=("audd_sweep", "shazam_secondary"),
 )
 

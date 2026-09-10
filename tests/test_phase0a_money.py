@@ -154,7 +154,7 @@ def test_frozen_recipes_contain_every_phase_zero_field_and_hash_canonical_json()
     assert DEEP_RECIPE.audd_concurrency == 4
     assert DEEP_RECIPE.max_usd_e2 == 900
     assert dict(DEEP_RECIPE.adapter_versions) == {"audd_clip": 2, "shazam": 1}
-    assert DEEP_RECIPE.algorithm_version == "targeting:0,fusion:1"
+    assert DEEP_RECIPE.algorithm_version == "targeting:1,fusion:1"
     assert DEEP_RECIPE.requires == ("audd_sweep", "shazam_secondary")
     audd_retry = DEEP_RECIPE.retry_policy["audd"]
     assert audd_retry.retryable_outcomes == (
@@ -301,7 +301,7 @@ def test_deep_success_records_price_recipe_reservation_and_settlement(tmp_path: 
     assert entry["usd_e2_spent"] == 4
     assert entry["costs"] == {"usd_e2": 4}
     assert entry["requested_recipe_id"] == DEEP_RECIPE.recipe_id
-    assert entry["algorithm_version"] == "targeting:0,fusion:1"
+    assert entry["algorithm_version"] == "targeting:1,fusion:1"
     assert entry["pricing_version"] == "v1"
     assert entry["audd_usd_e6_per_request"] == 5_000
 
@@ -506,7 +506,7 @@ def test_throttled_run_refunds_every_unit_and_bills_nothing(tmp_path: Path) -> N
     assert entry["status"] == "partial"
     assert entry["reason"] == "primary_not_achieved"
     assert entry["achieved"] == "deep"
-    assert entry["algorithm_version"] == "targeting:0,fusion:1"
+    assert entry["algorithm_version"] == "targeting:1,fusion:1"
     # Every planned dispatch and each of its three bounded retries was admitted; none was refused.
     assert audd.calls == 28
     assert audd.billed_units == 0

@@ -1,6 +1,7 @@
-"""Phase 0a-iv gate: the plan §2.3.5 status matrix, ``--allow-degrade`` and the ``targeting:0``
-secondary scheduler.  Every run is offline: the fakes script both providers over the 60 s fixture
-(seven frozen windows, so the Deep secondary capacity is ``C = ceil(1 min x 2) = 2``)."""
+"""Phase 0a-iv gate: the plan §2.3.5 status matrix, ``--allow-degrade`` and the secondary
+scheduler's candidate classes.  Every run is offline: the fakes script both providers over the
+60 s fixture (seven frozen windows, so the Deep secondary capacity is ``C = ceil(1 min x 2) = 2``
+and the reserve ``R = floor(0.25 x 2) = 0``)."""
 
 from __future__ import annotations
 
@@ -19,8 +20,8 @@ from id_detector.providers.base import AppConfig
 from id_detector.recipes import DEEP_RECIPE, FREE_RECIPE, Recipe
 from id_detector.secondary_targeting import (
     PRIORITY,
+    allocate_secondary_windows,
     blank_spans,
-    schedule_secondary_windows,
     secondary_capacity,
     select_secondary_candidates,
 )
@@ -213,7 +214,7 @@ def test_all_requirements_met_is_complete_with_the_gate_money_figures(tmp_path: 
     code, audd, shazam, entry, media_dir = _run(tmp_path, "gate0a-deep.json")
     assert code == 0
     assert (entry["status"], entry["reason"], entry["achieved"]) == ("complete", None, "deep")
-    assert entry["algorithm_version"] == "targeting:0,fusion:1"
+    assert entry["algorithm_version"] == "targeting:1,fusion:1"  # bumped in 1b-i
     assert entry["usd_e6_reserved"] == 36_750
     assert entry["usd_e6_spent"] == 35_000 and entry["usd_e2_spent"] == 4
     assert audd.calls == 7
@@ -384,7 +385,7 @@ def test_run_status_precedence_follows_the_matrix() -> None:
 
 
 # --------------------------------------------------------------------------------------------------
-# The provisional targeting:0 scheduler
+# The secondary scheduler (targeting:1 since 1b-i; the class ranking is unchanged from 0a-iv)
 # --------------------------------------------------------------------------------------------------
 def _window(start_ms: int, *, generation: int = 0, transform: Transform | None = None):
     base = WindowRecord.model_validate(
@@ -441,7 +442,7 @@ def test_secondary_capacity_is_ceil_of_minutes_times_clips_per_minute() -> None:
     assert secondary_capacity(0, 2) == 0 and secondary_capacity(60_000, 0) == 0
 
 
-def test_targeting_zero_ranks_classes_then_start_and_fills_capacity_without_duplicates() -> None:
+def test_candidates_rank_by_class_and_the_allocation_never_repeats_a_window() -> None:
     hint_id = "c" * 40
     episodes = _episodes_file(
         _episode((0, 15_000), badge="possible"),  # listed, not confident
@@ -471,27 +472,33 @@ def test_targeting_zero_ranks_classes_then_start_and_fills_capacity_without_dupl
     windows = [_window(start) for start in (0, 9_000, 18_000, 27_000, 36_000, 45_000, 48_000)]
     # Eligibility is >= 4 s of overlap: the hint-only span reaches windows 36, 45 and 48 (exactly
     # 4 s for 48-60); the listed span reaches 0 and 9 (18-30 overlaps only 0 s); the suppressed
-    # span reaches 18 and 27; the blanks reach 27, 36, 45 and 48 again, all already queued.
-    queued = schedule_secondary_windows(
-        windows, candidates, capacity=100, min_intersection_ms=4_000
+    # span reaches 18 and 27; the blanks reach 27, 36, 45 and 48 again.  targeting:1 (1b-i) gives
+    # every candidate its best window first, in class order, then shares the rest out; a window
+    # is queued at most once whatever the allocation.
+    picks = allocate_secondary_windows(
+        windows, candidates, allocation=100, min_intersection_ms=4_000
     )
-    assert [item.support_ms[0] for item in queued] == [
-        36_000,
-        45_000,
-        48_000,
-        0,
-        9_000,
-        18_000,
-        27_000,
-    ]
-    capped = schedule_secondary_windows(windows, candidates, capacity=4, min_intersection_ms=4_000)
-    assert [item.support_ms[0] for item in capped] == [36_000, 45_000, 48_000, 0]
+    starts = [item.window.support_ms[0] for item in picks]
+    assert sorted(starts) == [0, 9_000, 18_000, 27_000, 36_000, 45_000, 48_000]
+    # Every pick still clears the >= 4 s bar for the span that chose it — the eligibility rule
+    # the targeting:0 queue order used to carry implicitly.
+    for item in picks:
+        span = item.candidate.span
+        window = item.window.support_ms
+        assert min(window[1], span[1]) - max(window[0], span[0]) >= 4_000, (span, window)
+    assert starts[:5] == [36_000, 0, 18_000, 27_000, 48_000]
+    assert [item.round for item in picks[:5]] == ["first"] * 5
+    capped = allocate_secondary_windows(
+        windows, candidates, allocation=4, min_intersection_ms=4_000
+    )
+    assert [item.window.support_ms[0] for item in capped] == [36_000, 0, 18_000, 27_000]
     assert (
-        schedule_secondary_windows(windows, candidates, capacity=0, min_intersection_ms=4_000) == ()
+        allocate_secondary_windows(windows, candidates, allocation=0, min_intersection_ms=4_000)
+        == ()
     )
 
 
-def test_targeting_zero_never_queues_rescan_or_transformed_windows() -> None:
+def test_secondary_never_queues_rescan_or_transformed_windows() -> None:
     episodes = _episodes_file(_episode((0, 15_000)))
     candidates = select_secondary_candidates(
         episodes, duration_ms=60_000, suppressed_min_votes=2, min_intersection_ms=4_000
@@ -499,10 +506,10 @@ def test_targeting_zero_never_queues_rescan_or_transformed_windows() -> None:
     frozen = _window(0)
     rescan = _window(0, generation=1)
     transformed = _window(0, transform=Transform(type="resample", rate_e4=9_600, semitones=0))
-    queued = schedule_secondary_windows(
-        [transformed, rescan, frozen], candidates, capacity=10, min_intersection_ms=4_000
+    picks = allocate_secondary_windows(
+        [transformed, rescan, frozen], candidates, allocation=10, min_intersection_ms=4_000
     )
-    assert queued == (frozen,)
+    assert [item.window for item in picks] == [frozen]
 
 
 def test_blank_spans_cover_the_unresolved_tail_after_a_stopped_primary() -> None:

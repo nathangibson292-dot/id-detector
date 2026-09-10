@@ -1,0 +1,57 @@
+{
+  "note": "A=5 over spans of 60, 30 and 30 s: (i) one each (longest first); (ii) shares 2x60/120=1 and 2x30/120=0.5 twice -> floors 1,0,0, the leftover to the tied remainders by earlier start.",
+  "duration_ms": 180000,
+  "clips_per_minute": 2,
+  "reserve_fraction": 0.25,
+  "min_intersection_ms": 4000,
+  "windows": {
+    "hop_ms": 9000,
+    "window_ms": 12000
+  },
+  "energy": {},
+  "candidates": [
+    {
+      "priority": "listed_not_confident",
+      "span": [
+        0,
+        30000
+      ],
+      "episode_id": "1111111111111111111111111111111111111111"
+    },
+    {
+      "priority": "listed_not_confident",
+      "span": [
+        60000,
+        90000
+      ],
+      "episode_id": "2222222222222222222222222222222222222222"
+    },
+    {
+      "priority": "listed_not_confident",
+      "span": [
+        120000,
+        180000
+      ],
+      "episode_id": "3333333333333333333333333333333333333333"
+    }
+  ],
+  "expect": {
+    "capacity": 6,
+    "reserve": 1,
+    "allocation": 5,
+    "starts": [
+      126000,
+      0,
+      63000,
+      135000,
+      9000
+    ],
+    "rounds": [
+      "first",
+      "first",
+      "first",
+      "proportional",
+      "proportional"
+    ]
+  }
+}

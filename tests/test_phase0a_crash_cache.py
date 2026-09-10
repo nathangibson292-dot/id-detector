@@ -150,8 +150,8 @@ def test_paid_no_match_is_resolved_cached_and_gap_counts_accumulate(tmp_path: Pa
     assert len(cached) == 7
     assert all(item == {"status": "success", "result": None} for item in cached)
     assert entry["counts"]["paid_resolved"] == 7  # type: ignore[index]
-    # Seven AudD no-matches leave the whole mix blank, so the targeting:0 secondary sends the
-    # capacity of C = ceil(1 min x 2) = 2 Shazam clips to it (plan §2.3.4 step 4).
+    # Seven AudD no-matches leave the whole mix blank, so the secondary sends its whole
+    # capacity of C = ceil(1 min x 2) = 2 Shazam clips to it (plan §2.3.4 step 4; R = 0 here).
     assert entry["counts"]["requests"] == shazam.requests == 2  # type: ignore[index]
     assert entry["counts"]["physical_attempts"] == 2  # type: ignore[index]
     assert entry["counts"]["secondary_allocated"] == 2  # type: ignore[index]
