@@ -1,6 +1,6 @@
 # release-1 — the owner-verified real-mix corpus (launch gate L3)
 
-*Started 2026-09-10. Status: **drafts** — seeded from the owner's tracklists; not yet verified or frozen.*
+*Started 2026-09-10. Status: **all 7 drafts seeded**; not yet verified or frozen. First working numbers (Free recipe): [docs/accuracy/release-1-free-draft.md](../../docs/accuracy/release-1-free-draft.md).*
 
 Each set folder holds a `ground_truth.json` created by `idea truth seed` from the matching file in
 `tracklists/`. The committed-corpus policy applies: no URLs, no platform handles or numeric IDs in this
@@ -13,9 +13,9 @@ runs are matched to truth by `media_key`, not by URL.
 | `release1-redo-of-best-set` | test | 18 | owner's rekordbox playlist, order only | 49 min |
 | `release1-final-new-set-christmas` | test | 23 | owner's rekordbox playlist, order only | 46 min |
 | `release1-new-mix-jan-24th` | **dev-1** | 30 | owner's rekordbox playlist, order only | 55 min; **tuned on** (the 30 s on-air floor) — report separately, never in the clean number |
-| `release1-mall-grab-boiler-room-melbourne-22` | test | 25 | public tracklist with minute-level timestamps; many unreleased ("UR") and three unnamed "ID"s | second DJ; the underground stress case; seeded once its scan finishes |
-| `release1-mph-youtube-set` | test | 54 + 9 overlays | public YouTube comment tracklist with timestamps; "w/" overlays kept as overlapping entries | third DJ, **second platform (YouTube)**; live recording with crowd noise; seeded once its scan finishes |
-| `release1-dj-heartstring-youtube-set` | test | 23 | public YouTube comment tracklist with timestamps; 4 unknown IDs | fourth DJ, YouTube; seeded once its scan finishes |
+| `release1-mall-grab-boiler-room-melbourne-22` | test | 25 | public tracklist with minute-level timestamps; many unreleased ("UR") and three unnamed "ID"s | second DJ; the underground stress case; **seeded** (timed); tracklist clock ≈ +48 s vs the video |
+| `release1-mph-youtube-set` | test | 54 + 9 overlays | public YouTube comment tracklist with timestamps; "w/" overlays kept as overlapping entries | third DJ, **second platform (YouTube)**; live recording with crowd noise; **seeded** (54 + 9 overlays via `--overlays`) |
+| `release1-dj-heartstring-youtube-set` | test | 23 | public YouTube comment tracklist with timestamps; 4 unknown IDs | fourth DJ, YouTube; **seeded** (timed); tracklist clock ≈ +51 s vs the video |
 
 ## What "order only" means for scoring
 

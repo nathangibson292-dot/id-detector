@@ -1,0 +1,51 @@
+# release-1 — Free recipe, DRAFT truth (working numbers, not a release claim)
+
+*Scored 2026-09-10 with `scripts/score_corpus.py` (commit a1ee619) over the seven `data/corpus/release-1`
+drafts and the cached Free-scan runs. `truth_status: draft` — the owner has not yet verified the
+tracklists, so nothing here clears launch gate L3; it is the tool's honest working baseline.*
+
+## Pooled
+
+The free recipe was scored over 7 mix(es) (release1-boomtown-mix, release1-redo-of-best-set, release1-new-mix-jan-24th, release1-final-new-set-christmas, release1-mall-grab-boiler-room-melbourne-22, release1-mph-youtube-set, release1-dj-heartstring-youtube-set) against DRAFT truth (seeded tracklists with placeholder timings, not yet verified), so these are working numbers, not release numbers. Matching is WORK-ONLY (time-agnostic) because 4 of the 7 truth file(s) are order-only (a tracklist still carrying the seed's placeholder equal-slice timings): each listed track is matched to the tracklist by normalised artist and title alone (mix suffixes, case, word order and featured artists ignored), never by when it played. Of the 609 tracks the tool found, the presentation floor hid 118 as buried, 32 as contradicted, 29 as scatter, 231 as short, leaving 199 listed; it named 139 of the 218 distinct tracks actually played (work recall 63.8%); 139 of the 186 distinct tracks it listed were really played (work precision 74.7%); and 61 of the 68 it marked 'likely' or better were right (likely precision 89.7%). L3 asks for likely >= 90.0%, listed >= 80.0% and recall >= 70.0% for free; listed precision and every timing number need timed truth (reported as null), so the L3 bar cannot be judged from a work-only score, and the two numbers it can see are indicative only (a work-only match is looser than a timed one): likely precision 89.7% < 90.0%; work recall 63.8% < 70.0%. Full numbers: (local scoring output).
+
+## Per mix
+
+| Set | Matching | Recall | Precision | "Likely" precision | Median offset (engine − tracklist) |
+|---|---|---|---|---|---|
+| `release1-boomtown-mix` | work | 87.5 % | 87.5 % | 93.8 % | — |
+| `release1-redo-of-best-set` | work | 83.3 % | 62.5 % | 100.0 % | — |
+| `release1-new-mix-jan-24th` | work | 80.0 % | 80.0 % | 100.0 % | — |
+| `release1-final-new-set-christmas` | work | 82.6 % | 86.4 % | 100.0 % | — |
+| `release1-mall-grab-boiler-room-melbourne-22` | time | 28.0 % | 41.2 % | 42.9 % | +48 s |
+| `release1-mph-youtube-set` | time | 46.8 % | 76.3 % | 81.8 % | +13 s |
+| `release1-dj-heartstring-youtube-set` | time | 47.6 % | 66.7 % | 100.0 % | +51 s |
+
+Recall/precision are identity-based for order-only sets and time-based for timed sets (with identity
+parity). The offset column is a diagnostic only: a consistent ±50 s means the public tracklist's clock
+differs from the video's — to be corrected once during verification, not by the scorer.
+
+## Per-mix detail (missed = in the tracklist, not listed; wrong = listed, not in the tracklist)
+
+- release1-boomtown-mix [order-only; matched by work]: work-only: recall 35/40 (87.5%), precision 35/40 (87.5%), likely 15/16 (93.8%). Missed: Effy - Pitched; Cotto - Murda Sound (Original Mix); NOTION, Cameron Hayes - SECRETS (Original Mix); Cesco - Move Too Slow; Chase & Status - 5am. Wrong: Darude - Sandstorm [likely]; Fragma - Toca Me (Clubmix) [possible]; NCKNAME - Tryna Dance [possible]; Zombie Nation - Kernkraft 400 [possible]; 2 Bad Mice - Bombscare [possible].
+- release1-redo-of-best-set [order-only; matched by work]: work-only: recall 15/18 (83.3%), precision 15/24 (62.5%), likely 10/10 (100.0%). Missed: Bklava, bullet tooth - Makes Me (Wanna Move); DJ SCHEMA - SELF CONTROL (Extended); Riko Dan, Y U QT - Original Don (Extended). Wrong: Mass Medium - Gotta Have It (Extended Mix) [possible]; CHRYSTAL & NOTION - The Days (NOTION Remix) [possible]; Tiësto - Adagio for Strings [possible]; Ayla - Ayla (DJ Taucher Remix) [possible]; Jupiter 8000 - Inside [possible]; Mears - Be My Lover [possible]; Torres De Lara - De Barrio [possible]; Effy & Mall Grab - iluv [possible]; Rollercoaster NL - Come With Me (Raw Bounce Mix) [possible].
+- release1-new-mix-jan-24th [order-only; matched by work]: work-only: recall 24/30 (80.0%), precision 24/30 (80.0%), likely 10/10 (100.0%). Missed: Beau James - 4 Raws Edit; Bushbaby - Pumpin Jumpin (Extended Mix); Soul Mass Transit System - Feelin U (Original Mix); Tim Reaper, Special Request, OD - Pull Up (Extended Mix); Beau James - 18Hunna; Faster Horses - Get On Ya Knees. Wrong: Architechs - Body Groove (feat. Nana) [Mix Mc Version] [possible]; Tiësto - Adagio for Strings [possible]; Special Request, ODF & Tim Reaper - Pull Up (Extended Mix) [possible]; Headie One - 18HUNNA (feat. Dave) [possible]; Heparyna - WISH YOU WERE MINE REMIX [possible]; 4raws - beau james [possible].
+- release1-final-new-set-christmas [order-only; matched by work]: work-only: recall 19/23 (82.6%), precision 19/22 (86.4%), likely 11/11 (100.0%). Missed: Upper90 - I Am Ready 2; Testpress - FORZ4; Ollie Lishman - THA WAY; Bushbaby - DESIRE96. Wrong: t e s t p r e s s - Forz4 [possible]; Eatmyflesh - Gorejust Summer Mix [possible]; I'm ready - Upper90 [possible].
+- release1-mall-grab-boiler-room-melbourne-22 [timed; matched by time]: by time: likely 3/7 (42.9%), listed 7/19 (36.8%), recall 7/25 (28.0%); work-only: recall 7/24 (29.2%), precision 7/17 (41.2%), likely 3/7 (42.9%); median offset (tool start minus tracklist start) +48.0 s over 8 work-matched pairs. Missed: - Mall Grab - Winter (UR); - Mall Grab - Mirror Break (4/4 Mix) (UR); - Mall Grab - Inside (UR); - Mall Grab - Marathon (UR); - Mall Grab & Flansie - Love Yourself; - Mall Grab - Bear Witness (UR); - Surusinghe - ID (UR); - Effy - Get Down (UR); - Mall Grab & C.R.T.B. - Juice (MG Remix) (UR); - KETTAMA - Feel Emotion (UR); - Mall Grab - Escape From Belanglo (UR); - Mall Grab - BB MG (Soundcloud); - Sambaboys - ID (UR); - C.R.T.B. - Nothing Moves You; - Mall Grab - Madman (UR); - Mall Grab - 1ofthozedaze (Edit) (Soundcloud); - Mall Grab - Metaphysical. Wrong: @[handle] Jordon Alexander - Winter [possible]; Rank 1 - Airwave (Radio Vocal Edit) [likely]; System F - Out of the Blue [likely]; Darude - Sandstorm [likely]; System F - Out of the Blue 2010 (Original Violin Edit) [likely]; Flansie & Mall Grab - No One Else Will [possible]; Brandon Allan - HevE Tac (Brandon Allan Remix) [possible]; Long Season Intro Edit - Mall Grab [possible]; Be your best when your best is needed - clarkie [possible]; MG - Long Season Intro Edit [possible].
+- release1-mph-youtube-set [timed; matched by time]: by time: likely 9/11 (81.8%), listed 29/38 (76.3%), recall 29/62 (46.8%); work-only: recall 29/62 (46.8%), precision 29/38 (76.3%), likely 9/11 (81.8%); median offset (tool start minus tracklist start) +13.0 s over 28 work-matched pairs. Missed: Boy Better Know - Too Many Man (NOTION Edit); 33 Below & MPH & NOTION - Run Da Riddim; MPH & Capo Lee - Smoothies; MPH & Zero - Gold Coast (UR); TNGHT - Higher Ground (Higgo Edit); Redlight ft. Sweetie Irie - Zum Zum; Royal-T - Tokyo Dub; Soul Mass Transit System - Bomb; MPH - Raw; MPH - ID; NOTION - Bring In The Katz Dub; MPH - Brainwashing; Wost - Calentura Vaginal (Hard Drum Edit); MPH & Gentlemens Club - Kill Bill; Oppidan - Move Your Feet (VIP); 33 Below & MPH & NOTION - Light It Up; Groove Armada - Superstylin' (DJ Q Bootleg); Champion & MPH - Badderman Refix; Adam F - Circles (Oppidan Bootleg); Simula - Daddy Issues; MPH - Doubt; Sammy Virji - ID; MPH - Spend The Night; Chase & Status - Headtop (ft. IRAH) (Original Dub Mix); The Chemical Brothers - Swoon (MPH Edit); Uffie ft. Pharrell Williams - Add Suv (Armand van Helden Club Mix); 33 Below & MPH & NOTION - ID; MPH - Overrated (VIP); MJ Cole & MPH - Hold On; Flava D & P Money - Dutty; The Bug ft. Flowdan - Jah War; MPH - My Mind (time approx.); MPH - Home T Dub (time approx.). Wrong: Mark Krupp - Too Many Man [possible]; 17. [] MPH - LA NYC [possible]; Me & My Toothbrush - Everybody [possible]; Energy Reflect & Paul Miller - Ascend (Extended Mix) [possible]; Simula - Descent [possible]; Darude - Sandstorm [likely]; 53. MPH - My Mind [likely]; Riky López - Canary Sound [possible]; Armand Van Helden - You Don't Know Me (feat. Duane Harden) [possible].
+- release1-dj-heartstring-youtube-set [timed; matched by time]: by time: likely 3/3 (100.0%), listed 10/24 (41.7%), recall 10/21 (47.6%); work-only: recall 10/21 (47.6%), precision 10/15 (66.7%), likely 3/3 (100.0%); median offset (tool start minus tracklist start) +51.0 s over 13 work-matched pairs. Missed: Unknown - ?; DJ Seinfeld - Rythm of the Night (x Biicla - SWAG); Kettama, DJ Heartstring - If U Want My Heart; Shugz - The Drums (UR); Empire of the Sun - Alive (DJ Heartstring Remix); DJ Heartstring - ID (UR); DJ Seinfeld - Plush; DJ Heartstring - Another Year Alone (UR); DJ Heartstring - Staring into the Sun; The Groovaholics - Wake Up The Funk (Ragel Mood Remix); DJ Heartstring, DMA'S, Saidah - A Thousand Lies. Wrong: Corona - Rhythm of the Night (Lee Marrow Space Mix) [possible]; Rank 1 - Airwave (Radio Vocal Edit) [possible]; Torres De Lara - De Barrio [possible]; DJ HEARTSTRING - Another Year Alone (i love you) [possible]; DJ Hazel & svdst - Dropsik [possible].
+
+## How to read this
+
+- **"Likely" rows are the trustworthy ones** — that badge is right about 9 times in 10 pooled, and 100 % on
+  three of the owner's four sets. The remaining "likely" errors are the famous-track phantoms (Sandstorm,
+  Airwave, Adagio) that Deep scan's cross-check is designed to remove.
+- **Underground sets cap recall for every engine:** Mall Grab's set has 18 unreleased tracks; the tool found
+  essentially every released one and the comments gave it one unreleased one. That is the ceiling, and the
+  honest product claim.
+- **Live recordings with crowd noise** (MPH) still reach about half of the tracks by time once overlays and
+  featuring-credit variants are matched properly.
+- Several "wrong" rows are the original where the DJ played an edit (e.g. Headie One – 18HUNNA vs the
+  Beau James edit) — the work-vs-version distinction the tool exists to make; verification should mark
+  those as version mismatches, not misses.
+- Handles in crowd labels of OLD cached runs are scrubbed here as `@[handle]`; new analyses no longer
+  produce them.
