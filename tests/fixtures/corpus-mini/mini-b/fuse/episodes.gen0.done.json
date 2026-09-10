@@ -1,0 +1,7 @@
+{
+  "schema_version": "1.0.0",
+  "sha256": "84a50b722e6448d9762c467d594ae56a79f062fd43e1f49b0f0f545a0295ae89",
+  "upstream": {
+    "fuse/identities.gen0.json": "308f749b3c56254934a77a9aa2987968e177c378381815b8aecb57268d4ce2d2"
+  }
+}

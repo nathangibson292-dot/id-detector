@@ -1,0 +1,38 @@
+{
+  "assertions": [],
+  "candidates": [
+    {
+      "alternatives": [],
+      "canonical_id": "b8088ebbea73fdfdbc4d586cef749a43a57c59ed",
+      "conflicts": [],
+      "contested": false,
+      "generated_by": "id-detector/0.1.0",
+      "member_nodes": [
+        "shazam:mini-stale"
+      ],
+      "schema_version": "1.0.0",
+      "work_id": "cec8f7fae72fb89321268f428ed70b0da7cfbe03"
+    }
+  ],
+  "generated_by": "id-detector/0.1.0",
+  "nodes": [
+    {
+      "generated_by": "id-detector/0.1.0",
+      "id": "shazam:mini-stale",
+      "label": "Stale Artist - Stale Title",
+      "ns": "shazam",
+      "schema_version": "1.0.0"
+    }
+  ],
+  "schema_version": "1.0.0",
+  "works": [
+    {
+      "generated_by": "id-detector/0.1.0",
+      "member_nodes": [
+        "shazam:mini-stale"
+      ],
+      "schema_version": "1.0.0",
+      "work_id": "cec8f7fae72fb89321268f428ed70b0da7cfbe03"
+    }
+  ]
+}

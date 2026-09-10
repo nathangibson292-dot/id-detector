@@ -1,0 +1,130 @@
+{
+  "corpus_version": "corpus-mini",
+  "episodes": [
+    {
+      "annotator_ref": null,
+      "audible_rule": "manual annotation required",
+      "disagreement_resolution": null,
+      "draft": true,
+      "end_ms_range": [
+        100000,
+        100000
+      ],
+      "in_reference_pool": false,
+      "note": null,
+      "occurrence_index": 0,
+      "overlaps_with": [],
+      "role_segments": [
+        {
+          "from_ms": 0,
+          "role": "uncertain",
+          "to_ms": 100000
+        }
+      ],
+      "second_pass_ref": null,
+      "start_ms_range": [
+        0,
+        0
+      ],
+      "verified_against": null,
+      "version": {
+        "ids": {},
+        "qualifier": null
+      },
+      "version_verified": false,
+      "work": {
+        "artist": "Mini Artist",
+        "title": "Theta"
+      }
+    },
+    {
+      "annotator_ref": null,
+      "audible_rule": "manual annotation required",
+      "disagreement_resolution": null,
+      "draft": true,
+      "end_ms_range": [
+        200000,
+        200000
+      ],
+      "in_reference_pool": false,
+      "note": null,
+      "occurrence_index": 0,
+      "overlaps_with": [],
+      "role_segments": [
+        {
+          "from_ms": 100000,
+          "role": "uncertain",
+          "to_ms": 200000
+        }
+      ],
+      "second_pass_ref": null,
+      "start_ms_range": [
+        100000,
+        100000
+      ],
+      "verified_against": null,
+      "version": {
+        "ids": {},
+        "qualifier": null
+      },
+      "version_verified": false,
+      "work": {
+        "artist": "Mini Artist",
+        "title": "Iota"
+      }
+    },
+    {
+      "annotator_ref": null,
+      "audible_rule": "manual annotation required",
+      "disagreement_resolution": null,
+      "draft": true,
+      "end_ms_range": [
+        300000,
+        300000
+      ],
+      "in_reference_pool": false,
+      "note": null,
+      "occurrence_index": 0,
+      "overlaps_with": [],
+      "role_segments": [
+        {
+          "from_ms": 200000,
+          "role": "uncertain",
+          "to_ms": 300000
+        }
+      ],
+      "second_pass_ref": null,
+      "start_ms_range": [
+        200000,
+        200000
+      ],
+      "verified_against": null,
+      "version": {
+        "ids": {},
+        "qualifier": null
+      },
+      "version_verified": false,
+      "work": {
+        "artist": "Mini Artist",
+        "title": "Mu"
+      }
+    }
+  ],
+  "events": [],
+  "generated_by": "id-detector/0.1.0",
+  "regions": [],
+  "schema_version": "1.0.0",
+  "selection_basis": "hand-built plan 1b-iii scorer fixture; draft truth by design",
+  "set_id": "mini-b",
+  "source": {
+    "date": null,
+    "duration_ms": 300000,
+    "event_ref": null,
+    "media_key": "c0a63ccabc42a7fd6d7155527ab9fbb45165e4aba2e75c095b5b43c82bf16ac4",
+    "platform": "file",
+    "uploader_ref": "uploader-mini-b",
+    "url_ref": "source-mini-b"
+  },
+  "split": "test",
+  "stratum": "catalogue-covered"
+}

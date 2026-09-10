@@ -1,0 +1,130 @@
+{
+  "corpus_version": "corpus-mini",
+  "episodes": [
+    {
+      "annotator_ref": null,
+      "audible_rule": "manual annotation required",
+      "disagreement_resolution": null,
+      "draft": true,
+      "end_ms_range": [
+        200000,
+        200000
+      ],
+      "in_reference_pool": false,
+      "note": null,
+      "occurrence_index": 0,
+      "overlaps_with": [],
+      "role_segments": [
+        {
+          "from_ms": 0,
+          "role": "uncertain",
+          "to_ms": 200000
+        }
+      ],
+      "second_pass_ref": null,
+      "start_ms_range": [
+        0,
+        0
+      ],
+      "verified_against": null,
+      "version": {
+        "ids": {},
+        "qualifier": null
+      },
+      "version_verified": false,
+      "work": {
+        "artist": "Mini Artist",
+        "title": "Alpha"
+      }
+    },
+    {
+      "annotator_ref": null,
+      "audible_rule": "manual annotation required",
+      "disagreement_resolution": null,
+      "draft": true,
+      "end_ms_range": [
+        400000,
+        400000
+      ],
+      "in_reference_pool": false,
+      "note": null,
+      "occurrence_index": 0,
+      "overlaps_with": [],
+      "role_segments": [
+        {
+          "from_ms": 200000,
+          "role": "uncertain",
+          "to_ms": 400000
+        }
+      ],
+      "second_pass_ref": null,
+      "start_ms_range": [
+        200000,
+        200000
+      ],
+      "verified_against": null,
+      "version": {
+        "ids": {},
+        "qualifier": null
+      },
+      "version_verified": false,
+      "work": {
+        "artist": "Mini Artist",
+        "title": "Beta"
+      }
+    },
+    {
+      "annotator_ref": null,
+      "audible_rule": "manual annotation required",
+      "disagreement_resolution": null,
+      "draft": true,
+      "end_ms_range": [
+        600000,
+        600000
+      ],
+      "in_reference_pool": false,
+      "note": null,
+      "occurrence_index": 0,
+      "overlaps_with": [],
+      "role_segments": [
+        {
+          "from_ms": 400000,
+          "role": "uncertain",
+          "to_ms": 600000
+        }
+      ],
+      "second_pass_ref": null,
+      "start_ms_range": [
+        400000,
+        400000
+      ],
+      "verified_against": null,
+      "version": {
+        "ids": {},
+        "qualifier": null
+      },
+      "version_verified": false,
+      "work": {
+        "artist": "Mini Artist",
+        "title": "Gamma"
+      }
+    }
+  ],
+  "events": [],
+  "generated_by": "id-detector/0.1.0",
+  "regions": [],
+  "schema_version": "1.0.0",
+  "selection_basis": "hand-built plan 1b-iii scorer fixture; draft truth by design",
+  "set_id": "mini-a",
+  "source": {
+    "date": null,
+    "duration_ms": 600000,
+    "event_ref": null,
+    "media_key": "b044c18d470004dd8b1b7ab7004928efe25ff61f4e62776e7ace636e2d0ca349",
+    "platform": "file",
+    "uploader_ref": "uploader-mini-a",
+    "url_ref": "source-mini-a"
+  },
+  "split": "test",
+  "stratum": "catalogue-covered"
+}

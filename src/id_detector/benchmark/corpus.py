@@ -19,6 +19,7 @@ from id_detector.benchmark.scorer import (
 from id_detector.contracts import (
     BenchmarkCost,
     BenchmarkReportRecord,
+    EpisodesFile,
     GroundTruthRecord,
     IdentitiesRecord,
 )
@@ -129,8 +130,6 @@ def _load_fusion(media_dir: Path) -> tuple[IdentitiesRecord, Any]:
     identities = IdentitiesRecord.model_validate_json(
         read_text(media_dir / "fuse" / "identities.gen0.json")
     )
-    from id_detector.contracts import EpisodesFile
-
     episodes = EpisodesFile.model_validate_json(read_text(media_dir / "fuse" / "episodes.json"))
     return identities, episodes
 
@@ -154,6 +153,18 @@ def _prediction_set(set_id: str, fusion: FusionResult | None, media_dir: Path) -
         identities, episodes = _load_fusion(media_dir)
     else:
         identities, episodes = fusion.identities.record, fusion.episodes
+    return prediction_set_from_fusion(set_id, identities, episodes)
+
+
+def prediction_set_from_fusion(
+    set_id: str, identities: IdentitiesRecord, episodes: EpisodesFile
+) -> dict[str, Any]:
+    """The scorer's ``PredictionSet`` (as a plain dict) for one run's fuse artefacts.
+
+    The one place a fused episode becomes an identity-labelled prediction;
+    ``scripts/score_corpus.py`` feeds it the episodes left after the presentation floor.
+    """
+
     candidates = {item.canonical_id: item for item in identities.candidates}
     scored = []
     for episode in episodes.episodes:

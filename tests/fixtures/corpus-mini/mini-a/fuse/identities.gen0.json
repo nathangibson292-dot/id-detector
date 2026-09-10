@@ -1,0 +1,256 @@
+{
+  "assertions": [],
+  "candidates": [
+    {
+      "alternatives": [],
+      "canonical_id": "14b13c98f54d40fe5c6be7b0f422639abbf5d6b1",
+      "conflicts": [],
+      "contested": false,
+      "generated_by": "id-detector/0.1.0",
+      "member_nodes": [
+        "shazam:mini-eta"
+      ],
+      "schema_version": "1.0.0",
+      "work_id": "f3306915dabb5ef089b638594e7f0dbb3daa3d45"
+    },
+    {
+      "alternatives": [],
+      "canonical_id": "40d1e83cb04797355fe2252e0b126d485f5c7226",
+      "conflicts": [],
+      "contested": false,
+      "generated_by": "id-detector/0.1.0",
+      "member_nodes": [
+        "shazam:mini-zeta"
+      ],
+      "schema_version": "1.0.0",
+      "work_id": "9975df53317571aa9ebc00cb21445ce6beed0ab7"
+    },
+    {
+      "alternatives": [],
+      "canonical_id": "893219071a225287ecc560091b7c377ab1c6c7b1",
+      "conflicts": [],
+      "contested": false,
+      "generated_by": "id-detector/0.1.0",
+      "member_nodes": [
+        "shazam:mini-alpha"
+      ],
+      "schema_version": "1.0.0",
+      "work_id": "16c4519b57cf9faa6ca86c3462e0ed38c5793cbe"
+    },
+    {
+      "alternatives": [],
+      "canonical_id": "ae1eda174dafb16b3405c864cd1f7ef803c0cc05",
+      "conflicts": [],
+      "contested": false,
+      "generated_by": "id-detector/0.1.0",
+      "member_nodes": [
+        "shazam:mini-gamma"
+      ],
+      "schema_version": "1.0.0",
+      "work_id": "0dcb837839cfed288014278855b883d35e1f4341"
+    },
+    {
+      "alternatives": [],
+      "canonical_id": "cbf3e3e8a308323696ec17b608508eb05ed44781",
+      "conflicts": [],
+      "contested": false,
+      "generated_by": "id-detector/0.1.0",
+      "member_nodes": [
+        "shazam:mini-delta"
+      ],
+      "schema_version": "1.0.0",
+      "work_id": "87454c304634ea2f98ce6cc92b83d25b0b5abd58"
+    },
+    {
+      "alternatives": [],
+      "canonical_id": "cd2fc55fbd86e4e3955ea7d77c6c1e94e1f5b746",
+      "conflicts": [],
+      "contested": false,
+      "generated_by": "id-detector/0.1.0",
+      "member_nodes": [
+        "shazam:mini-beta"
+      ],
+      "schema_version": "1.0.0",
+      "work_id": "a8243747ca3f779a308f229624bd86bd54e028f9"
+    },
+    {
+      "alternatives": [],
+      "canonical_id": "f5d8884966c4d511a0f7b3e0148e16fdd2641326",
+      "conflicts": [],
+      "contested": false,
+      "generated_by": "id-detector/0.1.0",
+      "member_nodes": [
+        "shazam:mini-epsilon"
+      ],
+      "schema_version": "1.0.0",
+      "work_id": "b3e14eeef555da9b265a38e75ae815c7da8a203a"
+    }
+  ],
+  "generated_by": "id-detector/0.1.0",
+  "nodes": [
+    {
+      "generated_by": "id-detector/0.1.0",
+      "id": "shazam:mini-alpha",
+      "label": "Mini Artist - Alpha",
+      "ns": "shazam",
+      "schema_version": "1.0.0"
+    },
+    {
+      "generated_by": "id-detector/0.1.0",
+      "id": "shazam:mini-beta",
+      "label": "Mini Artist - Beta",
+      "ns": "shazam",
+      "schema_version": "1.0.0"
+    },
+    {
+      "generated_by": "id-detector/0.1.0",
+      "id": "shazam:mini-delta",
+      "label": "Mini Artist - Delta",
+      "ns": "shazam",
+      "schema_version": "1.0.0"
+    },
+    {
+      "generated_by": "id-detector/0.1.0",
+      "id": "shazam:mini-epsilon",
+      "label": "Mini Artist - Epsilon",
+      "ns": "shazam",
+      "schema_version": "1.0.0"
+    },
+    {
+      "generated_by": "id-detector/0.1.0",
+      "id": "shazam:mini-eta",
+      "label": "Mini Artist - Eta",
+      "ns": "shazam",
+      "schema_version": "1.0.0"
+    },
+    {
+      "generated_by": "id-detector/0.1.0",
+      "id": "shazam:mini-gamma",
+      "label": "Mini Artist - Gamma",
+      "ns": "shazam",
+      "schema_version": "1.0.0"
+    },
+    {
+      "generated_by": "id-detector/0.1.0",
+      "id": "shazam:mini-zeta",
+      "label": "Mini Artist - Zeta",
+      "ns": "shazam",
+      "schema_version": "1.0.0"
+    },
+    {
+      "generated_by": "id-detector/0.1.0",
+      "id": "text:mini artist|alpha",
+      "label": "Mini Artist - Alpha",
+      "ns": "text",
+      "schema_version": "1.0.0"
+    },
+    {
+      "generated_by": "id-detector/0.1.0",
+      "id": "text:mini artist|beta",
+      "label": "Mini Artist - Beta",
+      "ns": "text",
+      "schema_version": "1.0.0"
+    },
+    {
+      "generated_by": "id-detector/0.1.0",
+      "id": "text:mini artist|delta",
+      "label": "Mini Artist - Delta",
+      "ns": "text",
+      "schema_version": "1.0.0"
+    },
+    {
+      "generated_by": "id-detector/0.1.0",
+      "id": "text:mini artist|epsilon",
+      "label": "Mini Artist - Epsilon",
+      "ns": "text",
+      "schema_version": "1.0.0"
+    },
+    {
+      "generated_by": "id-detector/0.1.0",
+      "id": "text:mini artist|eta",
+      "label": "Mini Artist - Eta",
+      "ns": "text",
+      "schema_version": "1.0.0"
+    },
+    {
+      "generated_by": "id-detector/0.1.0",
+      "id": "text:mini artist|gamma",
+      "label": "Mini Artist - Gamma",
+      "ns": "text",
+      "schema_version": "1.0.0"
+    },
+    {
+      "generated_by": "id-detector/0.1.0",
+      "id": "text:mini artist|zeta",
+      "label": "Mini Artist - Zeta",
+      "ns": "text",
+      "schema_version": "1.0.0"
+    }
+  ],
+  "schema_version": "1.0.0",
+  "works": [
+    {
+      "generated_by": "id-detector/0.1.0",
+      "member_nodes": [
+        "shazam:mini-gamma",
+        "text:mini artist|gamma"
+      ],
+      "schema_version": "1.0.0",
+      "work_id": "0dcb837839cfed288014278855b883d35e1f4341"
+    },
+    {
+      "generated_by": "id-detector/0.1.0",
+      "member_nodes": [
+        "shazam:mini-alpha",
+        "text:mini artist|alpha"
+      ],
+      "schema_version": "1.0.0",
+      "work_id": "16c4519b57cf9faa6ca86c3462e0ed38c5793cbe"
+    },
+    {
+      "generated_by": "id-detector/0.1.0",
+      "member_nodes": [
+        "shazam:mini-delta",
+        "text:mini artist|delta"
+      ],
+      "schema_version": "1.0.0",
+      "work_id": "87454c304634ea2f98ce6cc92b83d25b0b5abd58"
+    },
+    {
+      "generated_by": "id-detector/0.1.0",
+      "member_nodes": [
+        "shazam:mini-zeta",
+        "text:mini artist|zeta"
+      ],
+      "schema_version": "1.0.0",
+      "work_id": "9975df53317571aa9ebc00cb21445ce6beed0ab7"
+    },
+    {
+      "generated_by": "id-detector/0.1.0",
+      "member_nodes": [
+        "shazam:mini-beta",
+        "text:mini artist|beta"
+      ],
+      "schema_version": "1.0.0",
+      "work_id": "a8243747ca3f779a308f229624bd86bd54e028f9"
+    },
+    {
+      "generated_by": "id-detector/0.1.0",
+      "member_nodes": [
+        "shazam:mini-epsilon",
+        "text:mini artist|epsilon"
+      ],
+      "schema_version": "1.0.0",
+      "work_id": "b3e14eeef555da9b265a38e75ae815c7da8a203a"
+    },
+    {
+      "generated_by": "id-detector/0.1.0",
+      "member_nodes": [
+        "shazam:mini-eta",
+        "text:mini artist|eta"
+      ],
+      "schema_version": "1.0.0",
+      "work_id": "f3306915dabb5ef089b638594e7f0dbb3daa3d45"
+    }
+  ]
+}

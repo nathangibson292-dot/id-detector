@@ -1,0 +1,116 @@
+{
+  "assertions": [],
+  "candidates": [
+    {
+      "alternatives": [],
+      "canonical_id": "275edcb57a01dc6f915c98630ec0112ad99589fa",
+      "conflicts": [],
+      "contested": false,
+      "generated_by": "id-detector/0.1.0",
+      "member_nodes": [
+        "shazam:mini-kappa"
+      ],
+      "schema_version": "1.0.0",
+      "work_id": "b0c6e02355d92b3fbae322b261133152eea3a663"
+    },
+    {
+      "alternatives": [],
+      "canonical_id": "3c55f429240d163aa6fa6ab1db2379bb95a8e629",
+      "conflicts": [],
+      "contested": false,
+      "generated_by": "id-detector/0.1.0",
+      "member_nodes": [
+        "shazam:mini-lambda"
+      ],
+      "schema_version": "1.0.0",
+      "work_id": "20c83954ed8de773217037c9cd017c366b881a0c"
+    },
+    {
+      "alternatives": [],
+      "canonical_id": "77e7c5ea50e29c2d628cc9a91d1a97c4c535d35c",
+      "conflicts": [],
+      "contested": false,
+      "generated_by": "id-detector/0.1.0",
+      "member_nodes": [
+        "shazam:mini-theta"
+      ],
+      "schema_version": "1.0.0",
+      "work_id": "44eb41134cdd2be166cacb6a7422143480860576"
+    }
+  ],
+  "generated_by": "id-detector/0.1.0",
+  "nodes": [
+    {
+      "generated_by": "id-detector/0.1.0",
+      "id": "shazam:mini-kappa",
+      "label": "Mini Artist - Kappa",
+      "ns": "shazam",
+      "schema_version": "1.0.0"
+    },
+    {
+      "generated_by": "id-detector/0.1.0",
+      "id": "shazam:mini-lambda",
+      "label": "Mini Artist - Lambda",
+      "ns": "shazam",
+      "schema_version": "1.0.0"
+    },
+    {
+      "generated_by": "id-detector/0.1.0",
+      "id": "shazam:mini-theta",
+      "label": "Mini Artist - Theta",
+      "ns": "shazam",
+      "schema_version": "1.0.0"
+    },
+    {
+      "generated_by": "id-detector/0.1.0",
+      "id": "text:mini artist|kappa",
+      "label": "Mini Artist - Kappa",
+      "ns": "text",
+      "schema_version": "1.0.0"
+    },
+    {
+      "generated_by": "id-detector/0.1.0",
+      "id": "text:mini artist|lambda",
+      "label": "Mini Artist - Lambda",
+      "ns": "text",
+      "schema_version": "1.0.0"
+    },
+    {
+      "generated_by": "id-detector/0.1.0",
+      "id": "text:mini artist|theta",
+      "label": "Mini Artist - Theta",
+      "ns": "text",
+      "schema_version": "1.0.0"
+    }
+  ],
+  "schema_version": "1.0.0",
+  "works": [
+    {
+      "generated_by": "id-detector/0.1.0",
+      "member_nodes": [
+        "shazam:mini-lambda",
+        "text:mini artist|lambda"
+      ],
+      "schema_version": "1.0.0",
+      "work_id": "20c83954ed8de773217037c9cd017c366b881a0c"
+    },
+    {
+      "generated_by": "id-detector/0.1.0",
+      "member_nodes": [
+        "shazam:mini-theta",
+        "text:mini artist|theta"
+      ],
+      "schema_version": "1.0.0",
+      "work_id": "44eb41134cdd2be166cacb6a7422143480860576"
+    },
+    {
+      "generated_by": "id-detector/0.1.0",
+      "member_nodes": [
+        "shazam:mini-kappa",
+        "text:mini artist|kappa"
+      ],
+      "schema_version": "1.0.0",
+      "work_id": "b0c6e02355d92b3fbae322b261133152eea3a663"
+    }
+  ]
+}

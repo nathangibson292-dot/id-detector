@@ -1,0 +1,7 @@
+{
+  "schema_version": "1.0.0",
+  "sha256": "84a50b722e6448d9762c467d594ae56a79f062fd43e1f49b0f0f545a0295ae89",
+  "upstream": {
+    "fuse/episodes.gen0.json": "84a50b722e6448d9762c467d594ae56a79f062fd43e1f49b0f0f545a0295ae89"
+  }
+}

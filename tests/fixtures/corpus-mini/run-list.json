@@ -1,0 +1,19 @@
+{
+  "recipe": "deep",
+  "runs": [
+    {
+      "episodes": "mini-a/fuse/episodes.json",
+      "media_key": "b044c18d470004dd8b1b7ab7004928efe25ff61f4e62776e7ace636e2d0ca349",
+      "min_track_ms": 30000,
+      "mix_id": "mini-a",
+      "truth": "mini-a/ground_truth.json"
+    },
+    {
+      "episodes": "mini-b/fuse/episodes.json",
+      "media_key": "c0a63ccabc42a7fd6d7155527ab9fbb45165e4aba2e75c095b5b43c82bf16ac4",
+      "min_track_ms": 30000,
+      "mix_id": "mini-b",
+      "truth": "mini-b/ground_truth.json"
+    }
+  ]
+}

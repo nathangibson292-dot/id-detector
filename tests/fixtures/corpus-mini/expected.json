@@ -1,0 +1,116 @@
+{
+  "counts": {
+    "episodes": {
+      "hidden": 3,
+      "listed": 7,
+      "total": 10
+    },
+    "hidden_by_reason": {
+      "buried": 1,
+      "short": 2
+    },
+    "likely": {
+      "correct": 4,
+      "predicted": 5
+    },
+    "listed": {
+      "correct": 4,
+      "predicted": 7,
+      "truth": 6
+    },
+    "mixes": 2,
+    "range_claims": 0,
+    "work": {
+      "correct": 4,
+      "predicted": 7,
+      "truth": 6
+    }
+  },
+  "generated_by": "id-detector/0.1.0 scripts/score_corpus.py",
+  "l3": {
+    "certifiable": false,
+    "thresholds": {
+      "likely_precision_e4": 9000,
+      "listed_precision_e4": 8000,
+      "work_recall_e4": 7500
+    },
+    "thresholds_met": false
+  },
+  "likely_precision_e4": 8000,
+  "listed_precision_e4": 5714,
+  "mixes": [
+    {
+      "counts": {
+        "likely": {
+          "correct": 3,
+          "predicted": 3
+        },
+        "listed": {
+          "correct": 3,
+          "predicted": 5,
+          "truth": 3
+        },
+        "work": {
+          "correct": 3,
+          "predicted": 5,
+          "truth": 3
+        }
+      },
+      "episodes": "mini-a/fuse/episodes.json",
+      "episodes_listed": 5,
+      "episodes_total": 7,
+      "hidden_by_reason": {
+        "buried": 1,
+        "short": 1
+      },
+      "likely_precision_e4": 10000,
+      "listed_precision_e4": 6000,
+      "min_track_ms": 30000,
+      "mix_id": "mini-a",
+      "range_claims": 0,
+      "report": "out-mixes/mini-a/report.json",
+      "set_id": "mini-a",
+      "truth": "mini-a/ground_truth.json",
+      "truth_status": "draft",
+      "work_recall_e4": 10000
+    },
+    {
+      "counts": {
+        "likely": {
+          "correct": 1,
+          "predicted": 2
+        },
+        "listed": {
+          "correct": 1,
+          "predicted": 2,
+          "truth": 3
+        },
+        "work": {
+          "correct": 1,
+          "predicted": 2,
+          "truth": 3
+        }
+      },
+      "episodes": "mini-b/fuse/episodes.json",
+      "episodes_listed": 2,
+      "episodes_total": 3,
+      "hidden_by_reason": {
+        "short": 1
+      },
+      "likely_precision_e4": 5000,
+      "listed_precision_e4": 5000,
+      "min_track_ms": 30000,
+      "mix_id": "mini-b",
+      "range_claims": 0,
+      "report": "out-mixes/mini-b/report.json",
+      "set_id": "mini-b",
+      "truth": "mini-b/ground_truth.json",
+      "truth_status": "draft",
+      "work_recall_e4": 3333
+    }
+  ],
+  "recipe": "deep",
+  "schema_version": "1.0.0",
+  "truth_status": "draft",
+  "work_recall_e4": 6667
+}

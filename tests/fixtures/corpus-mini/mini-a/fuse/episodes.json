@@ -1,0 +1,409 @@
+{
+  "certification": {
+    "per": [
+      {
+        "dimension": "work",
+        "lower_bound_e4": 0,
+        "n_test_predictions": 0,
+        "status": "provisional",
+        "test_version": "not-run",
+        "tier": "possible"
+      }
+    ],
+    "profile": "free"
+  },
+  "durations": {
+    "evidence_supported_ms": 294000,
+    "generated_by": "id-detector/0.1.0",
+    "no_evidence_ms": 306000,
+    "predicted_episode_ms": 0,
+    "schema_version": "1.0.0",
+    "unclear_ms": 0,
+    "unresolved_boundary_ms": 0,
+    "unscanned_ms": 0
+  },
+  "episodes": [
+    {
+      "alignment_events": [],
+      "alignment_segments": [],
+      "alternatives": [],
+      "badge": "likely",
+      "best_end_ms": 10000,
+      "best_start_ms": 70000,
+      "candidate_id": "893219071a225287ecc560091b7c377ab1c6c7b1",
+      "claim": "performed",
+      "end_no_earlier_than_ms": 10000,
+      "end_no_later_than_ms": null,
+      "end_pi": null,
+      "evidence": [
+        "df0988fa33babb443fe11c5fd44a28ae241c8df5"
+      ],
+      "evidence_support_ms": [
+        [
+          10000,
+          70000
+        ]
+      ],
+      "flags": [],
+      "generated_by": "id-detector/0.1.0",
+      "has_global_alignment": true,
+      "id": "a062301f8e4844f0c0f58b46ffe81b309cb87dbf",
+      "occurrence_index": 0,
+      "overlaps": [],
+      "rejected_evidence": [],
+      "rescan_state": "not_requested",
+      "role_segments": [
+        {
+          "from_ms": 10000,
+          "role": "dominant",
+          "to_ms": 70000
+        }
+      ],
+      "schema_version": "1.0.0",
+      "score_kind": "heuristic",
+      "scores": {
+        "boundary": 6000,
+        "version": 5000,
+        "work": 8200
+      },
+      "start_no_earlier_than_ms": null,
+      "start_no_later_than_ms": 70000,
+      "start_pi": null,
+      "suppressed": null,
+      "tiers": {
+        "boundary": "possible",
+        "version": "unclear",
+        "work": "likely"
+      },
+      "version_status": "unverified"
+    },
+    {
+      "alignment_events": [],
+      "alignment_segments": [],
+      "alternatives": [],
+      "badge": "likely",
+      "best_end_ms": 210000,
+      "best_start_ms": 270000,
+      "candidate_id": "cd2fc55fbd86e4e3955ea7d77c6c1e94e1f5b746",
+      "claim": "performed",
+      "end_no_earlier_than_ms": 210000,
+      "end_no_later_than_ms": null,
+      "end_pi": null,
+      "evidence": [
+        "90f06579521756f06d19e65b8d5a38bfee78afba"
+      ],
+      "evidence_support_ms": [
+        [
+          210000,
+          270000
+        ]
+      ],
+      "flags": [],
+      "generated_by": "id-detector/0.1.0",
+      "has_global_alignment": true,
+      "id": "a879b57c994c2f40937cfbed5bbb32d78d48442b",
+      "occurrence_index": 0,
+      "overlaps": [],
+      "rejected_evidence": [],
+      "rescan_state": "not_requested",
+      "role_segments": [
+        {
+          "from_ms": 210000,
+          "role": "dominant",
+          "to_ms": 270000
+        }
+      ],
+      "schema_version": "1.0.0",
+      "score_kind": "heuristic",
+      "scores": {
+        "boundary": 6000,
+        "version": 5000,
+        "work": 8200
+      },
+      "start_no_earlier_than_ms": null,
+      "start_no_later_than_ms": 270000,
+      "start_pi": null,
+      "suppressed": null,
+      "tiers": {
+        "boundary": "possible",
+        "version": "unclear",
+        "work": "likely"
+      },
+      "version_status": "unverified"
+    },
+    {
+      "alignment_events": [],
+      "alignment_segments": [],
+      "alternatives": [],
+      "badge": "possible",
+      "best_end_ms": 300000,
+      "best_start_ms": 350000,
+      "candidate_id": "cbf3e3e8a308323696ec17b608508eb05ed44781",
+      "claim": "performed",
+      "end_no_earlier_than_ms": 300000,
+      "end_no_later_than_ms": null,
+      "end_pi": null,
+      "evidence": [
+        "eb238b1820f3b6ef68992b1088eff3927ad6fd52"
+      ],
+      "evidence_support_ms": [
+        [
+          300000,
+          350000
+        ]
+      ],
+      "flags": [],
+      "generated_by": "id-detector/0.1.0",
+      "has_global_alignment": true,
+      "id": "ad668c8605458ba08b9c601011d9329e43dcbf74",
+      "occurrence_index": 0,
+      "overlaps": [],
+      "rejected_evidence": [],
+      "rescan_state": "not_requested",
+      "role_segments": [
+        {
+          "from_ms": 300000,
+          "role": "dominant",
+          "to_ms": 350000
+        }
+      ],
+      "schema_version": "1.0.0",
+      "score_kind": "heuristic",
+      "scores": {
+        "boundary": 6000,
+        "version": 5000,
+        "work": 6000
+      },
+      "start_no_earlier_than_ms": null,
+      "start_no_later_than_ms": 350000,
+      "start_pi": null,
+      "suppressed": null,
+      "tiers": {
+        "boundary": "possible",
+        "version": "unclear",
+        "work": "possible"
+      },
+      "version_status": "unverified"
+    },
+    {
+      "alignment_events": [],
+      "alignment_segments": [],
+      "alternatives": [],
+      "badge": "possible",
+      "best_end_ms": 420000,
+      "best_start_ms": 432000,
+      "candidate_id": "f5d8884966c4d511a0f7b3e0148e16fdd2641326",
+      "claim": "performed",
+      "end_no_earlier_than_ms": 420000,
+      "end_no_later_than_ms": null,
+      "end_pi": null,
+      "evidence": [
+        "d19e4fb347c5c3a339453af59b2df88dac93b3cc"
+      ],
+      "evidence_support_ms": [
+        [
+          420000,
+          432000
+        ]
+      ],
+      "flags": [],
+      "generated_by": "id-detector/0.1.0",
+      "has_global_alignment": true,
+      "id": "5d2ea3b61d778f5d23bae4cf7948765027768edc",
+      "occurrence_index": 0,
+      "overlaps": [],
+      "rejected_evidence": [],
+      "rescan_state": "not_requested",
+      "role_segments": [
+        {
+          "from_ms": 420000,
+          "role": "dominant",
+          "to_ms": 432000
+        }
+      ],
+      "schema_version": "1.0.0",
+      "score_kind": "heuristic",
+      "scores": {
+        "boundary": 6000,
+        "version": 5000,
+        "work": 6000
+      },
+      "start_no_earlier_than_ms": null,
+      "start_no_later_than_ms": 432000,
+      "start_pi": null,
+      "suppressed": null,
+      "tiers": {
+        "boundary": "possible",
+        "version": "unclear",
+        "work": "possible"
+      },
+      "version_status": "unverified"
+    },
+    {
+      "alignment_events": [],
+      "alignment_segments": [],
+      "alternatives": [],
+      "badge": "likely",
+      "best_end_ms": 450000,
+      "best_start_ms": 462000,
+      "candidate_id": "ae1eda174dafb16b3405c864cd1f7ef803c0cc05",
+      "claim": "performed",
+      "end_no_earlier_than_ms": 450000,
+      "end_no_later_than_ms": null,
+      "end_pi": null,
+      "evidence": [
+        "d36ea69b4ff6a09601f2e15c5eea6616dc69e522"
+      ],
+      "evidence_support_ms": [
+        [
+          450000,
+          462000
+        ]
+      ],
+      "flags": [],
+      "generated_by": "id-detector/0.1.0",
+      "has_global_alignment": true,
+      "id": "eb159b19c36a8d588b8437c5844e198978442f1c",
+      "occurrence_index": 0,
+      "overlaps": [],
+      "rejected_evidence": [],
+      "rescan_state": "not_requested",
+      "role_segments": [
+        {
+          "from_ms": 450000,
+          "role": "dominant",
+          "to_ms": 462000
+        }
+      ],
+      "schema_version": "1.0.0",
+      "score_kind": "heuristic",
+      "scores": {
+        "boundary": 6000,
+        "version": 5000,
+        "work": 8200
+      },
+      "start_no_earlier_than_ms": null,
+      "start_no_later_than_ms": 462000,
+      "start_pi": null,
+      "suppressed": null,
+      "tiers": {
+        "boundary": "possible",
+        "version": "unclear",
+        "work": "likely"
+      },
+      "version_status": "unverified"
+    },
+    {
+      "alignment_events": [],
+      "alignment_segments": [],
+      "alternatives": [],
+      "badge": "likely",
+      "best_end_ms": 500000,
+      "best_start_ms": 560000,
+      "candidate_id": "40d1e83cb04797355fe2252e0b126d485f5c7226",
+      "claim": "performed",
+      "end_no_earlier_than_ms": 500000,
+      "end_no_later_than_ms": null,
+      "end_pi": null,
+      "evidence": [
+        "83cd4fb89979050fe8b38537177806721b9863c1"
+      ],
+      "evidence_support_ms": [
+        [
+          500000,
+          560000
+        ]
+      ],
+      "flags": [],
+      "generated_by": "id-detector/0.1.0",
+      "has_global_alignment": true,
+      "id": "98215fbaf2f412a3908c404326963952026a0ba7",
+      "occurrence_index": 0,
+      "overlaps": [],
+      "rejected_evidence": [],
+      "rescan_state": "not_requested",
+      "role_segments": [
+        {
+          "from_ms": 500000,
+          "role": "dominant",
+          "to_ms": 560000
+        }
+      ],
+      "schema_version": "1.0.0",
+      "score_kind": "heuristic",
+      "scores": {
+        "boundary": 6000,
+        "version": 5000,
+        "work": 8200
+      },
+      "start_no_earlier_than_ms": null,
+      "start_no_later_than_ms": 560000,
+      "start_pi": null,
+      "suppressed": "buried",
+      "tiers": {
+        "boundary": "possible",
+        "version": "unclear",
+        "work": "likely"
+      },
+      "version_status": "unverified"
+    },
+    {
+      "alignment_events": [],
+      "alignment_segments": [],
+      "alternatives": [],
+      "badge": "unclear",
+      "best_end_ms": 560000,
+      "best_start_ms": 600000,
+      "candidate_id": "14b13c98f54d40fe5c6be7b0f422639abbf5d6b1",
+      "claim": "performed",
+      "end_no_earlier_than_ms": 560000,
+      "end_no_later_than_ms": null,
+      "end_pi": null,
+      "evidence": [
+        "90ddd36fbf2661ebfca684e6ff5eda5d0dc94d48"
+      ],
+      "evidence_support_ms": [
+        [
+          560000,
+          600000
+        ]
+      ],
+      "flags": [],
+      "generated_by": "id-detector/0.1.0",
+      "has_global_alignment": true,
+      "id": "2797fcbb9048ea7f9e564e00a4c466a68a2fd076",
+      "occurrence_index": 0,
+      "overlaps": [],
+      "rejected_evidence": [],
+      "rescan_state": "not_requested",
+      "role_segments": [
+        {
+          "from_ms": 560000,
+          "role": "dominant",
+          "to_ms": 600000
+        }
+      ],
+      "schema_version": "1.0.0",
+      "score_kind": "heuristic",
+      "scores": {
+        "boundary": 6000,
+        "version": 5000,
+        "work": 3500
+      },
+      "start_no_earlier_than_ms": null,
+      "start_no_later_than_ms": 600000,
+      "start_pi": null,
+      "suppressed": null,
+      "tiers": {
+        "boundary": "possible",
+        "version": "unclear",
+        "work": "unclear"
+      },
+      "version_status": "unverified"
+    }
+  ],
+  "gaps": [],
+  "generated_by": "id-detector/0.1.0",
+  "generation": 0,
+  "schema_version": "1.0.0"
+}

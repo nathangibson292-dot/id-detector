@@ -1104,6 +1104,18 @@ def _aggregate(states: list[ScoreState]) -> ScoreState:
     return result
 
 
+def pooled_metrics(states: list[ScoreState], *, physical_attempts: int = 0) -> BenchmarkMetrics:
+    """Metrics over the POOLED counts of several scored sets.
+
+    Numerators and denominators are summed before any ratio is taken (a forty-track mix weighs
+    forty times a one-track mix; never a mean of per-set ratios) — exactly how :func:`score_corpus`
+    derives ``overall`` from its sets.  ``scripts/score_corpus.py`` pools the per-mix scores of a
+    release run through this, so the L3 aggregate and an in-corpus ``overall`` cannot drift.
+    """
+
+    return _metrics_from_state(_aggregate(states), physical_attempts=physical_attempts)
+
+
 def _bootstrap_lower(
     scores: list[SetScore], metric: Any, *, seed: int, replicates: int = BOOTSTRAP_REPLICATES
 ) -> int:

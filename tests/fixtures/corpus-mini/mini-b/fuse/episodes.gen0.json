@@ -1,0 +1,193 @@
+{
+  "certification": {
+    "per": [
+      {
+        "dimension": "work",
+        "lower_bound_e4": 0,
+        "n_test_predictions": 0,
+        "status": "provisional",
+        "test_version": "not-run",
+        "tier": "possible"
+      }
+    ],
+    "profile": "free"
+  },
+  "durations": {
+    "evidence_supported_ms": 112000,
+    "generated_by": "id-detector/0.1.0",
+    "no_evidence_ms": 188000,
+    "predicted_episode_ms": 0,
+    "schema_version": "1.0.0",
+    "unclear_ms": 0,
+    "unresolved_boundary_ms": 0,
+    "unscanned_ms": 0
+  },
+  "episodes": [
+    {
+      "alignment_events": [],
+      "alignment_segments": [],
+      "alternatives": [],
+      "badge": "likely",
+      "best_end_ms": 5000,
+      "best_start_ms": 65000,
+      "candidate_id": "77e7c5ea50e29c2d628cc9a91d1a97c4c535d35c",
+      "claim": "performed",
+      "end_no_earlier_than_ms": 5000,
+      "end_no_later_than_ms": null,
+      "end_pi": null,
+      "evidence": [
+        "0f7c1e9dc11b538fa96b59e275502be77f9a1d6b"
+      ],
+      "evidence_support_ms": [
+        [
+          5000,
+          65000
+        ]
+      ],
+      "flags": [],
+      "generated_by": "id-detector/0.1.0",
+      "has_global_alignment": true,
+      "id": "2205bc84cc16ea3c4a3c3bcc996c38811b09be9b",
+      "occurrence_index": 0,
+      "overlaps": [],
+      "rejected_evidence": [],
+      "rescan_state": "not_requested",
+      "role_segments": [
+        {
+          "from_ms": 5000,
+          "role": "dominant",
+          "to_ms": 65000
+        }
+      ],
+      "schema_version": "1.0.0",
+      "score_kind": "heuristic",
+      "scores": {
+        "boundary": 6000,
+        "version": 5000,
+        "work": 8200
+      },
+      "start_no_earlier_than_ms": null,
+      "start_no_later_than_ms": 65000,
+      "start_pi": null,
+      "suppressed": null,
+      "tiers": {
+        "boundary": "possible",
+        "version": "unclear",
+        "work": "likely"
+      },
+      "version_status": "unverified"
+    },
+    {
+      "alignment_events": [],
+      "alignment_segments": [],
+      "alternatives": [],
+      "badge": "likely",
+      "best_end_ms": 100000,
+      "best_start_ms": 140000,
+      "candidate_id": "275edcb57a01dc6f915c98630ec0112ad99589fa",
+      "claim": "performed",
+      "end_no_earlier_than_ms": 100000,
+      "end_no_later_than_ms": null,
+      "end_pi": null,
+      "evidence": [
+        "76601d8fbc7fb3dc8074854ed869f4cad09f8858"
+      ],
+      "evidence_support_ms": [
+        [
+          100000,
+          140000
+        ]
+      ],
+      "flags": [],
+      "generated_by": "id-detector/0.1.0",
+      "has_global_alignment": true,
+      "id": "a8be8e9c09aa8c8bfe1557405529479eada241ce",
+      "occurrence_index": 0,
+      "overlaps": [],
+      "rejected_evidence": [],
+      "rescan_state": "not_requested",
+      "role_segments": [
+        {
+          "from_ms": 100000,
+          "role": "dominant",
+          "to_ms": 140000
+        }
+      ],
+      "schema_version": "1.0.0",
+      "score_kind": "heuristic",
+      "scores": {
+        "boundary": 6000,
+        "version": 5000,
+        "work": 8200
+      },
+      "start_no_earlier_than_ms": null,
+      "start_no_later_than_ms": 140000,
+      "start_pi": null,
+      "suppressed": null,
+      "tiers": {
+        "boundary": "possible",
+        "version": "unclear",
+        "work": "likely"
+      },
+      "version_status": "unverified"
+    },
+    {
+      "alignment_events": [],
+      "alignment_segments": [],
+      "alternatives": [],
+      "badge": "possible",
+      "best_end_ms": 200000,
+      "best_start_ms": 212000,
+      "candidate_id": "3c55f429240d163aa6fa6ab1db2379bb95a8e629",
+      "claim": "performed",
+      "end_no_earlier_than_ms": 200000,
+      "end_no_later_than_ms": null,
+      "end_pi": null,
+      "evidence": [
+        "137bfdff08d7f78ef094ef4c049233e1f02a48fa"
+      ],
+      "evidence_support_ms": [
+        [
+          200000,
+          212000
+        ]
+      ],
+      "flags": [],
+      "generated_by": "id-detector/0.1.0",
+      "has_global_alignment": true,
+      "id": "e5781a5a6c8c75c99d449699354ebaeb8ce5e944",
+      "occurrence_index": 0,
+      "overlaps": [],
+      "rejected_evidence": [],
+      "rescan_state": "not_requested",
+      "role_segments": [
+        {
+          "from_ms": 200000,
+          "role": "dominant",
+          "to_ms": 212000
+        }
+      ],
+      "schema_version": "1.0.0",
+      "score_kind": "heuristic",
+      "scores": {
+        "boundary": 6000,
+        "version": 5000,
+        "work": 6000
+      },
+      "start_no_earlier_than_ms": null,
+      "start_no_later_than_ms": 212000,
+      "start_pi": null,
+      "suppressed": null,
+      "tiers": {
+        "boundary": "possible",
+        "version": "unclear",
+        "work": "possible"
+      },
+      "version_status": "unverified"
+    }
+  ],
+  "gaps": [],
+  "generated_by": "id-detector/0.1.0",
+  "generation": 0,
+  "schema_version": "1.0.0"
+}
