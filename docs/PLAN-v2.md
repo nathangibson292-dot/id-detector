@@ -402,7 +402,7 @@ only, `IDEA_SHARING=off`, `IDEA_PUBLIC_CATALOGUE=off`, Panako not in the image.
 |---|---|---|
 | Unofficial Shazam from a server | ~20 req/min per IP shared by all users → ~40–65 mixes/day per IP; failures past the throttle (E-S1); ASN blocks; no official API | **D1 accepted.** Per-account weekly cap; `provider_attempt_events` per egress; §2.3.5 breaker; kill-switch; extra egress IPs as config rows; `trust_env=False` on Shazam and AudD clients; never proxied |
 | yt-dlp from a server | SoundCloud/Mixcloud direct; YouTube needs residential egress | **D4/D7:** YouTube paid-only (M2 7c); proxy passed explicitly to yt-dlp for YouTube jobs only; S2 runs before 7c |
-| AudD terms | unreadable production terms; trial = evaluation-only + attribution | **L1 blocks any hosted third-party AudD use, beta included** |
+| AudD terms | **Read 2026-09-10:** paying customers may use, display and cache Results in their own products; attribution optional; no standalone Results resale; no competing recognition service; users must be bound by equally protective terms; AudD may terminate without notice; terms-version endpoint to poll | licensing cleared; commercial questions (rate, limits, 429 billing) by email; ToS flow-down under L2; daily `GET https://api.audd.io/terms/version` check in the 6b runbook |
 | Disk | 330–370 MB/hour; 10–25 MB durable | retention for every terminal state (§4.6) |
 | RAM | novelty ~0.7 GB/hour | guarded off (0b-ii); 1.5 GB/job; length caps |
 
@@ -791,7 +791,7 @@ recorded option, not adopted.
 
 | | Gate | Owner |
 |---|---|---|
-| **L1** | AudD production terms in writing (hosted/consumer use, caching, attribution, concurrency, per-clip rate, whether throttled/refused requests bill, reconciliation of ambiguous requests). **Blocks any hosted third-party AudD use, beta included.** | Nathan |
+| **L1** | **Licensing cleared 2026-09-10** — the AudD API Terms (text of 2026-07-07, recorded verbatim in `docs/legal/audd-terms-2026-07-07.md`, assessed in `docs/legal/audd-terms-assessment.md`) permit use and display of Results within our own products, permit caching, and require no attribution from paying customers. **Remaining, commercial only:** per-clip subscription rate, documented rate limit/concurrency, whether 429s bill, reconciliation of ambiguous requests — one email to api@audd.io; they set the Pro allowance in `pricing.toml`, not launch. Restrictions to honour: no standalone Results data product; no competing recognition service (keep the L3 accuracy report about IDea's tiers, not a provider benchmark); flow-down of AudD's use restrictions to our users (L2). | Nathan (email) |
 | **L2** | Legal review of ToS/privacy/DMCA and ingestion posture | Nathan + solicitor |
 | **L3** | **Release gate:** ≥ 5 owner-verified mixes, ≥ 3 DJs, ≥ 2 platforms, ≥ 4 h, two-pass truth → `data/corpus/release-1/`; `uv run idea analyse <url> --recipe free|deep` per mix; `uv run python scripts/score_corpus.py --run-list data/corpus/release-1/runs-<recipe>.json --out docs/accuracy/release-1-<recipe>.json`; thresholds `likely_precision_e4 ≥ 9000`, `listed_precision_e4 ≥ 8000`, `work_recall_e4 ≥ 7500` (`deep`) / `≥ 7000` (`free`); also decides `serve_free_from_deep`. | Nathan (+ 1b-iii tooling) |
 | **L4** | Stripe business country, KYC, live keys, VAT — **payment launch (M2), not beta** | Nathan |
