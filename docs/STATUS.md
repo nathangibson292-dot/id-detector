@@ -20,8 +20,19 @@ explains them; novelty only runs when rescans are on; malformed Shazam replies c
 "no match"; a semantic Local-Free golden pins Free-scan output; loopback CSRF/Origin protects the local
 server; dead paid paths are unreachable. Test suite: 756 passed offline.
 
-**Not started:** Phase 1 (recipes' result bundles, analysis keys, compatibility serving, targeting v2,
-corroboration) and everything after — see PLAN-v2 §5. Do not start Phase 1 without the owner.
+**Also done (2026-09-10, isolated cycles built while the owner tests):** the corpus scorer
+(`scripts/score_corpus.py`, three parts: pooled L3 metrics, work-identity matching for order-only truth,
+timed-mode identity parity + overlay truth rows + crowd-label cleanup), the seven-set `release-1` truth
+drafts with first working Free-recipe numbers (`docs/accuracy/release-1-free-draft.md`: pooled recall 64 %,
+precision 75 %, "likely" 90 % — draft truth, not an L3 claim), **1b-i** (secondary targeting v2,
+`targeting:1`) and **1b-ii** (cross-family corroboration with time overlap, crowd-row contradiction rule,
+`fusion:2`). Test suite: 905 passed offline. **Stopped here by the owner's decision.**
+
+**Not started:** Phase 1a (result bundles, analysis keys, compatibility serving — changes the result
+layout on disk), the breaker half of 1b-iii, and everything after — see PLAN-v2 §5. Do not start them
+without the owner. Owner-side: verify the seven truth drafts (`idea truth verify`), AudD reply/top-up
+(~$20 covers Deep scoring of the whole corpus), fix the ~+50 s tracklist clock offsets on the Mall Grab
+and DJ Heartstring sets at verification.
 
 ## Acceptance status at a glance
 
