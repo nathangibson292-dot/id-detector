@@ -80,6 +80,7 @@ _DERIVED_WORDS = {
 # newly generated schemas/reports/goldens and committed fixtures.
 _HISTORICAL_PATTERN_EXEMPT = {
     Path("docs/PLAN.md"),
+    Path("docs/PLAN-v2.md"),  # cites vendor endpoints (e.g. the AudD terms-version URL)
     Path("data/fixtures/README.md"),
 }
 
@@ -89,6 +90,7 @@ def _pattern_exempt(relative: Path) -> bool:
         relative in _HISTORICAL_PATTERN_EXEMPT
         or relative.is_relative_to(Path("docs/research"))
         or relative.is_relative_to(Path("docs/reviews"))
+        or relative.is_relative_to(Path("docs/legal"))  # verbatim vendor terms + assessments
     )
 
 
