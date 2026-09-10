@@ -34,6 +34,11 @@ _NS_ALIASES = {
     "musicbrainz_work": "mb_work",
     "spotify_id": "spotify",
 }
+#: The featuring marker carries no identity of its own: "MPH ft. Cecelia - Rush" and "MPH - Rush
+#: (feat. Cecelia)" name the same people, and differ by nothing but the spelling of "featuring" —
+#: two tokens too short for the near-spelling rule.  The featured NAME stays in the word set.
+#: (1b-ii, decided on the release-1 corpus: three duplicate works merged, no listed row changed.)
+_FEATURING = frozenset({"ft", "feat", "featuring"})
 
 
 def normalise_text(value: str | None) -> str:
@@ -208,7 +213,8 @@ def _word_sets_corroborate(a: frozenset[str], b: frozenset[str]) -> bool:
     Exact rule: one set fully contains the other (≥2 words), so collaborators/extra words never
     block a genuine ID.  Tolerant rule: everything matches except a single long title token that is
     only a near-spelling apart (e.g. "clubgrls" vs "clubgirls") — that is a crowd ID of the SAME
-    track, not a different one, so it should corroborate the audio match rather than duplicate it.
+    track, not a different one, so it should corroborate the audio match rather than duplicate it
+    — or a single short word one trailing letter apart ("kno" vs "know").
     """
 
     if min(len(a), len(b)) < 2:
@@ -221,6 +227,19 @@ def _word_sets_corroborate(a: frozenset[str], b: frozenset[str]) -> bool:
         (x,) = tuple(a_only)
         (y,) = tuple(b_only)
         if len(x) >= 4 and len(y) >= 4 and _within_one_edit(x, y):
+            return True
+        # A short word missing or gaining one trailing LETTER ("kno"/"know", "od"/"odf") is the
+        # same word too; a substitution at that length ("up"/"us") or a digit ("1"/"12", two
+        # numbered titles) is not.  Decided on the release-1 corpus (1b-ii): both instances were
+        # the same track, no listed row changed, pooled likely precision unchanged.
+        short, long = sorted((x, y), key=len)
+        if (
+            len(short) >= 2
+            and len(long) == len(short) + 1
+            and short.isalpha()
+            and long.isalpha()
+            and long.startswith(short)
+        ):
             return True
     return False
 
@@ -328,7 +347,7 @@ def build_identity_graph(
     audio_text_nodes = {node for node in observation_text.values() if node}
 
     def _words(node: str) -> frozenset[str]:
-        return frozenset(re.findall(r"[a-z0-9]+", node.removeprefix("text:")))
+        return frozenset(re.findall(r"[a-z0-9]+", node.removeprefix("text:"))) - _FEATURING
 
     # Match on the WORD set (not the two fields) so order AND extra collaborators don't block it:
     # the answer "breaka breaka - bushbaby" must still corroborate the audio "Bushbaby & Eloq -

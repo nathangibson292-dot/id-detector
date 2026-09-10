@@ -22,7 +22,13 @@ from id_detector.contracts import (
     WindowRecord,
 )
 from id_detector.decode import DecodeResult
-from id_detector.fuse.episodes import FusionResult, fuse_generation, region_request_key
+from id_detector.fuse.episodes import (
+    CORROBORATION_OVERLAP_MIN_MS,
+    CORROBORATION_SEPARATION_MIN_MS,
+    FusionResult,
+    fuse_generation,
+    region_request_key,
+)
 from id_detector.novelty import novelty_change_points
 from id_detector.providers.base import AppConfig
 from id_detector.rescan import DEFAULT_MAX_GENERATIONS, BudgetedPlan, plan_within_budget
@@ -171,6 +177,8 @@ async def run_generation_loop(
     gen0_requests: int = 0,
     gen0_physical_attempts: int = 0,
     calibrator: object | None = None,
+    overlap_min_ms: int = CORROBORATION_OVERLAP_MIN_MS,
+    separation_min_ms: int = CORROBORATION_SEPARATION_MIN_MS,
 ) -> OrchestrationResult:
     """Run generation 0's fusion and every budgeted rescan generation after it.
 
@@ -178,7 +186,8 @@ async def run_generation_loop(
     the points it computed a single time; when absent they are computed here, and only if
     ``max_generations`` allows a rescan to consume them (review M2).  ``scanned_windows`` is the
     subset of ``windows.records`` an engine actually answered for (:func:`scanned_windows`);
-    it defaults to every window, the free-recipe truth.
+    it defaults to every window, the free-recipe truth.  ``overlap_min_ms`` and
+    ``separation_min_ms`` are the recipe's corroboration thresholds (plan §2.3.4 step 5).
     """
 
     duration_ms = decoded.record.pcm.duration_ms
@@ -225,6 +234,8 @@ async def run_generation_loop(
         scanned_window_shapes=window_shapes(all_windows),
         config=app_config,
         calibrator=calibrator,
+        overlap_min_ms=overlap_min_ms,
+        separation_min_ms=separation_min_ms,
     )
     generations = [
         GenerationRecord(
@@ -305,6 +316,8 @@ async def run_generation_loop(
             scanned_window_shapes=window_shapes(all_windows),
             config=app_config,
             calibrator=calibrator,
+            overlap_min_ms=overlap_min_ms,
+            separation_min_ms=separation_min_ms,
         )
         generations.append(
             GenerationRecord(

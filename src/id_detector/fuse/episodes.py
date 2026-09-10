@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from collections import defaultdict
 from dataclasses import dataclass
 from pathlib import Path
@@ -94,6 +95,75 @@ COMMERCIAL_PROVIDERS = frozenset({"audd", "acrcloud"})
 FULL_TRIAL_E4 = 10_000
 DISCOUNTED_TRIAL_E4 = 5_000
 
+#: Trust families (plan §2.3.4 step 5): the commercial catalogue engines are ONE family — they
+#: sell the same coverage, so their agreement is one catalogue queried twice (review M1) — Shazam
+#: is another and the local Panako index a third.  Corroboration counts only across families; a
+#: provider outside the table (a test fixture) is its own family.  Crowd hints are never in it:
+#: they stay hint corroboration.  The catalogue half is *derived* from
+#: :data:`COMMERCIAL_PROVIDERS` rather than repeated, so a commercial engine added there can never
+#: become its own family — which is exactly how review M1's flag would be gamed again.
+CATALOGUE_FAMILY = "catalogue"
+TRUST_FAMILIES: dict[str, str] = {
+    **{provider: CATALOGUE_FAMILY for provider in sorted(COMMERCIAL_PROVIDERS)},
+    "shazam": "shazam",
+    "panako": "local_index",
+}
+#: The Deep recipe's ``overlap_min_ms`` / ``separation_min_ms``, and what every other fuse uses
+#: (the Free recipe defines neither, yet Shazam + a local index can still agree under it).
+CORROBORATION_OVERLAP_MIN_MS = 6_000
+CORROBORATION_SEPARATION_MIN_MS = 60_000
+
+
+def trust_family(provider: str) -> str:
+    return TRUST_FAMILIES.get(provider, provider)
+
+
+def engine_agreements(
+    votes: list[ObservationRecord] | tuple[ObservationRecord, ...],
+    *,
+    overlap_min_ms: int = CORROBORATION_OVERLAP_MIN_MS,
+) -> list[tuple[int, int]]:
+    """The cross-family agreements among the selected votes for one normalised work.
+
+    An agreement is a pair of selected votes from different trust families whose supports overlap
+    by at least ``overlap_min_ms``; it is reported as the overlap interval.  Two votes of one
+    family never agree with each other, however many engines that family holds (review M1), and
+    a coincidence under the overlap floor is not the same moment.  Sorted, de-duplicated.
+    """
+
+    ordered = sorted(votes, key=lambda item: (item.support_ms, item.provider, item.id))
+    found: set[tuple[int, int]] = set()
+    for index, left in enumerate(ordered):
+        left_family = trust_family(left.provider)
+        for right in ordered[index + 1 :]:
+            if right.support_ms[0] >= left.support_ms[1]:
+                break  # start order: nothing later can overlap ``left`` any more
+            if trust_family(right.provider) == left_family:
+                continue
+            low = max(left.support_ms[0], right.support_ms[0])
+            high = min(left.support_ms[1], right.support_ms[1])
+            if high - low >= overlap_min_ms:
+                found.add((low, high))
+    return sorted(found)
+
+
+def separated_agreements(
+    agreements: list[tuple[int, int]] | tuple[tuple[int, int], ...],
+    *,
+    separation_min_ms: int = CORROBORATION_SEPARATION_MIN_MS,
+) -> bool:
+    """Whether two agreements lie at least ``separation_min_ms`` apart (start to start).
+
+    One cross-family coincidence is shown ("confirmed twice"); only two of them this far apart —
+    or the unchanged ``likely`` rule — let an episode past suppression and the on-air floor
+    (plan §2.3.4 step 5), so a single shared phantom window cannot list a track on its own.
+    """
+
+    if len(agreements) < 2:
+        return False
+    starts = sorted(start for start, _ in agreements)
+    return starts[-1] - starts[0] >= separation_min_ms
+
 
 def discounted_providers(votes: list[ObservationRecord]) -> frozenset[str]:
     """Return the commercial engines whose trials carry the initial 0.5 dependence prior."""
@@ -114,22 +184,22 @@ def _independent_trials_e4(votes: list[ObservationRecord]) -> int:
     Each logical trial contributes one interval — the hull of the supports of its selected
     observations — and greedy interval scheduling (earliest finishing interval first) yields the
     maximum pairwise non-overlapping subset.  Overlapping windows from a dense hop or a rescan
-    therefore cannot inflate the tier without new, disjoint evidence.  A selected trial owned by a
-    *second* commercial engine contributes ``0.5`` rather than ``1``.
+    therefore cannot inflate the tier without new, disjoint evidence.  A trial is attributed by
+    family (review L5): it contributes ``0.5`` rather than ``1`` only when *every* engine that
+    voted in it is a discounted second commercial engine — a Shazam, local-index or leading
+    catalogue vote on the same window makes it a full trial, whatever the other voters were.
     """
 
     discounted = discounted_providers(votes)
     by_trial: dict[str, tuple[int, int]] = {}
-    provider_by_trial: dict[str, str] = {}
+    providers_by_trial: dict[str, set[str]] = {}
     for item in votes:
         start, end = item.support_ms
         current = by_trial.get(item.logical_trial_id)
         by_trial[item.logical_trial_id] = (
             (start, end) if current is None else (min(current[0], start), max(current[1], end))
         )
-        previous = provider_by_trial.get(item.logical_trial_id)
-        if previous is None or item.provider < previous:
-            provider_by_trial[item.logical_trial_id] = item.provider
+        providers_by_trial.setdefault(item.logical_trial_id, set()).add(item.provider)
     total = 0
     last_end: int | None = None
     for trial_id, (start, end) in sorted(
@@ -137,23 +207,24 @@ def _independent_trials_e4(votes: list[ObservationRecord]) -> int:
     ):
         if last_end is None or start >= last_end:
             total += (
-                DISCOUNTED_TRIAL_E4
-                if provider_by_trial.get(trial_id) in discounted
-                else FULL_TRIAL_E4
+                DISCOUNTED_TRIAL_E4 if providers_by_trial[trial_id] <= discounted else FULL_TRIAL_E4
             )
             last_end = end
     return total
 
 
-def _engine_corroborated(votes: list[ObservationRecord]) -> bool:
-    """True when two or more distinct recognizer providers matched this occurrence.
+def _engine_corroborated(
+    votes: list[ObservationRecord], *, overlap_min_ms: int = CORROBORATION_OVERLAP_MIN_MS
+) -> bool:
+    """True when selected votes from two trust families agree on this work at the same moment.
 
-    Two independent engines (e.g. Shazam and AudD) landing on the same track at the same time is a
-    strong precision signal — the statistical basis for a paid cross-check — so it earns the
-    confident tier the way an independent hint does, without disturbing the calibrated badge maths.
+    Two independent engines (e.g. Shazam and AudD) landing on the same track at the same time is
+    a strong precision signal — the statistical basis for a paid cross-check.  One such agreement
+    is shown ("confirmed twice"); see :func:`separated_agreements` for what it takes to bypass
+    suppression and the on-air floor.
     """
 
-    return len({item.provider for item in votes}) >= 2
+    return bool(engine_agreements(votes, overlap_min_ms=overlap_min_ms))
 
 
 NOVELTY_REGION_PAD_MS = 10_000
@@ -222,6 +293,114 @@ def _eligible_tracklist_hint(hint: HintRecord) -> bool:
         and hint.mirror_status == "verified"
         and not hint.flags.id_unknown
     )
+
+
+#: A crowd ID is listed only when its parsed label could be a track name (U-F13): both fields,
+#: nothing a question, a link or a handle belongs in, and short enough to be a name rather than
+#: the sentence a comment is.  Structural on purpose — real titles start with "Is", "What" and
+#: "Who" and run to nine words, and answers are as often "Title - Artist" as the other way round —
+#: so neither field's words nor its position decides; only the shape of the whole label does.
+CROWD_LABEL_MAX_WORDS = 12
+CROWD_LABEL_MAX_CHARS = 120
+_CROWD_LINK_OR_HANDLE = re.compile(r"(?i)https?://|www\.|(?<!\w)@\w")
+
+
+def plausible_crowd_label(artist: str | None, title: str | None) -> bool:
+    """Whether a parsed comment answer reads as ``Artist - Title`` rather than comment text."""
+
+    if not artist or not title or not artist.strip() or not title.strip():
+        return False
+    # A field ending in a colon is a comment lead-in ("FULL TRACK LIST:", "ID:", "Track:"), never
+    # an artist or a title — the one shape the length and punctuation rules below let through.
+    if artist.strip().endswith(":") or title.strip().endswith(":"):
+        return False
+    text = f"{artist} {title}"
+    if "?" in text or "\n" in text or _CROWD_LINK_OR_HANDLE.search(text):
+        return False
+    if len(text) > CROWD_LABEL_MAX_CHARS:
+        return False
+    return len(re.findall(r"\w+", text)) <= CROWD_LABEL_MAX_WORDS
+
+
+#: One listable crowd answer: the hint, its identity work and that work's candidate.
+CrowdAnswer = tuple[HintRecord, str, str]
+#: One work named at one timestamp: ``(work_id, candidate_id, its answers in position order)``.
+CrowdWork = tuple[str, str, list[HintRecord]]
+
+
+def crowd_answer_clusters(
+    hints: list[HintRecord] | tuple[HintRecord, ...],
+    identity: IdentityBuildResult,
+    listed_spans: list[tuple[int, int]],
+) -> list[list[CrowdAnswer]]:
+    """The listable crowd answers in position order, clustered where their position ranges
+    intersect — "at one timestamp" — by a transitive sweep, so the clusters are disjoint.
+
+    Listable: a verified, positioned answer or correction with a plausible label whose work the
+    identity graph knows and that no listed track's span covers.  Whether the work is already
+    listed elsewhere is the caller's to decide, cluster by cluster.
+    """
+
+    eligible = [
+        hint
+        for hint in hints
+        if hint.kind in {"answer", "correction"}
+        and hint.mirror_status == "verified"
+        and not hint.flags.id_unknown
+        and hint.position_range_ms is not None
+        and hint.position_range_ms[1] > hint.position_range_ms[0]
+        and plausible_crowd_label(hint.artist, hint.title)
+    ]
+    clusters: list[list[CrowdAnswer]] = []
+    hull: tuple[int, int] | None = None
+    for hint in sorted(eligible, key=lambda item: (item.position_range_ms, item.id)):
+        work_id = identity.hint_work_ids.get(hint.id)
+        candidate_id = identity.hint_candidates.get(hint.id)
+        span = hint.position_range_ms
+        if work_id is None or candidate_id is None or span is None:
+            continue
+        if any(_intersects(span, listed) for listed in listed_spans):
+            continue
+        if hull is not None and _intersects(span, hull):
+            clusters[-1].append((hint, work_id, candidate_id))
+            hull = (hull[0], max(hull[1], span[1]))
+        else:
+            clusters.append([(hint, work_id, candidate_id)])
+            hull = span
+    return clusters
+
+
+def rank_crowd_works(cluster: list[CrowdAnswer]) -> list[CrowdWork]:
+    """The works one cluster of answers names, best-supported first.
+
+    Support is the number of independent answers (provenance groups) naming the work, then
+    whether a trusted voice (the uploader, a pinned comment) named it, then the strongest parse,
+    then the earliest position, then the work id — deterministic, and never the opaque hint id
+    order that used to pick the listed row (review M4).
+    """
+
+    by_work: dict[str, tuple[str, list[HintRecord]]] = {}
+    for hint, work_id, candidate_id in cluster:
+        by_work.setdefault(work_id, (candidate_id, []))[1].append(hint)
+
+    def support(item: tuple[str, tuple[str, list[HintRecord]]]) -> tuple[int, int, int, int, str]:
+        work_id, (_, answers) = item
+        return (
+            -len({hint.provenance_group for hint in answers}),
+            -int(any(hint.author.is_uploader or hint.is_pinned for hint in answers)),
+            -max(hint.parse_confidence for hint in answers),
+            min(hint.position_range_ms[0] for hint in answers),  # type: ignore[index]
+            work_id,
+        )
+
+    return [
+        (
+            work_id,
+            candidate_id,
+            sorted(answers, key=lambda hint: (hint.position_range_ms, hint.id)),
+        )
+        for work_id, (candidate_id, answers) in sorted(by_work.items(), key=support)
+    ]
 
 
 def competing_candidate_count(
@@ -448,6 +627,8 @@ def build_episodes(
     scanned_window_shapes: frozenset[tuple[int, int]] | None = None,
     config: AppConfig | None = None,
     calibrator: Any | None = None,
+    overlap_min_ms: int = CORROBORATION_OVERLAP_MIN_MS,
+    separation_min_ms: int = CORROBORATION_SEPARATION_MIN_MS,
 ) -> tuple[EpisodesFile, list[RescanRequestRecord]]:
     final = [item for item in observations if item.is_final]
     selection = select_logical_trial_points(final, identity.observation_candidates)
@@ -465,6 +646,19 @@ def build_episodes(
             [item.support_ms for _, votes, _ in groups for item in votes], duration_ms
         )
         for candidate, groups in assigned.items()
+    }
+    # Cross-family agreement is read per normalised WORK, not per candidate (plan §2.3.4 step 5):
+    # an AudD match carrying an ISRC and a Shazam match carrying its key are two recording
+    # components of one work — nothing asserts ``same_recording`` between them — so their selected
+    # votes never share a candidate, yet they are the two engines agreeing.  An episode carries
+    # the agreements of its work that fall inside its own supports.
+    work_votes: dict[str, list[ObservationRecord]] = defaultdict(list)
+    for candidate_id, groups in assigned.items():
+        for _, votes, _ in groups:
+            work_votes[candidate_by_id[candidate_id].work_id].extend(votes)
+    work_agreements = {
+        work_id: engine_agreements(votes, overlap_min_ms=overlap_min_ms)
+        for work_id, votes in work_votes.items()
     }
     provisional: list[dict[str, Any]] = []
     for candidate_id, groups in sorted(assigned.items()):
@@ -554,8 +748,18 @@ def build_episodes(
                 flags.append("alignment_outlier")
             if supporting_hints:
                 flags.append("hint_supported")
-            if _engine_corroborated(votes):
+            # One cross-family agreement here is "confirmed twice"; two of them
+            # ``separation_min_ms`` apart are what may bypass suppression and the on-air floor
+            # (with the ``likely`` rule above left exactly as it is — E-S6).
+            agreements = [
+                agreement
+                for agreement in work_agreements.get(candidate_work_id, [])
+                if any(_intersects(agreement, support) for support in supports)
+            ]
+            if agreements:
                 flags.append("engine_corroborated")
+            if separated_agreements(agreements, separation_min_ms=separation_min_ms):
+                flags.append("engine_corroborated_separated")
             provisional.append(
                 {
                     "id": episode_id,
@@ -712,13 +916,15 @@ def build_episodes(
     # Presentation suppression (free false-positive control): flag episodes that should not be
     # LISTED as tracks, from three signals a confident, continuously-played match never trips.  The
     # presentation layer honours EpisodeRecord.suppressed (hidden behind the "hidden matches"
-    # toggle — never deleted).  A likely/verified badge or a corroborating hint makes it immune.
+    # toggle — never deleted).  A likely/verified badge, a corroborating hint or two cross-family
+    # agreements ``separation_min_ms`` apart make it immune; one agreement alone does not (plan
+    # §2.3.4 step 5).
     confident_spans = [
         (episode.evidence_support_ms[0][0], episode.evidence_support_ms[-1][1])
         for episode in episode_records
         if episode.badge in {"likely", "verified"}
         or "hint_supported" in episode.flags
-        or "engine_corroborated" in episode.flags
+        or "engine_corroborated_separated" in episode.flags
     ]
     answer_positions = [
         (hint.position_range_ms, identity.hint_work_ids.get(hint.id))
@@ -741,7 +947,7 @@ def build_episodes(
         if (
             episode.badge in {"likely", "verified"}
             or "hint_supported" in episode.flags
-            or "engine_corroborated" in episode.flags
+            or "engine_corroborated_separated" in episode.flags
         ):
             return None
         span = (episode.evidence_support_ms[0][0], episode.evidence_support_ms[-1][1])
@@ -775,7 +981,10 @@ def build_episodes(
     # Hint-only tracks: a confident, position-anchored comment answer whose work no engine matched —
     # and that no listed track already covers — still names the track.  Surface it as a low-
     # confidence "from comments" episode so a crowd ID (e.g. an opener Shazam can't fingerprint that
-    # a listener named in the comments) appears on the tracklist instead of an empty gap.
+    # a listener named in the comments) appears on the tracklist instead of an empty gap.  Only a
+    # plausible ``Artist - Title`` qualifies (U-F13), the answers are read in position order, and
+    # contradictory answers at one timestamp become ONE row — the best-supported work listed, the
+    # others as its alternatives — instead of a track per answer (review M4).
     known_work_ids = {
         candidate_by_id[episode.candidate_id].work_id
         for episode in episode_records
@@ -787,19 +996,20 @@ def build_episodes(
         if not episode.suppressed
     ]
     hint_only_episodes: list[EpisodeRecord] = []
-    for hint in sorted(hints, key=lambda item: item.id):
-        if hint.kind not in {"answer", "correction"} or hint.mirror_status != "verified":
+    for cluster in crowd_answer_clusters(hints, identity, listed_spans):
+        # A work already listed — by an engine, or from an earlier timestamp — is not named again.
+        ranked = rank_crowd_works([item for item in cluster if item[1] not in known_work_ids])
+        if not ranked:
             continue
-        if hint.flags.id_unknown or hint.position_range_ms is None:
-            continue
-        work_id = identity.hint_work_ids.get(hint.id)
-        candidate_id = identity.hint_candidates.get(hint.id)
-        if work_id is None or candidate_id is None or work_id in known_work_ids:
-            continue
-        lo, hi = hint.position_range_ms
-        if hi <= lo or any(_intersects((lo, hi), span) for span in listed_spans):
-            continue
+        winner, *others = ranked
+        work_id, candidate_id, winning_hints = winner
         known_work_ids.add(work_id)
+        lo = min(hint.position_range_ms[0] for hint in winning_hints)  # type: ignore[index]
+        hi = max(hint.position_range_ms[1] for hint in winning_hints)  # type: ignore[index]
+        # Defensive only: the clusters are disjoint and each yields at most one row, so no crowd
+        # row can land under another (review M4's duplicate is prevented by the clustering, not by
+        # this list, which :func:`crowd_answer_clusters` has already read).
+        listed_spans.append((lo, hi))
         natural = {
             "candidate_id": candidate_id,
             "occurrence_index": 0,
@@ -811,7 +1021,8 @@ def build_episodes(
                 generated_by=GENERATED_BY,
                 id=make_id(media_key, "episode", compose_natural_key("episode", natural)),
                 candidate_id=candidate_id,
-                alternatives=[],
+                # The contradicting answers' works, best-supported first: "could also be".
+                alternatives=[other_candidate for _, other_candidate, _ in others],
                 claim="component_evidence",
                 start_no_later_than_ms=lo,
                 end_no_earlier_than_ms=hi,
@@ -833,7 +1044,7 @@ def build_episodes(
                 tiers={"work": "possible", "version": "unclear", "boundary": "unclear"},
                 badge="possible",
                 version_status="unverified",
-                evidence=[hint.id],
+                evidence=sorted(hint.id for hint in winning_hints),
                 rejected_evidence=[],
                 # "hint_supported" keeps it listed (it is not a short phantom) and immune to
                 # suppression; "hint_only" marks that it has NO audio match — a pure crowd ID.
@@ -952,7 +1163,7 @@ def build_episodes(
             return True
         if episode.badge == "likely" or episode.version_status == "verified":
             return True
-        if "hint_supported" in episode.flags or "engine_corroborated" in episode.flags:
+        if "hint_supported" in episode.flags or "engine_corroborated_separated" in episode.flags:
             return True
         hull = episode.evidence_support_ms
         return hull[-1][1] - hull[0][0] >= rescan_min_track_ms
@@ -1101,11 +1312,14 @@ def fuse_generation(
     config: AppConfig | None = None,
     calibrator: Any | None = None,
     write_final: bool = True,
+    overlap_min_ms: int = CORROBORATION_OVERLAP_MIN_MS,
+    separation_min_ms: int = CORROBORATION_SEPARATION_MIN_MS,
 ) -> FusionResult:
     """Fuse the union of every generation's evidence and publish generation ``N``'s artefacts.
 
     ``observation_paths``/``window_paths`` list **every** input generation, so the completion
     sidecar of ``fuse/episodes.gen<N>.json`` records the hash of each one, as the plan requires.
+    ``overlap_min_ms`` / ``separation_min_ms`` are the recipe's corroboration thresholds.
     """
 
     identity = build_identity_graph(media_key, observations, hints=hints)
@@ -1131,6 +1345,8 @@ def fuse_generation(
         scanned_window_shapes=scanned_window_shapes,
         config=config,
         calibrator=calibrator,
+        overlap_min_ms=overlap_min_ms,
+        separation_min_ms=separation_min_ms,
     )
     generation_path = media_dir / "fuse" / f"episodes.gen{generation}.json"
     upstream = {
@@ -1191,6 +1407,8 @@ def fuse_generation_zero(
     config: AppConfig | None = None,
     calibrator: Any | None = None,
     write_final: bool = True,
+    overlap_min_ms: int = CORROBORATION_OVERLAP_MIN_MS,
+    separation_min_ms: int = CORROBORATION_SEPARATION_MIN_MS,
 ) -> FusionResult:
     """Generation-0 convenience wrapper used by the single-generation callers."""
 
@@ -1212,4 +1430,6 @@ def fuse_generation_zero(
         config=config,
         calibrator=calibrator,
         write_final=write_final,
+        overlap_min_ms=overlap_min_ms,
+        separation_min_ms=separation_min_ms,
     )

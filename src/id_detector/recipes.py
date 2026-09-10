@@ -92,7 +92,7 @@ FREE_RECIPE = Recipe(
     retry_policy=MappingProxyType({"shazam": RetryPolicy(mode="existing_limiter")}),
     max_usd_e2=0,
     adapter_versions=MappingProxyType({"shazam": 1}),
-    algorithm_version="fusion:1",
+    algorithm_version="fusion:2",
     requires=("shazam_sweep",),
 )
 
@@ -137,7 +137,7 @@ DEEP_RECIPE = Recipe(
     ),
     max_usd_e2=900,
     adapter_versions=MappingProxyType({"audd_clip": 2, "shazam": 1}),
-    algorithm_version="targeting:1,fusion:1",
+    algorithm_version="targeting:1,fusion:2",
     requires=("audd_sweep", "shazam_secondary"),
 )
 

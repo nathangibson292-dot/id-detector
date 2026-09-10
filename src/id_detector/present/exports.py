@@ -13,6 +13,7 @@ from id_detector.contracts import (
     EpisodesFile,
     IdentitiesRecord,
 )
+from id_detector.fuse.episodes import plausible_crowd_label
 from id_detector.io import atomic_write_bytes, atomic_write_json, write_completion_sidecar
 
 _ROLE_PRECEDENCE = {
@@ -60,6 +61,13 @@ def _cue_quote(value: str) -> str:
     return '"' + value.replace('"', "'").replace("\n", " ").replace("\r", " ") + '"'
 
 
+def _split_label(label: str) -> tuple[str, str]:
+    if " - " not in label:
+        return "Unknown artist", label
+    artist, title = label.split(" - ", 1)
+    return artist, title
+
+
 def _candidate_label(identities: IdentitiesRecord, candidate_id: str) -> tuple[str, str]:
     candidate = next(item for item in identities.candidates if item.canonical_id == candidate_id)
     labels = [
@@ -68,12 +76,14 @@ def _candidate_label(identities: IdentitiesRecord, candidate_id: str) -> tuple[s
         if node.id in candidate.member_nodes and node.ns != "text"
     ]
     if not labels:
+        # A text-only candidate (a crowd ID, an engine match with no catalogue id) is labelled
+        # from the whole work, whose text nodes include tracklist and comment lines: one may be a
+        # lead-in ("FULL TRACK LIST: - …") or carry an @handle rather than a name.  Prefer a label
+        # that reads as a track (U-F13); only if none does is the bare minimum shown.
         work = next(item for item in identities.works if item.work_id == candidate.work_id)
         labels = [node.label for node in identities.nodes if node.id in work.member_nodes]
-    label = min(labels) if labels else "Unknown artist - Unknown title"
-    if " - " not in label:
-        return "Unknown artist", label
-    return tuple(label.split(" - ", 1))  # type: ignore[return-value]
+        labels = [item for item in labels if plausible_crowd_label(*_split_label(item))] or labels
+    return _split_label(min(labels) if labels else "Unknown artist - Unknown title")
 
 
 def _display_start(episode: EpisodeRecord) -> int:
@@ -128,15 +138,17 @@ def short_track(entry: dict[str, Any], min_track_ms: int) -> bool:
 
     On-air duration cleanly separates real tracks from false positives (most false positives are a
     single 12 s window), so a ``kind == "track"`` row whose summed proved support is under
-    ``min_track_ms`` is treated as short — UNLESS its badge is ``likely``/``verified`` or a text
-    hint supports it.  ``0`` disables the rule; ID gaps are never short.
+    ``min_track_ms`` is treated as short — UNLESS its badge is ``likely``/``verified``, a text
+    hint supports it, or two trust families agreed on it at two moments far enough apart
+    (``engine_corroborated_separated``; one shared window is "confirmed twice" but still short —
+    plan §2.3.4 step 5).  ``0`` disables the rule; ID gaps are never short.
     """
 
     if min_track_ms <= 0 or entry.get("kind") != "track":
         return False
     if entry.get("badge") in _KEEP_SHORT_BADGES or entry.get("hint_supported"):
         return False
-    if entry.get("engine_corroborated"):  # two engines agree — not a lone-window phantom
+    if entry.get("engine_corroborated_separated"):  # two families agree twice, well apart
         return False
     return int(entry.get("on_air_ms") or 0) < min_track_ms
 
@@ -199,6 +211,13 @@ def _track_entry(
         episode.best_start_ms if primary_role == "incoming" or primary is None else primary.from_ms
     )
     acquire_episode = acquire_by_episode.get(episode.id)
+    # A crowd row's ``alternatives`` are the contradicting comment answers at the same timestamp
+    # (fusion lists the best-supported one and carries the others as candidate ids).
+    crowd_alternatives = (
+        [_crowd_alternative_summary(other, identities, episode) for other in episode.alternatives]
+        if "hint_only" in episode.flags
+        else []
+    )
     return {
         "kind": "track",
         "start_ms": start_ms,
@@ -213,8 +232,12 @@ def _track_entry(
         "badge": episode.badge,
         "version_status": episode.version_status,
         "hint_supported": "hint_supported" in episode.flags,
-        # Two independent recognizers (e.g. Shazam + AudD) matched this track at the same time.
+        # Two trust families (e.g. Shazam + AudD) matched this track at the same time: shown as
+        # "confirmed twice".
         "engine_corroborated": "engine_corroborated" in episode.flags,
+        # ...and did so at two moments far enough apart — the one cross-engine signal that keeps
+        # a short row listed (see ``short_track``).
+        "engine_corroborated_separated": "engine_corroborated_separated" in episode.flags,
         # A crowd ID: named by a confident comment answer, but no engine matched the audio.
         "hint_only": "hint_only" in episode.flags,
         "on_air_ms": _on_air_ms(episode),
@@ -224,8 +247,8 @@ def _track_entry(
         "n_rejected_hypotheses": len(episode.rejected_evidence),
         "tiers": episode.tiers.model_dump(mode="json"),
         "acquire": _acquire_summary(acquire_episode) if acquire_episode is not None else None,
-        "alternatives": [],
-        "also_count": 0,
+        "alternatives": crowd_alternatives,
+        "also_count": len(crowd_alternatives),
     }
 
 
@@ -238,6 +261,25 @@ def _alternative_summary(episode: EpisodeRecord, identities: IdentitiesRecord) -
         "title": title,
         "track": f"{artist} — {title}",
         "candidate_id": episode.candidate_id,
+        "episode_id": episode.id,
+        "start_ms": _display_start(episode),
+    }
+
+
+def _crowd_alternative_summary(
+    candidate_id: str, identities: IdentitiesRecord, episode: EpisodeRecord
+) -> dict[str, Any]:
+    """A contradicting comment answer at the listed crowd row's timestamp: the same row shape as
+    a folded-in version, carrying the crowd row's own (comment-only) confidence."""
+
+    artist, title = _candidate_label(identities, candidate_id)
+    return {
+        "badge": episode.badge,
+        "version_status": "unverified",
+        "artist": artist,
+        "title": title,
+        "track": f"{artist} — {title}",
+        "candidate_id": candidate_id,
         "episode_id": episode.id,
         "start_ms": _display_start(episode),
     }
@@ -302,7 +344,14 @@ def flatten_tracklist(
                     for span in member.evidence_support_ms
                 ]
             )
-            alternatives = [_alternative_summary(alt, identities) for alt in track.alternatives]
+            # A crowd row keeps the contradicting answers it already carries; the folded-in
+            # versions follow them.
+            alternatives = list(entry["alternatives"])
+            seen = {alt["candidate_id"] for alt in alternatives}
+            for alt in track.alternatives:
+                if alt.candidate_id not in seen:
+                    seen.add(alt.candidate_id)
+                    alternatives.append(_alternative_summary(alt, identities))
             entry["alternatives"] = alternatives
             entry["also_count"] = len(alternatives)
             # The folded-in versions are already listed as alternatives, so drop them from the
@@ -425,15 +474,18 @@ def export_tracklist(
             elif entry["hint_supported"]:
                 badge += " +HINT"
             if entry.get("engine_corroborated"):
-                badge += " +2ENGINES"
+                badge += " +CONFIRMED TWICE"
             version_status = str(entry["version_status"]).upper()
             label = f"{entry['artist']} — {entry['title']}"
             if entry.get("also_count"):
                 others = "; ".join(alt["track"] for alt in entry["alternatives"])
-                label += (
-                    f"<br>also: {entry['also_count']} other version"
-                    f"{'s' if entry['also_count'] != 1 else ''} matched — {others}"
-                )
+                if entry.get("hint_only"):
+                    label += f"<br>also named in the comments — {others}"
+                else:
+                    label += (
+                        f"<br>also: {entry['also_count']} other version"
+                        f"{'s' if entry['also_count'] != 1 else ''} matched — {others}"
+                    )
             search_cell = "yes" if entry.get("acquire") else "—"
             lines.append(
                 f"| {_format_time(entry['start_ms'])} | {badge} | {version_status} | "

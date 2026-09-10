@@ -45,7 +45,7 @@ UNRESOLVED_CAP_MS = 120_000
 #: Bump when the page's look or behaviour changes: ``present.refresh.ensure_fresh_page`` re-renders
 #: any written page whose ``<meta name="id-detector-page">`` stamp is older, so already-analysed
 #: mixes pick up the new page the next time they are opened (no re-analysis).
-PAGE_VERSION = 17
+PAGE_VERSION = 18
 
 
 # --------------------------------------------------------------------------------------------------
@@ -390,8 +390,14 @@ def _alternatives_html(entry: dict[str, Any]) -> str:
         for alt in alternatives
     )
     plural = "s" if count != 1 else ""
+    # A crowd row's alternatives are the other answers given at the same moment, not versions.
+    summary = (
+        f"▸ {count} other answer{plural} in the comments"
+        if entry.get("hint_only")
+        else f"▸ {count} other version{plural}"
+    )
     return (
-        f'<details class="alts"><summary>▸ {count} other version{plural}</summary>'
+        f'<details class="alts"><summary>{summary}</summary>'
         f'<ul class="altlist">{items}</ul></details>'
     )
 
@@ -419,8 +425,9 @@ def _tags_html(entry: dict[str, Any], hidden: str | None = None) -> str:
         tags.append('<span class="hint" title="supported by a text hint">hint</span>')
     if entry.get("engine_corroborated"):
         tags.append(
-            '<span class="hint engine" title="a second recogniser independently '
-            'matched this track here">cross-checked</span>'
+            '<span class="hint engine" title="a recogniser from a second, independent family '
+            "(catalogue, Shazam or the local index) matched this track at the same "
+            'moment">confirmed twice</span>'
         )
     if hidden == "short":
         seconds = round(int(entry.get("on_air_ms") or 0) / 1000)

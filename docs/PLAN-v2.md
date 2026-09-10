@@ -573,7 +573,7 @@ E-H1, E-S3.
   $env:IDEA_TEST_MODE = "1"; $env:IDEA_FAKE_SCRIPT = "tests/fakes/scripts/gate0a-deep.json"
   $w = Join-Path $env:TEMP ("idea-gate0a-" + [guid]::NewGuid().ToString("N"))   # fresh root each run: Windows cannot delete the long-path cache files
   uv run idea analyse tests/fixtures/audio/tone-60s.wav --recipe deep --fake-providers audd,shazam --work-root $w
-  uv run python scripts/assert_journal.py --work-root $w --expect status=complete algorithm_version=targeting:0,fusion:1 usd_e6_reserved=36750 usd_e6_spent=35000 usd_e2_spent=4
+  uv run python scripts/assert_journal.py --work-root $w --expect status=complete algorithm_version=targeting:1,fusion:2 usd_e6_reserved=36750 usd_e6_spent=35000 usd_e2_spent=4
   ```
   plus `uv run pytest tests/test_phase0a_status.py -q` asserting every matrix row (`http_401` first →
   exit 3; `quota_error` after two matches → `partial/provider_unavailable_midrun`; `--allow-degrade` →

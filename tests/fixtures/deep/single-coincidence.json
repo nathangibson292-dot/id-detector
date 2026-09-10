@@ -1,0 +1,19 @@
+{
+  "note": "One shared window: Shazam and AudD both match the same track on window 2 and nowhere else. The 12 s overlap is one cross-family agreement, so the row reads 'confirmed twice' (engine_corroborated) - but one coincidence is no bypass: 12 s on air is under the 30 s floor and the row stays hidden as short.",
+  "duration_ms": 60000,
+  "window_starts_ms": [0, 9000, 18000, 27000, 36000, 45000, 48000],
+  "window_ms": 12000,
+  "label": {"artist": "Fixture Artist B", "title": "Tone 554"},
+  "votes": {"shazam": [2], "audd": [2]},
+  "min_track_ms": 30000,
+  "expect": {
+    "episodes": 1,
+    "selected_votes": 2,
+    "badge": "unclear",
+    "flags": ["engine_corroborated"],
+    "not_flags": ["engine_corroborated_separated"],
+    "agreements": 1,
+    "suppressed": null,
+    "hidden": "short"
+  }
+}

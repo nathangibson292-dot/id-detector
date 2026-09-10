@@ -1,0 +1,31 @@
+{
+  "note": "Two agreements 117 s apart (windows 0 and 13 of a 180 s mix) on a track with only 24 s on air across a 129 s hull (two disjoint trials over 20 s: badge possible, which the scatter rule does not spare): fusion's scatter rule would suppress it and the on-air floor would hide it, and two cross-family agreements >= 60 s apart bypass both. 'variant' is the same evidence with AudD on window 0 only - one agreement is 'confirmed twice' but the scatter suppression stands.",
+  "duration_ms": 180000,
+  "windows": {"hop_ms": 9000, "window_ms": 12000},
+  "label": {"artist": "Fixture Artist C", "title": "Tone 659"},
+  "votes": {"shazam": [0, 13], "audd": [0, 13]},
+  "min_track_ms": 30000,
+  "expect": {
+    "episodes": 1,
+    "selected_votes": 4,
+    "badge": "possible",
+    "flags": ["engine_corroborated", "engine_corroborated_separated"],
+    "not_flags": [],
+    "agreements": 2,
+    "suppressed": null,
+    "hidden": null
+  },
+  "variant": {
+    "votes": {"shazam": [0, 13], "audd": [0]},
+    "expect": {
+      "episodes": 1,
+      "selected_votes": 3,
+      "badge": "possible",
+      "flags": ["engine_corroborated"],
+      "not_flags": ["engine_corroborated_separated"],
+      "agreements": 1,
+      "suppressed": "scatter",
+      "hidden": "scatter"
+    }
+  }
+}

@@ -34,7 +34,11 @@ from id_detector.decode import decode
 from id_detector.doctor import run_doctor
 from id_detector.enrich.benchmark import build_link_sample, score_link_sample
 from id_detector.enrich.run import enrich_media_dir
-from id_detector.fuse.episodes import fuse_generation_zero  # noqa: F401  (public re-export)
+from id_detector.fuse.episodes import (  # noqa: F401  (fuse_generation_zero: public re-export)
+    CORROBORATION_OVERLAP_MIN_MS,
+    CORROBORATION_SEPARATION_MIN_MS,
+    fuse_generation_zero,
+)
 from id_detector.hints.pipeline import run_hints
 from id_detector.ingest import _load_cached, ingest
 from id_detector.io import read_text, redact_text
@@ -937,6 +941,20 @@ async def _analyse(
                 gen0_requests=gen0_requests,
                 gen0_physical_attempts=gen0_physical,
                 calibrator=calibrator,
+                # The recipe's corroboration thresholds (plan §2.3.4 step 5); the Free recipe
+                # defines neither (``None``) and takes the fuser's defaults, which are the Deep
+                # values.  Only ``None`` falls back — a recipe that deliberately sets ``0`` means
+                # "no floor", not "use the default".
+                overlap_min_ms=(
+                    CORROBORATION_OVERLAP_MIN_MS
+                    if requested_recipe.overlap_min_ms is None
+                    else requested_recipe.overlap_min_ms
+                ),
+                separation_min_ms=(
+                    CORROBORATION_SEPARATION_MIN_MS
+                    if requested_recipe.separation_min_ms is None
+                    else requested_recipe.separation_min_ms
+                ),
             )
 
         orchestrated = await _fuse((), ())
@@ -1336,8 +1354,10 @@ def analyse(
         None,
         "--recipe",
         help=(
-            "Select the scan recipe ('free' or 'deep'). Defaults to deep for the legacy "
-            "max_accuracy profile and free otherwise."
+            "Select the scan recipe ('free' or 'deep'). Defaults to free; only the legacy "
+            "'--profile max_accuracy --engine audd' pair still defaults to deep. A profile alone "
+            "never selects paid work: '--profile max_accuracy' without --recipe is the free "
+            "recipe."
         ),
     ),
     allow_degrade: bool = typer.Option(

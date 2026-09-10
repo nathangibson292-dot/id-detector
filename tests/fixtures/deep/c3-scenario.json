@@ -1,0 +1,19 @@
+{
+  "note": "Review C3: a track Shazam matched cleanly over all seven frozen windows of a 60 s mix (T_ind 4, span 60 s, global alignment -> likely) that AudD agrees with on all seven. AudD is its own trial source, so both engines' votes are selected: the badge stays likely under the unchanged rule (E-S6), no hypothesis is rejected, and every shared window is a cross-family agreement (12 s overlap >= 6 s) - eight in all, the two tail windows (45-57 s, 48-60 s) overlapping each other by 9 s across the engines as well; adjacent 9 s-hop windows overlap by only 3 s and never agree. The agreements start 0-48 s apart, under the 60 s separation, so only the likely rule keeps the row listed.",
+  "duration_ms": 60000,
+  "window_starts_ms": [0, 9000, 18000, 27000, 36000, 45000, 48000],
+  "window_ms": 12000,
+  "label": {"artist": "Fixture Artist A", "title": "Tone 440"},
+  "votes": {"shazam": [0, 1, 2, 3, 4, 5, 6], "audd": [0, 1, 2, 3, 4, 5, 6]},
+  "min_track_ms": 30000,
+  "expect": {
+    "episodes": 1,
+    "selected_votes": 14,
+    "badge": "likely",
+    "flags": ["engine_corroborated"],
+    "not_flags": ["engine_corroborated_separated", "hypothesis_rejected"],
+    "agreements": 8,
+    "suppressed": null,
+    "hidden": null
+  }
+}

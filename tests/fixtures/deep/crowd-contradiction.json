@@ -1,0 +1,37 @@
+{
+  "note": "Crowd rows (E-M4, U-F13) on a 10 min mix no engine matched at all. At ~3:00 three comments answer: two independent listeners name X (one of them written 'Title - Artist'), one names Y - contradictory answers at one timestamp become ONE row, X listed with Y as its alternative and both X answers as evidence. At 4:00 a whole paragraph parsed as an answer ('... by MPH? ...') and at 4:20 a question the parser read as an answer are not plausible track labels and are dropped. At 5:00 a lone answer is listed on its own.",
+  "duration_ms": 600000,
+  "comments": [
+    {"comment": "x1", "text": "Fixture Artist X - Title X", "at_ms": 180000, "author": "fan-1"},
+    {"comment": "y1", "text": "Fixture Artist Y - Title Y", "at_ms": 182000, "author": "fan-3"},
+    {"comment": "x2", "text": "Title X - Fixture Artist X", "at_ms": 184000, "author": "fan-2"},
+    {
+      "comment": "prose",
+      "text": "Can we talk about that crazy transition from Perfect - salute into Nova by MPH? For a moment I thought I was listening to a remix of Perfect but realised it was Nova pitched and sped up slightly",
+      "at_ms": 240000,
+      "author": "fan-4"
+    },
+    {"comment": "question", "text": "who is this - anyone know?", "at_ms": 260000, "author": "fan-5"},
+    {"comment": "z1", "text": "Fixture Artist Z - Title Z", "at_ms": 300000, "author": "fan-6"}
+  ],
+  "min_track_ms": 30000,
+  "expect": {
+    "rows": [
+      {
+        "start_ms": 175000,
+        "end_ms": 189000,
+        "label": "Fixture Artist X - Title X",
+        "evidence": ["x1", "x2"],
+        "alternatives": ["Fixture Artist Y - Title Y"]
+      },
+      {
+        "start_ms": 295000,
+        "end_ms": 305000,
+        "label": "Fixture Artist Z - Title Z",
+        "evidence": ["z1"],
+        "alternatives": []
+      }
+    ],
+    "dropped": ["prose", "question"]
+  }
+}
