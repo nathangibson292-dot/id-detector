@@ -1,7 +1,7 @@
 # Truth — MPH live set (YouTube), 54 entries + 9 "w/" overlays, from a public comment tracklist supplied by the owner 2026-09-10.
 # Mix: source URL held privately in data/local/corpus-sources.json (committed-corpus policy: no URLs / platform IDs)
 # Crowd noise present (live recording). Record labels in [brackets] removed. "w/" lines = a second track overlaid at the same time (overlap truth).
-# The 9 'w/' overlays (a second track playing at the same time) are kept in mph-youtube-set.overlays.txt — the seeder cannot express simultaneous rows; attach them as overlaps_with during verification.
+# The 9 'w/' overlays (a second track playing at the same time) live in mph-youtube-set.overlays.txt and are seeded via `idea truth seed --overlays` as `layer` episodes with overlaps_with set both ways.
 # Entries 1, 53 and 54 had no timestamp in the source: 1 = start; 53/54 marked approx. — verifier to fix by listening.
 0:00:00 - MPH - One Sixty (Intro Edit)
 0:02:04 - Boy Better Know - Too Many Man (NOTION Edit)

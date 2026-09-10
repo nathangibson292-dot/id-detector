@@ -2392,6 +2392,17 @@ def truth_seed(
     media_key: Annotated[str, typer.Option("--media-key")],
     hints: Annotated[Path | None, typer.Option("--hints")] = None,
     tracklist: Annotated[Path | None, typer.Option("--tracklist")] = None,
+    overlays: Annotated[
+        Path | None,
+        typer.Option(
+            "--overlays",
+            help=(
+                "Tracks blended in over a tracklist row ('w/' lines, 'H:MM:SS - Artist - Title "
+                "(w/ overlay)'): each becomes a layered episode from its time to the end of the "
+                "row it overlays, linked both ways. Needs a timestamped --tracklist."
+            ),
+        ),
+    ] = None,
     split: Annotated[str, typer.Option("--split")] = "dev-1",
     stratum: Annotated[str, typer.Option("--stratum")] = "catalogue-covered",
     corpus_version: Annotated[str, typer.Option("--corpus-version")] = "draft",
@@ -2412,6 +2423,7 @@ def truth_seed(
             media_key=media_key,
             hints=hints,
             tracklist=tracklist,
+            overlays=overlays,
             split=split,
             stratum=stratum,
             corpus_version=corpus_version,

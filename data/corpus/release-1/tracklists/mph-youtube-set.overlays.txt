@@ -1,4 +1,4 @@
-# Overlays for mph-youtube-set (same start time as the row they are blended with); not seeded — attach via overlaps_with in verification.
+# Overlays for mph-youtube-set (same start time as the row they are blended with); seeded via `idea truth seed --overlays` as layer episodes (overlaps_with both ways).
 0:17:09 - MPH - Funk Master (w/ overlay)
 0:33:10 - Sammy Virji - Bogeyman (w/ overlay)
 0:39:45 - Sammy Virji & 33 Below - Dub It In (w/ overlay)

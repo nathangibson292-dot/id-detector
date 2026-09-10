@@ -21,9 +21,14 @@ from id_detector.io import (
 
 Input = Callable[[str], str]
 Output = Callable[[str], None]
+# "H:MM:SS Artist - Title", optionally bulleted after the time ("0:17:09 - Artist - Title"): the
+# bullet is list furniture, never the first character of the artist.
 _TRACKLIST = re.compile(
-    r"^\s*(?:(?P<time>\d+(?::\d{1,2}){1,2})\s+)?(?P<artist>.+?)\s+-\s+(?P<title>.+?)\s*$"
+    r"^\s*(?:(?P<time>\d+(?::\d{1,2}){1,2})\s+)?(?:[-\u2013\u2014\u2022]\s+)?"
+    r"(?P<artist>.+?)\s+-\s+(?P<title>.+?)\s*$"
 )
+#: The marker an overlays file may carry on each line ("... - Title (w/ overlay)").
+_OVERLAY_SUFFIX = re.compile(r"(?i)\s*\(\s*w/\s*overlay\s*\)\s*$")
 
 
 def _parse_time(value: str) -> int:
@@ -75,21 +80,32 @@ def _seed_entries(hints: Path | None, tracklist: Path | None) -> list[dict[str, 
                 }
             )
     if tracklist is not None:
-        for line_number, line in enumerate(read_text(tracklist).splitlines(), 1):
-            if not line.strip() or line.lstrip().startswith("#"):
-                continue
-            match = _TRACKLIST.match(line)
-            if not match:
-                raise ValueError(f"invalid manual tracklist line {line_number}: {line}")
-            at_ms = _parse_time(match.group("time")) if match.group("time") else None
-            entries.append(
-                {
-                    "artist": match.group("artist"),
-                    "title": match.group("title"),
-                    "version_qualifier": None,
-                    "position": [at_ms, at_ms] if at_ms is not None else None,
-                }
-            )
+        entries.extend(_tracklist_entries(tracklist, what="manual tracklist"))
+    return _unique_entries(entries)
+
+
+def _tracklist_entries(path: Path, *, what: str) -> list[dict[str, Any]]:
+    entries: list[dict[str, Any]] = []
+    for line_number, line in enumerate(read_text(path).splitlines(), 1):
+        if not line.strip() or line.lstrip().startswith("#"):
+            continue
+        match = _TRACKLIST.match(line)
+        if not match:
+            raise ValueError(f"invalid {what} line {line_number}: {line}")
+        at_ms = _parse_time(match.group("time")) if match.group("time") else None
+        entries.append(
+            {
+                "artist": match.group("artist"),
+                "title": match.group("title"),
+                "version_qualifier": None,
+                "position": [at_ms, at_ms] if at_ms is not None else None,
+                "line": line_number,
+            }
+        )
+    return entries
+
+
+def _unique_entries(entries: list[dict[str, Any]]) -> list[dict[str, Any]]:
     unique: list[dict[str, Any]] = []
     seen: set[tuple[str, str, int | None]] = set()
     for item in entries:
@@ -99,6 +115,27 @@ def _seed_entries(hints: Path | None, tracklist: Path | None) -> list[dict[str, 
             seen.add(key)
             unique.append(item)
     return unique
+
+
+def _overlay_entries(overlays: Path) -> list[dict[str, Any]]:
+    """Lines ``H:MM:SS - Artist - Title (w/ overlay)`` (the suffix optional); every one timed."""
+
+    entries = []
+    for item in _tracklist_entries(overlays, what="overlays"):
+        if item["position"] is None:
+            raise ValueError(
+                f"overlays line {item['line']} needs a timestamp: an overlay is placed by the "
+                "time it was blended in"
+            )
+        entries.append({**item, "title": _OVERLAY_SUFFIX.sub("", item["title"]).strip()})
+    return _unique_entries(entries)
+
+
+def _format_ms(value: int) -> str:
+    seconds, milliseconds = divmod(value, 1000)
+    minutes, seconds = divmod(seconds, 60)
+    hours, minutes = divmod(minutes, 60)
+    return f"{hours}:{minutes:02d}:{seconds:02d}" + (f".{milliseconds:03d}" if milliseconds else "")
 
 
 def _write_source_links(project_root: Path, links: dict[str, str]) -> None:
@@ -120,6 +157,7 @@ def seed_truth(
     media_key: str,
     hints: Path | None = None,
     tracklist: Path | None = None,
+    overlays: Path | None = None,
     split: str = "dev-1",
     stratum: str = "catalogue-covered",
     corpus_version: str = "draft",
@@ -138,6 +176,12 @@ def seed_truth(
     has_timed = any(item["position"] is not None for item in entries)
     if has_timed and any(item["position"] is None for item in entries):
         raise ValueError("mixed timed and untimed seeds require an explicit cue for every entry")
+    overlay_entries = _overlay_entries(overlays) if overlays is not None else []
+    if overlay_entries and not has_timed:
+        raise ValueError(
+            "overlays need a timestamped tracklist: an overlay is attached to the row playing at "
+            "its time, which placeholder equal-slice timings cannot say"
+        )
     entries.sort(key=lambda item: item["position"][0] if item["position"] else duration_ms + 1)
     positions: list[list[int]] = []
     for index, item in enumerate(entries):
@@ -150,37 +194,70 @@ def seed_truth(
             point = index * duration_ms // len(entries)
             position = [point, point]
         positions.append(position)
-    episodes: list[dict[str, Any]] = []
+    # Each row ends where the next begins.  An overlay ("w/": a second track blended in at the same
+    # time) cannot be a row of its own in that chain — it would end the row it plays over — so it
+    # is attached to the row playing at its timestamp and given that row's end.
+    attached: dict[int, list[dict[str, Any]]] = {}
+    # Sorted by time (stable, so a file already in order seeds byte-identically): two overlays of
+    # the same row must still land in the episode list in the order they were blended in.
+    for item in sorted(overlay_entries, key=lambda item: item["position"][0]):
+        at_ms = min(duration_ms, max(0, int(item["position"][0])))
+        rows = [index for index, position in enumerate(positions) if position[0] <= at_ms]
+        if not rows:
+            raise ValueError(
+                f"overlay at {_format_ms(at_ms)} (line {item['line']}) precedes the first "
+                "tracklist row"
+            )
+        if at_ms >= duration_ms:
+            raise ValueError(
+                f"overlay at {_format_ms(at_ms)} (line {item['line']}) lies at or beyond the end "
+                "of the mix"
+            )
+        attached.setdefault(rows[-1], []).append({**item, "position": [at_ms, at_ms]})
     occurrences: dict[tuple[str, str], int] = {}
+
+    def _episode(
+        item: dict[str, Any], start_range: list[int], end_range: list[int], role: str
+    ) -> dict[str, Any]:
+        work_identity = (item["artist"].casefold(), item["title"].casefold())
+        occurrence_index = occurrences.get(work_identity, 0)
+        occurrences[work_identity] = occurrence_index + 1
+        return {
+            "work": {"artist": item["artist"], "title": item["title"]},
+            "version": {"qualifier": item["version_qualifier"], "ids": {}},
+            "version_verified": False,
+            "verified_against": None,
+            "start_ms_range": start_range,
+            "end_ms_range": end_range,
+            "audible_rule": "manual annotation required",
+            "role_segments": [{"from_ms": start_range[0], "to_ms": end_range[1], "role": role}],
+            "overlaps_with": [],
+            "occurrence_index": occurrence_index,
+            "in_reference_pool": False,
+            "annotator_ref": None,
+            "second_pass_ref": None,
+            "disagreement_resolution": None,
+            "note": None,
+            "draft": True,
+        }
+
+    episodes: list[dict[str, Any]] = []
     for index, (item, start_range) in enumerate(zip(entries, positions, strict=True)):
         end_range = (
             positions[index + 1] if index + 1 < len(positions) else [duration_ms, duration_ms]
         )
-        work_identity = (item["artist"].casefold(), item["title"].casefold())
-        occurrence_index = occurrences.get(work_identity, 0)
-        occurrences[work_identity] = occurrence_index + 1
-        episodes.append(
-            {
-                "work": {"artist": item["artist"], "title": item["title"]},
-                "version": {"qualifier": item["version_qualifier"], "ids": {}},
-                "version_verified": False,
-                "verified_against": None,
-                "start_ms_range": start_range,
-                "end_ms_range": end_range,
-                "audible_rule": "manual annotation required",
-                "role_segments": [
-                    {"from_ms": start_range[0], "to_ms": end_range[1], "role": "uncertain"}
-                ],
-                "overlaps_with": [],
-                "occurrence_index": occurrence_index,
-                "in_reference_pool": False,
-                "annotator_ref": None,
-                "second_pass_ref": None,
-                "disagreement_resolution": None,
-                "note": None,
-                "draft": True,
-            }
-        )
+        row = _episode(item, start_range, end_range, "uncertain")
+        episodes.append(row)
+        row_index = len(episodes) - 1
+        for overlay in attached.get(index, []):
+            layer = _episode(overlay, overlay["position"], end_range, "layer")
+            layer["note"] = (
+                "seeded as an overlay ('w/'): blended in at this time over the row before it; "
+                "its end is assumed to be that row's end"
+            )
+            layer["overlaps_with"] = [row_index]
+            episodes.append(layer)
+            row["overlaps_with"].append(len(episodes) - 1)
     source_ref = f"source-{set_id}"
     uploader_ref = f"uploader-{set_id}"
     event_ref = f"event-{set_id}" if event else None

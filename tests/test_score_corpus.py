@@ -42,20 +42,31 @@ from pathlib import Path
 import pytest
 
 from id_detector.benchmark.corpus import _prediction_set, prediction_set_from_fusion
-from id_detector.benchmark.scorer import pooled_metrics
+from id_detector.benchmark.scorer import (
+    PredictionDocument,
+    pooled_metrics,
+    score_set,
+    work_key,
+)
 from id_detector.contracts import EpisodesFile, GroundTruthRecord, IdentitiesRecord, TruthWork
+from id_detector.fuse.identity import _word_sets_corroborate
 from id_detector.io import canonical_json_bytes
+from id_detector.truth import seed_truth
 from scripts.score_corpus import (
     L3_THRESHOLDS,
     ListedWork,
     RunEntry,
     WorkCounts,
     identities_path,
+    is_range_claim,
     listed_episodes,
     load_run_list,
     main,
     match_works,
+    median_offset,
     mix_line,
+    parity_identities,
+    placeholder_rows,
     proved_bounds,
     run_media_key,
     score_mix,
@@ -263,7 +274,18 @@ def test_time_mode_numbers_on_corpus_mini_are_unchanged(tmp_path: Path) -> None:
     # The per-mix artefacts the plan's `idea benchmark score` step would have written.
     for mix in document["mixes"]:
         assert (tmp_path / mix["report"]).is_file()
-        assert (tmp_path / mix["report"]).with_name("predictions.json").is_file()
+        predictions_path = (tmp_path / mix["report"]).with_name("predictions.json")
+        assert predictions_path.is_file()
+        # Part iii, asserted explicitly: the fixture has no near-duplicate labels, so identity
+        # parity granted nothing and the scorer saw the run's own identity graph, node for node.
+        predictions = json.loads(predictions_path.read_text("utf-8"))
+        assert predictions["config_snapshot"]["run_config"]["parity_keys"] == 0
+        fixture_graph = json.loads(
+            (FIXTURE / mix["mix_id"] / "fuse" / "identities.gen0.json").read_text("utf-8")
+        )
+        assert predictions["sets"][0]["identities"] == fixture_graph
+        # Placeholder-timed rows carry no offset to measure.
+        assert (mix["median_offset_ms"], mix["offset_pairs"]) == (None, 0)
 
 
 @pytest.mark.parametrize("document", [EXPECTED, EXPECTED_TIME], ids=["work", "time"])
@@ -685,11 +707,20 @@ def test_a_half_verified_truth_is_matched_by_work_not_by_its_placeholder_slices(
         "or all rows (1 order-only, 1 only partly timed)" in paragraph
     )
 
-    # What the old detector did: forced onto the time path, the untimed rows score as misses.
+    # The offset diagnostic reads only rows that no longer look like seed placeholders: Alpha (its
+    # tracklist start is 9 s, the tool first heard it at 10 s) and row 0, whose end the verifier
+    # trimmed (Gamma, heard at 450 s: +450 s); Beta's untouched placeholder row is left out.  The
+    # lower median of {+1 s, +450 s} is +1 s.
+    assert (mini_a["median_offset_ms"], mini_a["offset_pairs"]) == (1_000, 2)
+
+    # What the old detector did: forced onto the time path, the untimed rows score as misses —
+    # only Alpha, the one row with a real start, can be right (with identity parity, part iii, it
+    # is: the strict key "mini artist|alpha extended mix" alone would have missed it too).
     code, document = _run_time(tmp_path / "time", root / "run-list.json", "--print")
     assert code == 0
     mini_a = next(mix for mix in document["mixes"] if mix["mix_id"] == "mini-a")
-    assert [mini_a[key] for key in HEADLINE] == [0, 0, 0, 0]
+    assert [mini_a[key] for key in HEADLINE] == [3_333, 2_000, 2_000, 2_500]
+    assert mini_a["counts"]["work"] == {"correct": 1, "predicted": 5, "truth": 4}
     assert mini_a["work_only"]["work_recall_e4"] == 7_500
     assert (
         "2 of the 2 truth file(s) still carry placeholder timings on some or all rows"
@@ -708,7 +739,9 @@ def test_work_identity_is_fusions_normaliser_not_a_second_one() -> None:
     assert work_identity("Beau James", "4 Raws Edit (Edit)")[0] == ("beau james", "4 raws edit")
     key, words = work_identity("Old Sport & Loboski", "Tell Me Wagwan (ft. Flowdan)")
     assert key == ("old sport loboski", "tell me wagwan ft flowdan")
-    assert words == {"old", "sport", "loboski", "tell", "me", "wagwan", "ft", "flowdan"}
+    # The key is fusion's; the word set drops the featuring MARKER only (part iii) — the featured
+    # name stays, so "Flowdan" still has to be accounted for by the containment rule.
+    assert words == {"old", "sport", "loboski", "tell", "me", "wagwan", "flowdan"}
     # A bare "(Extended)" is not a descriptor the shared normaliser strips: the scorer does not
     # strip it either (the word-set rule absorbs it as an extra word instead).
     assert work_identity("Bushbaby", "Whine Up (Extended)")[1] == {
@@ -1305,3 +1338,356 @@ def test_a_crowd_row_is_scored_instead_of_failing_the_prediction_contract(tmp_pa
     mini_b = next(mix for mix in document["mixes"] if mix["mix_id"] == "mini-b")
     assert mini_b["range_claims"] == 1
     assert mini_b["work_only"]["counts"]["rows"]["predicted"] == 3
+
+
+# --- part iii: timed-mode identity parity, overlay truth rows, the offset diagnostic -----------
+
+
+def _relabel_text_node(fuse_dir: Path, old_id: str, new_id: str, new_label: str) -> None:
+    """Rename one ``text:`` node of a fixture graph everywhere it is referenced."""
+
+    path = fuse_dir / "identities.gen0.json"
+    graph = json.loads(path.read_text("utf-8"))
+    for node in graph["nodes"]:
+        if node["id"] == old_id:
+            node["id"], node["label"] = new_id, new_label
+    for group in ("works", "candidates"):
+        for item in graph[group]:
+            item["member_nodes"] = [
+                new_id if node == old_id else node for node in item["member_nodes"]
+            ]
+    for assertion in graph["assertions"]:
+        for side in ("a", "b"):
+            if assertion[side] == old_id:
+                assertion[side] = new_id
+    _write_json(path, graph)
+
+
+def test_featuring_marker_spelling_never_separates_one_work() -> None:
+    """The cycle's pair: "MPH ft. Cecelia - Rush" (truth) and "MPH - Rush (feat. Cecelia)" (engine)
+    are one work.  Fusion's normaliser keeps the marker and its near-spelling tolerance needs four
+    letters, so neither the key nor the word-set rule alone can say so; the scorer drops the
+    marker (never the name) from the word set, in both modes."""
+
+    truth_key, truth_words = work_identity("MPH ft. Cecelia", "Rush")
+    listed_key, listed_words = work_identity("MPH", "Rush (feat. Cecelia)")
+    assert truth_key == ("mph ft cecelia", "rush")
+    assert listed_key == ("mph", "rush feat cecelia")
+    assert not _word_sets_corroborate(
+        frozenset(["mph", "ft", "cecelia", "rush"]), frozenset(["mph", "rush", "feat", "cecelia"])
+    )
+    assert truth_words == listed_words == {"mph", "cecelia", "rush"}
+    assert work_identity("MPH", "Rush featuring Cecelia")[1] == truth_words
+    # The name is what identifies the work: a different featured artist is a different word set.
+    assert work_identity("MPH", "Rush (feat. Somebody Else)")[1] != truth_words
+
+    truth = [
+        TruthWork(artist="MPH ft. Cecelia", title="Rush"),
+        TruthWork(artist="AC Slater & MPH ft. Eloise Keeble", title="Lights On"),
+    ]
+    listed = [
+        ListedWork("e1", "MPH", "Rush (feat. Cecelia)", "likely", "w1"),
+        ListedWork("e2", "MPH & AC Slater", "Lights On (feat. Eloise Keeble)", "possible", "w2"),
+        ListedWork("e3", "MPH", "Rush (feat. Somebody Else)", "possible", "w3"),
+    ]
+    match = match_works(truth, listed)
+    assert match.assignments == {0: 0, 1: 1}
+    assert match.unmatched_predictions == [
+        {"artist": "MPH", "title": "Rush (feat. Somebody Else)", "tier": "possible", "rows": 1}
+    ]
+
+
+def test_parity_identities_grants_each_truth_key_to_one_work_only() -> None:
+    fuse = FIXTURE / "mini-b" / "fuse"
+    identities = IdentitiesRecord.model_validate_json(
+        (fuse / "identities.gen0.json").read_text("utf-8")
+    )
+    work_of = {node: work.work_id for work in identities.works for node in work.member_nodes}
+    theta, kappa = work_of["text:mini artist|theta"], work_of["text:mini artist|kappa"]
+    truth = _truth("mini-b").model_copy(
+        update={
+            "episodes": [
+                _truth("mini-b")
+                .episodes[0]
+                .model_copy(
+                    update={"work": TruthWork(artist="Mini Artist feat. Guest", title="Theta")}
+                )
+            ]
+        }
+    )
+    # Two listed works both corroborate the one truth row (the work matcher is many-to-one); the
+    # scorer resolves a truth to ONE work, so the key goes to the closest word set: the row whose
+    # words equal the truth's beats the one missing "guest".
+    listed = [
+        ListedWork("e-theta", "Mini Artist", "Theta", "likely", theta),
+        ListedWork("e-kappa", "Mini Artist Guest", "Theta", "possible", kappa),
+    ]
+    match = match_works([episode.work for episode in truth.episodes], listed)
+    assert match.assignments == {0: 0, 1: 0}
+    canonical, granted = parity_identities(identities, truth, listed, match)
+    key = f"text:{work_key(truth.episodes[0].work)}"
+    assert key == "text:mini artist feat guest|theta"
+    assert granted == 1
+    holders = [work.work_id for work in canonical.works if key in work.member_nodes]
+    assert holders == [kappa]
+    node = next(item for item in canonical.nodes if item.id == key)
+    assert (node.ns, node.label) == ("text", "Mini Artist feat. Guest - Theta")
+    # The run's own graph is not touched: a new record is returned.
+    assert key not in {item.id for item in identities.nodes}
+    assert len(canonical.nodes) == len(identities.nodes) + 1
+
+    # A key some work already holds is left there (the scorer resolves the truth to it already),
+    # and nothing is granted or copied.
+    held = truth.model_copy(
+        update={
+            "episodes": [
+                truth.episodes[0].model_copy(
+                    update={"work": TruthWork(artist="Mini Artist", title="Theta")}
+                )
+            ]
+        }
+    )
+    other = [ListedWork("e-kappa", "Mini Artist Theta", "Theta", "possible", kappa)]
+    match = match_works([episode.work for episode in held.episodes], other)
+    assert match.assignments == {0: 0}
+    assert parity_identities(identities, held, other, match) == (identities, 0)
+    # Strict equality already: nothing to grant either.
+    same = [ListedWork("e-theta", "Mini Artist", "Theta", "likely", theta)]
+    match = match_works([episode.work for episode in held.episodes], same)
+    assert parity_identities(identities, held, same, match) == (identities, 0)
+
+
+def test_timed_truth_with_a_near_duplicate_label_is_matched_by_time_only_through_parity(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The cycle's fixture: ``mini-b`` really timed, its Theta row written "Mini Artist ft. Guest -
+    THETA (Extended Mix)" in the truth and "Mini Artist - Theta (feat. Guest)" in the run's identity
+    graph — one work, spelled two ways, at the same time.  The time path must score it as the work
+    matcher does, and the original labels must survive in the missed / wrong lists."""
+
+    root = _copy_fixture(tmp_path)
+    _make_mini_b_timed(root)
+    truth_path = root / "mini-b" / "ground_truth.json"
+    truth = json.loads(truth_path.read_text("utf-8"))
+    truth["episodes"][0]["work"] = {
+        "artist": "Mini Artist ft. Guest",
+        "title": "THETA (Extended Mix)",
+    }
+    _write_json(truth_path, truth)
+    _relabel_text_node(
+        root / "mini-b" / "fuse",
+        "text:mini artist|theta",
+        "text:mini artist|theta (feat. guest)",
+        "Mini Artist - Theta (feat. Guest)",
+    )
+    run_list = json.loads((root / "run-list.json").read_text("utf-8"))
+    run_list["runs"] = [run for run in run_list["runs"] if run["mix_id"] == "mini-b"]
+    _write_json(root / "run-list.json", run_list)
+
+    code, document = _run(tmp_path / "auto", root / "run-list.json", "--print")
+    assert code == 0
+    assert document["match_mode"] == "time"
+    (mix,) = document["mixes"]
+    # Exactly the numbers the untouched timed fixture scores: Theta right, Kappa wrong, Iota and Mu
+    # missed — the spelling cost nothing.
+    assert [mix[key] for key in HEADLINE] == [5_000, 5_000, 5_000, 3_333]
+    assert mix["counts"]["listed"] == {"correct": 1, "predicted": 2, "truth": 3}
+    assert mix["work_only"]["work_recall_e4"] == 3_333
+    # The lists keep the labels as written on each side.
+    assert mix["unmatched_truth"] == [
+        {"artist": "Mini Artist", "title": "Iota"},
+        {"artist": "Mini Artist", "title": "Mu"},
+    ]
+    assert mix["unmatched_predictions"] == [
+        {"artist": "Mini Artist", "title": "Kappa", "tier": "likely", "rows": 1}
+    ]
+    line = capsys.readouterr().out.strip().splitlines()[-1]
+    assert (
+        "Missed: Mini Artist - Iota; Mini Artist - Mu. Wrong: Mini Artist - Kappa [likely]." in line
+    )
+    # What parity did: the truth row's own scorer key joined the Theta work as one more text node.
+    predictions_path = (tmp_path / "auto" / mix["report"]).with_name("predictions.json")
+    predictions = json.loads(predictions_path.read_text("utf-8"))
+    assert predictions["config_snapshot"]["run_config"]["parity_keys"] == 1
+    graph = predictions["sets"][0]["identities"]
+    key = "text:mini artist ft guest|theta extended mix"
+    (holder,) = [work for work in graph["works"] if key in work["member_nodes"]]
+    assert "text:mini artist|theta (feat. guest)" in holder["member_nodes"]
+    assert predictions["sets"][0]["episodes"][0]["work"] == {
+        "artist": "Mini Artist",
+        "title": "Theta (feat. Guest)",
+    }
+    # Without it the certified scorer — unchanged by this cycle — sees two different strings and
+    # scores the same run 0 for 3: the reason the wrapper canonicalises.
+    original = json.loads((root / "mini-b" / "fuse" / "identities.gen0.json").read_text("utf-8"))
+    predictions["sets"][0]["identities"] = original
+    document_without = PredictionDocument.model_validate(predictions)
+    state = score_set(GroundTruthRecord.model_validate(truth), document_without.sets[0]).state
+    assert (state.identification_work.correct, state.occurrence.correct) == (0, 0)
+    assert state.tier_work["likely"] == (0, 2)
+
+
+def test_median_offset_reads_engine_evidence_against_really_timed_rows_only(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    root = _copy_fixture(tmp_path)
+    _make_mini_b_timed(root)
+    entry = _entry("mini-b", root / "run-list.json")
+    episodes = _episodes("mini-b")
+    truth = _truth("mini-b", root)
+    assert placeholder_rows(truth) == frozenset()
+    identities = IdentitiesRecord.model_validate_json(
+        (root / "mini-b" / "fuse" / "identities.gen0.json").read_text("utf-8")
+    )
+    listed, _ = listed_episodes(episodes, identities, entry.min_track_ms)
+    prediction_set = prediction_set_from_fusion("mini-b", identities, listed)
+    listed_works = [
+        ListedWork(
+            episode.id,
+            item["work"]["artist"],
+            item["work"]["title"],
+            item["tiers"].work,
+            "w-" + episode.id,
+        )
+        for episode, item in zip(listed.episodes, prediction_set["episodes"], strict=True)
+    ]
+    match = match_works([episode.work for episode in truth.episodes], listed_works)
+    # Theta: the tool first heard it at 5 s, the tracklist starts it at 0 s.  Kappa is unmatched.
+    assert median_offset(listed, match, truth, range_claims=set()) == (5_000, 1)
+    # A crowd row (a position range from the same comments) says nothing about the video, so it is
+    # left out even when the work matcher pairs it.
+    assert median_offset(listed, match, truth, range_claims={0}) == (None, 0)
+    # A seed placeholder row is left out too.
+    assert median_offset(listed, match, _truth("mini-b"), range_claims=set()) == (None, 0)
+
+    run_list = json.loads((root / "run-list.json").read_text("utf-8"))
+    run_list["runs"] = [run for run in run_list["runs"] if run["mix_id"] == "mini-b"]
+    _write_json(root / "run-list.json", run_list)
+    code, document = _run(tmp_path / "timed", root / "run-list.json", "--print")
+    assert code == 0
+    (mix,) = document["mixes"]
+    assert (mix["median_offset_ms"], mix["offset_pairs"]) == (5_000, 1)
+    line = capsys.readouterr().out.strip().splitlines()[-1]
+    assert (
+        "; median offset (tool start minus tracklist start) +5.0 s over 1 work-matched pair. "
+        "Missed:" in line
+    )
+    assert line.startswith("- mini-b [timed; matched by time]: by time: likely 1/2 (50.0%)")
+    # An order-only mix prints no offset at all; a timed mix with no usable pair says so.
+    assert "median offset" not in mix_line({**EXPECTED["mixes"][0]})
+    assert "median offset n/a" in mix_line({**mix, "median_offset_ms": None, "offset_pairs": 0})
+
+
+def test_median_offset_is_the_lower_median_of_signed_offsets(tmp_path: Path) -> None:
+    """Four timed rows on mini-a: offsets +10 s, +5 s, -10 s, +10 s -> the lower middle, +5 s."""
+
+    root = _copy_fixture(tmp_path)
+    truth_path = root / "mini-a" / "ground_truth.json"
+    raw = json.loads(truth_path.read_text("utf-8"))
+    four = _order_only_truth(
+        raw,
+        [
+            ("Mini Artist", "Alpha"),
+            ("Mini Artist", "Beta"),
+            ("Mini Artist", "Delta"),
+            ("Mini Artist", "Gamma"),
+        ],
+    )
+    # a1 Alpha heard at 10 s, a2 Beta at 210 s, a3 Delta at 300 s, a5 Gamma at 450 s.
+    timed = _timed_truth(
+        four,
+        [
+            (0, 0, 190_000, 190_000),
+            (205_000, 205_000, 280_000, 280_000),
+            (290_000, 290_000, 440_000, 440_000),
+            (460_000, 460_000, 600_000, 600_000),
+        ],
+    )
+    _write_json(truth_path, timed)
+    assert truth_timing(_truth("mini-a", root)) == "timed"
+    run_list = json.loads((root / "run-list.json").read_text("utf-8"))
+    run_list["runs"] = [run for run in run_list["runs"] if run["mix_id"] == "mini-a"]
+    _write_json(root / "run-list.json", run_list)
+    code, document = _run(tmp_path / "four", root / "run-list.json")
+    assert code == 0
+    (mix,) = document["mixes"]
+    assert (mix["median_offset_ms"], mix["offset_pairs"]) == (5_000, 4)
+
+
+def test_an_overlay_seeded_truth_scores_the_blended_track_by_time(tmp_path: Path) -> None:
+    """``idea truth seed --overlays``: a second track blended in at a row's time becomes a layered
+    truth episode from that time to the row's end, and a listed prediction of it is right by time
+    (the MPH "w/" rows scored as WRONG predictions against a truth that could not hold them)."""
+
+    root = _copy_fixture(tmp_path)
+    media_key = _truth("mini-b").source.media_key
+    tracklist = tmp_path / "tracklist.txt"
+    tracklist.write_text(
+        "0:00:00 - Mini Artist - Theta\n0:01:40 - Mini Artist - Iota\n0:03:20 - Mini Artist - Mu\n",
+        encoding="utf-8",
+    )
+    overlays = tmp_path / "overlays.txt"
+    overlays.write_text(
+        "# blended in over the row playing at that time\n"
+        "0:01:40 - Mini Artist - Kappa (w/ overlay)\n",
+        encoding="utf-8",
+    )
+    truth_path = root / "mini-b" / "ground_truth.json"
+    seeded = seed_truth(
+        out_path=truth_path,
+        set_id="mini-b",
+        duration_ms=300_000,
+        media_key=media_key,
+        tracklist=tracklist,
+        overlays=overlays,
+        split="test",
+        corpus_version="corpus-mini",
+        project_root=tmp_path,
+    )
+    assert [episode.work.title for episode in seeded.episodes] == ["Theta", "Iota", "Kappa", "Mu"]
+    kappa = seeded.episodes[2]
+    assert (tuple(kappa.start_ms_range), tuple(kappa.end_ms_range)) == (
+        (100_000, 100_000),
+        (200_000, 200_000),
+    )
+    assert [segment.role for segment in kappa.role_segments] == ["layer"]
+    assert kappa.overlaps_with == [1] and seeded.episodes[1].overlaps_with == [2]
+    assert truth_timing(seeded) == "timed"
+
+    run_list = json.loads((root / "run-list.json").read_text("utf-8"))
+    run_list["runs"] = [run for run in run_list["runs"] if run["mix_id"] == "mini-b"]
+    _write_json(root / "run-list.json", run_list)
+    code, document = _run(tmp_path / "overlay", root / "run-list.json")
+    assert code == 0
+    (mix,) = document["mixes"]
+    assert mix["match_mode"] == "time"
+    # Kappa [100 s, 140 s] now names the overlay row: both listed rows right, 2 of 4 works named.
+    assert [mix[key] for key in HEADLINE] == [10_000, 10_000, 10_000, 5_000]
+    assert mix["counts"]["listed"] == {"correct": 2, "predicted": 2, "truth": 4}
+    assert mix["unmatched_predictions"] == []
+    assert mix["unmatched_truth"] == [
+        {"artist": "Mini Artist", "title": "Iota"},
+        {"artist": "Mini Artist", "title": "Mu"},
+    ]
+    # Theta heard 5 s late, Kappa on time: the lower median of {0, +5 s}.
+    assert (mix["median_offset_ms"], mix["offset_pairs"]) == (0, 2)
+    report = json.loads((tmp_path / "overlay" / mix["report"]).read_text("utf-8"))
+    assert report["overall"]["identification_work"]["recall_e4"] == 5_000
+
+
+def test_is_range_claim_is_the_predicate_behind_proved_bounds() -> None:
+    engine = {
+        "evidence_support_ms": [(10_000, 70_000)],
+        "start_no_later_than_ms": 22_000,
+        "end_no_earlier_than_ms": 58_000,
+        "start_pi": None,
+        "end_pi": None,
+    }
+    crowd = {
+        **engine,
+        "evidence_support_ms": [(250_000, 260_000)],
+        "start_no_later_than_ms": 250_000,
+        "end_no_earlier_than_ms": 260_000,
+    }
+    assert not is_range_claim(engine)
+    assert is_range_claim(crowd)

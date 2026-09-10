@@ -382,3 +382,202 @@ def test_ground_truth_requires_symmetric_overlaps_and_unique_occurrences() -> No
     duplicate["episodes"].append(json.loads(json.dumps(duplicate["episodes"][0])))
     with pytest.raises(ValueError, match="occurrence_index"):
         GroundTruthRecord.model_validate(duplicate)
+
+
+# --- overlays (scorer part iii): a second track blended in at a row's time -----------------------
+
+
+def _seed_with_overlays(tmp_path: Path, tracklist_text: str, overlays_text: str, **kwargs):
+    tracklist = tmp_path / "tracklist.txt"
+    tracklist.write_text(tracklist_text, encoding="utf-8")
+    overlays = tmp_path / "overlays.txt"
+    overlays.write_text(overlays_text, encoding="utf-8")
+    return seed_truth(
+        out_path=tmp_path / "ground_truth.json",
+        set_id="overlay-set",
+        duration_ms=kwargs.pop("duration_ms", 180_000),
+        media_key="d" * 64,
+        tracklist=tracklist,
+        overlays=overlays,
+        project_root=tmp_path,
+        **kwargs,
+    )
+
+
+def test_seed_overlays_become_layered_episodes_linked_both_ways(tmp_path: Path) -> None:
+    """Each overlay line ("H:MM:SS - Artist - Title (w/ overlay)", the suffix optional) becomes an
+    episode that starts at its time and ends where the row it plays over ends, marked as a layer
+    and linked to that row in both directions; it sits right after that row in the file."""
+
+    truth = _seed_with_overlays(
+        tmp_path,
+        "# main list, bulleted after the time as comment tracklists are\n"
+        "0:00:10 - Artist A - One\n"
+        "0:01:00 - Artist B - Two\n"
+        "0:02:00 - Artist C - Three\n",
+        "# overlays for the set\n"
+        "0:01:00 - Artist D - Four (w/ overlay)\n"
+        "0:02:30 - Artist E - Five\n"
+        "0:02:30 - Artist E - Five (W/ Overlay)\n",
+    )
+    reloaded = GroundTruthRecord.model_validate_json(
+        (tmp_path / "ground_truth.json").read_text(encoding="utf-8")
+    )
+    assert reloaded == truth
+    assert [(episode.work.artist, episode.work.title) for episode in truth.episodes] == [
+        ("Artist A", "One"),
+        ("Artist B", "Two"),
+        ("Artist D", "Four"),
+        ("Artist C", "Three"),
+        ("Artist E", "Five"),
+    ]
+    four, five = truth.episodes[2], truth.episodes[4]
+    assert (tuple(four.start_ms_range), tuple(four.end_ms_range)) == (
+        (60_000, 60_000),
+        (120_000, 120_000),
+    )
+    assert [(segment.from_ms, segment.to_ms, segment.role) for segment in four.role_segments] == [
+        (60_000, 120_000, "layer")
+    ]
+    assert four.overlaps_with == [1] and truth.episodes[1].overlaps_with == [2]
+    # An overlay after the last row's start ends where the mix ends.
+    assert (tuple(five.start_ms_range), tuple(five.end_ms_range)) == (
+        (150_000, 150_000),
+        (180_000, 180_000),
+    )
+    assert five.overlaps_with == [3] and truth.episodes[3].overlaps_with == [4]
+    assert five.note is not None and "overlay" in five.note
+    # Main rows are untouched by the overlays: still uncertain, still ending at the next row.
+    assert [segment.role for segment in truth.episodes[1].role_segments] == ["uncertain"]
+    assert tuple(truth.episodes[1].end_ms_range) == (120_000, 120_000)
+    assert all(
+        episode.draft and episode.audible_rule == "manual annotation required"
+        for episode in truth.episodes
+    )
+    assert [episode.occurrence_index for episode in truth.episodes] == [0, 0, 0, 0, 0]
+
+
+def test_seed_overlay_of_a_repeated_work_counts_its_occurrence(tmp_path: Path) -> None:
+    truth = _seed_with_overlays(
+        tmp_path,
+        "0:00:00 Artist A - One\n0:01:00 Artist B - Two\n",
+        "0:01:00 - Artist A - One (w/ overlay)\n",
+    )
+    assert [episode.occurrence_index for episode in truth.episodes] == [0, 0, 1]
+    assert truth.episodes[2].overlaps_with == [1]
+
+
+@pytest.mark.parametrize(
+    ("tracklist_text", "overlays_text", "message"),
+    [
+        (
+            "0:00:10 Artist A - One\n0:01:00 Artist B - Two\n",
+            "Artist D - Four (w/ overlay)\n",
+            "needs a timestamp",
+        ),
+        (
+            "0:00:10 Artist A - One\n0:01:00 Artist B - Two\n",
+            "0:00:05 - Artist D - Four\n",
+            "precedes the first tracklist row",
+        ),
+        (
+            "0:00:10 Artist A - One\n0:01:00 Artist B - Two\n",
+            "0:03:00 - Artist D - Four\n",
+            "at or beyond the end of the mix",
+        ),
+        (
+            "Artist A - One\nArtist B - Two\n",
+            "0:01:00 - Artist D - Four\n",
+            "overlays need a timestamped tracklist",
+        ),
+        (
+            "0:00:10 Artist A - One\n",
+            "0:00:30 no separator here\n",
+            "invalid overlays line 1",
+        ),
+    ],
+    ids=["untimed-overlay", "before-first-row", "past-the-end", "order-only-main", "malformed"],
+)
+def test_seed_overlays_reject_what_cannot_be_placed(
+    tmp_path: Path, tracklist_text: str, overlays_text: str, message: str
+) -> None:
+    with pytest.raises(ValueError, match=message):
+        _seed_with_overlays(tmp_path, tracklist_text, overlays_text)
+    assert not (tmp_path / "ground_truth.json").exists()
+
+
+def test_seed_strips_a_leading_bullet_from_a_timed_tracklist_row(tmp_path: Path) -> None:
+    """ "0:17:09 - Royal-T - Tokyo Dub": the bullet after the time is list furniture, not the first
+    character of the artist (the Mall Grab draft was seeded as "- Mall Grab")."""
+
+    tracklist = tmp_path / "tracklist.txt"
+    tracklist.write_text(
+        "0:00:00 - Artist A - One\n0:17:09 – Royal-T - Tokyo Dub\n- Artist C - Three\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="explicit cue"):
+        seed_truth(
+            out_path=tmp_path / "ground_truth.json",
+            set_id="bullets",
+            duration_ms=3_600_000,
+            media_key="e" * 64,
+            tracklist=tracklist,
+            project_root=tmp_path,
+        )
+    tracklist.write_text(
+        "0:00:00 - Artist A - One\n0:17:09 – Royal-T - Tokyo Dub\n", encoding="utf-8"
+    )
+    truth = seed_truth(
+        out_path=tmp_path / "ground_truth.json",
+        set_id="bullets",
+        duration_ms=3_600_000,
+        media_key="e" * 64,
+        tracklist=tracklist,
+        project_root=tmp_path,
+    )
+    assert [(episode.work.artist, episode.work.title) for episode in truth.episodes] == [
+        ("Artist A", "One"),
+        ("Royal-T", "Tokyo Dub"),
+    ]
+    assert tuple(truth.episodes[1].start_ms_range) == (1_029_000, 1_029_000)
+
+
+def test_truth_seed_cli_exposes_overlays() -> None:
+    from typer.testing import CliRunner
+
+    from id_detector.cli import app
+
+    result = CliRunner().invoke(app, ["truth", "seed", "--help"])
+    assert result.exit_code == 0
+    assert "--overlays" in result.stdout
+
+
+def test_seed_overlays_of_one_row_are_ordered_by_time_whatever_the_file_says(
+    tmp_path: Path,
+) -> None:
+    """Two overlays over the same row: the episode list stays in mix order however the overlays
+    file was written, so a truth is never handed to the scorer out of chronological order."""
+
+    truth = _seed_with_overlays(
+        tmp_path,
+        "0:00:00 - Artist A - One\n0:02:00 - Artist B - Two\n",
+        "0:01:30 - Artist D - Late (w/ overlay)\n0:00:30 - Artist C - Early (w/ overlay)\n",
+    )
+    assert [episode.work.title for episode in truth.episodes] == [
+        "One",
+        "Early",
+        "Late",
+        "Two",
+    ]
+    assert [episode.start_ms_range[0] for episode in truth.episodes] == [0, 30_000, 90_000, 120_000]
+    assert truth.episodes[0].overlaps_with == [1, 2]
+    assert truth.episodes[1].overlaps_with == [0] and truth.episodes[2].overlaps_with == [0]
+    # Same file, already in order: the same truth, so a sorted file seeds byte-identically.
+    sorted_dir = tmp_path / "sorted"
+    sorted_dir.mkdir()
+    in_order = _seed_with_overlays(
+        sorted_dir,
+        "0:00:00 - Artist A - One\n0:02:00 - Artist B - Two\n",
+        "0:00:30 - Artist C - Early (w/ overlay)\n0:01:30 - Artist D - Late (w/ overlay)\n",
+    )
+    assert in_order.episodes == truth.episodes

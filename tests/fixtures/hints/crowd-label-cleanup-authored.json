@@ -1,0 +1,25 @@
+{
+  "note": "Synthetic comment shapes whose list furniture, headers or mentions used to leak into the artist field (scorer part iii). Mentions use the fixture placeholder [mention]; no handle appears here.",
+  "cases": [
+    {"name": "enumerated_bracket_cue", "text": "14. [21:40] Example Artist - Signal Path", "units": [["tracklist_line", "Example Artist", "Signal Path", null, 1300000]]},
+    {"name": "enumerated_no_cue_with_label", "text": "53. Example Artist - Signal Path [Example Label]", "units": [["answer", "Example Artist", "Signal Path", "Example Label", null]]},
+    {"name": "zero_padded_enumerator", "text": "07. [10:22] Example Artist & Other Artist - Signal Path (Other Bootleg)", "units": [["tracklist_line", "Example Artist & Other Artist", "Signal Path", null, 622000]]},
+    {"name": "paren_enumerator", "text": "7) Example Artist - Signal Path", "units": [["answer", "Example Artist", "Signal Path", null, null]]},
+    {"name": "empty_bracket_bullet", "text": "[] Example Artist - Signal Path", "units": [["answer", "Example Artist", "Signal Path", null, null]]},
+    {"name": "spaced_bracket_bullet", "text": "[ ] Example Artist - Signal Path", "units": [["answer", "Example Artist", "Signal Path", null, null]]},
+    {"name": "ticked_bracket_bullet", "text": "[x] Example Artist - Signal Path", "units": [["answer", "Example Artist", "Signal Path", null, null]]},
+    {"name": "dash_bullet", "text": "- Example Artist - Signal Path", "units": [["answer", "Example Artist", "Signal Path", null, null]]},
+    {"name": "dot_bullet", "text": "• Example Artist - Signal Path", "units": [["answer", "Example Artist", "Signal Path", null, null]]},
+    {"name": "bullet_after_cue", "text": "0:17:09 - Example Artist - Signal Path", "units": [["tracklist_line", "Example Artist", "Signal Path", null, 1029000]]},
+    {"name": "enumerator_after_cue_block", "text": "0:00 1. Example Artist - Signal Path\n2:00 2. Other Artist - Other Title", "units": [["tracklist_line", "Example Artist", "Signal Path", null, 0], ["tracklist_line", "Other Artist", "Other Title", null, 120000]]},
+    {"name": "full_tracklist_header_mega_line", "text": "FULL TRACK LIST: 0:00:00 - Example Artist - Signal Path 0:05:00 - Other Artist - Other Title", "units": [["tracklist_line", "Example Artist", "Signal Path", null, 0], ["tracklist_line", "Other Artist", "Other Title", null, 300000]]},
+    {"name": "header_on_a_later_line", "text": "Great set\nTRACKLIST: 00:00 Example Artist - Signal Path 05:00 Other Artist - Other Title", "units": [["tracklist_line", "Example Artist", "Signal Path", null, 0], ["tracklist_line", "Other Artist", "Other Title", null, 300000]]},
+    {"name": "header_with_dash", "text": "Tracklist - 00:00 Example Artist - Signal Path 05:00 Other Artist - Other Title", "units": [["tracklist_line", "Example Artist", "Signal Path", null, 0], ["tracklist_line", "Other Artist", "Other Title", null, 300000]]},
+    {"name": "two_mentions_then_answer", "text": "[mention] [mention]  Example Artist - Signal Path", "units": [["answer", "Example Artist", "Signal Path", null, null]]},
+    {"name": "two_mentions_then_correction", "text": "[mention] [mention] actually Example Artist - Alternate Title", "units": [["correction", "Example Artist", "Alternate Title", null, null]]},
+    {"name": "dotted_cue_is_not_an_enumerator", "text": "track 1.02?", "units": [["question", null, null, null, 62000]]},
+    {"name": "decimal_at_start_is_not_an_enumerator", "text": "1.02 Example Artist - Signal Path", "units": [["answer", "1.02 Example Artist", "Signal Path", null, null]]},
+    {"name": "minute_cue_still_a_cue", "text": "[75] Example Artist - Signal Path", "units": [["tracklist_line", "Example Artist", "Signal Path", null, 4500000]]},
+    {"name": "trailing_label_kept", "text": "12. [17:09] Example Artist - Signal Path [Example Label]", "units": [["tracklist_line", "Example Artist", "Signal Path", "Example Label", 1029000]]}
+  ]
+}

@@ -26,7 +26,11 @@ of what a reader is actually shown.  What remains is matched to the truth one of
 - ``time`` — the existing benchmark scorer (``benchmark.scorer.score_corpus_detailed``, the
   function behind ``idea benchmark score``): a listed prediction is right when its support
   overlaps the truth occurrence it names, and that mix's full report is written next to
-  ``--out``.  Needs truth with start times.  Three e4 integers come out of the pooled metrics:
+  ``--out``.  Needs truth with start times.  The scorer is untouched; what it is handed is
+  canonicalised first (:func:`parity_identities`) so that its strict string comparison sees the
+  same work the ``work`` matcher below sees — "MPH ft. Cecelia - Rush" in the truth and "MPH -
+  Rush (feat. Cecelia)" from the engine are one work at one time, not a miss and a wrong ID.
+  Three e4 integers come out of the pooled metrics:
   ``likely_precision_e4`` (``empirical_tier_precision_e4["likely"]``: of the listed predictions
   whose work tier is ``likely`` or better, the share that named a track really played there),
   ``listed_precision_e4`` (``selective_precision_e4`` after the floor: of every listed prediction,
@@ -43,6 +47,8 @@ of what a reader is actually shown.  What remains is matched to the truth one of
   ``work_recall_e4`` (of the distinct works played, the share listed) and ``likely_precision_e4``
   (a ``likely`` row is right iff it names any truth row); ``listed_precision_e4`` and every timing
   number are ``null``, and so is ``l3.thresholds_met`` — the listed-precision bar needs timed truth.
+  The only thing added to fusion's rule here is that the featuring marker itself ("ft", "feat",
+  "featuring") carries no identity: the featured name does, and stays.
 - ``auto`` picks ``time`` only for **fully timed** truth and ``work`` for anything still carrying
   ``idea truth seed``'s placeholder equal-slice timings (:func:`truth_timing`) — a whole file of
   them (``order-only``, as the rekordbox-playlist drafts under ``data/corpus/release-1/`` are) or
@@ -53,7 +59,11 @@ of what a reader is actually shown.  What remains is matched to the truth one of
 Whatever the mode, every mix also gets the work-only numbers under ``work_only`` (pooled at the
 top level too) and a ``work-match.json`` beside its ``predictions.json`` listing every assignment,
 so a timed corpus and an order-only one stay comparable; the per-mix rows name the truth works no
-prediction matched (what was missed) and the listed labels no truth row matched (what was wrong).
+prediction matched (what was missed) and the listed labels no truth row matched (what was wrong),
+always under their original labels.  A timed mix also carries ``median_offset_ms`` — the median
+of (first engine evidence of a listed track − the tracklist's start of the truth row the work
+matcher paired it with), a diagnostic for a tracklist whose clock does not start where the video
+does (an intro, a cut); it is reported, never corrected for.
 
 Across mixes the counts are **pooled**: numerators and denominators are summed before any ratio is
 taken, never a mean of per-mix ratios, so a forty-track mix weighs forty times a one-track mix.
@@ -74,6 +84,7 @@ from __future__ import annotations
 import argparse
 import json
 import re
+import statistics
 import sys
 import tempfile
 from collections import Counter
@@ -96,12 +107,15 @@ from id_detector.benchmark.scorer import (
     pooled_metrics,
     score_corpus_detailed,
     truth_is_frozen_verified,
+    work_key,
 )
 from id_detector.contracts import (
+    SCHEMA_VERSION,
     BenchmarkMetrics,
     EpisodesFile,
     GroundTruthRecord,
     IdentitiesRecord,
+    IdentityNode,
     TruthWork,
 )
 
@@ -140,6 +154,9 @@ MatchMode = Literal["time", "work"]
 Timing = Literal["timed", "partial", "order-only"]
 #: What ``idea truth seed`` writes on every row it cannot time (``truth.py``).
 SEED_AUDIBLE_RULE = "manual annotation required"
+#: The featuring marker carries no identity of its own ("MPH ft. Cecelia" and "MPH (feat.
+#: Cecelia)" name the same people); the featured name stays in the word set.
+_FEATURING = frozenset({"ft", "feat", "featuring"})
 #: Plan §6.3 L3 also asks for a corpus shape these three numbers cannot judge; named in ``--print``.
 L3_CORPUS_NOTE = (
     "L3 also needs >= 5 owner-verified mixes, >= 3 DJs, >= 2 platforms and >= 4 h of audio, "
@@ -266,6 +283,12 @@ class MixScore:
     range_claims: int
     work_match: WorkMatch
     work_match_path: Path
+    #: Truth keys granted to a predicted work for the time path (see `parity_identities`).
+    parity_keys: int
+    #: Median of (first engine evidence − tracklist start) over the work-matched pairs of really
+    #: timed truth rows; ``None`` when there are no such pairs (see `median_offset`).
+    median_offset_ms: int | None
+    offset_pairs: int
     #: The benchmark scorer's result; ``None`` when the mix was matched by work.
     score: SetScore | None
     metrics: BenchmarkMetrics | None
@@ -407,6 +430,25 @@ def truth_status(truth_path: Path, truth: GroundTruthRecord) -> TruthStatus:
     return "unverified"
 
 
+def placeholder_rows(truth: GroundTruthRecord) -> frozenset[int]:
+    """The rows still carrying ``idea truth seed``'s placeholder equal-slice timings.
+
+    Row *i* of *n* sits on both slice points ``i * duration // n`` and ``(i + 1) * duration // n``
+    and is flagged ``manual annotation required``; see :func:`truth_timing` for why both bounds
+    are read.  Such a row holds no timing to score, or measure an offset, against.
+    """
+
+    count = len(truth.episodes)
+    duration = truth.source.duration_ms
+    return frozenset(
+        index
+        for index, episode in enumerate(truth.episodes)
+        if episode.audible_rule == SEED_AUDIBLE_RULE
+        and tuple(episode.start_ms_range) == (index * duration // count,) * 2
+        and tuple(episode.end_ms_range) == ((index + 1) * duration // count,) * 2
+    )
+
+
 def truth_timing(truth: GroundTruthRecord) -> Timing:
     """How much of a truth is really timed, read from its content rather than from a flag.
 
@@ -430,17 +472,10 @@ def truth_timing(truth: GroundTruthRecord) -> Timing:
       matched by work like an order-only file, not by time.
     """
 
-    count = len(truth.episodes)
-    duration = truth.source.duration_ms
-    placeholders = sum(
-        episode.audible_rule == SEED_AUDIBLE_RULE
-        and tuple(episode.start_ms_range) == (index * duration // count,) * 2
-        and tuple(episode.end_ms_range) == ((index + 1) * duration // count,) * 2
-        for index, episode in enumerate(truth.episodes)
-    )
+    placeholders = len(placeholder_rows(truth))
     if placeholders == 0:
         return "timed"
-    return "order-only" if placeholders == count else "partial"
+    return "order-only" if placeholders == len(truth.episodes) else "partial"
 
 
 def work_identity(artist: str, title: str) -> tuple[tuple[str, str], frozenset[str]]:
@@ -451,11 +486,15 @@ def work_identity(artist: str, title: str) -> tuple[tuple[str, str], frozenset[s
     Mix)", "(Edit)", "(VIP)", "(Club Dub)") dropped, everything non-alphanumeric a space.  The word
     set of both fields together is what ``fuse.identity`` compares order-independently to attach a
     hint to an audio match, so a "feat." clause, an extra collaborator or a swapped artist/title
-    never blocks a match.  Nothing else is stripped here: the scorer is not a second normaliser.
+    never blocks a match.  One thing is added to that word set: the featuring marker itself is
+    dropped (``_FEATURING``) — "MPH ft. Cecelia - Rush" and "MPH - Rush (feat. Cecelia)" differ by
+    nothing but the spelling of "featuring", and fusion's near-spelling tolerance only covers
+    tokens of four letters or more.  The featured name stays.  Nothing else is stripped: the
+    scorer is not a second normaliser.
     """
 
     artist_key, title_key = _normalise(artist), _normalise(title)
-    return (artist_key, title_key), frozenset(f"{artist_key} {title_key}".split())
+    return (artist_key, title_key), frozenset(f"{artist_key} {title_key}".split()) - _FEATURING
 
 
 def match_works(truth_works: list[TruthWork], listed: list[ListedWork]) -> WorkMatch:
@@ -553,6 +592,19 @@ def listed_episodes(
     return episodes.model_copy(update={"episodes": kept}), by_reason
 
 
+def is_range_claim(episode: dict[str, Any]) -> bool:
+    """A row whose bounds are the two ends of a position range, not engine-proved bounds."""
+
+    spans = [(int(start), int(end)) for start, end in episode["evidence_support_ms"]]
+    lo, hi = min(start for start, _ in spans), max(end for _, end in spans)
+    calibrated = any(getattr(episode[key], "calibrated", False) for key in ("start_pi", "end_pi"))
+    return not (
+        calibrated
+        or episode["start_no_later_than_ms"] > lo
+        or episode["end_no_earlier_than_ms"] < hi
+    )
+
+
 def proved_bounds(episodes: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], int]:
     """Re-express range claims in the benchmark contract's proved-bound convention.
 
@@ -570,18 +622,11 @@ def proved_bounds(episodes: list[dict[str, Any]]) -> tuple[list[dict[str, Any]],
     normalised: list[dict[str, Any]] = []
     claims = 0
     for episode in episodes:
-        spans = [(int(start), int(end)) for start, end in episode["evidence_support_ms"]]
-        lo, hi = min(start for start, _ in spans), max(end for _, end in spans)
-        calibrated = any(
-            getattr(episode[key], "calibrated", False) for key in ("start_pi", "end_pi")
-        )
-        if (
-            calibrated
-            or episode["start_no_later_than_ms"] > lo
-            or episode["end_no_earlier_than_ms"] < hi
-        ):
+        if not is_range_claim(episode):
             normalised.append(episode)
             continue
+        spans = [(int(start), int(end)) for start, end in episode["evidence_support_ms"]]
+        lo, hi = min(start for start, _ in spans), max(end for _, end in spans)
         claims += 1
         normalised.append(
             {
@@ -593,6 +638,108 @@ def proved_bounds(episodes: list[dict[str, Any]]) -> tuple[list[dict[str, Any]],
             }
         )
     return normalised, claims
+
+
+def parity_identities(
+    identities: IdentitiesRecord,
+    truth: GroundTruthRecord,
+    listed: list[ListedWork],
+    work_match: WorkMatch,
+) -> tuple[IdentitiesRecord, int]:
+    """Canonicalise the identity graph for the time path: the truth's own key joins the work.
+
+    The benchmark scorer never compares a prediction's label with the truth's; it asks whether the
+    predicted work holds a ``text:`` node whose id equals the truth row's ``work_key`` — a strict
+    string comparison, stricter than fusion's own notion of "the same track" and stricter than
+    the ``work`` matcher, which reuses fusion's normaliser and word-set rule.  So the two sides are
+    brought to one canonical string exactly the way fusion does it for a corroborating crowd
+    label: each truth row the work matcher paired with a listed prediction lends its own scorer
+    key (``text:<artist>|<title>``, already in the scorer's normal form) to that prediction's work
+    as one more text node, and the scorer's strict comparison then sees identical strings for
+    identical works.  Only the identity graph handed to the scorer changes; the run's artefacts,
+    the truth file and every label in the output stay as they were.
+
+    A truth row may have been paired with rows of several works (the work matcher is many-to-one);
+    the scorer resolves a truth to at most ONE work, so the key goes to the closest word set,
+    ties to the earlier listed row.  A key another work already holds is left where it is (the
+    scorer already resolves that truth there); an existing node is reused, never duplicated.
+    Returns the graph and the number of keys granted.
+    """
+
+    ranked: dict[int, tuple[tuple[int, int], str]] = {}
+    for index, row in work_match.assignments.items():
+        _, words = work_identity(listed[index].artist, listed[index].title)
+        work = truth.episodes[row].work
+        _, truth_words = work_identity(work.artist, work.title)
+        rank = (len(words ^ truth_words), index)
+        if row not in ranked or rank < ranked[row][0]:
+            ranked[row] = (rank, listed[index].work_id)
+    known = {node.id for node in identities.nodes}
+    member_of = {node: work.work_id for work in identities.works for node in work.member_nodes}
+    new_nodes: list[IdentityNode] = []
+    granted: dict[str, list[str]] = {}
+    for row, (_, work_id) in sorted(ranked.items()):
+        episode = truth.episodes[row]
+        node_id = f"text:{work_key(episode.work)}"
+        owner = member_of.get(node_id)
+        if owner is not None:
+            continue
+        if node_id not in known:
+            new_nodes.append(
+                IdentityNode(
+                    schema_version=SCHEMA_VERSION,
+                    generated_by=GENERATED_BY,
+                    id=node_id,
+                    ns="text",
+                    label=f"{episode.work.artist} - {episode.work.title}",
+                )
+            )
+            known.add(node_id)
+        granted.setdefault(work_id, []).append(node_id)
+        member_of[node_id] = work_id
+    if not granted:
+        return identities, 0
+    works = [
+        work.model_copy(update={"member_nodes": [*work.member_nodes, *granted[work.work_id]]})
+        if work.work_id in granted
+        else work
+        for work in identities.works
+    ]
+    canonical = identities.model_copy(
+        update={"nodes": [*identities.nodes, *new_nodes], "works": works}
+    )
+    return canonical, sum(len(nodes) for nodes in granted.values())
+
+
+def median_offset(
+    listed: EpisodesFile,
+    work_match: WorkMatch,
+    truth: GroundTruthRecord,
+    *,
+    range_claims: set[int],
+) -> tuple[int | None, int]:
+    """Median of (first engine evidence − tracklist start) over the work-matched pairs.
+
+    A diagnostic for the owner, not a correction: a comment tracklist whose clock starts at the
+    set's first beat while the video carries an intro (or a cut) puts every truth start early (or
+    late) by the same amount, and a by-time score then misses tracks the tool named at the right
+    place.  The pairs are the work matcher's (time-agnostic, so the offset can be seen even when
+    time-matching fails), restricted to truth rows that are really timed (never a seed
+    placeholder) and to listed rows with engine evidence — a crowd row's position range comes
+    from the same comments, so it can say nothing about the video.  Lower median for an even
+    count; ``None`` with no pairs.
+    """
+
+    placeholders = placeholder_rows(truth)
+    offsets = [
+        min(start for start, _ in listed.episodes[index].evidence_support_ms)
+        - truth.episodes[row].start_ms_range[0]
+        for index, row in sorted(work_match.assignments.items())
+        if row not in placeholders and index not in range_claims
+    ]
+    if not offsets:
+        return None, 0
+    return statistics.median_low(offsets), len(offsets)
 
 
 def _work_match_document(
@@ -662,7 +809,29 @@ def score_mix(
     # still-placeholder rows against an equal-slice point, i.e. as misses.
     mode: MatchMode = ("time" if timing == "timed" else "work") if match == "auto" else match
     prediction_set = prediction_set_from_fusion(truth.set_id, identities, listed)
+    range_claim_rows = {
+        index for index, episode in enumerate(prediction_set["episodes"]) if is_range_claim(episode)
+    }
     prediction_set["episodes"], range_claims = proved_bounds(prediction_set["episodes"])
+    candidates = {item.canonical_id: item for item in identities.candidates}
+    listed_works = [
+        ListedWork(
+            episode_id=episode.id,
+            artist=prediction["work"]["artist"],
+            title=prediction["work"]["title"],
+            tier=prediction["tiers"].work,
+            work_id=candidates[prediction["candidate_id"]].work_id,
+        )
+        for episode, prediction in zip(listed.episodes, prediction_set["episodes"], strict=True)
+    ]
+    work_match = match_works([episode.work for episode in truth.episodes], listed_works)
+    parity_keys = 0
+    if mode == "time":
+        # The certified scorer compares strings; hand it a graph in which the works it must
+        # recognise carry the truth's own strings (see `parity_identities`).
+        prediction_set["identities"], parity_keys = parity_identities(
+            identities, truth, listed_works, work_match
+        )
     snapshot = ScoringConfigSnapshot(
         schema_version="1.0.0",
         config_version=CONFIG_VERSION,
@@ -679,6 +848,7 @@ def score_mix(
             "range_claims": range_claims,
             "timing": timing,
             "match_mode": mode,
+            "parity_keys": parity_keys,
         },
     )
     # Built in both modes: the contract check on the run's artefacts is worth having either way.
@@ -693,24 +863,15 @@ def score_mix(
     mix_dir = artefact_dir / entry.mix_id
     predictions_path = mix_dir / "predictions.json"
     atomic_write_json(predictions_path, document)
-    candidates = {item.canonical_id: item for item in identities.candidates}
-    listed_works = [
-        ListedWork(
-            episode_id=episode.id,
-            artist=prediction["work"]["artist"],
-            title=prediction["work"]["title"],
-            tier=prediction["tiers"].work,
-            work_id=candidates[prediction["candidate_id"]].work_id,
-        )
-        for episode, prediction in zip(listed.episodes, prediction_set["episodes"], strict=True)
-    ]
-    work_match = match_works([episode.work for episode in truth.episodes], listed_works)
     work_match_path = mix_dir / "work-match.json"
     atomic_write_json(
         work_match_path,
         _work_match_document(
             entry, truth, timing=timing, match_mode=mode, listed=listed_works, work_match=work_match
         ),
+    )
+    offset_ms, offset_pairs = median_offset(
+        listed, work_match, truth, range_claims=range_claim_rows
     )
     score: SetScore | None = None
     metrics: BenchmarkMetrics | None = None
@@ -731,6 +892,9 @@ def score_mix(
         range_claims=range_claims,
         work_match=work_match,
         work_match_path=work_match_path,
+        parity_keys=parity_keys,
+        median_offset_ms=offset_ms,
+        offset_pairs=offset_pairs,
         score=score,
         metrics=metrics,
         report_path=report_path,
@@ -913,6 +1077,8 @@ def score_run_list(
                     else _work_counts(mix.work_match.counts)
                 ),
                 "work_only": _work_only(mix.work_match.counts),
+                "median_offset_ms": mix.median_offset_ms,
+                "offset_pairs": mix.offset_pairs,
                 "unmatched_truth": mix.work_match.unmatched_truth,
                 "unmatched_predictions": mix.work_match.unmatched_predictions,
                 "report": (
@@ -1070,7 +1236,8 @@ def work_only_line(document: dict[str, Any]) -> str:
 
 
 def mix_line(mix: dict[str, Any]) -> str:
-    """One line per mix: its numbers, what was missed and what was wrong."""
+    """One line per mix: its numbers, the offset diagnostic when timed, what was missed and what
+    was wrong (both under their original labels)."""
 
     work_only = mix["work_only"]
     counts = work_only["counts"]
@@ -1091,6 +1258,16 @@ def mix_line(mix: dict[str, Any]) -> str:
         f"{counts['likely']['correct']}/{counts['likely']['predicted']} "
         f"({_pct(work_only['likely_precision_e4'])})"
     )
+    offset = ""
+    if mix["median_offset_ms"] is not None:
+        pairs = mix["offset_pairs"]
+        seconds = mix["median_offset_ms"] / 1000
+        offset = (
+            f"; median offset (tool start minus tracklist start) {seconds:+.1f} s over {pairs} "
+            f"work-matched pair{'s' if pairs != 1 else ''}"
+        )
+    elif mix["timing"] != "order-only":
+        offset = "; median offset n/a (no work-matched pair with engine evidence on a timed row)"
     missed = (
         "; ".join(f"{item['artist']} - {item['title']}" for item in mix["unmatched_truth"])
         or "nothing"
@@ -1103,8 +1280,8 @@ def mix_line(mix: dict[str, Any]) -> str:
         or "nothing"
     )
     return (
-        f"- {mix['mix_id']} [{mix['timing']}; matched by {mix['match_mode']}]: {by_time}{by_work}. "
-        f"Missed: {missed}. Wrong: {wrong}."
+        f"- {mix['mix_id']} [{mix['timing']}; matched by {mix['match_mode']}]: {by_time}{by_work}"
+        f"{offset}. Missed: {missed}. Wrong: {wrong}."
     )
 
 

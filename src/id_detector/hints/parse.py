@@ -52,22 +52,42 @@ _EDIT = re.compile(r"(?i)\b(edit|rework|vip|dub)\b")
 _BOOTLEG = re.compile(r"(?i)\bbootleg\b")
 _UNKNOWN = re.compile(r"(?i)^\s*(?:id\s*-\s*id|id|\?)\s*(?:\([^)]*\))?\s*$")
 _REACTION = re.compile(r"(?i)^\s*(?:this is|so good|fire\b|what a set|love this)\b")
+# A reply may open with several mentions ("@a @b  Artist - Title"): every prefix that tolerates
+# one tolerates any number, and nothing downstream may ever emit an ``@handle`` in a label.
+_MENTIONS = r"(?:@[\w.-]+:?\s*|\[mention\]\s*)*"
 _ANSWER_PREFIX = re.compile(
-    r"(?ix)^\s*(?:@[\w.-]+:?\s*|\[mention\]\s*)?"
+    rf"(?ix)^\s*{_MENTIONS}"
     r"(?:(?:this|it|that|track|song|tune)\s*(?:is|=|:)\s*|"
     r"(?:track\s+)?id\s*[:=-]\s*)"
 )
 _CORRECTION_PREFIX = re.compile(
-    r"(?ix)^\s*(?:@[\w.-]+:?\s*|\[mention\]\s*)?"
+    rf"(?ix)^\s*{_MENTIONS}"
     r"(?:actually\s+|(?:the\s+)?track\s+at\s+"
     r"(?:\d+:)?\d{1,3}:\d{2}\s+is\s+(?:actually\s+)?)"
 )
 _CORRECTION_CLEAN = re.compile(
-    r"(?i)^\s*(?:@[\w.-]+:?\s*|\[mention\]\s*)?"
+    rf"(?i)^\s*{_MENTIONS}"
     r"(?:(?:the\s+)?track\s+at\s+(?:is\s+)?(?:actually\s+)?|actually\s+)"
 )
-_MENTION_PREFIX = re.compile(r"^\s*(?:@[\w.-]+:?\s*|\[mention\]\s*)", re.IGNORECASE)
-_TRACKLIST_PREFIX = re.compile(r"(?i)^\s*(?:track\s*list|tracklist|tl)(?:\s+so\s+far)?\s*:?\s*")
+_MENTION_PREFIX = re.compile(rf"^\s*{_MENTIONS}", re.IGNORECASE)
+_MENTION_ANYWHERE = re.compile(r"(?<!\w)@[\w.-]+:?")
+# "TRACKLIST:", "Full track list -", "TL so far:" ... a header, whether it opens the comment or
+# one of its lines, is never part of the first track's artist.  The header word must END there
+# (``(?![\w'])``): an artist whose name merely STARTS with it ("TLC - No Scrubs", "Tracklisting")
+# is a track, not a header, and the line is now read per line, so one such artist anywhere in a
+# pasted tracklist would otherwise lose its first letters.
+_TRACKLIST_PREFIX = re.compile(
+    r"(?i)^\s*(?:(?:full|complete|entire|whole|my|the|updated|final)\s+)*"
+    r"(?:track\s*list|tl)(?![\w'])(?:\s+so\s+far)?\s*[:\-\u2013\u2014]?\s*"
+)
+# List furniture that precedes the track on a line and would otherwise be read as the artist:
+# enumerators ("53.", "7)"), empty or ticked bracket bullets ("[]", "[ ]", "[x]", and the "[]"
+# a bracketed cue leaves behind), and dash / dot bullets.  Stripped before the cue is read, so
+# "14. [21:40] MPH - Raw" is a cue at the start of the line, not "14. [] MPH".
+_LEADING_NOISE = re.compile(
+    r"^\s*(?:(?:\d{1,3}[.)](?=[\s\[])|\[\s*[xX\u2713\u2022\u00b7*-]?\s*\]|\(\s*\)"
+    r"|[-\u2013\u2014\u2022\u00b7*](?=\s))\s*)+"
+)
 
 PositionKind = Literal["cue_hms", "cue_minute", "comment_timestamp", "chapter", "section", "none"]
 
@@ -180,7 +200,11 @@ def _cue_range(cue_ms: int, form: str, duration_ms: int) -> tuple[int, int] | No
 def _split_mega(text: str, duration_ms: int) -> list[str]:
     text = unicodedata.normalize("NFKC", text).replace("\r\n", "\n").replace("\r", "\n")
     text = _TRACKLIST_PREFIX.sub("", text, count=1)
-    lines = [line.strip() for line in text.split("\n") if line.strip()]
+    lines = [
+        stripped
+        for line in text.split("\n")
+        if (stripped := _TRACKLIST_PREFIX.sub("", line.strip(), count=1).strip())
+    ]
     result: list[str] = []
     for line in lines:
         bigos = list(re.finditer(r"\((\d{1,3})\)(?=\s*\S)", line))
@@ -210,12 +234,20 @@ def _split_mega(text: str, duration_ms: int) -> list[str]:
     return result
 
 
+def _strip_noise(text: str) -> str:
+    """Drop list furniture from the start of a unit (see ``_LEADING_NOISE``)."""
+
+    return _LEADING_NOISE.sub("", text, count=1).strip()
+
+
 def _strip_cues(text: str, duration_ms: int) -> tuple[str, int | None, str, tuple[int, int] | None]:
+    text = _strip_noise(text)
     minute = _MINUTE_CUE.match(text)
     if minute:
         cue = int(minute.group(1)) * 60_000
         if cue <= duration_ms:
-            return minute.group(2).strip(), cue, "minute", _cue_range(cue, "minute", duration_ms)
+            cleaned = _strip_noise(minute.group(2))
+            return cleaned, cue, "minute", _cue_range(cue, "minute", duration_ms)
 
     stamps = _timestamp_matches(text, duration_ms)
     if not stamps:
@@ -224,8 +256,8 @@ def _strip_cues(text: str, duration_ms: int) -> tuple[str, int | None, str, tupl
             cue = (int(dotted.group(1)) * 60 + int(dotted.group(2))) * 1_000
             if cue <= duration_ms:
                 cleaned = (text[: dotted.start()] + text[dotted.end() :]).strip(" -–—:|@")
-                return cleaned.strip(), cue, "hms", _cue_range(cue, "hms", duration_ms)
-        return text.strip(), None, "none", None
+                return _strip_noise(cleaned), cue, "hms", _cue_range(cue, "hms", duration_ms)
+        return text, None, "none", None
 
     first_match, first_value = stamps[0]
     if len(stamps) >= 2:
@@ -234,7 +266,7 @@ def _strip_cues(text: str, duration_ms: int) -> tuple[str, int | None, str, tupl
         if re.fullmatch(r"\s*[-–—]\s*", between) and second_value >= first_value:
             cleaned = (text[: first_match.start()] + text[second_match.end() :]).strip()
             return (
-                cleaned.lstrip("-–—:.) "),
+                _strip_noise(cleaned.lstrip("-–—:.) ")),
                 first_value,
                 "range",
                 _clip_range(first_value, second_value, duration_ms),
@@ -247,11 +279,27 @@ def _strip_cues(text: str, duration_ms: int) -> tuple[str, int | None, str, tupl
         cleaned = text[: first_match.start()].rstrip(" -–—:.)[")
     else:
         cleaned = (text[: first_match.start()] + text[first_match.end() :]).strip()
-    return cleaned.strip(), first_value, "hms", _cue_range(first_value, "hms", duration_ms)
+    return _strip_noise(cleaned), first_value, "hms", _cue_range(first_value, "hms", duration_ms)
+
+
+def _scrub_mentions(value: str | None) -> str | None:
+    """Remove every ``@handle`` token: a commenter's handle is never part of a track label."""
+
+    if value is None:
+        return None
+    scrubbed = _MENTION_ANYWHERE.sub(" ", value)
+    if scrubbed != value:
+        # A handle inside a bracket or a version qualifier ("[@x Records]", "(@x Remix)") would
+        # otherwise leave "[ Records]" behind, which no longer matches the "Records" the label
+        # reader emits, so `_clean_identity_field` could not cut it back out of the title.
+        scrubbed = re.sub(r"([(\[])\s+", r"\1", scrubbed)
+        scrubbed = re.sub(r"\s+([)\]])", r"\1", scrubbed)
+    cleaned = re.sub(r"\s+", " ", scrubbed).strip()
+    return cleaned or None
 
 
 def _artist_title(text: str, *, split_no_space: bool) -> tuple[str | None, str | None, int]:
-    clean = _MENTION_PREFIX.sub("", text).strip()
+    clean = _scrub_mentions(_MENTION_PREFIX.sub("", text)) or ""
     by_match = re.fullmatch(r"(.+?)\s+by\s+(.+)", clean, re.IGNORECASE)
     if by_match:
         return by_match.group(2).strip(), by_match.group(1).strip(), 8_500
@@ -407,6 +455,11 @@ def parse_text_units(
             body = clean
         else:
             body = _ANSWER_PREFIX.sub("", clean)
+        # Scrub the handles ONCE, before the body is read for either the identity fields or the
+        # qualifier / label: scrubbing them separately leaves "(@x Remix)" as "( Remix)" in the
+        # title while the qualifier reads "Remix", and `_clean_identity_field` then cannot cut the
+        # bracket back out of the title.
+        body = _scrub_mentions(body) or ""
         artist, title, confidence = _artist_title(body, split_no_space=split_no_space)
         qualifier, label, flags, specificity = _flags_and_qualifiers(body, artist, title)
         artist = _clean_identity_field(artist, qualifier, label)
