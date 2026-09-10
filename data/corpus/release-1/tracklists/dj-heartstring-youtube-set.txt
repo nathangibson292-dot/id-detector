@@ -1,0 +1,26 @@
+# Truth — DJ Heartstring live set (YouTube), 23 entries, from a public comment tracklist (by a listener, edited) supplied by the owner 2026-09-10.
+# Mix: source URL held privately in data/local/corpus-sources.json (committed-corpus policy: no URLs / platform IDs)
+# Source lists "Title (Artist)"; normalised here to "Artist - Title". "?" and "ID" entries are unknown tracks; "(UR)" = unreleased per the source.
+0:01:40 - Unknown - ?
+0:03:30 - Luke Alessi - B Phonk
+0:05:30 - DJ Seinfeld - Rythm of the Night (x Biicla - SWAG)
+0:08:57 - Kettama, DJ Heartstring - If U Want My Heart
+0:13:05 - Entasia - Invasion
+0:16:47 - Paige Tomlison - I Wanna Feel (Secondcity Remix)
+0:20:35 - DJ Heartstring, Narciss - While U Sleep
+0:24:00 - Bryson Hill - I Want You
+0:28:00 - EUROCLUB - FUNKY SHIT
+0:30:53 - Shugz - The Drums (UR)
+0:35:20 - SHEE, A-Trak, Mighty Dub Katz - The Groove
+0:39:10 - Empire of the Sun - Alive (DJ Heartstring Remix)
+0:43:40 - DJ Heartstring - ID (UR)
+0:47:30 - DJ Heartstring, Southstar - Don't Stop
+0:51:40 - DJ Heartstring, BAUGRUPPE90 - What Music Felt Like in 2007
+0:56:35 - DJ Heartstring - ID (UR)
+1:00:10 - DJ Seinfeld - Plush
+1:03:10 - DJ Heartstring - Another Year Alone (UR)
+1:07:40 - DJ Heartstring - Staring into the Sun
+1:13:10 - The Groovaholics - Wake Up The Funk (Ragel Mood Remix)
+1:17:30 - DJ Heartstring, DMA'S, Saidah - A Thousand Lies
+1:22:00 - DJ Heartstring - ID (UR)
+1:26:16 - DJ Heartstring - It Ain't Over

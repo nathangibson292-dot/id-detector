@@ -14,6 +14,8 @@ runs are matched to truth by `media_key`, not by URL.
 | `release1-final-new-set-christmas` | test | 23 | owner's rekordbox playlist, order only | 46 min |
 | `release1-new-mix-jan-24th` | **dev-1** | 30 | owner's rekordbox playlist, order only | 55 min; **tuned on** (the 30 s on-air floor) — report separately, never in the clean number |
 | `release1-mall-grab-boiler-room-melbourne-22` | test | 25 | public tracklist with minute-level timestamps; many unreleased ("UR") and three unnamed "ID"s | second DJ; the underground stress case; seeded once its scan finishes |
+| `release1-mph-youtube-set` | test | 54 + 9 overlays | public YouTube comment tracklist with timestamps; "w/" overlays kept as overlapping entries | third DJ, **second platform (YouTube)**; live recording with crowd noise; seeded once its scan finishes |
+| `release1-dj-heartstring-youtube-set` | test | 23 | public YouTube comment tracklist with timestamps; 4 unknown IDs | fourth DJ, YouTube; seeded once its scan finishes |
 
 ## What "order only" means for scoring
 
@@ -38,6 +40,6 @@ Then run each mix (`uv run idea analyse <url> --recipe free|deep`) and score wit
 
 ## Gaps against the L3 gate
 
-L3 asks for ≥ 5 mixes, ≥ 3 DJs, ≥ 2 platforms, ≥ 4 h total. Present: 5 mixes, 2 DJs (owner + Mall Grab),
-1 platform (SoundCloud), ~5.3 h. **Missing:** a third DJ and a second platform (a Mixcloud or YouTube set
-with a trustworthy tracklist).
+L3 asks for ≥ 5 mixes, ≥ 3 DJs, ≥ 2 platforms, ≥ 4 h total. Present (2026-09-10): 7 mixes, 4 DJs (owner,
+Mall Grab, MPH, DJ Heartstring), 2 platforms (SoundCloud, YouTube), ~8.2 h. **The corpus-shape gate is met;
+what remains is verification** (first pass by the owner, a blind second pass, resolve, freeze).
