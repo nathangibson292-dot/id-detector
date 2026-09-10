@@ -1,6 +1,7 @@
 # Truth — MPH live set (YouTube), 54 entries + 9 "w/" overlays, from a public comment tracklist supplied by the owner 2026-09-10.
 # Mix: source URL held privately in data/local/corpus-sources.json (committed-corpus policy: no URLs / platform IDs)
 # Crowd noise present (live recording). Record labels in [brackets] removed. "w/" lines = a second track overlaid at the same time (overlap truth).
+# The 9 'w/' overlays (a second track playing at the same time) are kept in mph-youtube-set.overlays.txt — the seeder cannot express simultaneous rows; attach them as overlaps_with during verification.
 # Entries 1, 53 and 54 had no timestamp in the source: 1 = start; 53/54 marked approx. — verifier to fix by listening.
 0:00:00 - MPH - One Sixty (Intro Edit)
 0:02:04 - Boy Better Know - Too Many Man (NOTION Edit)
@@ -14,7 +15,6 @@
 0:14:35 - TNGHT - Higher Ground (Higgo Edit)
 0:15:44 - Redlight ft. Sweetie Irie - Zum Zum
 0:17:09 - Royal-T - Tokyo Dub
-0:17:09 - MPH - Funk Master (w/ overlay)
 0:19:24 - Soul Mass Transit System - Bomb
 0:21:40 - MPH - Raw
 0:23:17 - Chris Lorenzo & MPH - Run
@@ -24,28 +24,22 @@
 0:30:04 - NOTION - Bring In The Katz Dub
 0:31:41 - MPH - Brainwashing
 0:33:10 - Wost - Calentura Vaginal (Hard Drum Edit)
-0:33:10 - Sammy Virji - Bogeyman (w/ overlay)
 0:36:00 - Levity - Front To Back
 0:37:10 - AC Slater & MPH ft. Eloise Keeble - Lights On
 0:38:46 - MPH & Gentlemens Club - Kill Bill
 0:39:45 - Oppidan - Move Your Feet (VIP)
-0:39:45 - Sammy Virji & 33 Below - Dub It In (w/ overlay)
 0:42:24 - 33 Below & MPH & NOTION - Light It Up
 0:43:38 - Groove Armada - Superstylin' (DJ Q Bootleg)
 0:45:00 - Milky - Just The Way You Are (Mall Grab Edit)
 0:46:31 - Champion & MPH - Badderman Refix
 0:47:58 - Adam F - Circles (Oppidan Bootleg)
-0:47:58 - Simula - Daddy Issues (w/ overlay)
 0:49:34 - MPH - Doubt
-0:49:34 - MPH - Run It (w/ overlay)
 0:51:10 - MPH - Endorphins
 0:52:44 - MPH - Shoot To Kill
 0:54:08 - Joy Orbison - Flight FM
-0:54:08 - NOTION - After The Break (w/ overlay)
 0:55:27 - MPH ft. Cecelia - Rush
 0:57:07 - Sammy Virji - ID
 0:58:17 - MPH - Spend The Night
-0:58:17 - Chase & Status - Headtop (ft. IRAH) (Original Dub Mix) (w/ overlay)
 0:59:43 - MPH & Gentlemens Club - GOOD 4 U
 1:00:50 - The Chemical Brothers - Swoon (MPH Edit)
 1:03:24 - Sammy Virji & Interplanetary Criminal - Damager
@@ -58,10 +52,8 @@
 1:14:33 - Fritz Schnackenpfefferhausen - Rippin' Bongz
 1:15:53 - Peggy Gou - (It Goes Like) Nanana (Sammy Virji Edit)
 1:18:13 - Flava D & P Money - Dutty
-1:18:13 - The Bug ft. Flowdan - Jah War (w/ overlay)
 1:20:07 - salute & Leilah - Perfect
 1:22:04 - MPH - Nova
 1:23:04 - Sammy Virji - Never Let You Go
-1:23:04 - Modelle - Bloodgulch (w/ overlay)
 1:24:30 - MPH - My Mind (time approx.)
 1:25:45 - MPH - Home T Dub (time approx.)
