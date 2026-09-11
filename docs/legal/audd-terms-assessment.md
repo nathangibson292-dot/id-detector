@@ -15,7 +15,7 @@ owner's solicitor reviews under L2.*
 | Attribution | **Optional for paying customers** ("the customer might display a 'Powered by AudD' link or image"); mandatory only for free/educational/non-profit access under separate branding rules. | The Test License's logo requirement ends once we pay. Keep the attribution slot as an optional config value. |
 | Clip vs whole-file recognition | No distinction; nothing forbids DJ-mix analysis. | The clip path is fine. |
 | Concurrency / rate limits | Not stated numerically; customers must not "use automated systems in a manner inconsistent with AudD's documentation, rate limits, or written instructions" nor "bypass … rate limits". | Our AIMD limiter backs off on 429/503 (0b-i). **Ask AudD for the documented ceiling** and set `[deep] audd_requests_per_minute` from it. |
-| Per-clip subscription rate; whether throttled/refused requests bill; reconciliation of ambiguous requests | **Not in the Terms** (pricing is "in accordance with our current pricing policy"). | Remaining L1 items are commercial only — one email to api@audd.io. They set the Pro allowance (`pricing.toml`), not whether we may launch. |
+| Per-clip subscription rate; whether throttled/refused requests bill; reconciliation of ambiguous requests | **Not in the Terms** (pricing is "in accordance with our current pricing policy"). | **Answered 2026-09-11** — see [audd-commercial-answers-2026-09-11.md](audd-commercial-answers-2026-09-11.md): the $2/1,000 subscription is enterprise-only (hundreds of millions of requests a month), so we stand on the $5/1,000 walk-up rate already in `pricing.toml`; no documented rate limit or concurrency; 429/503 are not billed; no reconciliation mechanism for a post-upload timeout. |
 
 ## Restrictions we must honour
 
@@ -46,6 +46,9 @@ owner's solicitor reviews under L2.*
 ## L1 status
 
 **Licensing: cleared.** Hosted third-party Deep scans, caching and display are permitted for a paying
-customer; no attribution obligation. **Commercial questions remain** (rate for the per-clip endpoint,
-documented rate limit/concurrency, billing of 429s, reconciliation of ambiguous requests) — they set the
-Pro allowance in `pricing.toml` and do not block the private beta.
+customer; no attribution obligation. **The commercial questions are now answered (2026-09-11)** — the
+subscription rate is enterprise-only so pricing stands on $5/1,000 walk-up (unchanged in `pricing.toml`),
+there is no documented rate limit or concurrency, 429/503 are not billed, and a post-upload timeout cannot be
+reconciled (it stays ambiguous and counted as spent). Details and consequences:
+[audd-commercial-answers-2026-09-11.md](audd-commercial-answers-2026-09-11.md). No written service commitment
+was given, so the defensive provider handling is load-bearing.

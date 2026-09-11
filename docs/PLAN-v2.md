@@ -201,7 +201,7 @@ UTC; (c) latch: three (a)-opens in one UTC day → off until an admin re-enables
 service-wide over `provider_attempt_events` from 4b-ii. Manual `IDEA_ENGINE_SHAZAM=off`. Never a mid-run
 engine swap; never proxied; "sparse AudD" free is post-L1 operator-only configuration.
 
-#### 2.3.6 Cost per 60-minute mix (400 windows; $5/1,000 walk-up · $2/1,000 subscription)
+#### 2.3.6 Cost per 60-minute mix (400 windows; $5/1,000 walk-up · the $2/1,000 subscription column is unreachable — enterprise-only, AudD 2026-09-11)
 
 | Recipe | AudD req | Shazam req | AudD $ | Wall-clock (after 0b) |
 |---|---|---|---|---|
@@ -314,8 +314,16 @@ infra`, with `proxy_share = 0.5 × $0.30 = $0.15` (Pro only) and `infra = $0.10`
 |---|---|---|---|
 | walk-up, d=1 | $2.35 | **90** | **55** |
 | walk-up, d=2 | $1.30 | 165 | 100 |
-| subscription, d=1 | $1.09 | 195 | 120 |
-| subscription, d=2 | $0.67 | 320 | 200 |
+| ~~subscription, d=1~~ | ~~$1.09~~ | ~~195~~ | ~~120~~ |
+| ~~subscription, d=2~~ | ~~$0.67~~ | ~~320~~ | ~~200~~ |
+
+**The subscription rows are unreachable (AudD, 2026-09-11):** $2/1,000 is enterprise pricing for "clients
+sending hundreds of millions of requests per month on negotiated terms". Pricing therefore stands on the
+walk-up rate, which is what `pricing.toml` already encodes; the shipped Pro allowance and pack are the walk-up
+d=1 row. AudD also states there is no rate limit or concurrency limit on `api.audd.io`, that 429/503 are not
+billed, and that requests should not time out — expectations, not commitments, so the adapter's self-imposed
+concurrency + token bucket, the retry/breaker paths and the "ambiguous = spent, never auto-retried" rule all
+stay. See [legal/audd-commercial-answers-2026-09-11.md](legal/audd-commercial-answers-2026-09-11.md).
 
 **No price is published and no third-party Deep scan runs before L1** (beta included).
 
@@ -537,8 +545,9 @@ earlier cycles.
   installed on the owner's machine); scripts must run under both.
 
 ### Phase S — spikes and owner gates (parallel; not build cycles)
-- **S1 (owner):** AudD production terms + per-clip rate + whether throttled/refused requests bill +
-  reconciliation → L1.
+- **S1 (owner): DONE 2026-09-11.** AudD production terms cleared from the pasted Terms; the four commercial
+  questions answered by email (walk-up $5/1,000 only, no documented limits, 429/503 unbilled, no reconciliation)
+  → [legal/audd-commercial-answers-2026-09-11.md](legal/audd-commercial-answers-2026-09-11.md). L1 closed.
 - **S2 (owner runs; script from 0a-iii; runs before M2 7c):** `scripts/spike_ingest_vps.sh <sc-url> <mc-url>
   <yt-url> [proxy]` → `docs/spikes/ingest-vps.md`.
 - **S3 (owner runs; script from 0a-iii):** `scripts/spike_shazam_vps.py --minutes 60 --ceiling 45` daily × 5
