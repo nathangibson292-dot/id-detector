@@ -140,7 +140,7 @@ async def _probe_original(path: Path) -> tuple[str, str, int | None]:
     )
 
 
-def _load_cached(work_root: Path, input_url: str) -> IngestResult | None:
+def _load_ingest_cached(work_root: Path, input_url: str) -> IngestResult | None:
     local_path = Path(input_url)
     candidate_uri = local_path.resolve().as_uri() if local_path.is_file() else None
     candidate_canonical = candidate_uri or canonicalize_url(input_url, None)[0]
@@ -167,6 +167,27 @@ def _load_cached(work_root: Path, input_url: str) -> IngestResult | None:
     return None
 
 
+def _load_cached(work_root: Path, input_url: str) -> IngestResult | None:
+    """Open retained results without verifying or requiring the fetched original."""
+
+    from id_detector.present.bundles import read_manifest, result_dir
+    from id_detector.present.index import cached_media_dir
+
+    media_dir = cached_media_dir(work_root, input_url)
+    if media_dir is not None:
+        directory = result_dir(media_dir)
+        manifest = read_manifest(directory)
+        source_path = directory / "source.json" if manifest else media_dir / "ingest/source.json"
+        try:
+            record = SourceRecord.model_validate_json(read_text(source_path))
+            return IngestResult(
+                record, media_dir, source_path, media_dir / record.original.path, True
+            )
+        except (OSError, ValueError):
+            pass
+    return _load_ingest_cached(work_root, input_url)
+
+
 async def ingest(input_url: str, work_root: Path) -> IngestResult:
     """Download one best-audio source and materialise its immutable source record."""
 
@@ -174,7 +195,7 @@ async def ingest(input_url: str, work_root: Path) -> IngestResult:
         raise ValueError("credential-bearing URLs are not accepted")
     work_root = work_root.resolve()
     os.makedirs(native_path(work_root), exist_ok=True)
-    cached = _load_cached(work_root, input_url)
+    cached = _load_ingest_cached(work_root, input_url)
     if cached is not None:
         return cached
 

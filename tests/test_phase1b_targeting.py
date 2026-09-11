@@ -28,6 +28,7 @@ from id_detector.contracts import (
     WindowRecord,
 )
 from id_detector.io import native_path, path_is_file
+from id_detector.present.bundles import shown_result_dir
 from id_detector.providers.base import AppConfig
 from id_detector.recipes import DEEP_RECIPE, FREE_RECIPE, get_recipe
 from id_detector.secondary_targeting import (
@@ -696,7 +697,9 @@ def test_secondary_under_80_percent_is_degraded(
     assert counts["secondary_allocated"] == 2 and counts["secondary_resolved"] == 1  # type: ignore[index]
     assert shazam.requests == 2
     assert entry["algorithm_version"] == "targeting:1,fusion:2"
-    tracklist = json.loads((media_dir / "present" / "tracklist.json").read_text(encoding="utf-8"))
+    tracklist = json.loads(
+        (shown_result_dir(media_dir) / "tracklist.json").read_text(encoding="utf-8")
+    )
     assert tracklist["status"] == "degraded"  # shown with a banner, never served
 
 

@@ -31,7 +31,7 @@ from id_detector.contracts import (
     compose_natural_key,
     make_id,
 )
-from id_detector.ingest import _load_cached
+from id_detector.ingest import _load_cached, _load_ingest_cached
 from id_detector.io import (
     atomic_write_bytes,
     canonical_json_bytes,
@@ -41,6 +41,7 @@ from id_detector.io import (
     read_text,
     sha256_file,
 )
+from id_detector.present.bundles import result_dir
 from id_detector.present.exports import _format_time
 from id_detector.present.page import EmbedPlan, plan_embed_from_url
 from id_detector.present.refresh import ensure_fresh_page
@@ -185,7 +186,7 @@ def _discover_sets(work_root: Path) -> list[AnalysedSet]:
     if not work_root.is_dir():
         return []
     for source_json in work_root.glob("*/*/ingest/source.json"):
-        index_html = source_json.parents[1] / "present" / "index.html"
+        index_html = result_dir(source_json.parents[1]) / "index.html"
         if not path_is_file(index_html):
             continue
         try:
@@ -232,7 +233,7 @@ class _SetSummary:
 
 
 def _set_summary(item: AnalysedSet) -> _SetSummary | None:
-    path = item.media_dir / "present" / "tracklist.json"
+    path = result_dir(item.media_dir) / "tracklist.json"
     if not path_is_file(path):
         return None
     try:
@@ -1026,8 +1027,8 @@ def _audio_content_type(path: Path, container: str | None = None) -> str:
 def _resolve_job_audio(job: Job, work_root: Path) -> Path | None:
     """The job's fetched original on disk, resolved (once) from the target after ingest.
 
-    ``ingest._load_cached`` verifies the completion sidecar and the media-key hash, so a partial
-    download is never served; the result is memoised on the job.
+    ``ingest._load_ingest_cached`` verifies the completion sidecar and the media-key hash, so a
+    partial or altered download is never served; the result is memoised on the job.
     """
 
     if job.audio_path:
@@ -1039,7 +1040,7 @@ def _resolve_job_audio(job: Job, work_root: Path) -> Path | None:
         if job.phase == "ingest" and job.phase_done < job.phase_total:
             return None
     try:
-        cached = _load_cached(work_root, job.target)
+        cached = _load_ingest_cached(work_root, job.target)
     except (OSError, ValueError):
         return None
     if cached is None or not path_is_file(cached.original_path):
@@ -1246,14 +1247,21 @@ class _Handler(BaseHTTPRequestHandler):
         """Map a URL path to a file strictly inside ``work_root`` and under a ``present/`` dir."""
 
         segments = [segment for segment in path.split("/") if segment not in ("", ".")]
-        if any(segment == ".." for segment in segments):
+        if any(segment == ".." or "\\" in segment or ":" in segment for segment in segments):
             return None
         candidate = self.work_root
         for segment in segments:
             candidate = candidate / segment
+        if not Path(native_path(candidate)).is_relative_to(Path(native_path(self.work_root))):
+            return None
+        if len(segments) == 4 and segments[2] == "present":
+            media_dir = self.work_root / segments[0] / segments[1]
+            if segments[3] == "index.html":
+                ensure_fresh_page(media_dir, config=self.config)
+            candidate = result_dir(media_dir) / segments[3]
         try:
-            resolved = candidate.resolve()
-            root = self.work_root.resolve()
+            resolved = Path(native_path(candidate))
+            root = Path(native_path(self.work_root))
         except OSError:
             return None
         if root != resolved and root not in resolved.parents:
@@ -1278,8 +1286,8 @@ class _Handler(BaseHTTPRequestHandler):
         for segment in segments:
             candidate = candidate / segment
         try:
-            resolved = candidate.resolve()
-            root = self.work_root.resolve()
+            resolved = Path(native_path(candidate))
+            root = Path(native_path(self.work_root))
         except OSError:
             return None
         if root != resolved and root not in resolved.parents:
@@ -1323,6 +1331,22 @@ class _Handler(BaseHTTPRequestHandler):
         if self._app_active() and route.startswith("/jobs/"):
             self._handle_job_get(route)
             return
+        if route.startswith("/media/"):
+            match = re.fullmatch(r"/media/([a-f0-9]{64})/audio", route)
+            audio = None
+            if match:
+                cached = _load_cached(self.work_root, match.group(1))
+                if cached is not None:
+                    candidate = cached.original_path.resolve()
+                    if candidate.is_relative_to(cached.media_dir.resolve()) and path_is_file(
+                        candidate
+                    ):
+                        audio = candidate
+            if audio is None:
+                self._send(HTTPStatus.NOT_FOUND, b"not found", "text/plain; charset=utf-8")
+            else:
+                self._send_file_range(audio, _audio_content_type(audio))
+            return
         served_audio = self._resolve_served_audio(route)
         if served_audio is not None:
             # The result page's <audio> points at the fetched original; serve it Range-capable so
@@ -1333,9 +1357,6 @@ class _Handler(BaseHTTPRequestHandler):
         if served is None:
             self._send(HTTPStatus.NOT_FOUND, b"not found", "text/plain; charset=utf-8")
             return
-        if served.name == "index.html" and served.parent.name == "present":
-            # A page written by an older build is re-rendered from its artefacts on open.
-            ensure_fresh_page(served.parent.parent, config=self.config)
         with open(native_path(served), "rb") as handle:
             body = handle.read()
         self._send(HTTPStatus.OK, body, _CONTENT_TYPES[served.suffix.lower()])

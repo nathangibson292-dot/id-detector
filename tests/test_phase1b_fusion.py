@@ -65,6 +65,7 @@ from id_detector.fuse.scanners import scanner_logical_trial_id
 from id_detector.hints.parse import HintInput, parse_hint_inputs
 from id_detector.hints.relations import apply_relations
 from id_detector.io import atomic_write_json
+from id_detector.present.bundles import shown_result_dir
 from id_detector.present.exports import (
     _candidate_label,
     export_tracklist,
@@ -855,7 +856,9 @@ def test_deep_run_marks_the_shazam_probed_tracks_confirmed_twice(
     code, media_dir = _run(tmp_path, "overlap-allowed", recipe=recipe)
     assert code == 0
     episodes = json.loads((media_dir / "fuse" / "episodes.json").read_text(encoding="utf-8"))
-    tracklist = json.loads((media_dir / "present" / "tracklist.json").read_text(encoding="utf-8"))
+    tracklist = json.loads(
+        (shown_result_dir(media_dir) / "tracklist.json").read_text(encoding="utf-8")
+    )
     confirmed = [item for item in episodes["episodes"] if "engine_corroborated" in item["flags"]]
     rows = [entry for entry in tracklist["entries"] if entry["kind"] == "track"]
     assert rows
@@ -864,7 +867,7 @@ def test_deep_run_marks_the_shazam_probed_tracks_confirmed_twice(
         assert any(entry["engine_corroborated"] for entry in rows)
         # A 60 s tone never yields two agreements 60 s apart.
         assert not any(entry["engine_corroborated_separated"] for entry in rows)
-        markdown = (media_dir / "present" / "tracklist.md").read_text(encoding="utf-8")
+        markdown = (shown_result_dir(media_dir) / "tracklist.md").read_text(encoding="utf-8")
         assert "+CONFIRMED TWICE" in markdown
     else:
         assert not confirmed
@@ -881,7 +884,9 @@ def test_a_recipe_threshold_of_zero_is_not_mistaken_for_an_unset_one(tmp_path: P
     recipe = replace(get_recipe("deep"), overlap_min_ms=0, separation_min_ms=0)
     code, media_dir = _run(tmp_path, "overlap-allowed", recipe=recipe)
     assert code == 0
-    tracklist = json.loads((media_dir / "present" / "tracklist.json").read_text(encoding="utf-8"))
+    tracklist = json.loads(
+        (shown_result_dir(media_dir) / "tracklist.json").read_text(encoding="utf-8")
+    )
     rows = [entry for entry in tracklist["entries"] if entry["kind"] == "track"]
     assert any(entry["engine_corroborated_separated"] for entry in rows)
 

@@ -14,7 +14,7 @@ import httpx
 import pytest
 
 from id_detector.contracts import SourceRecord
-from id_detector.io import path_is_file
+from id_detector.io import native_path, path_is_file
 from id_detector.present.page import generate_page
 from id_detector.present.server import (
     append_rescan_request,
@@ -206,11 +206,32 @@ def test_stale_result_page_is_regenerated_on_open(tmp_path: Path) -> None:
         assert '<tr class="track"' in page.text
     finally:
         running.shutdown()
-    assert page_version(index_html) == PAGE_VERSION
+    from id_detector.present.bundles import result_dir
+
+    assert page_version(result_dir(media_dir) / "index.html") == PAGE_VERSION
+    assert page_version(index_html) == 0  # Legacy bytes are never rewritten.
     assert (media_dir / "fuse" / "episodes.json").read_bytes() == episodes_before
 
-    # A page that cannot be regenerated (artefact missing) is served as-is, never an error.
-    index_html.write_bytes(b"<!doctype html><title>old page</title>")
-    (media_dir / "decode" / "pcm.json").unlink()
-    assert ensure_fresh_page(media_dir) is False
-    assert index_html.read_bytes().startswith(b"<!doctype html><title>old page</title>")
+    # A page that cannot be regenerated (artefact missing) is served as-is, never an error.  It
+    # needs a mix whose *selected* result is still the legacy page, or the refresh returns early
+    # on the fresh bundle and never reaches the failing render at all.
+    other = _source("mixcloud")
+    other_dir = _seed_work_root(tmp_path, other)
+    other_html = other_dir / "present" / "index.html"
+    other_html.write_bytes(b"<!doctype html><title>old page</title>")
+    assert page_version(other_html) == 0  # selected, stale, and decode/pcm.json never existed
+    from id_detector.present.bundles import result_dir as _result_dir
+
+    assert _result_dir(other_dir) == Path(native_path(other_dir / "present"))
+    assert ensure_fresh_page(other_dir) is False
+    assert other_html.read_bytes() == b"<!doctype html><title>old page</title>"
+    assert not (other_dir / "present" / "bundles").exists()
+    running = serve_in_background(tmp_path, port=0)
+    try:
+        served = httpx.get(
+            f"{running.base_url}/{other.source_key}/{other.media_key}/present/index.html",
+            timeout=TIMEOUT,
+        )
+        assert served.status_code == 200 and b"old page" in served.content
+    finally:
+        running.shutdown()

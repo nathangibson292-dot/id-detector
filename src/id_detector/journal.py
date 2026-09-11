@@ -14,6 +14,7 @@ from id_detector.contracts import GENERATED_BY, SCHEMA_VERSION, InvocationJourna
 from id_detector.io import (
     atomic_write_bytes,
     canonical_json_bytes,
+    fsync_directory,
     native_path,
     path_is_file,
     read_bytes,
@@ -41,6 +42,7 @@ def tool_versions(ffmpeg_version: str | None = None) -> dict[str, str]:
 def append_invocation(path: Path, entry: InvocationJournalEntry) -> None:
     existing = read_bytes(path) if path_is_file(path) else b""
     atomic_write_bytes(path, existing + canonical_json_bytes(entry) + b"\n")
+    fsync_directory(path.parent)
 
 
 def append_line(path: Path, record: Any) -> None:
@@ -102,6 +104,8 @@ class InvocationTimer:
             schema_version=SCHEMA_VERSION,
             generated_by=GENERATED_BY,
             invocation_id=self.run_id,
+            bundle_id=None,
+            fuse_run=None,
             command=self.command,
             started_at=self.started_at,
             finished_at=timestamp(),

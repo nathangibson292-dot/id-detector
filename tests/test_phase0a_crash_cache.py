@@ -17,6 +17,7 @@ from typer.testing import CliRunner
 
 from id_detector.cli import _analyse
 from id_detector.io import native_path
+from id_detector.present.bundles import shown_result_dir
 from id_detector.providers import audd as audd_module
 from id_detector.providers.audd import AudDAdapter, AudDCredentials
 from id_detector.providers.base import AppConfig
@@ -137,7 +138,7 @@ def test_paid_primary_success_completes_without_the_branch_local_crash(tmp_path:
     assert entry["counts"]["paid_resolved"] == 7  # type: ignore[index]
     assert entry["counts"]["paid_billable_units"] == 7  # type: ignore[index]
     assert audd.calls == audd.billed_units == 7
-    assert (media_dir / "present" / "index.html").is_file()
+    assert (shown_result_dir(media_dir) / "index.html").is_file()
 
 
 def test_paid_no_match_is_resolved_cached_and_gap_counts_accumulate(tmp_path: Path) -> None:
@@ -238,7 +239,7 @@ def test_all_http_401_is_provider_unavailable_unspent_and_never_cached(tmp_path:
     assert audd.calls == 1 and audd.billed_units == 0
     assert shazam.requests == 0
     assert not _raw_payloads(raw_dir)
-    assert not (media_dir / "present" / "index.html").exists()
+    assert not (shown_result_dir(media_dir) / "index.html").exists()
     assert any("(1 requests, 0 cached, 6 not sent)" in message for message in progress_messages)
     assert all("billable" not in message for message in progress_messages)
 

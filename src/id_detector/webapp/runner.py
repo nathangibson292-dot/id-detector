@@ -193,7 +193,9 @@ def make_pipeline_runner(
 
         cached = cli._load_cached(root.resolve(), target)
         if cached is not None:
-            index = cached.media_dir / "present" / "index.html"
+            from id_detector.present.bundles import shown_result_dir
+
+            index = shown_result_dir(cached.media_dir) / "index.html"
             if index.is_file():
                 ctx.set_result(index)
 

@@ -399,6 +399,7 @@ def _acquire_cell(entry: dict[str, Any], key: str) -> str:
 def export_tracklist(
     *,
     media_dir: Path,
+    output_dir: Path | None = None,
     media_key: str,
     duration_ms: int,
     episodes: EpisodesFile,
@@ -431,8 +432,9 @@ def export_tracklist(
         same_track_bridge_ms=same_track_bridge_ms,
         min_track_ms=min_track_ms,
     )
-    json_path = media_dir / "present" / "tracklist.json"
-    markdown_path = media_dir / "present" / "tracklist.md"
+    output_dir = output_dir or media_dir / "present"
+    json_path = output_dir / "tracklist.json"
+    markdown_path = output_dir / "tracklist.md"
     atomic_write_json(
         json_path,
         {
@@ -496,11 +498,11 @@ def export_tracklist(
     atomic_write_bytes(markdown_path, ("\n".join(lines) + "\n").encode("utf-8"))
     write_completion_sidecar(markdown_path, upstream)
 
-    cue_path = media_dir / "present" / "tracklist.cue"
+    cue_path = output_dir / "tracklist.cue"
     atomic_write_bytes(cue_path, render_cue(entries, title=title).encode("utf-8"))
     write_completion_sidecar(cue_path, upstream)
 
-    m3u_path = media_dir / "present" / "tracklist.m3u"
+    m3u_path = output_dir / "tracklist.m3u"
     atomic_write_bytes(
         m3u_path, render_m3u(entries, media_target=media_target or "audio").encode("utf-8")
     )

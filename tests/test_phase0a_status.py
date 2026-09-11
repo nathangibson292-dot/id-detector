@@ -16,6 +16,7 @@ from typer.testing import CliRunner
 from id_detector import cli
 from id_detector.cli import _achieved, _run_status
 from id_detector.contracts import EpisodeRecord, EpisodesFile, Transform, WindowRecord
+from id_detector.present.bundles import shown_result_dir
 from id_detector.providers.base import AppConfig
 from id_detector.recipes import DEEP_RECIPE, FREE_RECIPE, Recipe
 from id_detector.secondary_targeting import (
@@ -40,7 +41,7 @@ def _entry(work_root: Path) -> tuple[Path, dict[str, object]]:
 
 
 def _tracklist(media_dir: Path) -> dict[str, object]:
-    return json.loads((media_dir / "present" / "tracklist.json").read_text(encoding="utf-8"))
+    return json.loads((shown_result_dir(media_dir) / "tracklist.json").read_text(encoding="utf-8"))
 
 
 def _run(
@@ -136,7 +137,7 @@ def test_quota_error_after_two_matches_is_partial_provider_unavailable_midrun(
     assert entry["usd_e6_spent"] == 10_000 and entry["usd_e2_spent"] == 1
     # The Deep secondary still runs over the two-track hull and the blank remainder.
     assert entry["counts"]["secondary_allocated"] == shazam.requests == 2  # type: ignore[index]
-    assert (media_dir / "present" / "index.html").is_file()
+    assert (shown_result_dir(media_dir) / "index.html").is_file()
     tracklist = _tracklist(media_dir)
     assert (tracklist["status"], tracklist["reason"], tracklist["achieved"]) == (
         "partial",
@@ -203,7 +204,7 @@ def test_secondary_below_80_percent_is_degraded(tmp_path: Path) -> None:
     assert entry["usd_e6_spent"] == 35_000
     assert shazam.requests == entry["counts"]["secondary_allocated"] == 2  # type: ignore[index]
     assert entry["counts"]["secondary_resolved"] == 0  # type: ignore[index]
-    assert (media_dir / "present" / "index.html").is_file()  # shown, with a banner
+    assert (shown_result_dir(media_dir) / "index.html").is_file()  # shown, with a banner
     assert _tracklist(media_dir)["status"] == "degraded"
 
 
@@ -274,7 +275,7 @@ def test_allow_degrade_restarts_as_the_free_recipe_before_any_paid_work(
     assert entry["usd_e6_spent"] == 0 and entry["costs"] == {"usd_e2": 0}
     assert entry["usd_e6_reserved"] == 36_750  # reserved, then released in full
     assert any("restarting as the free recipe" in message for message in messages)
-    assert (media_dir / "present" / "index.html").is_file()
+    assert (shown_result_dir(media_dir) / "index.html").is_file()
     tracklist = _tracklist(media_dir)
     assert (tracklist["status"], tracklist["reason"], tracklist["achieved"]) == (
         "degraded",

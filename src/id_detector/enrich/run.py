@@ -319,10 +319,17 @@ async def enrich_media_dir(
     cache_root: Path,
     refresh: bool = False,
     enable_soundcloud: bool = True,
+    episodes: EpisodesFile | None = None,
+    identities: IdentitiesRecord | None = None,
 ) -> AcquireResult:
-    """Run enrichment end-to-end for a media dir, owning the HTTP clients."""
+    """Run enrichment end-to-end for a media dir, owning the HTTP clients.
 
-    episodes, identities = load_analysis(media_dir)
+    ``episodes``/``identities`` let the caller pin one run's rows, so the links resolved here and
+    the rows the result page renders can never come from two different runs.
+    """
+
+    if episodes is None or identities is None:
+        episodes, identities = load_analysis(media_dir)
     client = build_async_client()
     sc_client = build_async_client() if enable_soundcloud else None
     http = EnrichHttp(client=client, cache_root=cache_root, refresh=refresh)

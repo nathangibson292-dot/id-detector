@@ -105,7 +105,10 @@ def run_local_free(work_root: Path) -> Path:
     )
     if code != 0:
         raise RuntimeError(f"the golden run did not complete (exit code {code})")
-    (tracklist,) = work_root.rglob("tracklist.json")
+    from id_detector.present.bundles import result_dir
+
+    (source,) = work_root.glob("*/*/ingest/source.json")
+    tracklist = result_dir(source.parents[1]) / "tracklist.json"
     return tracklist
 
 

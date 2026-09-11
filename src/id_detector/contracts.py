@@ -919,6 +919,8 @@ class ShortlistReportRecord(Record):
 
 
 class InvocationJournalEntry(Record):
+    bundle_id: Sha256 | None
+    fuse_run: str | None
     invocation_id: str
     command: list[str]
     started_at: str
@@ -952,6 +954,13 @@ class InvocationJournalEntry(Record):
     pricing_version: str
     audd_usd_e6_per_request: NonNegativeInt
     source_ids: list[str]
+
+    @model_validator(mode="before")
+    @classmethod
+    def legacy_bundle_fields(cls, value: Any) -> Any:
+        if isinstance(value, dict):
+            return {"bundle_id": None, "fuse_run": None, **value}
+        return value
 
 
 #: The frozen money outcome of one provider request (plan §2.3.2–2.3.3).

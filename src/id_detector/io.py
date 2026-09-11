@@ -95,12 +95,34 @@ def atomic_write_bytes(path: Path, content: bytes) -> None:
             handle.write(content)
             handle.flush()
             os.fsync(handle.fileno())
-        os.replace(native_path(temporary), native_path(path))
+        if os.name == "nt":
+            import ctypes
+
+            move = ctypes.WinDLL("kernel32", use_last_error=True).MoveFileExW
+            move.argtypes = [ctypes.c_wchar_p, ctypes.c_wchar_p, ctypes.c_uint32]
+            move.restype = ctypes.c_int
+            # REPLACE_EXISTING | WRITE_THROUGH: Windows has no POSIX directory fsync.
+            if not move(native_path(temporary), native_path(path), 0x1 | 0x8):
+                raise ctypes.WinError(ctypes.get_last_error())
+        else:
+            os.replace(native_path(temporary), native_path(path))
         temporary = None
     finally:
         if temporary is not None:
             with contextlib.suppress(FileNotFoundError):
                 os.unlink(native_path(temporary))
+
+
+def fsync_directory(path: Path) -> None:
+    """Persist directory entries on POSIX; Windows atomic writes use WRITE_THROUGH above."""
+
+    if os.name == "nt":
+        return
+    descriptor = os.open(path, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
 
 
 def atomic_write_json(path: Path, value: Any) -> None:

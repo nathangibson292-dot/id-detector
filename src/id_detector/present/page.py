@@ -45,7 +45,7 @@ UNRESOLVED_CAP_MS = 120_000
 #: Bump when the page's look or behaviour changes: ``present.refresh.ensure_fresh_page`` re-renders
 #: any written page whose ``<meta name="id-detector-page">`` stamp is older, so already-analysed
 #: mixes pick up the new page the next time they are opened (no re-analysis).
-PAGE_VERSION = 18
+PAGE_VERSION = 19
 
 
 # --------------------------------------------------------------------------------------------------
@@ -1173,10 +1173,9 @@ def render_page(
     """
 
     embed = plan_embed(source)
-    # The fetched original lives at media_dir/<original.path>; the page is at media_dir/present/, so
-    # a "../" relative URL reaches it (the server serves it Range-capable for seeking).
+    # A stable local route survives bundle nesting and cached-open without the source file.
     original_path = getattr(getattr(source, "original", None), "path", None)
-    audio_src = "../" + quote(str(original_path), safe="/") if original_path else None
+    audio_src = f"/media/{source.media_key}/audio" if original_path else None
     # Every row, including short/suppressed ones: the page hides them itself (see hidden_by_id).
     entries = flatten_tracklist(
         episodes,
@@ -1370,6 +1369,7 @@ let LEAD_IN_MS = CONFIG.leadInMs;
 def generate_page(
     *,
     media_dir: Path,
+    output_dir: Path | None = None,
     source: SourceRecord,
     episodes: EpisodesFile,
     identities: IdentitiesRecord,
@@ -1396,7 +1396,7 @@ def generate_page(
         same_track_bridge_ms=same_track_bridge_ms,
         min_track_ms=min_track_ms,
     )
-    index_path = media_dir / "present" / "index.html"
+    index_path = (output_dir or media_dir / "present") / "index.html"
     atomic_write_bytes(index_path, html_text.encode("utf-8"))
     upstream = {
         episodes_path.relative_to(media_dir).as_posix(): episodes_path,

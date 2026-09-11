@@ -64,7 +64,6 @@ from id_detector.paid_clip import (
     SleepFn,
     run_paid_clip_recognition,
 )
-from id_detector.present import export_tracklist, generate_page
 from id_detector.present.server import consume_rescan_queue, read_rescan_queue
 from id_detector.process import run_process
 from id_detector.profiles import (
@@ -524,18 +523,6 @@ def _run_status(
     ):
         return "degraded", "secondary_not_achieved"
     return "complete", None
-
-
-def _tracklist_run_fields(media_dir: Path) -> dict[str, str | None]:
-    """The run outcome a previous export recorded, so a re-export (``acquire``) carries it on."""
-
-    try:
-        document = json.loads(read_text(media_dir / "present" / "tracklist.json"))
-    except (OSError, ValueError):
-        return {}
-    if not isinstance(document, dict):
-        return {}
-    return {key: document.get(key) for key in ("status", "reason", "achieved") if key in document}
 
 
 async def _analyse(
@@ -1190,35 +1177,24 @@ async def _analyse(
             status, reason = "degraded", degrade_reason
         _report(progress, "present", 0, 1, "writing result page")
         timer.start_stage("export_ms")
-        exported = export_tracklist(
-            media_dir=media_dir,
-            media_key=ingested.record.media_key,
-            duration_ms=decoded.record.pcm.duration_ms,
-            episodes=fused.episodes,
-            identities=fused.identities.record,
-            episodes_path=fused.final_path,
-            identities_path=fused.identities_path,
-            title=ingested.record.title,
-            media_target=ingested.record.canonical_url,
-            collapse=app_config.collapse,
-            same_track_bridge_ms=app_config.same_track_bridge_ms,
-            min_track_ms=app_config.present_min_track_ms,
-            status=status,
-            reason=reason,
-            achieved=achieved_recipe.name,
-        )
-        generate_page(
+        from id_detector.present.bundles import publish_result
+
+        settlement = _settle_money(usd_admitter)
+        bundle = publish_result(
             media_dir=media_dir,
             source=ingested.record,
             episodes=fused.episodes,
             identities=fused.identities.record,
             duration_ms=decoded.record.pcm.duration_ms,
-            episodes_path=fused.final_path,
-            identities_path=fused.identities_path,
-            lead_in_ms=app_config.lead_in_ms,
-            collapse=app_config.collapse,
-            same_track_bridge_ms=app_config.same_track_bridge_ms,
-            min_track_ms=app_config.present_min_track_ms,
+            metadata={
+                "run_id": timer.run_id,
+                "started_at": timer.started_at,
+                "status": status,
+                "reason": reason,
+                "achieved": achieved_recipe.name,
+                **_money_journal_fields(settlement, requested_recipe, app_config, achieved_recipe),
+            },
+            config=app_config,
         )
         timer.finish_stage("export_ms")
         _report(progress, "present", 1, 1, "result page ready")
@@ -1244,9 +1220,8 @@ async def _analyse(
                 f"{counts['physical_attempts']} physical attempts; "
                 f"{orchestrated.final_generation + 1} generations "
                 f"(stop={orchestrated.stop_reason}); "
-                f"{len(fused.episodes.episodes)} episodes; tracklist={exported.json_path}"
+                f"{len(fused.episodes.episodes)} episodes; tracklist={bundle / 'tracklist.json'}"
             )
-        settlement = _settle_money(usd_admitter)
         entry = timer.entry(
             status=status,
             reason=reason,
@@ -1257,6 +1232,9 @@ async def _analyse(
             source_ids=source_ids,
             ffmpeg_version=ffmpeg_version,
             **_money_journal_fields(settlement, requested_recipe, app_config, achieved_recipe),
+        )
+        entry = entry.model_copy(
+            update={"bundle_id": bundle.name, "fuse_run": f"fuse/runs/{timer.run_id}"}
         )
         append_invocation(media_dir / "invocations.jsonl", entry)
         return 0
@@ -1603,8 +1581,7 @@ async def _acquire(
     enable_soundcloud: bool,
     progress: ProgressFn | None = None,
 ) -> int:
-    from id_detector.contracts import PcmRecord
-    from id_detector.enrich.run import final_identities_path, load_analysis
+    from id_detector.present.bundles import load_run_snapshot, publish_snapshot
 
     work_root = work_root.resolve()
     cached = _load_cached(work_root, url)
@@ -1615,60 +1592,31 @@ async def _acquire(
         )
         return 2
     media_dir = cached.media_dir
-    if not (media_dir / "fuse" / "episodes.json").is_file():
+    try:
+        # One snapshot for both halves: the links below and the rows the new bundle renders must
+        # come from the same run, and that run owns the identity the bundle is published under.
+        snapshot = load_run_snapshot(media_dir)
+    except (OSError, ValueError, KeyError) as error:
         typer.echo(
-            f"analysis at {media_dir} has no fuse/episodes.json; run `analyse` first", err=True
+            f"analysis at {media_dir} cannot be opened ({error}); run `analyse` first", err=True
         )
         return 2
 
     _report(progress, "enrich", 0, 1, "resolving acquire links")
     cache_root = PROJECT_ROOT / "data" / "local" / "enrich"
     result = await enrich_media_dir(
-        source=cached.record,
+        source=snapshot.source,
         media_dir=media_dir,
         cache_root=cache_root,
         refresh=refresh,
         enable_soundcloud=enable_soundcloud,
+        episodes=snapshot.episodes,
+        identities=snapshot.identities,
     )
     _report(progress, "enrich", 1, 1, "acquire links resolved")
     _report(progress, "present", 0, 1, "updating result page")
-    episodes, identities = load_analysis(media_dir)
     acquire_config = _load_app_config(Path("idea.toml"))
-    duration_ms = PcmRecord.model_validate_json(
-        read_text(media_dir / "decode" / "pcm.json")
-    ).pcm.duration_ms
-    export_tracklist(
-        media_dir=media_dir,
-        media_key=cached.record.media_key,
-        duration_ms=duration_ms,
-        episodes=episodes,
-        identities=identities,
-        episodes_path=media_dir / "fuse" / "episodes.json",
-        identities_path=final_identities_path(media_dir),
-        acquire=result.record,
-        acquire_path=result.path,
-        title=cached.record.title,
-        media_target=cached.record.canonical_url,
-        collapse=acquire_config.collapse,
-        same_track_bridge_ms=acquire_config.same_track_bridge_ms,
-        min_track_ms=acquire_config.present_min_track_ms,
-        **_tracklist_run_fields(media_dir),
-    )
-    generate_page(
-        media_dir=media_dir,
-        source=cached.record,
-        episodes=episodes,
-        identities=identities,
-        duration_ms=duration_ms,
-        episodes_path=media_dir / "fuse" / "episodes.json",
-        identities_path=final_identities_path(media_dir),
-        acquire=result.record,
-        acquire_path=result.path,
-        lead_in_ms=acquire_config.lead_in_ms,
-        collapse=acquire_config.collapse,
-        same_track_bridge_ms=acquire_config.same_track_bridge_ms,
-        min_track_ms=acquire_config.present_min_track_ms,
-    )
+    publish_snapshot(snapshot, media_dir=media_dir, config=acquire_config, acquire=result.record)
     _report(progress, "present", 1, 1, "result page updated")
     typer.echo(
         f"acquire: {result.counts['episodes']} identified episodes; "

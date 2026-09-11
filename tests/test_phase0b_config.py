@@ -18,6 +18,7 @@ from typer.testing import CliRunner
 
 from id_detector import cli, orchestrate
 from id_detector.contracts import EpisodesFile
+from id_detector.present.bundles import shown_result_dir
 from id_detector.profiles import (
     PROFILE_FIXED_FIELDS,
     effective_app_config,
@@ -461,7 +462,7 @@ def test_free_run_with_malformed_replies_is_partial_and_says_so(
     (loop,) = loops
     assert _scanned_starts(loop) == [18_000, 27_000, 36_000, 45_000, 48_000]
     assert loop["novelty_change_points_ms"] == ()  # rescans off
-    assert (media_dir / "present" / "tracklist.json").is_file()
+    assert (shown_result_dir(media_dir) / "tracklist.json").is_file()
 
 
 def test_one_unanswered_window_says_the_run_can_still_complete(tmp_path: Path) -> None:
