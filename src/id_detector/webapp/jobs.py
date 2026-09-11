@@ -41,7 +41,18 @@ RUNNING = "running"
 SUCCEEDED = "succeeded"
 FAILED = "failed"
 CANCELLED = "cancelled"
-TERMINAL_STATES = frozenset({SUCCEEDED, FAILED, CANCELLED})
+#: Plan §2.3.5: the Shazam breaker is open, so this request never started analysing.  It is not a
+#: failure — nothing went wrong with the mix — and local mode has no queue to retry it from, so the
+#: job stops here and the page says so.  Polling treats it as terminal.
+WAITING = "waiting"
+TERMINAL_STATES = frozenset({SUCCEEDED, FAILED, CANCELLED, WAITING})
+
+
+class JobWaiting(RuntimeError):
+    """The runner refused this job because Shazam is paused (breaker open or kill-switch off).
+
+    Distinct from every other runner error: the job becomes :data:`WAITING`, never ``failed``.
+    """
 
 
 class JobCancelled(asyncio.CancelledError):
@@ -406,6 +417,9 @@ class JobManager:
             self._runner(ctx)
         except asyncio.CancelledError:
             outcome = CANCELLED
+        except JobWaiting as exc:
+            outcome = WAITING
+            error = redact_text(str(exc))[:500] or WAITING
         except Exception as exc:  # noqa: BLE001 - record on the job, never crash the worker
             outcome = FAILED
             error = redact_text(str(exc))[:500] or exc.__class__.__name__
@@ -415,6 +429,13 @@ class JobManager:
                 job.status = CANCELLED
                 job.phase = CANCELLED
                 job.log.append(f"{_stamp()} cancelled")
+            elif outcome == WAITING:
+                # Not an error: no result, no spend, nothing to retry from locally.  The reason
+                # lives in ``message`` so the page can explain the pause without a failure banner.
+                job.status = WAITING
+                job.phase = WAITING
+                job.message = error or WAITING
+                job.log.append(f"{_stamp()} waiting: {error}")
             elif outcome == FAILED:
                 job.status = FAILED
                 job.phase = FAILED

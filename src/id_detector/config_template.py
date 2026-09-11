@@ -59,6 +59,22 @@ lead_in_ms = 5000
 requests_per_minute = 45
 concurrency = 3
 
+# Per-process Shazam breaker (one direct egress). Daily budget is provisional until S3.
+# Open: new Free requests are refused as waiting (exit 6, no local queue); an admitted Free
+# run continues. Deep skips its remaining secondary and reports degraded.
+# Explicit re-enable: INCREMENT reenable_generation, save, then submit the next job.
+# The long-running local server reads it per job; it clears the latch/rate history once,
+# preserving today's spent budget. No timer clears the latch. Process restart loses state.
+# IDEA_ENGINE_SHAZAM=off is always a hard off, even after re-enable.
+[shazam_breaker]
+failure_rate_e4 = 3000
+window_seconds = 300
+cooldown_seconds = 1800
+minimum_sample = 20
+shazam_daily_budget_per_egress = 2000
+latch_count = 3
+reenable_generation = 0
+
 # Deep scans use every frozen window by default.  Density 2 selects even-indexed windows and halves
 # AudD request volume; because density affects results it also produces a distinct recipe_id.
 # audd_requests_per_minute is the ceiling of the paid sweep's token bucket (4 clips in flight, per
@@ -183,6 +199,9 @@ def render_effective_config(
             f"requests_per_minute = {config.shazam_requests_per_minute}",
         ),
         line("recognise_concurrency", f"concurrency = {config.recognise_concurrency}"),
+        "",
+        "[shazam_breaker]",
+        *(f"{name} = {value}" for name, value in vars(config.shazam_breaker).items()),
         "",
         "[transforms]",
         line("transforms_policy", f'policy = "{config.transforms_policy}"'),

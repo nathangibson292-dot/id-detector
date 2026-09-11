@@ -3,11 +3,12 @@
 from __future__ import annotations
 
 import tomllib
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Literal
 
 from id_detector.pricing import load_pricing
+from id_detector.shazam_breaker import BreakerConfig
 
 TransformPolicy = Literal["off", "rescan_only", "global"]
 
@@ -122,6 +123,7 @@ class AppConfig:
     deep_primary_density: int = 1
     audd_requests_per_minute: int = DEFAULT_AUDD_REQUESTS_PER_MINUTE
     shazam_requests_per_minute: int = DEFAULT_SHAZAM_REQUESTS_PER_MINUTE
+    shazam_breaker: BreakerConfig = field(default_factory=BreakerConfig)
     recognise_concurrency: int = DEFAULT_RECOGNISE_CONCURRENCY
     lead_in_ms: int = DEFAULT_LEAD_IN_MS
     collapse: bool = True
@@ -159,6 +161,13 @@ class AppConfig:
             )
         with path.open("rb") as handle:
             payload = tomllib.load(handle)
+        breaker_table = payload.get("shazam_breaker", {})
+        if not isinstance(breaker_table, dict):
+            raise ValueError("shazam_breaker must be a TOML table")
+        try:
+            breaker_config = BreakerConfig(**breaker_table)
+        except TypeError as exc:
+            raise ValueError(f"invalid shazam_breaker setting: {exc}") from exc
         value = payload.get("allow_third_party_upload", False)
         if not isinstance(value, bool):
             raise ValueError("allow_third_party_upload must be true or false")
@@ -286,6 +295,7 @@ class AppConfig:
         )
         hints_enabled, disabled_connectors = _hints_table(hints)
         return cls(
+            shazam_breaker=breaker_config,
             allow_third_party_upload=value,
             transforms_policy=policy,
             transform_rates_e4=rates,

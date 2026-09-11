@@ -929,6 +929,7 @@ class InvocationJournalEntry(Record):
     finished_at: str | None
     status: Literal[
         "running",
+        "waiting",
         "complete",
         "degraded",
         "partial",

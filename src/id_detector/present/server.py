@@ -395,6 +395,7 @@ font-variant-numeric:tabular-nums}
 border-radius:4px}
 .act[data-status="failed"] .bar>span{background:var(--bad)}
 .act[data-status="cancelled"] .bar>span{background:var(--dim)}
+.act[data-status="waiting"] .bar>span{background:var(--warn)}
 /* how it works (new-mix page) */
 .how{display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:12px;margin-top:8px}
 .how div{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:16px}
@@ -690,6 +691,13 @@ function showOutcome(j){
     row.innerHTML = j.result_url ? open : '';
     confetti();
     if(j.result_url && redirectLeft === null){ redirectLeft = 5; countdown(j.result_url); }
+  } else if(j.status === 'waiting'){
+    h.textContent = 'Waiting for the free engine';
+    p.textContent = j.message || 'The free engine is paused, so this scan did not start. ' +
+      'Nothing was used up — try again once it is back.';
+    row.innerHTML = '<a class="btn primary" href="/new?url=' + encodeURIComponent(
+  DISPLAY) + '">Try again</a>' +
+      '<a class="btn" href="/">Your mixes</a>';
   } else if(j.status === 'failed'){
     box.classList.add('bad'); h.textContent = 'That one didn\\'t work';
     p.textContent = 'The analysis stopped with an error. The log below has the details.';
@@ -749,7 +757,8 @@ function render(j){
   t || 'Analysing') + ' — IDea';
   document.getElementById('log').textContent = (j.log || []).join('\\n');
   document.getElementById('cancel').style.display = j.terminal ? 'none' : '';
-  var eyebrow = {succeeded: 'Analysed', failed: 'Analysis failed', cancelled: 'Analysis cancelled'};
+  var eyebrow = {succeeded: 'Analysed', failed: 'Analysis failed', cancelled: 'Analysis cancelled',
+  waiting: 'Not started'};
   document.getElementById('eyebrow').textContent = eyebrow[j.status] || 'Analysing';
   if(window.wireAudio) wireAudio(j);
   if(j.terminal) showOutcome(j); else if(flavourPhase !== j.phase) rotateFlavour();

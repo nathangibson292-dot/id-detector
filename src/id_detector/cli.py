@@ -103,6 +103,7 @@ from id_detector.secondary_targeting import (
     serve_confirmations,
 )
 from id_detector.shazam import HTTPClientInterface
+from id_detector.shazam_breaker import ShazamBreaker, shazam_off
 from id_detector.truth import (
     freeze_truth,
     resolve_truth,
@@ -560,6 +561,7 @@ async def _analyse(
     result_paths: list[Path] | None = None,
     paid_scan_adapters: Mapping[str, object] | None = None,
     shazam_http_client: HTTPClientInterface | None = None,
+    shazam_breaker: ShazamBreaker | None = None,
     local_index_label: str | None = None,
     index_root: Path = Path("data/local/panako-db"),
     panako_tool_dir: Path = Path("data/local/panako"),
@@ -585,6 +587,9 @@ async def _analyse(
         enabled_engines = tuple(engine for engine in enabled_engines if engine not in _PAID_ENGINES)
     elif "audd" not in enabled_engines:
         enabled_engines = (*enabled_engines, "audd")
+    shazam_breaker = shazam_breaker or ShazamBreaker(app_config.shazam_breaker)
+    if not shazam_off():
+        shazam_breaker.configure(app_config.shazam_breaker)
     run_id = uuid.uuid4().hex
     timer = InvocationTimer(run_id, ["analyse", url])
     media_dir: Path | None = None
@@ -601,6 +606,36 @@ async def _analyse(
         "failures": 0,
         "cache_hits": 0,
     }
+
+    def refuse_free() -> bool:
+        """Refuse a Free request that would start new Shazam work while the breaker is open.
+
+        Called only where a new analysis is about to begin — never before the compatible-result
+        lookup (§3.4), which serves a stored result without a single Shazam request.  A Deep
+        request refused at its ``--allow-degrade`` restart has already reserved USD, so the
+        journal settles that reservation rather than reporting a run that never reserved.
+        """
+
+        reason = "shazam_manual_off" if shazam_off() else shazam_breaker.reason()
+        if reason is None:
+            return False
+        settlement = _settle_money(usd_admitter)
+        entry = timer.entry(
+            status="waiting",
+            reason=reason,
+            exit_code=6,
+            counts=counts,
+            costs={"usd_e2": settlement.usd_e2_spent},
+            source_ids=source_ids,
+            ffmpeg_version=ffmpeg_version,
+            **_money_journal_fields(settlement, requested_recipe, app_config),
+        )
+        append_invocation((media_dir or work_root) / "invocations.jsonl", entry)
+        typer.echo(
+            f"waiting ({reason}): not queued locally; retry after re-enable or recovery", err=True
+        )
+        return True
+
     try:
         lock_key = sha256(url.encode("utf-8")).hexdigest()
         source_lock = ProcessLock(work_root.resolve() / ".locks" / f"{lock_key}.lock")
@@ -684,6 +719,10 @@ async def _analyse(
                 result_paths.append(compatible)
             typer.echo(f"cached; tracklist={compatible / 'tracklist.json'}")
             return 0
+        # Submission order (§3.4): the compatible result above is served even while the breaker is
+        # open — it needs no Shazam request.  Only a request that would start a new analysis waits.
+        if requested_recipe.name == "free" and refuse_free():
+            return 6
         free_bundle = None if refresh else find_result(media_dir, request, free_evidence=True)
         reused_observations, reused_path = (
             load_free_observations(free_bundle) if free_bundle else ((), None)
@@ -788,6 +827,8 @@ async def _analyse(
                 no_match_max_age_seconds=app_config.cache_no_match_max_age_seconds,
                 on_window=_on_recognise_window if progress is not None else None,
                 http_client=shazam_http_client,
+                process_breaker=shazam_breaker,
+                running_free=achieved_recipe.name == "free",
                 refresh_states=refresh_states,
             )
 
@@ -897,6 +938,8 @@ async def _analyse(
                     f"paid engine unavailable ({reason}); restarting as the free recipe",
                 )
                 achieved_recipe = get_recipe("free")
+                if refuse_free():
+                    return 6
                 degrade_reason = "provider_unavailable"
                 paid_first = False
                 primary_clip = PaidScanResult()
@@ -1045,6 +1088,7 @@ async def _analyse(
         # and the Free recipe's cap forbids every paid call.
         index_scan = PaidScanResult()
         secondary_scan = PaidScanResult()
+        secondary_blocked: str | None = None
         secondary_allocated = 0
         secondary_resolved = 0
         supplemental_requests = 0
@@ -1082,6 +1126,8 @@ async def _analyse(
             await _refuse_with(secondary_scan)
 
         if paid_first and free_bundle is None:
+            secondary_blocked = "shazam_manual_off" if shazam_off() else shazam_breaker.reason()
+        if paid_first and free_bundle is None and secondary_blocked is None:
             hint_ids = (
                 frozenset(hint.id for hint in hint_result.hints)
                 if hint_result is not None
@@ -1128,6 +1174,8 @@ async def _analyse(
                     generation=0,
                     run_label=run_label,
                 )
+                nonlocal secondary_blocked
+                secondary_blocked = secondary_blocked or result.blocked_reason
                 secondary_passes.append(result)
                 return result
 
@@ -1255,6 +1303,8 @@ async def _analyse(
             provider_stopped=primary_clip.provider_stopped,
             reservation_exhausted=primary_clip.reservation_exhausted,
         )
+        if secondary_blocked is not None and status in {"complete", "degraded"}:
+            status, reason = "degraded", secondary_blocked
         if degrade_reason is not None and status == "complete":
             status, reason = "degraded", degrade_reason
         _report(progress, "present", 0, 1, "writing result page")

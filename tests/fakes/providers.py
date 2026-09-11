@@ -271,7 +271,7 @@ class FakeShazamHTTP(HTTPClientInterface):
         if outcome == "quota_error":
             raise ShazamHTTPError(402, "scripted Shazam quota error")
         if outcome in {"timeout_pre", "timeout_post"}:
-            raise ShazamHTTPError(0, f"scripted Shazam {outcome}")
+            raise ShazamHTTPError(0, f"scripted Shazam {outcome}", outcome=outcome)
         if outcome == "malformed":
             raise ShazamHTTPError(200, "scripted malformed Shazam response")
         if outcome == "no_match":

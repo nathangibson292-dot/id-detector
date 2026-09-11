@@ -54,6 +54,7 @@ from id_detector.shazam import (
     response_to_observation,
     retry_delay,
 )
+from id_detector.shazam_breaker import ShazamBreaker
 from id_detector.windows import WindowsResult
 
 POSITIVE_MAX_AGE_SECONDS = 180 * 24 * 60 * 60
@@ -77,6 +78,7 @@ class RecognitionResult:
     physical_attempts: int
     failures: int
     cache_hits: int
+    blocked_reason: str | None = None
 
 
 def _unmeasured_config() -> ProviderConfigRecord:
@@ -368,6 +370,8 @@ async def recognise_generation(
     no_match_max_age_seconds: int = NO_MATCH_MAX_AGE_SECONDS,
     on_window: Callable[[int, int], None] | None = None,
     http_client: HTTPClientInterface | None = None,
+    process_breaker: ShazamBreaker | None = None,
+    running_free: bool = True,
     refresh_states: frozenset[str] = frozenset(),
 ) -> RecognitionResult:
     config, config_name = load_provider_config(project_root)
@@ -400,6 +404,8 @@ async def recognise_generation(
         config,
         limiter=TokenBucket(rate_per_minute=requests_per_minute, capacity=worker_count),
         http_client=http_client,
+        process_breaker=process_breaker or ShazamBreaker(),
+        running_free=running_free,
     )
     cache_hits = 0
     initial_physical = 0
@@ -597,6 +603,7 @@ async def recognise_generation(
         physical_attempts=final_physical - initial_physical,
         failures=failures,
         cache_hits=cache_hits,
+        blocked_reason=adapter.blocked_reason,
     )
 
 

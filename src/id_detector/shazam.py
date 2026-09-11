@@ -30,12 +30,21 @@ from id_detector.contracts import (
 )
 from id_detector.io import canonical_json_bytes, native_path
 from id_detector.semantics import aggregate_shazam_anchor
+from id_detector.shazam_breaker import ShazamBlocked, ShazamBreaker, shazam_off
 
 AttemptCallback = Callable[[], Awaitable[None]]
 
 
 class ShazamHTTPError(RuntimeError):
-    def __init__(self, status_code: int, message: str, retry_after: float | None = None) -> None:
+    def __init__(
+        self,
+        status_code: int,
+        message: str,
+        retry_after: float | None = None,
+        *,
+        outcome: str | None = None,
+    ) -> None:
+        self.outcome = outcome
         self.status_code = status_code
         self.retry_after = retry_after
         super().__init__(message)
@@ -119,19 +128,17 @@ class TokenBucket:
 
 @dataclass
 class CircuitBreaker:
+    """Consecutive-failure diagnostics for one transport.
+
+    Admission is owned by :class:`~id_detector.shazam_breaker.ShazamBreaker` (plan §2.3.5), which
+    judges the egress rather than one client, so this no longer gates or sleeps before a request:
+    ``failures``/``opened_at`` only record that the threshold was crossed.
+    """
+
     failure_threshold: int = 5
     open_seconds: int = 60
     failures: int = 0
     opened_at: float | None = None
-
-    async def before_request(self) -> None:
-        if self.opened_at is None:
-            return
-        remaining = self.open_seconds - (time.monotonic() - self.opened_at)
-        if remaining > 0:
-            await asyncio.sleep(remaining)
-        self.failures = 0
-        self.opened_at = None
 
     def success(self) -> None:
         self.failures = 0
@@ -163,9 +170,10 @@ class InjectedHTTPClient(HTTPClientInterface):
 
     async def request(self, method: str, url: str, *args: object, **kwargs: Any) -> Any:
         del args
+        if shazam_off():
+            raise ShazamBlocked("shazam_manual_off")
         if method.upper() not in {"GET", "POST"}:
             raise ValueError("injected Shazam transport accepts only GET/POST")
-        await self.breaker.before_request()
         await self.limiter.acquire()
         await self.on_attempt()
         kwargs.pop("proxy", None)
@@ -360,8 +368,46 @@ class ShazamAdapter:
     transport: httpx.AsyncBaseTransport | None = None
     url_override: str | None = None
     http_client: HTTPClientInterface | None = None
+    process_breaker: ShazamBreaker = field(default_factory=ShazamBreaker)
+    running_free: bool = True
+    blocked_reason: str | None = None
 
     async def recognize_once(self, wav_path: Path, on_attempt: AttemptCallback) -> dict[str, Any]:
+        if shazam_off():
+            self.blocked_reason = "shazam_manual_off"
+            raise ShazamBlocked(self.blocked_reason)
+        if not self.running_free and (reason := self.process_breaker.reason()) is not None:
+            self.blocked_reason = reason
+            raise ShazamBlocked(reason)
+        dispatched = False
+
+        async def dispatch() -> None:
+            nonlocal dispatched
+            try:
+                dispatch_day = self.process_breaker.dispatch(running_free=self.running_free)
+            except ShazamBlocked as exc:
+                self.blocked_reason = str(exc)
+                raise
+            try:
+                await on_attempt()
+            except BaseException:
+                self.process_breaker.release_dispatch(dispatch_day)
+                raise
+            dispatched = True
+
+        try:
+            result = await self._recognize_once(wav_path, dispatch)
+        except Exception as exc:
+            if dispatched:
+                self.process_breaker.resolved(shazam_outcome(exc))
+            raise
+        if dispatched:
+            self.process_breaker.resolved(
+                "match" if result.get("matches") and result.get("track") else "no_match"
+            )
+        return result
+
+    async def _recognize_once(self, wav_path: Path, on_attempt: AttemptCallback) -> dict[str, Any]:
         client = self.http_client
         if client is None:
             client = InjectedHTTPClient(
@@ -394,3 +440,28 @@ def retry_delay(attempt_index: int, retry_after: float | None = None) -> float:
 
 def provider_config_timestamp() -> str:
     return datetime.now(UTC).isoformat(timespec="seconds").replace("+00:00", "Z")
+
+
+def shazam_outcome(exc: Exception) -> str:
+    if isinstance(exc, ShazamHTTPError) and exc.outcome is not None:
+        return exc.outcome
+    cause = exc.__cause__ or exc
+    if isinstance(cause, (httpx.ConnectTimeout, httpx.PoolTimeout)):
+        return "timeout_pre"
+    if isinstance(cause, httpx.TimeoutException):
+        return "timeout_post"
+    if isinstance(cause, httpx.NetworkError):
+        return "connect_error"
+    if isinstance(exc, ShazamHTTPError):
+        code = exc.status_code
+        if code in {429, 503}:
+            return f"http_{code}"
+        if code >= 500:
+            return "http_5xx"
+        if code in {401, 403}:
+            return "auth_error"
+        if code == 402:
+            return "quota_error"
+        if code == 0:
+            return "timeout_post"
+    return "malformed"

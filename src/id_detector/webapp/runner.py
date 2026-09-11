@@ -15,7 +15,8 @@ from hashlib import sha256
 from pathlib import Path
 
 from id_detector.providers.base import AppConfig
-from id_detector.webapp.jobs import JobContext
+from id_detector.shazam_breaker import ShazamBreaker
+from id_detector.webapp.jobs import JobContext, JobWaiting
 
 #: Where the browser's "build index" step fingerprints the uploader's tracks, and the label the
 #: analysis then queries (D3: Panako kept; the index is built AND used).  Mirrors ``idea
@@ -23,12 +24,15 @@ from id_detector.webapp.jobs import JobContext
 WEB_INDEX_LABEL = "default"
 WEB_INDEX_ROOT = Path("data/local/panako-db")
 WEB_PANAKO_TOOL_DIR = Path("data/local/panako")
+#: ``_analyse`` refused to start new Shazam work: the job waits instead of failing.
+WAITING_EXIT = 6
 #: What each non-zero ``_analyse`` exit code means to a browser job (plan §2.3.5).
 _EXIT_STATUS = {
     1: "failed",
     3: "paid provider unavailable",
     4: "budget exhausted",
     5: "source changed",
+    WAITING_EXIT: "waiting: not queued locally; Shazam is paused (breaker open or kill-switch)",
 }
 
 
@@ -124,6 +128,8 @@ def make_pipeline_runner(
     project = project_root if project_root is not None else cli.PROJECT_ROOT
     config_file = config_path if config_path is not None else Path("idea.toml")
 
+    shazam_breaker = ShazamBreaker(AppConfig.load(config_file).shazam_breaker)
+
     def runner(ctx: JobContext) -> None:
         target = ctx.target
 
@@ -163,6 +169,7 @@ def make_pipeline_runner(
                 enabled_engines=settings.enabled_engines,
                 # The recipe owns engine selection and the shared compatible-result lookup.
                 recipe=selected_recipe,
+                shazam_breaker=shazam_breaker,
                 result_paths=result_paths,
                 # The index this job just built (or one an earlier job built) is queried over the
                 # still-uncertain spans; without a label the build was paid for and never used.
@@ -175,6 +182,10 @@ def make_pipeline_runner(
                 cancel_token=ctx.cancel_token,
             )
         )
+        if exit_code == WAITING_EXIT:
+            # Plan §2.3.5: the breaker (or the kill-switch) refused a new Free request. The job
+            # waits — it did not fail — so the manager records ``waiting``, not ``failed``.
+            raise JobWaiting(_EXIT_STATUS[WAITING_EXIT])
         if exit_code != 0:
             meaning = _EXIT_STATUS.get(exit_code, "error")
             raise RuntimeError(f"analysis failed: {meaning} (exit code {exit_code})")

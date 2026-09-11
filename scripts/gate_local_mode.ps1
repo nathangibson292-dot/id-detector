@@ -15,12 +15,16 @@ import sys
 from pathlib import Path
 
 os.environ["AUDD_API_TOKEN"] = ""
-os.environ["IDEA_ENGINE_SHAZAM"] = "off"
 os.environ["IDEA_TEST_MODE"] = "1"
 repo, root, port, mode = Path(sys.argv[1]), Path(sys.argv[2]), sys.argv[3], sys.argv[4]
 sys.path.insert(0, str(repo))
 work = root / "work"
 if mode == "serve":
+    # The server analyses nothing here (--no-analyse), so the Shazam kill-switch stays on.
+    # The prepare phase below must NOT set it: since 1b-iii it is a real refusal (plan
+    # §2.3.5), and the golden Free run reaches no network anyway - _analyse is handed an
+    # injected FakeShazamHTTP transport, so no request can leave this process.
+    os.environ["IDEA_ENGINE_SHAZAM"] = "off"
     raise SystemExit(subprocess.call([str(repo / "idea.cmd"), "--no-open", "--no-analyse",
                                      "--port", port, "--work-root", str(work)], cwd=repo))
 from scripts.make_golden import run_local_free
