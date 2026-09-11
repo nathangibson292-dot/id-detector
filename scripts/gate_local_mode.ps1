@@ -113,7 +113,14 @@ try {
     if ($null -ne $listener) { $listener.Stop() }
     foreach ($child in @($browser, $process)) {
         if ($null -ne $child -and -not $child.HasExited) {
-            & taskkill.exe /PID $child.Id /T /F 2>$null | Out-Null
+            # Edge can exit one subprocess between HasExited and taskkill's tree walk. Swallow
+            # only that race: if the process really is gone, cleanup succeeded; any other
+            # taskkill failure leaves it running and must still fail the gate.
+            try { & taskkill.exe /PID $child.Id /T /F 2>$null | Out-Null }
+            catch {
+                $child.Refresh()
+                if (-not $child.HasExited) { throw }
+            }
         }
     }
 }
