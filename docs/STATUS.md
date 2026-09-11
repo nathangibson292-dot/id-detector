@@ -5,34 +5,56 @@ one-page answer to "what actually works, and what is only claimed?"*
 
 ## v2 (hosted product) — where the build stands
 
-*Updated 2026-09-10. Plan: [PLAN-v2.md](PLAN-v2.md) rev 6; cycle log: [reviews/README.md](reviews/README.md).*
+*Updated 2026-09-11. Plan: [PLAN-v2.md](PLAN-v2.md) rev 6; cycle log: [reviews/README.md](reviews/README.md).*
 
-**Phase 0 is complete and committed; the build is paused here by the owner's decision so the tool can be
-tested locally.** What Phase 0 delivered (cycles 0a-i, 0a-ii, 0a-iv+0a-iii, 0b-i+0b-iii, 0b-ii): the paid
-(Deep) path no longer crashes after spending; AudD error bodies are never cached; spend is reserved,
-admitted per request against a hard cap and settled/journaled honestly; every run ends with an explicit
-status (`complete / degraded / partial / provider_unavailable / budget_exhausted / source_changed`) and exit
-code; `--recipe free|deep` (Deep is explicit opt-in; `pricing.toml` is the single pricing authority);
-AudD observations carry a validated anchor and their own vote; the paid pass is concurrent, rate-limited,
-retried, cancellable, and journals every attempt durably before network I/O; a provisional Shazam second
-pass makes a Deep run finish end-to-end; config knobs are effective under profiles and `idea config show`
-explains them; novelty only runs when rescans are on; malformed Shazam replies count as failures, never as
-"no match"; a semantic Local-Free golden pins Free-scan output; loopback CSRF/Origin protects the local
-server; dead paid paths are unreachable. Test suite: 756 passed offline.
+**Phase 0 and Phase 1 are complete and committed.** Test suite: 1033 passed offline.
 
-**Also done (2026-09-10, isolated cycles built while the owner tests):** the corpus scorer
-(`scripts/score_corpus.py`, three parts: pooled L3 metrics, work-identity matching for order-only truth,
-timed-mode identity parity + overlay truth rows + crowd-label cleanup), the seven-set `release-1` truth
-drafts with first working Free-recipe numbers (`docs/accuracy/release-1-free-draft.md`: pooled recall 64 %,
-precision 75 %, "likely" 90 % — draft truth, not an L3 claim), **1b-i** (secondary targeting v2,
-`targeting:1`) and **1b-ii** (cross-family corroboration with time overlap, crowd-row contradiction rule,
-`fusion:2`). Test suite: 905 passed offline. **Stopped here by the owner's decision.**
+Phase 0 (cycles 0a-i, 0a-ii, 0a-iv+0a-iii, 0b-i+0b-iii, 0b-ii): the paid (Deep) path no longer crashes after
+spending; AudD error bodies are never cached; spend is reserved, admitted per request against a hard cap and
+settled/journaled honestly; every run ends with an explicit status (`complete / degraded / partial /
+provider_unavailable / budget_exhausted / source_changed`) and exit code; `--recipe free|deep` (Deep is
+explicit opt-in; `pricing.toml` is the single pricing authority); AudD observations carry a validated anchor
+and their own vote; the paid pass is concurrent, rate-limited, retried, cancellable, and journals every
+attempt durably before network I/O; config knobs are effective under profiles and `idea config show` explains
+them; malformed Shazam replies count as failures, never as "no match"; a semantic Local-Free golden pins
+Free-scan output; loopback CSRF/Origin protects the local server.
 
-**Not started:** Phase 1a (result bundles, analysis keys, compatibility serving — changes the result
-layout on disk), the breaker half of 1b-iii, and everything after — see PLAN-v2 §5. Do not start them
-without the owner. Owner-side: verify the seven truth drafts (`idea truth verify`), AudD reply/top-up
-(~$20 covers Deep scoring of the whole corpus), fix the ~+50 s tracklist clock offsets on the Mall Grab
-and DJ Heartstring sets at verification.
+Accuracy tooling (before Phase 1): the corpus scorer (`scripts/score_corpus.py`), the seven-set `release-1`
+truth drafts and first Free numbers ([release-1-free-draft](accuracy/release-1-free-draft.md): pooled recall
+64 %, precision 75 %, "likely" 90 % — draft truth, not an L3 claim), **1b-i** secondary targeting v2
+(`targeting:1`) and **1b-ii** cross-family corroboration (`fusion:2`).
+
+Phase 1 (cycles 1a-i+1a-iii, 1a-ii, 1b-iii breaker):
+- **Result bundles.** Results live in `present/bundles/<bundle_id>/` with a sealed manifest hashing every
+  file, and fuse artefacts are frozen per run under `fuse/runs/<run_id>/`. Files and manifests are fsynced
+  before any pointer or journal entry names them, bundles are never rewritten, and refresh mints a new one.
+  `present/current` follows the newest `complete` run in local mode only.
+- **Cached-open and audio.** A cached mix opens without its original media through a rebuildable
+  `work/index.json` (every source alias preserved); the page streams from a traversal-safe, range-capable
+  `/media/<media_key>/audio`. Pre-bundle runs on disk still open through legacy fallbacks and are never
+  rewritten. Owner gate: `scripts/gate_local_mode.ps1`.
+- **Analysis keys and compatibility.** `analysis_key` hashes the plan's inputs; `serves()` (`compat_version 1`)
+  implements the §3.4 table — d=1 answers a d=2 request but never the reverse, unequal algorithm/adapter
+  versions are never served, `partial` never, `degraded` only with `accept_degraded`, scope must match.
+  Lookup is alias-wide, so the same audio reached by a second URL is served from cache instead of re-paying
+  AudD. `serve_free_from_deep` and `compat_version` come from `pricing.toml` alone. A Deep request over an
+  existing Free result reuses its Shazam evidence, reserves the primary only and issues zero Shazam requests.
+  Re-read bytes that no longer hash to `media_key` end the run `source_changed` (exit 5).
+- **Shazam breaker (D8).** Qualifying failures over all resolved attempts in a rolling 5-minute window,
+  minimum sample 20: > 30 % opens 30 minutes, an exhausted daily budget opens until 00:00 UTC, three rate
+  trips in one UTC day latch Shazam off until an explicit re-enable. A running free primary continues, a deep
+  secondary is skipped → `degraded` naming the rule, new free work reports `waiting` (a cached compatible
+  result is still served). `IDEA_ENGINE_SHAZAM=off` remains a hard off.
+
+**Not started:** 2b (retention and sidecar pruning), 3a (presentation), 4a–4d (service API, FastAPI, worker,
+accounts, credits), 6a–6b (ingest policy, container, launch checklist), then M2 (billing, Stripe sandbox) —
+see PLAN-v2 §5.
+
+**Owner-side, open:** verify the seven truth drafts (`idea truth verify`) and fix the ~+50 s tracklist clock
+offsets on the Mall Grab and DJ Heartstring sets while verifying; AudD's reply on the per-clip subscription
+rate plus a ~$20 top-up (covers Deep scoring of the whole corpus); run `scripts/spike_shazam_vps.py` (S3) on a
+throwaway host to replace the **provisional 2,000/day Shazam attempt budget** with a measured ceiling, and
+`scripts/spike_ingest_vps.sh` (S2) before any hosting work.
 
 ## Acceptance status at a glance
 
