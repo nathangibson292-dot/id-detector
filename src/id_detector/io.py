@@ -192,9 +192,17 @@ def verify_completion_sidecar(
     if set(recorded) != expected_names:
         errors.append("upstream path set differs")
     for logical_path, upstream_path in upstream_paths.items():
-        if not path_is_file(upstream_path) or recorded.get(logical_path) != sha256_file(
-            upstream_path
-        ):
+        expected = recorded.get(logical_path)
+        if isinstance(expected, dict) and set(expected) == {"pruned_upstream"}:
+            pruned_hash = expected["pruned_upstream"]
+            if not isinstance(pruned_hash, str) or not re.fullmatch(r"[0-9a-f]{64}", pruned_hash):
+                errors.append(f"invalid pruned upstream: {logical_path}")
+            elif path_is_file(upstream_path) and sha256_file(upstream_path) != pruned_hash:
+                # The marker records the bytes this artefact was really derived from. Once the
+                # upstream is re-derived it must reproduce them, or everything downstream of it
+                # is stale evidence and has to be rebuilt.
+                errors.append(f"re-derived upstream differs: {logical_path}")
+        elif not path_is_file(upstream_path) or expected != sha256_file(upstream_path):
             errors.append(f"upstream hash differs: {logical_path}")
     return VerificationResult(not errors, tuple(errors))
 

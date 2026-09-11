@@ -87,6 +87,7 @@ from id_detector.providers.base import AppConfig
 from id_detector.recipes import Recipe, get_recipe
 from id_detector.recognise import recognise_generation
 from id_detector.rescan import DEFAULT_MAX_GENERATIONS
+from id_detector.retention import collect
 from id_detector.scan import PAID_FILE_SCANNERS
 from id_detector.scan_targeting import select_scan_targets
 from id_detector.secondary_targeting import (
@@ -568,6 +569,7 @@ async def _analyse(
     progress: ProgressFn | None = None,
     cancel_token: CancelToken | None = None,
     paid_sleep: SleepFn | None = None,
+    keep_intermediates: bool = False,
 ) -> int:
     """Run one analysis and return its exit code (plan §2.3.5).
 
@@ -591,7 +593,7 @@ async def _analyse(
     if not shazam_off():
         shazam_breaker.configure(app_config.shazam_breaker)
     run_id = uuid.uuid4().hex
-    timer = InvocationTimer(run_id, ["analyse", url])
+    timer = InvocationTimer(run_id, ["analyse", url], keep_intermediates=keep_intermediates)
     media_dir: Path | None = None
     ffmpeg_version: str | None = None
     source_ids: list[str] = []
@@ -1462,6 +1464,29 @@ def _load_profile_or_exit(name: str):
 
 
 @app.command()
+def gc(
+    policy: str = typer.Option("local", "--policy", help="Retention policy: local or hosted."),
+    work_root: Path = typer.Option(DEFAULT_WORK_ROOT, "--work-root"),  # noqa: B008
+    apply: bool = typer.Option(
+        False,
+        "--apply",
+        help="Move expired artefacts to dated trash and purge old trash (default: dry run).",
+    ),
+) -> None:
+    """Apply retention explicitly; without --apply, print a dry run and change nothing."""
+
+    if policy not in {"local", "hosted"}:
+        typer.echo("--policy must be local or hosted", err=True)
+        raise typer.Exit(2)
+    result = collect(work_root, policy=policy, apply=apply)  # type: ignore[arg-type]
+    prefix = "" if apply else "would "
+    for action in result.actions:
+        verb = {"move": "move", "purge": "purge", "skip": "skip"}[action.operation]
+        typer.echo(f"{prefix}{verb} {action.path}: {action.reason}")
+    typer.echo(f"gc {'applied' if apply else 'dry run'}: {len(result.actions)} action(s)")
+
+
+@app.command()
 def analyse(
     url: str = typer.Argument(..., help="Public mix URL (or a local media file)."),
     raw: bool = typer.Option(False, "--raw", help="Print raw match tuples with mix times."),
@@ -1515,6 +1540,11 @@ def analyse(
             "credential, exhausted quota, unreachable), restart this request as the free recipe "
             "and report it as degraded instead of stopping with exit code 3. Local only."
         ),
+    ),
+    keep_intermediates: bool = typer.Option(
+        False,
+        "--keep-intermediates",
+        help="Pin this media's generated windows and decoded PCM against retention GC.",
     ),
     confirm_mirror: list[str] | None = typer.Option(  # noqa: B008
         None,
@@ -1735,6 +1765,7 @@ def analyse(
                 local_index_label=local_index,
                 index_root=index_root,
                 panako_tool_dir=panako_tool_dir,
+                keep_intermediates=keep_intermediates,
             )
         )
     except KeyboardInterrupt:

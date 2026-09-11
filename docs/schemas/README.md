@@ -50,6 +50,13 @@ artefact `sha256`, and an `upstream` object mapping logical input paths to their
 Writers close a temporary file in the destination directory before atomically replacing the final
 path, which is safe on Windows.
 
+After retention prunes an upstream (plan §3.4, §4.6), that upstream's value becomes the object
+`{"pruned_upstream": "<the SHA-256 it had>"}` instead of a bare string. The verifier accepts the
+marker while the upstream is absent — the artefact's own hash is still checked — and requires a
+re-derived upstream to reproduce exactly those bytes; anything else is reported as a differing
+upstream, so the consumer rebuilds. Writing the sidecar again after re-derivation replaces the
+marker with the plain current hash.
+
 ## Stage 0 implementation decisions
 
 - Query targets are a union of two closed objects: exactly `{window_id}` for clip/local-index

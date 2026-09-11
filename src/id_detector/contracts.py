@@ -936,9 +936,12 @@ class InvocationJournalEntry(Record):
         "provider_unavailable",
         "budget_exhausted",
         "source_changed",
+        "quota_exceeded",
+        "dead_letter",
         "failed",
         "cancelled",
     ]
+    keep_intermediates: bool
     reason: str | None
     #: The recipe whose pipeline produced the shown result (a local ``--allow-degrade`` restart
     #: achieves ``free`` for a ``deep`` request); ``None`` when the run produced no result.
@@ -968,6 +971,7 @@ class InvocationJournalEntry(Record):
                 "compatibility": None,
                 "bundle_id": None,
                 "fuse_run": None,
+                "keep_intermediates": False,
                 **value,
             }
         return value

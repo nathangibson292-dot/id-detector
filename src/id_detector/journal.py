@@ -70,6 +70,7 @@ class InvocationTimer:
     timings: dict[str, int] = field(default_factory=dict)
     analysis_key: str | None = None
     compatibility: dict[str, Any] | None = None
+    keep_intermediates: bool = False
     _stage_started: dict[str, float] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
@@ -110,6 +111,7 @@ class InvocationTimer:
             compatibility=self.compatibility,
             bundle_id=None,
             fuse_run=None,
+            keep_intermediates=self.keep_intermediates,
             command=self.command,
             started_at=self.started_at,
             finished_at=timestamp(),
