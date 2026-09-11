@@ -1,4 +1,4 @@
-"""Shared look for every IDea page: design tokens, the top bar, buttons, chips, toast.
+"""Shared look for every ID'er page: design tokens, the top bar, buttons, chips, toast.
 
 Pure strings — no I/O — so both the static result page (offline, written to ``present/index.html``)
 and the live server pages (home, new-mix, progress) share one visual system.  Dark by design: a
@@ -139,7 +139,7 @@ def head_html(title: str, css: str, extra: str = "") -> str:
 def topbar_html(*, back: bool = False, new: bool = True, middle: str = "") -> str:
     """The sticky brand bar.  ``middle`` is an optional centre slot (the result page's NOW pill)."""
 
-    nav = ""
+    nav = '<a class="btn" href="/playlists">Playlists</a>'
     if back:
         nav += '<a class="btn hide-sm" href="/">Your mixes</a>'
     if new:
@@ -148,7 +148,7 @@ def topbar_html(*, back: bool = False, new: bool = True, middle: str = "") -> st
         '<nav class="topbar"><div class="topbar-in">'
         '<a class="brand" href="/">'
         '<span class="logo"><span class="eq"><i></i><i></i><i></i><i></i></span></span>'
-        '<span class="wm"><b>ID</b><span>ea</span></span></a>'
+        '<span class="wm"><b>ID</b><span>&#39;er</span></span></a>'
         f'{middle}<span class="nav">{nav}</span></div></nav>'
     )
 

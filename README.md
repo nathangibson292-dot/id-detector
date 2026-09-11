@@ -1,4 +1,4 @@
-# IDea
+# ID'er
 
 **Find out what tracks are in a DJ set.** You give it a link to a mix (SoundCloud, YouTube, or
 Mixcloud); it downloads the audio, listens to it in short overlapping windows, asks music-recognition
@@ -11,6 +11,24 @@ The guiding rule is **accuracy over cost or speed**, and **honesty over complete
 "unclear" rather than guess.
 
 ---
+
+## Likes and playlists
+
+The playlists module adds ♥ to save a shown track to **Likes**, and ＋ to save it
+to a named playlist or create one. The **Playlists** navigation opens saved lists,
+with confidence badges, download/listen links, and a jump back to the original mix.
+Named playlists can be renamed or deleted; Likes is built in. Controls require the
+local HTTP server and are hidden in offline result pages.
+
+Snapshots live separately from analysis bundles in `data/local/playlists.json`
+(relative to the parent of the server's work root). `IDEA_PLAYLISTS_PATH` can select
+an absolute alternate file. Saving a track copies its current metadata and links;
+it does not trigger recognition or acquisition requests.
+
+Server integration is separate: dispatch playlist GET/POST requests to
+`id_detector.playlists.handle_get` / `handle_post` with `work_root`. The server
+must validate CSRF/Origin before POST dispatch and expose `/csrf` returning a token.
+Both handlers return `(status, body_bytes, content_type)`.
 
 ## Quick start (for the owner) — the browser way
 

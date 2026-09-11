@@ -277,7 +277,7 @@ def _index_html(sets: list[AnalysedSet]) -> bytes:
         + _footer_html()
         + "</main>"
     )
-    return _page_shell("IDea — analysed sets", body)
+    return _page_shell("ID'er — analysed sets", body)
 
 
 # --------------------------------------------------------------------------------------------------
@@ -754,7 +754,7 @@ function render(j){
   setSteps(j);
   document.title = (j.terminal ? (
   j.status === 'succeeded' ? 'Done' : j.status) : pct + '%') + ' · ' + (
-  t || 'Analysing') + ' — IDea';
+  t || 'Analysing') + " — ID'er";
   document.getElementById('log').textContent = (j.log || []).join('\\n');
   document.getElementById('cancel').style.display = j.terminal ? 'none' : '';
   var eyebrow = {succeeded: 'Analysed', failed: 'Analysis failed', cancelled: 'Analysis cancelled',
@@ -806,7 +806,7 @@ def _page_shell(title: str, body: str, script: str = "") -> bytes:
 def _footer_html() -> str:
     return (
         "<footer><span>🔒 runs on your machine — no account, only short clips go to the "
-        "recognizers</span><span>IDea</span></footer>"
+        "recognizers</span><span>ID&#39;er</span></footer>"
     )
 
 
@@ -955,7 +955,7 @@ def _home_html(sets: list[AnalysedSet], jobs: list[Job], csrf_token: str = "") -
         + _footer_html()
         + "</main>"
     )
-    return _page_shell("IDea — your mixes", body, _FORM_JS + _HOME_JS)
+    return _page_shell("ID'er — your mixes", body, _FORM_JS + _HOME_JS)
 
 
 def _new_html(prefill: str = "", csrf_token: str = "") -> bytes:
@@ -984,7 +984,7 @@ def _new_html(prefill: str = "", csrf_token: str = "") -> bytes:
         "links to get the ones you want.</small></div>"
         "</div>" + _footer_html() + "</main>"
     )
-    return _page_shell("IDea — new mix", body, _FORM_JS)
+    return _page_shell("ID'er — new mix", body, _FORM_JS)
 
 
 def _job_steps(job: Job) -> list[tuple[str, str, str]]:
@@ -1130,7 +1130,7 @@ def _job_page_html(job: Job, csrf_token: str = "") -> bytes:
         + _JOB_JS
         + _PLAYER_JS
     )
-    return _page_shell("Analysing — IDea", body, script)
+    return _page_shell("Analysing — ID'er", body, script)
 
 
 class _Handler(BaseHTTPRequestHandler):
@@ -1321,6 +1321,16 @@ class _Handler(BaseHTTPRequestHandler):
             # Readable only by this origin's own scripts (no CORS header is ever sent).
             self._send_json(HTTPStatus.OK, {"token": self.csrf_token})
             return
+        if route == "/playlists" or route.startswith("/playlists/"):
+            # The playlists feature is a self-contained module with its own storage; the server
+            # only routes to it (see ``id_detector.playlists``).  Available in read-only mode too.
+            from id_detector import playlists
+
+            status, body, content_type = playlists.handle_get(
+                route, parse_qs(urlsplit(self.path).query), work_root=self.work_root
+            )
+            self._send(HTTPStatus(status), body, content_type)
+            return
         if route in ("/", "/index.html"):
             if self._app_active():
                 assert self.job_manager is not None
@@ -1411,6 +1421,9 @@ class _Handler(BaseHTTPRequestHandler):
             self._send_json(
                 HTTPStatus.FORBIDDEN, {"error": f"cross-site request refused ({refusal})"}
             )
+            return
+        if route == "/playlists" or route.startswith("/playlists/"):
+            self._handle_playlists_post(route)
             return
         if self._app_active() and route == "/analyse":
             self._handle_analyse()
@@ -1542,6 +1555,32 @@ class _Handler(BaseHTTPRequestHandler):
         self.send_header("Location", location)
         self.send_header("Content-Length", "0")
         self.end_headers()
+
+    def _handle_playlists_post(self, route: str) -> None:
+        """Playlist mutations reuse the analyse route's guards: loopback Origin/Host (checked
+        in ``do_POST``) plus the CSRF token.  All logic lives in ``id_detector.playlists``."""
+
+        raw = self._read_body()
+        if raw is None:
+            self._drain_body()
+            self._send_json(HTTPStatus.BAD_REQUEST, {"error": "bad length"})
+            return
+        try:
+            parsed = parse_qs(raw.decode("utf-8"), keep_blank_values=True)
+        except (ValueError, UnicodeDecodeError):
+            self._send_json(HTTPStatus.BAD_REQUEST, {"error": "bad request"})
+            return
+        form = {key: values[0] for key, values in parsed.items()}
+        if not self._csrf_ok(form.get(_CSRF_FIELD)):
+            self._send_json(
+                HTTPStatus.FORBIDDEN,
+                {"error": f"missing or invalid CSRF token (GET /csrf, then send {_CSRF_HEADER})"},
+            )
+            return
+        from id_detector import playlists
+
+        status, body, content_type = playlists.handle_post(route, form, work_root=self.work_root)
+        self._send(HTTPStatus(status), body, content_type)
 
     def _handle_job_cancel(self, route: str) -> None:
         assert self.job_manager is not None

@@ -27,6 +27,7 @@ from id_detector.contracts import (
     SourceRecord,
 )
 from id_detector.io import atomic_write_bytes, write_completion_sidecar
+from id_detector.playlists import PLAYLIST_CSS, PLAYLIST_JS, row_actions_html
 from id_detector.present.exports import (
     _candidate_label,
     _format_time,
@@ -45,7 +46,7 @@ UNRESOLVED_CAP_MS = 120_000
 #: Bump when the page's look or behaviour changes: ``present.refresh.ensure_fresh_page`` re-renders
 #: any written page whose ``<meta name="id-detector-page">`` stamp is older, so already-analysed
 #: mixes pick up the new page the next time they are opened (no re-analysis).
-PAGE_VERSION = 19
+PAGE_VERSION = 20
 
 
 # --------------------------------------------------------------------------------------------------
@@ -459,6 +460,7 @@ def _track_row_html(
     return (
         f'<tr class="{row_class}" data-episode-id="{_esc(entry["episode_id"])}" '
         f'{crowd_attr}style="--i:{index}" '
+        f'id="{_esc(entry["episode_id"])}" '
         f'data-best-start-ms="{best_start}" tabindex="0" role="button" '
         f'aria-label="Seek to {_esc(_format_time(best_start))} — {label}">'
         f'<td class="time"><span class="eqi"><i></i><i></i><i></i></span>'
@@ -470,7 +472,8 @@ def _track_row_html(
         f'<span class="sep">—</span><span class="tt">{_esc(entry["title"])}</span>'
         f"{_tags_html(entry, hidden)}{alternatives}</td>"
         f'<td class="acquire">{acquire}</td>'
-        f'<td class="ops"><button type="button" class="rescan" '
+        f'<td class="ops">{row_actions_html(entry) if not hidden else ""}'
+        f'<button type="button" class="rescan" '
         f'title="Ask for a rescan around here" data-trigger="edge" '
         f'data-start-ms="{best_start}" '
         f'data-end-ms="{int(entry.get("end_ms") or best_start)}">rescan</button></td>'
@@ -1350,7 +1353,7 @@ play</span></div>
 </tbody>
 </table></div>
 <footer><span>🔒 ran entirely on this machine — nothing leaves 127.0.0.1</span>
-<span>IDea</span></footer>
+<span>ID&#39;er</span></footer>
 <div class="toast" id="toast" role="status" aria-live="polite"></div>
 </main>
 <script>
@@ -1361,9 +1364,12 @@ let LEAD_IN_MS = CONFIG.leadInMs;
 {_SEEK_JS}
 {_PLAYHEAD_JS}
 </script>
-<script>{_PAGE_JS}</script>"""
+<script>{_PAGE_JS}</script>
+<script>{PLAYLIST_JS}</script>"""
     stamp = f'<meta name="id-detector-page" content="{PAGE_VERSION}">'
-    return head_html(f"{title} — IDea", _CSS, stamp) + f"<body>{body}</body></html>\n"
+    return (
+        head_html(f"{title} — ID'er", _CSS + PLAYLIST_CSS, stamp) + f"<body>{body}</body></html>\n"
+    )
 
 
 def generate_page(
