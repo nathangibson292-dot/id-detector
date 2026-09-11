@@ -118,6 +118,7 @@ class AppConfig:
     audd_usd_e6_per_request: int = 5_000
     bill_on_throttle: bool = False
     max_usd_e2: int | None = None
+    serve_free_from_deep: bool = False
     deep_primary_density: int = 1
     audd_requests_per_minute: int = DEFAULT_AUDD_REQUESTS_PER_MINUTE
     shazam_requests_per_minute: int = DEFAULT_SHAZAM_REQUESTS_PER_MINUTE
@@ -154,6 +155,7 @@ class AppConfig:
                 audd_usd_e6_per_request=pricing.audd_usd_e6_per_request,
                 bill_on_throttle=pricing.bill_on_throttle,
                 max_usd_e2=pricing.max_usd_e2,
+                serve_free_from_deep=pricing.serve_free_from_deep,
             )
         with path.open("rb") as handle:
             payload = tomllib.load(handle)
@@ -187,6 +189,11 @@ class AppConfig:
         unknown_deep = sorted(set(deep) - {"primary_density", "audd_requests_per_minute"})
         if unknown_deep:
             raise ValueError(f"unknown deep setting: {', '.join(unknown_deep)}")
+        if "serve_free_from_deep" in cache:
+            # Launch-controlled (L3), so it is set in the pricing authority only: an owner config
+            # able to override it could serve Deep results to Free requests while pricing.toml
+            # still says no (plan §3.3, §3.4).
+            raise ValueError("serve_free_from_deep is set in pricing.toml, not cache")
         deep_primary_density = deep.get("primary_density", 1)
         if isinstance(deep_primary_density, bool) or deep_primary_density not in {1, 2}:
             raise ValueError("deep.primary_density must be 1 or 2")
@@ -296,6 +303,7 @@ class AppConfig:
             audd_usd_e6_per_request=pricing.audd_usd_e6_per_request,
             bill_on_throttle=pricing.bill_on_throttle,
             max_usd_e2=pricing.max_usd_e2,
+            serve_free_from_deep=pricing.serve_free_from_deep,
             deep_primary_density=deep_primary_density,
             audd_requests_per_minute=audd_requests_per_minute,
             shazam_requests_per_minute=requests_per_minute,

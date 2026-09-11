@@ -201,6 +201,9 @@ def render_effective_config(
         line("rescan_max_generations", f"max_generations = {config.rescan_max_generations}"),
         "",
         "[cache]",
+        # Launch-controlled in pricing.toml, shown here as a comment so `config show` stays a
+        # complete picture without implying the owner's file could set it.
+        f"# serve_free_from_deep = {str(config.serve_free_from_deep).lower()}  (pricing.toml)",
         line(
             "cache_positive_max_age_days",
             f"positive_max_age_days = {config.cache_positive_max_age_days}",

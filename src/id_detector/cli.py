@@ -28,6 +28,15 @@ from id_detector.calibrate.certify import CorpusNotFrozen, DuplicateTestVersion,
 from id_detector.calibrate.model import load_calibration
 from id_detector.calibrate.validate import run_calibration_validation
 from id_detector.calibration import calibrate_shazam
+from id_detector.compat import (
+    LOCAL_OWNER_SCOPE,
+    AnalysisInputs,
+    RunRequest,
+    find_result,
+    hints_snapshot,
+    index_identity,
+    load_free_observations,
+)
 from id_detector.config_template import CONFIG_TEMPLATE, render_effective_config
 from id_detector.contracts import SourceRecord
 from id_detector.decode import decode
@@ -40,8 +49,8 @@ from id_detector.fuse.episodes import (  # noqa: F401  (fuse_generation_zero: pu
     fuse_generation_zero,
 )
 from id_detector.hints.pipeline import run_hints
-from id_detector.ingest import _load_cached, ingest
-from id_detector.io import read_text, redact_text
+from id_detector.ingest import SourceChanged, _load_cached, ingest
+from id_detector.io import atomic_write_json, read_text, redact_text, sha256_file
 from id_detector.jobs import AsyncJobStore, ProcessLock
 from id_detector.journal import InvocationTimer, append_invocation
 from id_detector.local_index import run_local_index_recognition
@@ -545,6 +554,10 @@ async def _analyse(
     primary_engine: str = "shazam",
     recipe: Recipe | None = None,
     allow_degrade: bool = False,
+    accept_degraded: bool = False,
+    source_kind: str | None = None,
+    tenant_scope: str | None = None,
+    result_paths: list[Path] | None = None,
     paid_scan_adapters: Mapping[str, object] | None = None,
     shazam_http_client: HTTPClientInterface | None = None,
     local_index_label: str | None = None,
@@ -580,6 +593,7 @@ async def _analyse(
     source_lock: ProcessLock | None = None
     media_lock: ProcessLock | None = None
     usd_admitter: UsdAdmitter | None = None
+    request = None
     counts = {
         "requests": 0,
         "physical_attempts": 0,
@@ -593,7 +607,8 @@ async def _analyse(
         source_lock.acquire()
         _report(progress, "ingest", 0, 1, "resolving source")
         timer.start_stage("ingest_ms")
-        ingested = await ingest(url, work_root)
+        retained = _load_cached(work_root, url)
+        ingested = retained or await ingest(url, work_root)
         timer.finish_stage("ingest_ms")
         media_dir = ingested.media_dir
         acquired_media_lock = ProcessLock(media_dir / ".media.lock")
@@ -602,13 +617,91 @@ async def _analyse(
         source_ids = [f"source:{ingested.record.source_key}"]
         _report(progress, "ingest", 1, 1, ingested.record.title or "source ready")
 
-        _report(progress, "decode", 0, 1, "decoding audio")
-        timer.start_stage("decode_ms")
-        decoded = await decode(ingested)
-        timer.finish_stage("decode_ms")
-        ffmpeg_version = decoded.record.decoder.ffmpeg_version
-        duration_ms = decoded.record.pcm.duration_ms
-        _report(progress, "decode", 1, 1, "audio decoded")
+        from id_detector.present.bundles import read_bundle_manifest
+
+        retained_manifest = read_bundle_manifest(ingested.source_path.parent) if retained else None
+        decoded = None
+        if retained_manifest is not None:
+            duration_ms = retained_manifest["duration_ms"]
+        else:
+            _report(progress, "decode", 0, 1, "decoding audio")
+            timer.start_stage("decode_ms")
+            decoded = await decode(ingested)
+            timer.finish_stage("decode_ms")
+            ffmpeg_version = decoded.record.decoder.ffmpeg_version
+            duration_ms = decoded.record.pcm.duration_ms
+            _report(progress, "decode", 1, 1, "audio decoded")
+
+        hint_result = None
+        if not no_hints:
+            _report(progress, "hints", 0, 1, "reading tracklist hints")
+            timer.start_stage("hints_ms")
+            hint_result = await run_hints(
+                source=ingested.record,
+                duration_ms=duration_ms,
+                media_dir=media_dir,
+                source_path=ingested.source_path,
+                project_root=PROJECT_ROOT,
+                manual_tracklist=tracklist,
+                confirmed_mirrors=confirmed_mirrors,
+                refresh=refresh,
+                disabled_connectors=app_config.disabled_hint_connectors,
+            )
+            timer.finish_stage("hints_ms")
+            counts["hints"] = len(hint_result.hints)
+            _report(progress, "hints", 1, 1, f"{len(hint_result.hints)} hints")
+
+        kind = source_kind or ("local" if ingested.record.platform == "file" else "platform")
+        manual_hash = sha256_file(tracklist) if tracklist is not None else ""
+        panako_id = index_identity(index_root, local_index_label)
+        scope = tenant_scope or (
+            LOCAL_OWNER_SCOPE if kind == "upload" or manual_hash or panako_id else "public"
+        )
+        request = RunRequest(
+            AnalysisInputs(
+                ingested.record.media_key,
+                requested_recipe.recipe_id,
+                kind,
+                scope,
+                hints_snapshot(hint_result.hints if hint_result else ()),
+                manual_hash,
+                panako_id,
+            ),
+            requested_recipe,
+            accept_degraded=accept_degraded,
+        )
+        timer.analysis_key = request.inputs.analysis_key
+        timer.compatibility = request.metadata()
+        compatible = (
+            None
+            if refresh
+            else find_result(
+                media_dir, request, serve_free_from_deep=app_config.serve_free_from_deep
+            )
+        )
+        if compatible is not None:
+            if result_paths is not None:
+                result_paths.append(compatible)
+            typer.echo(f"cached; tracklist={compatible / 'tracklist.json'}")
+            return 0
+        free_bundle = None if refresh else find_result(media_dir, request, free_evidence=True)
+        reused_observations, reused_path = (
+            load_free_observations(free_bundle) if free_bundle else ((), None)
+        )
+
+        if free_bundle is not None:
+            max_generations = 0  # Reused Free evidence replaces all new Shazam allocation.
+        if decoded is None:
+            ingested = await ingest(url, work_root)
+            _report(progress, "decode", 0, 1, "decoding audio")
+            timer.start_stage("decode_ms")
+            decoded = await decode(ingested)
+            timer.finish_stage("decode_ms")
+            ffmpeg_version = decoded.record.decoder.ffmpeg_version
+            # The retained manifest's duration seeded the identity above; from here the plan's
+            # window, reservation and secondary arithmetic runs on the decoded PCM's own figure.
+            duration_ms = decoded.record.pcm.duration_ms
+            _report(progress, "decode", 1, 1, "audio decoded")
 
         _report(progress, "windows", 0, 1, "cutting windows")
         timer.start_stage("windows_ms")
@@ -865,25 +958,6 @@ async def _analyse(
         matches = [item for item in gen0_observations if item.status == "match"]
         timer.finish_stage("recognise_ms")
 
-        hint_result = None
-        if not no_hints:
-            _report(progress, "hints", 0, 1, "reading tracklist hints")
-            timer.start_stage("hints_ms")
-            hint_result = await run_hints(
-                source=ingested.record,
-                duration_ms=duration_ms,
-                media_dir=media_dir,
-                source_path=ingested.source_path,
-                project_root=PROJECT_ROOT,
-                manual_tracklist=tracklist,
-                confirmed_mirrors=confirmed_mirrors,
-                refresh=refresh,
-                disabled_connectors=app_config.disabled_hint_connectors,
-            )
-            timer.finish_stage("hints_ms")
-            counts["hints"] = len(hint_result.hints)
-            _report(progress, "hints", 1, 1, f"{len(hint_result.hints)} hints")
-
         _report(progress, "fuse", 0, 1, "fusing episodes")
         timer.start_stage("fuse_ms")
         # Novelty change points only ever feed rescan triggers, so they are computed here once
@@ -999,7 +1073,15 @@ async def _analyse(
             timer.finish_stage("refuse_ms")
             _report(progress, "fuse", 1, 1, f"{len(fused.episodes.episodes)} episodes")
 
-        if paid_first:
+        if paid_first and free_bundle is not None:
+            secondary_scan = PaidScanResult(
+                observations=reused_observations, observation_paths=(reused_path,)
+            )
+            counts["secondary_reused"] = len(reused_observations)
+            counts["secondary_allocated"] = 0
+            await _refuse_with(secondary_scan)
+
+        if paid_first and free_bundle is None:
             hint_ids = (
                 frozenset(hint.id for hint in hint_result.hints)
                 if hint_result is not None
@@ -1180,6 +1262,14 @@ async def _analyse(
         from id_detector.present.bundles import publish_result
 
         settlement = _settle_money(usd_admitter)
+        if achieved_recipe.name == "free":
+            shazam_observations = [
+                json.loads(line)
+                for generation in orchestrated.generations
+                for line in read_text(generation.observations_path).splitlines()
+                if line.strip()
+            ]
+            atomic_write_json(media_dir / "fuse/shazam-observations.json", shazam_observations)
         bundle = publish_result(
             media_dir=media_dir,
             source=ingested.record,
@@ -1187,6 +1277,8 @@ async def _analyse(
             identities=fused.identities.record,
             duration_ms=decoded.record.pcm.duration_ms,
             metadata={
+                "analysis_key": request.inputs.analysis_key,
+                "compatibility": request.metadata(achieved_recipe),
                 "run_id": timer.run_id,
                 "started_at": timer.started_at,
                 "status": status,
@@ -1234,10 +1326,34 @@ async def _analyse(
             **_money_journal_fields(settlement, requested_recipe, app_config, achieved_recipe),
         )
         entry = entry.model_copy(
-            update={"bundle_id": bundle.name, "fuse_run": f"fuse/runs/{timer.run_id}"}
+            update={
+                "bundle_id": bundle.name,
+                "fuse_run": f"fuse/runs/{timer.run_id}",
+                "analysis_key": request.inputs.analysis_key,
+                "compatibility": request.metadata(achieved_recipe),
+            }
         )
         append_invocation(media_dir / "invocations.jsonl", entry)
+        if result_paths is not None:
+            result_paths.append(bundle)
         return 0
+    except SourceChanged as exc:
+        # Source identity is proven before any window is cut, so nothing can be reserved here yet;
+        # settling the admitter regardless keeps the journal honest if that order ever moves.
+        settlement = _settle_money(usd_admitter)
+        entry = timer.entry(
+            status="source_changed",
+            reason="media_key_mismatch",
+            exit_code=5,
+            counts=counts,
+            costs={"usd_e2": settlement.usd_e2_spent},
+            source_ids=source_ids,
+            ffmpeg_version=ffmpeg_version,
+            **_money_journal_fields(settlement, requested_recipe, app_config),
+        )
+        append_invocation(exc.media_dir / "invocations.jsonl", entry)
+        typer.echo("source_changed: source bytes no longer match the stored media", err=True)
+        return 5
     except asyncio.CancelledError:
         if media_dir is not None:
             settlement = _settle_money(usd_admitter)
@@ -1337,6 +1453,9 @@ def analyse(
             "never selects paid work: '--profile max_accuracy' without --recipe is the free "
             "recipe."
         ),
+    ),
+    accept_degraded: bool = typer.Option(
+        False, "--accept-degraded", help="Allow a compatible degraded result in local mode."
     ),
     allow_degrade: bool = typer.Option(
         False,
@@ -1560,6 +1679,7 @@ def analyse(
                 primary_engine=requested_recipe.primary_engine,
                 recipe=requested_recipe,
                 allow_degrade=allow_degrade,
+                accept_degraded=accept_degraded,
                 paid_scan_adapters=paid_scan_adapters,
                 shazam_http_client=shazam_http_client,
                 local_index_label=local_index,
@@ -1580,22 +1700,29 @@ async def _acquire(
     refresh: bool,
     enable_soundcloud: bool,
     progress: ProgressFn | None = None,
+    bundle: Path | None = None,
+    result_paths: list[Path] | None = None,
 ) -> int:
     from id_detector.present.bundles import load_run_snapshot, publish_snapshot
 
     work_root = work_root.resolve()
-    cached = _load_cached(work_root, url)
-    if cached is None:
-        typer.echo(
-            f"no cached analysis for {redact_text(url)} under {work_root}; run `analyse` first",
-            err=True,
-        )
-        return 2
-    media_dir = cached.media_dir
+    # ``bundle`` is the run the compatibility lookup selected (§3.4).  Without it acquisition would
+    # reopen ``present/current`` — the newest complete run — and hand the caller a result it was
+    # never served: a Deep bundle for a Free request with ``serve_free_from_deep`` off.
+    media_dir: Path | None = bundle.parents[2] if bundle is not None else None
+    if media_dir is None:
+        cached = _load_cached(work_root, url)
+        if cached is None:
+            typer.echo(
+                f"no cached analysis for {redact_text(url)} under {work_root}; run `analyse` first",
+                err=True,
+            )
+            return 2
+        media_dir = cached.media_dir
     try:
         # One snapshot for both halves: the links below and the rows the new bundle renders must
         # come from the same run, and that run owns the identity the bundle is published under.
-        snapshot = load_run_snapshot(media_dir)
+        snapshot = load_run_snapshot(media_dir, directory=bundle)
     except (OSError, ValueError, KeyError) as error:
         typer.echo(
             f"analysis at {media_dir} cannot be opened ({error}); run `analyse` first", err=True
@@ -1616,7 +1743,11 @@ async def _acquire(
     _report(progress, "enrich", 1, 1, "acquire links resolved")
     _report(progress, "present", 0, 1, "updating result page")
     acquire_config = _load_app_config(Path("idea.toml"))
-    publish_snapshot(snapshot, media_dir=media_dir, config=acquire_config, acquire=result.record)
+    published = publish_snapshot(
+        snapshot, media_dir=media_dir, config=acquire_config, acquire=result.record
+    )
+    if result_paths is not None:
+        result_paths.append(published)
     _report(progress, "present", 1, 1, "result page updated")
     typer.echo(
         f"acquire: {result.counts['episodes']} identified episodes; "

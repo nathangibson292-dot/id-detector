@@ -68,6 +68,8 @@ class InvocationTimer:
     started_at: str = field(default_factory=timestamp)
     started_monotonic: float = field(default_factory=time.monotonic)
     timings: dict[str, int] = field(default_factory=dict)
+    analysis_key: str | None = None
+    compatibility: dict[str, Any] | None = None
     _stage_started: dict[str, float] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
@@ -104,6 +106,8 @@ class InvocationTimer:
             schema_version=SCHEMA_VERSION,
             generated_by=GENERATED_BY,
             invocation_id=self.run_id,
+            analysis_key=self.analysis_key,
+            compatibility=self.compatibility,
             bundle_id=None,
             fuse_run=None,
             command=self.command,

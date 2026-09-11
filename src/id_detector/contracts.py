@@ -919,6 +919,8 @@ class ShortlistReportRecord(Record):
 
 
 class InvocationJournalEntry(Record):
+    analysis_key: Sha256 | None
+    compatibility: dict[str, Any] | None
     bundle_id: Sha256 | None
     fuse_run: str | None
     invocation_id: str
@@ -932,6 +934,7 @@ class InvocationJournalEntry(Record):
         "partial",
         "provider_unavailable",
         "budget_exhausted",
+        "source_changed",
         "failed",
         "cancelled",
     ]
@@ -959,7 +962,13 @@ class InvocationJournalEntry(Record):
     @classmethod
     def legacy_bundle_fields(cls, value: Any) -> Any:
         if isinstance(value, dict):
-            return {"bundle_id": None, "fuse_run": None, **value}
+            return {
+                "analysis_key": None,
+                "compatibility": None,
+                "bundle_id": None,
+                "fuse_run": None,
+                **value,
+            }
         return value
 
 

@@ -321,10 +321,16 @@ def publish_result(
                 reason=metadata.get("reason"),
                 achieved=metadata.get("achieved"),
             )
+            if metadata.get("analysis_key") is not None:
+                tracklist_path = directory / "tracklist.json"
+                tracklist = json.loads(read_text(tracklist_path))
+                tracklist["analysis_key"] = metadata["analysis_key"]
+                atomic_write_json(tracklist_path, tracklist)
             page.generate_page(**common, source=source, lead_in_ms=config.lead_in_ms)
             manifest = {
                 "run_id": run_id,
-                "analysis_key": metadata.get("analysis_key"),  # Cycle 1a-ii fills this field.
+                "analysis_key": metadata.get("analysis_key"),
+                "compatibility": metadata.get("compatibility"),
                 "requested_recipe_id": metadata.get("requested_recipe_id"),
                 "achieved": metadata.get("achieved"),
                 "status": metadata["status"],
@@ -366,21 +372,28 @@ class RunSnapshot:
     acquire: AcquireFile | None
 
 
-def load_run_snapshot(media_dir: Path) -> RunSnapshot:
+def load_run_snapshot(media_dir: Path, *, directory: Path | None = None) -> RunSnapshot:
     """The selected result *and* the exact inputs that produced it, resolved under one lock.
 
     Resolving the run and its artefacts separately is how an older ``complete`` run's identity ends
     up stamped on a newer ``partial`` run's rows: the mutable ``fuse/`` tree always belongs to the
     newest run, while ``result_dir`` deliberately prefers the newest *complete* one.  Every caller
     that re-publishes an existing run (refresh, acquisition) takes both from here instead.
+
+    ``directory`` names one specific bundle: the compatibility lookup (§3.4) may deliberately select
+    an older run than ``present/current`` names, and re-publishing it must not silently swap in
+    whatever the newest complete run happens to be.
     """
 
     from id_detector.enrich.run import load_analysis
 
     media_dir = Path(native_path(media_dir))
     with _PUBLICATION_LOCK:
-        directory = result_dir(media_dir)
+        selected = directory is not None
+        directory = result_dir(media_dir) if directory is None else Path(native_path(directory))
         manifest = read_bundle_manifest(directory)
+        if selected and manifest is None:
+            raise ValueError("selected bundle is missing or damaged")
         if manifest is not None:
             source = SourceRecord.model_validate_json(read_text(directory / "source.json"))
             fuse_run = _frozen_run(media_dir, manifest)

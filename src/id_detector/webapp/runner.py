@@ -17,8 +17,6 @@ from pathlib import Path
 from id_detector.providers.base import AppConfig
 from id_detector.webapp.jobs import JobContext
 
-#: The single paid engine the browser's max-accuracy tier uses (see the runner note below).
-WEB_PAID_ENGINE = "audd"
 #: Where the browser's "build index" step fingerprints the uploader's tracks, and the label the
 #: analysis then queries (D3: Panako kept; the index is built AND used).  Mirrors ``idea
 #: build-index`` / ``idea analyse --local-index default`` on their default roots.
@@ -136,18 +134,19 @@ def make_pipeline_runner(
 
         settings = _resolve_settings(project, config_file, ctx.profile)
         tracklist_path = _materialise_tracklist(root, ctx.known_tracklist)
-        # The browser's paid tier.  Choosing max_accuracy activates ONE paid engine (AudD — the
-        # broadest single catalogue) via its gate-free CLIP path: the Deep recipe sweeps the mix in
-        # the same ~12 s clips Shazam sees, so it needs no whole-file upload and no ownership.  That
-        # is what lets us cross-check OTHER people's mixes.  It self-gates on its credentials; a
-        # missing key ends the job as "paid provider unavailable" rather than silently going free.
-        engines = settings.enabled_engines
-        if ctx.profile == "max_accuracy":
-            engines = tuple(dict.fromkeys([*engines, WEB_PAID_ENGINE]))
 
         def progress(phase: str, done: int, total: int, message: str = "") -> None:
             ctx.progress(phase, done, total, message)
 
+        from id_detector.recipes import get_recipe
+
+        selected_recipe = get_recipe(
+            "deep" if ctx.profile == "max_accuracy" else "free",
+            primary_density=settings.config.deep_primary_density
+            if ctx.profile == "max_accuracy"
+            else 1,
+        )
+        result_paths: list[Path] = []
         exit_code = asyncio.run(
             cli._analyse(
                 target,
@@ -161,9 +160,10 @@ def make_pipeline_runner(
                 max_generations=settings.max_generations,
                 novelty=settings.novelty,
                 calibrator=settings.calibrator,
-                enabled_engines=engines,
-                # max_accuracy is paid-first: the paid engine leads, the free engine seconds it.
-                primary_engine="audd" if ctx.profile == "max_accuracy" else "shazam",
+                enabled_engines=settings.enabled_engines,
+                # The recipe owns engine selection and the shared compatible-result lookup.
+                recipe=selected_recipe,
+                result_paths=result_paths,
                 # The index this job just built (or one an earlier job built) is queried over the
                 # still-uncertain spans; without a label the build was paid for and never used.
                 local_index_label=WEB_INDEX_LABEL if ctx.build_index else None,
@@ -179,6 +179,7 @@ def make_pipeline_runner(
             meaning = _EXIT_STATUS.get(exit_code, "error")
             raise RuntimeError(f"analysis failed: {meaning} (exit code {exit_code})")
 
+        selected = result_paths[-1] if result_paths else None
         if ctx.acquire:
             ctx.check_cancel()
             asyncio.run(
@@ -188,9 +189,17 @@ def make_pipeline_runner(
                     refresh=False,
                     enable_soundcloud=True,
                     progress=progress,
+                    # Acquisition re-publishes a revision of the run the pipeline selected, so the
+                    # job still delivers that run and not whichever bundle is newest.
+                    bundle=selected,
+                    result_paths=result_paths,
                 )
             )
+            selected = result_paths[-1] if result_paths else None
 
+        if selected is not None and (selected / "index.html").is_file():
+            ctx.set_result(selected / "index.html")
+            return
         cached = cli._load_cached(root.resolve(), target)
         if cached is not None:
             from id_detector.present.bundles import shown_result_dir

@@ -35,6 +35,24 @@ from id_detector.io import (
 from id_detector.process import run_process
 
 
+class SourceChanged(RuntimeError):
+    def __init__(self, media_dir: Path) -> None:
+        super().__init__("source_changed")
+        self.media_dir = media_dir
+
+
+def _verify_local_source(record: SourceRecord, media_dir: Path, input_url: str) -> None:
+    if record.platform != "file":
+        return
+    from urllib.request import url2pathname
+
+    path = Path(input_url).expanduser()
+    if not path.is_file():
+        path = Path(url2pathname(urlsplit(record.canonical_url).path))
+    if path.is_file() and sha256_file(path) != record.media_key:
+        raise SourceChanged(media_dir)
+
+
 @dataclass(frozen=True)
 class IngestResult:
     record: SourceRecord
@@ -156,6 +174,7 @@ def _load_ingest_cached(work_root: Path, input_url: str) -> IngestResult | None:
             ):
                 continue
             media_dir = source_path.parents[1]
+            _verify_local_source(record, media_dir, input_url)
             original_path = media_dir / record.original.path
             verification = verify_completion_sidecar(
                 source_path, {record.original.path: original_path}
@@ -168,7 +187,12 @@ def _load_ingest_cached(work_root: Path, input_url: str) -> IngestResult | None:
 
 
 def _load_cached(work_root: Path, input_url: str) -> IngestResult | None:
-    """Open retained results without verifying or requiring the fetched original."""
+    """Open retained results without verifying or requiring the fetched original.
+
+    This resolves the *source*, never the compatible result: choosing which stored result may
+    answer a request is :func:`id_detector.compat.find_result`'s job, and having two lookups
+    would be two chances to serve the wrong one.
+    """
 
     from id_detector.present.bundles import read_manifest, result_dir
     from id_detector.present.index import cached_media_dir
@@ -180,6 +204,7 @@ def _load_cached(work_root: Path, input_url: str) -> IngestResult | None:
         source_path = directory / "source.json" if manifest else media_dir / "ingest/source.json"
         try:
             record = SourceRecord.model_validate_json(read_text(source_path))
+            _verify_local_source(record, media_dir, input_url)
             return IngestResult(
                 record, media_dir, source_path, media_dir / record.original.path, True
             )
@@ -199,6 +224,7 @@ async def ingest(input_url: str, work_root: Path) -> IngestResult:
     if cached is not None:
         return cached
 
+    previous = _load_cached(work_root, input_url)
     local = Path(input_url).expanduser()
     info: dict[str, Any]
     format_id: str | None
@@ -251,6 +277,8 @@ async def ingest(input_url: str, work_root: Path) -> IngestResult:
             format_id = str(info["format_id"]) if info.get("format_id") is not None else None
 
         media_key = derive_media_key_from_path(temporary_media)
+        if previous is not None and media_key != previous.record.media_key:
+            raise SourceChanged(previous.media_dir)
         source_key = derive_source_key(canonical_url)
         media_dir = work_root / source_key / media_key
         ingest_dir = media_dir / "ingest"
@@ -259,7 +287,7 @@ async def ingest(input_url: str, work_root: Path) -> IngestResult:
         original_path = ingest_dir / f"original{suffix}"
         if path_is_file(original_path):
             if sha256_file(original_path) != media_key:
-                raise ValueError("cached original path contains different bytes")
+                raise SourceChanged(media_dir)
             os.unlink(native_path(temporary_media))
         else:
             os.replace(native_path(temporary_media), native_path(original_path))

@@ -141,7 +141,11 @@ def test_paid_primary_success_completes_without_the_branch_local_crash(tmp_path:
     assert (shown_result_dir(media_dir) / "index.html").is_file()
 
 
-def test_paid_no_match_is_resolved_cached_and_gap_counts_accumulate(tmp_path: Path) -> None:
+def test_paid_no_match_is_resolved_cached_and_gap_counts_accumulate(
+    tmp_path: Path, monkeypatch
+) -> None:
+    # Exercise raw response refresh below the independently tested derived-result cache.
+    monkeypatch.setattr("id_detector.cli.find_result", lambda *args, **kwargs: None)
     exit_code, audd, shazam = _run_analysis(tmp_path, "all-no-match.json")
 
     media_dir, entry = _entry(tmp_path / "work")
@@ -169,7 +173,10 @@ def test_paid_no_match_is_resolved_cached_and_gap_counts_accumulate(tmp_path: Pa
 
 def test_shazam_no_match_refresh_gets_a_fresh_allowance_after_exhausting_budget(
     tmp_path: Path,
+    monkeypatch,
 ) -> None:
+    monkeypatch.setattr("id_detector.cli.find_result", lambda *args, **kwargs: None)
+
     async def analyse_with(client: FakeShazamHTTP, run_id: str) -> int:
         del run_id
         return await _analyse(
