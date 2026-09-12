@@ -5,9 +5,9 @@ one-page answer to "what actually works, and what is only claimed?"*
 
 ## v2 (hosted product) — where the build stands
 
-*Updated 2026-09-11. Plan: [PLAN-v2.md](PLAN-v2.md) rev 6; cycle log: [reviews/README.md](reviews/README.md).*
+*Updated 2026-09-12. Plan: [PLAN-v2.md](PLAN-v2.md) rev 6; cycle log: [reviews/README.md](reviews/README.md).*
 
-**Phase 0 and Phase 1 are complete and committed.** Test suite: 1033 passed offline.
+**Phases 0, 1 and 2 are complete and committed, plus presentation cycle 3a-i.** Test suite: 1094 passed offline.
 
 Phase 0 (cycles 0a-i, 0a-ii, 0a-iv+0a-iii, 0b-i+0b-iii, 0b-ii): the paid (Deep) path no longer crashes after
 spending; AudD error bodies are never cached; spend is reserved, admitted per request against a hard cap and
@@ -46,9 +46,32 @@ Phase 1 (cycles 1a-i+1a-iii, 1a-ii, 1b-iii breaker):
   secondary is skipped → `degraded` naming the rule, new free work reports `waiting` (a cached compatible
   result is still served). `IDEA_ENGINE_SHAZAM=off` remains a hard off.
 
-**Not started:** 2b (retention and sidecar pruning), 3a (presentation), 4a–4d (service API, FastAPI, worker,
-accounts, credits), 6a–6b (ingest policy, container, launch checklist), then M2 (billing, Stripe sandbox) —
-see PLAN-v2 §5.
+Phase 2 and the first presentation cycle (committed 2026-09-11/12):
+- **2b — retention.** `idea gc --policy local|hosted` reclaims a finished analysis: window clips at once, PCM
+  after 48 h, and on hosted the fetched original after 7 d while **local always keeps the original**. Failed
+  and cancelled runs lose intermediates immediately and their media directory after 7 d if unreferenced. GC is
+  opt-in, defaults to a dry run, never deletes in place (it moves to `work/.trash/<date>/` and purges only once
+  provably 7 days old), rejects symlink/junction escapes, and treats anything it cannot read as a reference.
+  Pruned artefacts leave a `pruned_upstream` marker; consumers re-derive windows ← PCM ← original ← re-fetch,
+  and re-fetched bytes that no longer hash to `media_key` end the run `source_changed`.
+- **3a-i — canonical projection.** Presentation rules live in one typed, ordered projection per run, and the
+  page table, hero counts, legend, timeline lanes, library card count and confidence bar, Copy, CUE, Markdown
+  and JSON all render from it, so one mix can no longer report four different tracklists. Re-rendering mints a
+  new immutable bundle from the frozen snapshot with page and exports written together. Markdown drops the
+  `Version`/`Role` columns the page hides (JSON keeps them); the dead M3U export is gone. Suppression is applied
+  per episode **before** rows collapse, and coverage is a true union, so the "identified" percentage no longer
+  double-counts overlapping tracks.
+
+**Also on main (a second Claude session, commit `6ef821f`):** a self-contained playlists/Likes feature
+(`src/id_detector/playlists/`, storage in git-ignored `data/local/playlists.json`) and the display-brand rename
+**IDea → ID'er**. Internals are deliberately unchanged: the `id_detector` package, the `idea` console script,
+`idea.cmd` and every `IDEA_*` variable. Its five-point result-page contract (row anchor, both row identifiers,
+asset injection, controls on shown rows only, the result URL shape) is a standing constraint on every
+presentation cycle.
+
+**Not started:** 3a-ii (honesty, accessibility, mobile), 4a–4d (service API, FastAPI, worker, accounts,
+credits), 6a–6b (ingest policy, container, launch checklist), then M2 (billing, Stripe sandbox) — see
+PLAN-v2 §5.
 
 **Owner-side, open:** verify the seven truth drafts (`idea truth verify`) and fix the ~+50 s tracklist clock
 offsets on the Mall Grab and DJ Heartstring sets while verifying; AudD's reply on the per-clip subscription
