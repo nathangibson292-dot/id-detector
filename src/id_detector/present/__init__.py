@@ -3,7 +3,10 @@
 from __future__ import annotations
 
 from id_detector.present.exports import (
+    CanonicalProjection,
     ExportResult,
+    ProjectionEntry,
+    build_projection,
     export_tracklist,
     flatten_tracklist,
     render_cue,
@@ -37,14 +40,17 @@ from id_detector.present.server import (
 
 __all__ = [
     "DEFAULT_LEAD_IN_MS",
+    "CanonicalProjection",
     "DisplayTrack",
     "EmbedPlan",
     "ExportResult",
+    "ProjectionEntry",
     "RunningServer",
     "append_rescan_request",
     "build_rescan_request",
     "consume_rescan_queue",
     "export_tracklist",
+    "build_projection",
     "flatten_tracklist",
     "generate_page",
     "group_display_tracks",

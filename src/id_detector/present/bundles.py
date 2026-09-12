@@ -29,7 +29,7 @@ from id_detector.io import (
     sha256_file,
 )
 from id_detector.present import page
-from id_detector.present.exports import export_tracklist
+from id_detector.present.exports import build_projection, export_tracklist
 from id_detector.providers.base import AppConfig
 
 _PUBLICATION_LOCK = threading.RLock()
@@ -298,6 +298,14 @@ def publish_result(
             if acquire is not None:
                 acquire_path = directory / "acquire.json"
                 atomic_write_json(acquire_path, acquire)
+            projection = build_projection(
+                episodes,
+                identities,
+                acquire,
+                collapse=config.collapse,
+                same_track_bridge_ms=config.same_track_bridge_ms,
+                min_track_ms=config.present_min_track_ms,
+            )
             common = dict(
                 media_dir=media_dir,
                 output_dir=directory,
@@ -311,12 +319,12 @@ def publish_result(
                 collapse=config.collapse,
                 same_track_bridge_ms=config.same_track_bridge_ms,
                 min_track_ms=config.present_min_track_ms,
+                projection=projection,
             )
             export_tracklist(
                 **common,
                 media_key=source.media_key,
                 title=source.title,
-                media_target=source.canonical_url,
                 status=metadata["status"],
                 reason=metadata.get("reason"),
                 achieved=metadata.get("achieved"),

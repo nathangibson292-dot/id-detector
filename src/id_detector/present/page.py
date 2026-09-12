@@ -29,10 +29,10 @@ from id_detector.contracts import (
 from id_detector.io import atomic_write_bytes, write_completion_sidecar
 from id_detector.playlists import PLAYLIST_CSS, PLAYLIST_JS, row_actions_html
 from id_detector.present.exports import (
+    CanonicalProjection,
     _candidate_label,
     _format_time,
-    flatten_tracklist,
-    hidden_reason,
+    build_projection,
 )
 from id_detector.present.theme import PLATFORM_NAMES, head_html, topbar_html
 
@@ -46,7 +46,7 @@ UNRESOLVED_CAP_MS = 120_000
 #: Bump when the page's look or behaviour changes: ``present.refresh.ensure_fresh_page`` re-renders
 #: any written page whose ``<meta name="id-detector-page">`` stamp is older, so already-analysed
 #: mixes pick up the new page the next time they are opened (no re-analysis).
-PAGE_VERSION = 20
+PAGE_VERSION = 21
 
 
 # --------------------------------------------------------------------------------------------------
@@ -584,16 +584,16 @@ _HIDDEN_LABELS = {
 }
 
 
-def _stats_html(
-    entries: tuple[dict[str, Any], ...], episodes: EpisodesFile, duration_ms: int
-) -> str:
+def _stats_html(projection: CanonicalProjection, duration_ms: int) -> str:
     """The hero stat tiles: tracks found, share of the set identified, confidence mix, ID gaps.
 
     "Identified" is honest coverage — listening time backed by proved evidence (plus any
     calibrated predicted episode time) over the set's length — not a guess at how many tracks
-    were in the set.
+    were in the set.  Every tile is read off the one canonical projection, coverage included:
+    a tile must never describe rows the tracklist beneath it does not list.
     """
 
+    entries = projection.shown_entries
     tracks = [entry for entry in entries if entry["kind"] == "track"]
     counts = dict.fromkeys(_BADGE_ORDER, 0)
     for entry in tracks:
@@ -602,7 +602,7 @@ def _stats_html(
     n = len(tracks)
     crowd = sum(1 for entry in tracks if entry.get("hint_only"))
     crowd_note = f" · {crowd} from comments" if crowd else ""
-    covered = episodes.durations.evidence_supported_ms + episodes.durations.predicted_episode_ms
+    covered = projection.covered_ms
     pct = int(round(max(0.0, min(100.0, covered * 100.0 / duration_ms)))) if duration_ms else 0
     bars = "".join(
         f'<i class="c-{key}" style="width:{counts[key] * 100.0 / n:.2f}%"></i>'
@@ -614,7 +614,7 @@ def _stats_html(
         for key in _BADGE_ORDER
         if counts[key]
     )
-    gaps = len(episodes.gaps)
+    gaps = projection.gap_count
     return (
         '<div class="stats">'
         f'<div class="stat"><div><span class="big">{n}</span>'
@@ -1045,16 +1045,10 @@ function seekToPositionMs(positionMs){
   return seekPlayerArg(seekArgument(positionMs, 0)); }
 // Copy the tracklist as plain text (time, artist — title; ID for a gap) ------
 function tracklistText(){
-  const lines = [];
-  const showingShort = document.body.classList.contains('show-short');
-  document.querySelectorAll('tr.track, tr.gap').forEach(function(row){
-    if(row.classList.contains('short') && !showingShort) return;
-    const t = row.querySelector('.time').textContent.trim();
-    if(row.classList.contains('gap')){ lines.push(t + '  ID'); return; }
-    lines.push(t + '  ' + (ROW_LABELS[row.getAttribute('data-episode-id')] || '') +
-      (row.getAttribute('data-crowd') ? ' (from comments)' : ''));
-  });
-  return lines.join('\\n');
+  return COPY_ENTRIES.map(function(entry){
+    if(entry.kind === 'id'){ return entry.time + '  ID'; }
+    return entry.time + '  ' + entry.label + (entry.crowd ? ' (from comments)' : '');
+  }).join('\\n');
 }
 function copyTracklist(){
   const text = tracklistText(); const n = text ? text.split('\\n').length : 0;
@@ -1158,6 +1152,7 @@ def render_page(
     collapse: bool = True,
     same_track_bridge_ms: int | None = None,
     min_track_ms: int = 0,
+    projection: CanonicalProjection | None = None,
 ) -> str:
     """Render the complete self-contained HTML page as a string.
 
@@ -1179,47 +1174,40 @@ def render_page(
     # A stable local route survives bundle nesting and cached-open without the source file.
     original_path = getattr(getattr(source, "original", None), "path", None)
     audio_src = f"/media/{source.media_key}/audio" if original_path else None
-    # Every row, including short/suppressed ones: the page hides them itself (see hidden_by_id).
-    entries = flatten_tracklist(
+    projection = projection or build_projection(
         episodes,
         identities,
         acquire,
         collapse=collapse,
         same_track_bridge_ms=same_track_bridge_ms,
-        include_hidden=True,
+        min_track_ms=min_track_ms,
     )
+    # Every row, including short/suppressed ones: the page hides them itself (see hidden_by_id).
+    entries = projection.entries
     boundaries = _evidence_boundaries(list(episodes.episodes))
     hidden_by_id = {
-        e["episode_id"]: reason
+        e["episode_id"]: e["hidden_reason"]
         for e in entries
-        if e["kind"] == "track" and (reason := hidden_reason(e, min_track_ms)) is not None
+        if e["kind"] == "track" and e["hidden_reason"] is not None
     }
     short_ids = set(hidden_by_id)
-    visible = tuple(e for e in entries if e.get("episode_id") not in short_ids)
 
     # A display track is one collapsed row (primary + folded-in alternatives); ungrouped, it is one
     # episode.  Lanes, the highlight partition and the row all key off the primary's id so the
-    # Stage 11 playhead lights the same row + lane as the tracklist.
-    if collapse:
-        from id_detector.present.grouping import (
-            DEFAULT_SAME_TRACK_BRIDGE_MS,
-            group_display_tracks,
-        )
-
-        bridge_ms = (
-            DEFAULT_SAME_TRACK_BRIDGE_MS if same_track_bridge_ms is None else same_track_bridge_ms
-        )
-        display_tracks = group_display_tracks(
-            list(episodes.episodes), identities, duration_ms, same_track_bridge_ms=bridge_ms
-        )
-        lane_episodes = [track.primary for track in display_tracks]
-        span_items = [(track.primary.id, track.start_ms, track.end_ms) for track in display_tracks]
-    else:
-        lane_episodes = list(episodes.episodes)
-        span_items = [
-            (episode.id, episode.best_start_ms, episode.best_end_ms)
-            for episode in episodes.episodes
-        ]
+    # Stage 11 playhead lights the same row + lane as the tracklist.  They are read straight off
+    # the canonical projection — re-grouping here is exactly how the page used to end up showing a
+    # different set of tracks from its own exports.
+    episode_by_id = {episode.id: episode for episode in episodes.episodes}
+    track_entries = [entry for entry in entries if entry["kind"] == "track"]
+    lane_episodes = [
+        episode_by_id[entry["episode_id"]]
+        for entry in track_entries
+        if entry["episode_id"] in episode_by_id
+    ]
+    span_items = [
+        (str(entry["episode_id"]), int(entry["start_ms"]), int(entry["end_ms"]))
+        for entry in track_entries
+    ]
 
     lanes = [
         _timeline_lane(
@@ -1235,7 +1223,12 @@ def render_page(
         lane["short"] = lane["episode_id"] in short_ids
         lane["crowd"] = lane["episode_id"] in crowd_ids
     span_items = [item for item in span_items if item[0] not in short_ids]
-    gap_markers = [_gap_marker(gap, duration_ms) for gap in episodes.gaps]
+    shown_gap_ids = {
+        entry.get("gap_id") for entry in projection.shown_entries if entry["kind"] == "id"
+    }
+    gap_markers = [
+        _gap_marker(gap, duration_ms) for gap in episodes.gaps if gap.id in shown_gap_ids
+    ]
 
     # Playhead → current-track partition: each display track owns time from its start up to the
     # next display track's start (the plan's ``[start, next start)`` interval); the last one owns
@@ -1271,6 +1264,17 @@ def render_page(
         }
     )
     episode_spans_js = json.dumps(episode_spans)
+    copy_entries_js = json.dumps(
+        [
+            {
+                "kind": entry["kind"],
+                "time": _format_time(entry["start_ms"]),
+                "label": entry["display_label"],
+                "crowd": bool(entry.get("hint_only")),
+            }
+            for entry in projection.shown_entries
+        ]
+    ).replace("</", "<\\/")
     # The control shows whole seconds; the page converts back to milliseconds on change.
     lead_in_s = f"{lead_in_ms / 1000:g}"
     short_note = ""
@@ -1313,14 +1317,13 @@ class="pd"></span>{_esc(platform_name)}</span>
   {gen_chip}
 </div>
 <h1>{_esc(title)}</h1>
-{_stats_html(visible, episodes, duration_ms)}
+{_stats_html(projection, duration_ms)}
 </header>
 <section class="player">{_embed_html(embed, audio_src)}</section>
 <div class="exports">
   <span class="lbl">Export</span>
   <button type="button" class="xbtn copy" id="copy">Copy tracklist</button>
   <a class="xbtn" href="tracklist.cue" download>CUE sheet</a>
-  <a class="xbtn" href="tracklist.m3u" download>M3U playlist</a>
   <a class="xbtn" href="tracklist.md" download>Markdown</a>
   <a class="xbtn" href="tracklist.json" download>JSON</a>
 </div>
@@ -1360,6 +1363,7 @@ play</span></div>
 const CONFIG = {config_js};
 const PLATFORM = CONFIG.platform;
 const EPISODE_SPANS = {episode_spans_js};
+const COPY_ENTRIES = {copy_entries_js};
 let LEAD_IN_MS = CONFIG.leadInMs;
 {_SEEK_JS}
 {_PLAYHEAD_JS}
@@ -1388,6 +1392,7 @@ def generate_page(
     collapse: bool = True,
     same_track_bridge_ms: int | None = None,
     min_track_ms: int = 0,
+    projection: CanonicalProjection | None = None,
 ) -> Path:
     """Render and atomically write ``present/index.html`` with a completion sidecar."""
 
@@ -1401,6 +1406,7 @@ def generate_page(
         collapse=collapse,
         same_track_bridge_ms=same_track_bridge_ms,
         min_track_ms=min_track_ms,
+        projection=projection,
     )
     index_path = (output_dir or media_dir / "present") / "index.html"
     atomic_write_bytes(index_path, html_text.encode("utf-8"))

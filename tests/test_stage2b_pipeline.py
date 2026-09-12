@@ -150,8 +150,9 @@ def test_partition_and_byte_determinism_on_full_local_pipeline_sync(tmp_path: Pa
         if entry["kind"] == "track"
     )
     markdown = exported.markdown_path.read_text(encoding="utf-8")
-    assert "| Time | Badge | Version | Role | Track |" in markdown
-    assert "| POSSIBLE | UNVERIFIED |" in markdown
+    assert "| Time | Confidence | Track |" in markdown
+    assert "| Version |" not in markdown and "| Role |" not in markdown
+    assert "| POSSIBLE |" in markdown and "UNVERIFIED" not in markdown
 
 
 def test_recorded_responses_reject_unrelated_window_content(tmp_path: Path) -> None:

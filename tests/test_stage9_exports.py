@@ -168,7 +168,9 @@ def _seed_upstream(tmp_path: Path, episodes: EpisodesFile, identities: Identitie
     (fuse / "identities.gen0.json").write_text(identities.model_dump_json(), encoding="utf-8")
 
 
-def test_flatten_populates_overlap_labels_and_export_writes_cue_and_m3u(tmp_path: Path) -> None:
+def test_flatten_populates_overlap_labels_and_export_writes_cue_not_retired_m3u(
+    tmp_path: Path,
+) -> None:
     episodes = _overlapping_episodes_file()
     identities = _identities()
     _seed_upstream(tmp_path, episodes, identities)
@@ -190,17 +192,13 @@ def test_flatten_populates_overlap_labels_and_export_writes_cue_and_m3u(tmp_path
         episodes_path=tmp_path / "fuse" / "episodes.json",
         identities_path=tmp_path / "fuse" / "identities.gen0.json",
         title="Overlap Set",
-        media_target="https://example.invalid/set",
         collapse=False,
     )
     cue = (tmp_path / "present" / "tracklist.cue").read_text(encoding="utf-8")
-    m3u = (tmp_path / "present" / "tracklist.m3u").read_text(encoding="utf-8")
     assert "REM LAYER" in cue
-    assert "#EXTVLCOPT:start-time=" in m3u
-    assert "https://example.invalid/set" in m3u
-    assert result.m3u_path == tmp_path / "present" / "tracklist.m3u"
+    assert result.cue_path == tmp_path / "present" / "tracklist.cue"
     assert (tmp_path / "present" / "tracklist.cue").is_file()
-    assert (tmp_path / "present" / "tracklist.m3u").is_file()
+    assert not (tmp_path / "present" / "tracklist.m3u").exists()
     # A completion sidecar is written for the export set (shared X.done.json name).
     assert (tmp_path / "present" / "tracklist.done.json").is_file()
 

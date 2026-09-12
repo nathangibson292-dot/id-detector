@@ -1,0 +1,51 @@
+{
+  "title": "Boiler fixture",
+  "duration_ms": 300000,
+  "min_track_ms": 30000,
+  "_why": "F-2/F-3: five sub-floor rows and one suppressed row must leave the hero, the card, the page and every export describing the same two tracks — 150 s of 300 s, not the 270 s the fused durations still account for.",
+  "tracks": [
+    {"artist": "Anchor", "title": "Opening", "start_ms": 0, "end_ms": 70000, "badge": "likely"},
+    {"artist": "Flash", "title": "One", "start_ms": 70000, "end_ms": 82000, "badge": "unclear"},
+    {"artist": "Flash", "title": "Two", "start_ms": 85000, "end_ms": 97000, "badge": "possible"},
+    {"artist": "Flash", "title": "Three", "start_ms": 100000, "end_ms": 112000, "badge": "unclear"},
+    {"artist": "Flash", "title": "Four", "start_ms": 115000, "end_ms": 127000, "badge": "possible"},
+    {"artist": "Flash", "title": "Five", "start_ms": 130000, "end_ms": 142000, "badge": "unclear"},
+    {"artist": "Buried", "title": "Contradicted", "start_ms": 145000, "end_ms": 205000, "badge": "possible", "suppressed": "contradicted"},
+    {"artist": "Anchor", "title": "Closing", "start_ms": 205000, "end_ms": 285000, "badge": "possible"}
+  ],
+  "gaps": [
+    {"start_ms": 285000, "end_ms": 300000, "reason": "unclear_only"}
+  ],
+  "hidden": [
+    "Flash — One",
+    "Flash — Two",
+    "Flash — Three",
+    "Flash — Four",
+    "Flash — Five",
+    "Buried — Contradicted"
+  ],
+  "expected": {
+    "collapsed": {
+      "tracks": 2,
+      "suppressed": 6,
+      "gaps": 1,
+      "pct": 50,
+      "crowd": 0,
+      "badges": {"likely": 1, "possible": 1},
+      "note": "<b>6</b> matches (5 short, 1 suppressed) hidden",
+      "copy": ["0:00  Anchor — Opening", "3:25  Anchor — Closing", "4:45  ID"],
+      "alternatives": {}
+    },
+    "flat": {
+      "tracks": 2,
+      "suppressed": 6,
+      "gaps": 1,
+      "pct": 50,
+      "crowd": 0,
+      "badges": {"likely": 1, "possible": 1},
+      "note": "<b>6</b> matches (5 short, 1 suppressed) hidden",
+      "copy": ["0:00  Anchor — Opening", "3:25  Anchor — Closing", "4:45  ID"],
+      "alternatives": {}
+    }
+  }
+}

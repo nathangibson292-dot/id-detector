@@ -1,0 +1,49 @@
+{
+  "title": "Garage fixture",
+  "duration_ms": 240000,
+  "min_track_ms": 30000,
+  "_why": "The ordinary mix: nothing hidden, one acquisition link, one honest ID gap. Every surface must agree, and the hero must still report the full evidence-backed coverage when there is nothing to subtract.",
+  "tracks": [
+    {"artist": "North", "title": "First Light", "start_ms": 0, "end_ms": 65000, "badge": "likely", "version_status": "verified"},
+    {"artist": "East", "title": "Side Street", "start_ms": 65000, "end_ms": 130000, "badge": "possible", "acquire": "purchase"},
+    {"artist": "South", "title": "Night Bus", "start_ms": 130000, "end_ms": 205000, "badge": "unclear"}
+  ],
+  "gaps": [
+    {"start_ms": 205000, "end_ms": 240000, "reason": "no_evidence"}
+  ],
+  "hidden": [],
+  "expected": {
+    "collapsed": {
+      "tracks": 3,
+      "suppressed": 0,
+      "gaps": 1,
+      "pct": 85,
+      "crowd": 0,
+      "badges": {"likely": 1, "possible": 1, "unclear": 1},
+      "note": "",
+      "copy": [
+        "0:00  North — First Light",
+        "1:05  East — Side Street",
+        "2:10  South — Night Bus",
+        "3:25  ID"
+      ],
+      "alternatives": {}
+    },
+    "flat": {
+      "tracks": 3,
+      "suppressed": 0,
+      "gaps": 1,
+      "pct": 85,
+      "crowd": 0,
+      "badges": {"likely": 1, "possible": 1, "unclear": 1},
+      "note": "",
+      "copy": [
+        "0:00  North — First Light",
+        "1:05  East — Side Street",
+        "2:10  South — Night Bus",
+        "3:25  ID"
+      ],
+      "alternatives": {}
+    }
+  }
+}

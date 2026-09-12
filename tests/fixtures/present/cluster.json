@@ -1,0 +1,53 @@
+{
+  "title": "Cluster fixture",
+  "duration_ms": 300000,
+  "min_track_ms": 30000,
+  "_why": "Suppression must be decided per match BEFORE collapsing: a suppressed near-duplicate must not ride into a shown row as an alternative (Work), and a suppressed match that would win primary selection on badge must not hide its honest group-mates (Night Bus). Rise proves a legitimate near-duplicate cluster still folds.",
+  "tracks": [
+    {"artist": "Pupa Nas-T", "title": "Work", "start_ms": 0, "end_ms": 60000, "badge": "likely"},
+    {"artist": "Pupa Nas-T", "title": "Work (Kevin McKay ViP)", "start_ms": 10000, "end_ms": 55000, "badge": "unclear", "suppressed": "contradicted"},
+    {"artist": "South", "title": "Night Bus", "start_ms": 70000, "end_ms": 140000, "badge": "possible", "suppressed": "buried"},
+    {"artist": "South", "title": "Night Bus (Dub)", "start_ms": 75000, "end_ms": 135000, "badge": "unclear"},
+    {"artist": "Denise", "title": "Rise", "start_ms": 150000, "end_ms": 210000, "badge": "possible"},
+    {"artist": "Denise", "title": "Rise (Club Mix)", "start_ms": 160000, "end_ms": 205000, "badge": "unclear"}
+  ],
+  "gaps": [
+    {"start_ms": 210000, "end_ms": 300000, "reason": "no_evidence"}
+  ],
+  "hidden": ["Pupa Nas-T — Work (Kevin McKay ViP)", "South — Night Bus"],
+  "expected": {
+    "collapsed": {
+      "tracks": 3,
+      "suppressed": 2,
+      "gaps": 1,
+      "pct": 60,
+      "crowd": 0,
+      "badges": {"likely": 1, "possible": 1, "unclear": 1},
+      "note": "<b>2</b> suppressed matches hidden",
+      "copy": [
+        "0:00  Pupa Nas-T — Work",
+        "1:15  South — Night Bus (Dub)",
+        "2:30  Denise — Rise",
+        "3:30  ID"
+      ],
+      "alternatives": {"Denise — Rise": ["Denise — Rise (Club Mix)"]}
+    },
+    "flat": {
+      "tracks": 4,
+      "suppressed": 2,
+      "gaps": 1,
+      "pct": 60,
+      "crowd": 0,
+      "badges": {"likely": 1, "possible": 1, "unclear": 2},
+      "note": "<b>2</b> suppressed matches hidden",
+      "copy": [
+        "0:00  Pupa Nas-T — Work",
+        "1:15  South — Night Bus (Dub)",
+        "2:30  Denise — Rise",
+        "2:40  Denise — Rise (Club Mix)",
+        "3:30  ID"
+      ],
+      "alternatives": {}
+    }
+  }
+}

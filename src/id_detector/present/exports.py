@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal, NotRequired, TypedDict
 
 from id_detector.contracts import (
     AcquireEpisode,
@@ -15,6 +15,7 @@ from id_detector.contracts import (
 )
 from id_detector.fuse.episodes import plausible_crowd_label
 from id_detector.io import atomic_write_bytes, atomic_write_json, write_completion_sidecar
+from id_detector.semantics import interval_length, subtract_intervals
 
 _ROLE_PRECEDENCE = {
     "incoming": 0,
@@ -32,7 +33,73 @@ class ExportResult:
     markdown_path: Path
     entries: tuple[dict[str, Any], ...]
     cue_path: Path | None = None
-    m3u_path: Path | None = None
+
+
+class ProjectionEntry(TypedDict):
+    """One ordered presentation row, with every consumer-facing field made explicit."""
+
+    kind: Literal["track", "id"]
+    identity: str
+    display_label: str
+    tier: str | None
+    start_ms: int
+    end_ms: int
+    hidden_reason: str | None
+    episode_id: str | None
+    candidate_id: str | None
+    acquire: dict[str, Any] | None
+    gap_id: NotRequired[str]
+    artist: NotRequired[str]
+    title: NotRequired[str]
+
+
+@dataclass(frozen=True)
+class CanonicalProjection:
+    """The immutable, ordered result-page projection for one frozen run.
+
+    Every presentation surface — page rows, hero tiles, timeline lanes, Copy, CUE, Markdown, JSON
+    and the library card — reads this one object, so an analysis can only ever have ONE tracklist.
+    ``covered_ms`` is the hero's honest-coverage numerator: the run's evidence-backed (plus
+    calibrated predicted) listening time with the time proved ONLY by hidden rows removed, so the
+    percentage can never describe tracks the tracklist does not list.
+
+    "Immutable" is enforced, not merely promised: ``frozen=True`` protects the tuple, but the rows
+    inside it are plain dicts, and one projection object is handed to the page, the exports and the
+    library card in turn.  A surface that edited a row in place would hand the next surface a
+    different tracklist — the exact defect this class exists to make impossible — so the row
+    accessors hand out copies and the stored rows are never exposed directly.
+    """
+
+    _entries: tuple[ProjectionEntry, ...]
+    covered_ms: int
+
+    @property
+    def entries(self) -> tuple[ProjectionEntry, ...]:
+        """Every ordered row, hidden ones included (the page tucks those behind its reveal)."""
+
+        return tuple(ProjectionEntry(**entry) for entry in self._entries)  # type: ignore[typeddict-item]
+
+    @property
+    def shown_entries(self) -> tuple[ProjectionEntry, ...]:
+        """The one filtered tracklist: what the page lists and every export writes."""
+
+        return tuple(
+            ProjectionEntry(**entry)  # type: ignore[typeddict-item]
+            for entry in self._entries
+            if entry["hidden_reason"] is None
+        )
+
+    @property
+    def suppressed_count(self) -> int:
+        return sum(1 for entry in self._entries if entry["hidden_reason"] is not None)
+
+    @property
+    def gap_count(self) -> int:
+        """ID gaps as the tracklist shows them (gaps are never hidden, but never assume it)."""
+
+        return sum(
+            1 for entry in self._entries if entry["kind"] == "id" and entry["hidden_reason"] is None
+        )
 
 
 def _format_time(milliseconds: int) -> str:
@@ -220,7 +287,12 @@ def _track_entry(
     )
     return {
         "kind": "track",
+        "identity": episode.id,
+        "display_label": f"{artist} — {title}",
+        "tier": episode.badge,
         "start_ms": start_ms,
+        "end_ms": episode.best_end_ms,
+        "hidden_reason": None,
         "episode_id": episode.id,
         "candidate_id": episode.candidate_id,
         "artist": artist,
@@ -285,7 +357,7 @@ def _crowd_alternative_summary(
     }
 
 
-def flatten_tracklist(
+def _derive_projection_entries(
     episodes: EpisodesFile,
     identities: IdentitiesRecord,
     acquire: AcquireFile | None = None,
@@ -293,9 +365,8 @@ def flatten_tracklist(
     collapse: bool = True,
     same_track_bridge_ms: int | None = None,
     min_track_ms: int = 0,
-    include_hidden: bool = False,
-) -> tuple[dict[str, Any], ...]:
-    """Flatten episodes to tracklist rows using primary-role precedence and honest ID gaps.
+) -> tuple[tuple[ProjectionEntry, ...], dict[str, list[tuple[int, int]]]]:
+    """Derive all presentation rows and apply suppression exactly once.
 
     With ``collapse`` (the default), a contiguous run of competing near-duplicate matches of the
     same underlying track becomes ONE row: the closest match is shown and the others ride along as
@@ -303,20 +374,38 @@ def flatten_tracklist(
     (``None`` → the grouping default) with no different confident track between them likewise stack
     into one row.  ``collapse=False`` restores the historical one-row-per-episode view.
 
-    ``min_track_ms`` (default ``0`` = off) drops track rows that played too briefly to be a real
-    track, and any row fusion marked ``suppressed`` — see :func:`hidden_reason` — while leaving
-    every ID gap in place.  ``include_hidden=True`` keeps those rows (the page uses it to tuck
-    them behind a toggle instead of losing them).
+    ``min_track_ms`` (default ``0`` = off) marks track rows that played too briefly to be a real
+    track, as well as any row fusion marked ``suppressed``.  Rows remain in this canonical list;
+    :class:`CanonicalProjection` exposes the one shared shown subset.
+
+    The two suppression sources are applied at the two different moments they belong to.  A
+    fusion-side ``suppressed`` verdict is about ONE match's identity, so it is applied BEFORE
+    collapsing: a suppressed episode never joins a display group, so it can neither ride into a
+    shown row as a silent "could also be" alternative nor win primary selection on badge and drag
+    an honest group into hiding.  It becomes its own hidden row instead.  The on-air floor is a
+    property of the COLLAPSED row (two short appearances of one track legitimately stack past the
+    floor), so it is applied after grouping.
+
+    Returns the ordered rows and, beside them, the proved-evidence spans each row stands on —
+    what the hero's honest-coverage figure has to subtract when a row is hidden.
     """
 
     acquire_by_episode = (
         {item.episode_id: item for item in acquire.episodes} if acquire is not None else {}
     )
+    suppressed_episodes = [
+        episode for episode in episodes.episodes if getattr(episode, "suppressed", None)
+    ]
+    live_episodes = [
+        episode for episode in episodes.episodes if not getattr(episode, "suppressed", None)
+    ]
+    # Overlap notes name other episodes by label and reach the CUE: only live identities may.
     label_by_episode = {
         episode.id: " - ".join(_candidate_label(identities, episode.candidate_id))
-        for episode in episodes.episodes
+        for episode in live_episodes
     }
     entries: list[dict[str, Any]] = []
+    spans: dict[str, list[tuple[int, int]]] = {}
     if collapse:
         from id_detector.present.grouping import (
             DEFAULT_SAME_TRACK_BRIDGE_MS,
@@ -332,18 +421,18 @@ def flatten_tracklist(
                 duration_ms, episode.best_end_ms, *(s[1] for s in episode.evidence_support_ms)
             )
         for track in group_display_tracks(
-            list(episodes.episodes), identities, duration_ms, same_track_bridge_ms=bridge_ms
+            live_episodes, identities, duration_ms, same_track_bridge_ms=bridge_ms
         ):
             entry = _track_entry(track.primary, identities, acquire_by_episode, label_by_episode)
             entry["start_ms"] = track.start_ms
             entry["end_ms"] = track.end_ms
-            entry["on_air_ms"] = _support_ms(
-                [
-                    span
-                    for member in (track.primary, *track.alternatives)
-                    for span in member.evidence_support_ms
-                ]
-            )
+            member_spans = [
+                (int(span[0]), int(span[1]))
+                for member in (track.primary, *track.alternatives)
+                for span in member.evidence_support_ms
+            ]
+            spans[entry["identity"]] = member_spans
+            entry["on_air_ms"] = _support_ms(member_spans)
             # A crowd row keeps the contradicting answers it already carries; the folded-in
             # versions follow them.
             alternatives = list(entry["alternatives"])
@@ -362,22 +451,39 @@ def flatten_tracklist(
             ]
             entries.append(entry)
     else:
-        for episode in episodes.episodes:
-            entries.append(_track_entry(episode, identities, acquire_by_episode, label_by_episode))
+        for episode in live_episodes:
+            entry = _track_entry(episode, identities, acquire_by_episode, label_by_episode)
+            spans[entry["identity"]] = [
+                (int(span[0]), int(span[1])) for span in episode.evidence_support_ms
+            ]
+            entries.append(entry)
+    # Every suppressed match keeps its own row so the page's reveal and the hidden count still see
+    # it — but as a row of its own, never folded into someone else's.
+    for episode in suppressed_episodes:
+        entry = _track_entry(episode, identities, acquire_by_episode, label_by_episode)
+        spans[entry["identity"]] = [
+            (int(span[0]), int(span[1])) for span in episode.evidence_support_ms
+        ]
+        entries.append(entry)
     entries.extend(
         {
             "kind": "id",
+            "identity": gap.id,
+            "display_label": "ID",
+            "tier": None,
             "start_ms": gap.start_ms,
             "end_ms": gap.end_ms,
+            "hidden_reason": None,
+            "episode_id": None,
+            "candidate_id": None,
+            "acquire": None,
             "gap_id": gap.id,
             "label": "ID",
             "reason": gap.reason,
         }
         for gap in episodes.gaps
     )
-    if not include_hidden:
-        entries = [entry for entry in entries if hidden_reason(entry, min_track_ms) is None]
-    return tuple(
+    ordered = tuple(
         sorted(
             entries,
             key=lambda item: (
@@ -387,6 +493,105 @@ def flatten_tracklist(
             ),
         )
     )
+    judged = [dict(entry, hidden_reason=hidden_reason(entry, min_track_ms)) for entry in ordered]
+    # A hidden identity must not survive as a shown row's overlap note either — that note is what
+    # the CUE prints as its ``REM`` lines, and it would be the fourth tracklist all over again.
+    hidden_labels = {
+        str(entry["display_label"]).replace(" — ", " - ")
+        for entry in judged
+        if entry["hidden_reason"] is not None
+    }
+    for entry in judged:
+        if entry["hidden_reason"] is None and entry.get("overlap_labels"):
+            entry["overlap_labels"] = [
+                label for label in entry["overlap_labels"] if label not in hidden_labels
+            ]
+    return tuple(ProjectionEntry(entry) for entry in judged), spans  # type: ignore[typeddict-item]
+
+
+def build_projection(
+    episodes: EpisodesFile,
+    identities: IdentitiesRecord,
+    acquire: AcquireFile | None = None,
+    *,
+    collapse: bool = True,
+    same_track_bridge_ms: int | None = None,
+    min_track_ms: int = 0,
+) -> CanonicalProjection:
+    """Build the single typed projection consumed by the page, exports and library card."""
+
+    entries, spans = _derive_projection_entries(
+        episodes,
+        identities,
+        acquire,
+        collapse=collapse,
+        same_track_bridge_ms=same_track_bridge_ms,
+        min_track_ms=min_track_ms,
+    )
+    return CanonicalProjection(entries, _covered_ms(episodes, entries, spans))
+
+
+def _covered_ms(
+    episodes: EpisodesFile,
+    entries: tuple[ProjectionEntry, ...],
+    spans: dict[str, list[tuple[int, int]]],
+) -> int:
+    """Evidence-backed listening time the SHOWN rows account for.
+
+    The fused partition's evidence-supported (plus calibrated predicted) time is the honest
+    numerator for "of the set identified" — but it covers every fused episode, including the ones
+    this projection hides.  Time proved only by a hidden row is removed, so the hero can never
+    claim more of the set than the tracklist under it lists.  Time a hidden row merely shares with
+    a shown one still counts: the shown row proves it.
+    """
+
+    durations = episodes.durations
+    base = int(durations.evidence_supported_ms) + int(durations.predicted_episode_ms)
+    limit = max(
+        [span[1] for value in spans.values() for span in value]
+        + [int(entry["end_ms"]) for entry in entries]
+        + [base, 0]
+    )
+    hidden = [
+        span
+        for entry in entries
+        if entry["hidden_reason"] is not None
+        for span in spans.get(entry["identity"], ())
+    ]
+    if not hidden:
+        return base
+    shown = [
+        span
+        for entry in entries
+        if entry["hidden_reason"] is None
+        for span in spans.get(entry["identity"], ())
+    ]
+    hidden_only = interval_length(subtract_intervals(hidden, shown, limit), limit)
+    return max(0, base - hidden_only)
+
+
+def flatten_tracklist(
+    episodes: EpisodesFile,
+    identities: IdentitiesRecord,
+    acquire: AcquireFile | None = None,
+    *,
+    collapse: bool = True,
+    same_track_bridge_ms: int | None = None,
+    min_track_ms: int = 0,
+    include_hidden: bool = False,
+) -> tuple[dict[str, Any], ...]:
+    """Compatibility wrapper around :func:`build_projection`."""
+
+    projection = build_projection(
+        episodes,
+        identities,
+        acquire,
+        collapse=collapse,
+        same_track_bridge_ms=same_track_bridge_ms,
+        min_track_ms=min_track_ms,
+    )
+    entries = projection.entries if include_hidden else projection.shown_entries
+    return tuple(dict(entry) for entry in entries)
 
 
 def _acquire_cell(entry: dict[str, Any], key: str) -> str:
@@ -409,13 +614,13 @@ def export_tracklist(
     acquire: AcquireFile | None = None,
     acquire_path: Path | None = None,
     title: str | None = None,
-    media_target: str | None = None,
     collapse: bool = True,
     same_track_bridge_ms: int | None = None,
     min_track_ms: int = 0,
     status: str | None = None,
     reason: str | None = None,
     achieved: str | None = None,
+    projection: CanonicalProjection | None = None,
 ) -> ExportResult:
     """Write the flattened exports.
 
@@ -424,7 +629,7 @@ def export_tracklist(
     them (``acquire``, the benchmark) carries the previous values forward or leaves them null.
     """
 
-    entries = flatten_tracklist(
+    projection = projection or build_projection(
         episodes,
         identities,
         acquire,
@@ -432,6 +637,7 @@ def export_tracklist(
         same_track_bridge_ms=same_track_bridge_ms,
         min_track_ms=min_track_ms,
     )
+    entries = tuple(dict(entry) for entry in projection.shown_entries)
     output_dir = output_dir or media_dir / "present"
     json_path = output_dir / "tracklist.json"
     markdown_path = output_dir / "tracklist.md"
@@ -446,6 +652,7 @@ def export_tracklist(
             "status": status,
             "reason": reason,
             "achieved": achieved,
+            "suppressed_count": projection.suppressed_count,
             "entries": list(entries),
         },
     )
@@ -460,15 +667,13 @@ def export_tracklist(
     lines = [
         "# Tracklist",
         "",
-        "| Time | Badge | Version | Role | Track | Free DL | Gate | Buy | Search |",
-        "|---:|:---:|:---:|:---:|---|:---:|:---:|:---:|:---:|",
+        "| Time | Confidence | Track | Free DL | Gate | Buy | Search |",
+        "|---:|:---:|---|:---:|:---:|:---:|:---:|",
     ]
     for entry in entries:
         if entry["kind"] == "id":
             label = f"ID — no evidence through {_format_time(entry['end_ms'])}"
-            lines.append(
-                f"| {_format_time(entry['start_ms'])} | — | — | gap | {label} | — | — | — | — |"
-            )
+            lines.append(f"| {_format_time(entry['start_ms'])} | — | {label} | — | — | — | — |")
         else:
             badge = str(entry["badge"]).upper()
             if entry.get("hint_only"):
@@ -477,7 +682,6 @@ def export_tracklist(
                 badge += " +HINT"
             if entry.get("engine_corroborated"):
                 badge += " +CONFIRMED TWICE"
-            version_status = str(entry["version_status"]).upper()
             label = f"{entry['artist']} — {entry['title']}"
             if entry.get("also_count"):
                 others = "; ".join(alt["track"] for alt in entry["alternatives"])
@@ -490,8 +694,7 @@ def export_tracklist(
                     )
             search_cell = "yes" if entry.get("acquire") else "—"
             lines.append(
-                f"| {_format_time(entry['start_ms'])} | {badge} | {version_status} | "
-                f"{entry['primary_role']} | {label} | "
+                f"| {_format_time(entry['start_ms'])} | {badge} | {label} | "
                 f"{_acquire_cell(entry, 'free_download')} | {_acquire_cell(entry, 'gate')} | "
                 f"{_acquire_cell(entry, 'buy')} | {search_cell} |"
             )
@@ -502,13 +705,7 @@ def export_tracklist(
     atomic_write_bytes(cue_path, render_cue(entries, title=title).encode("utf-8"))
     write_completion_sidecar(cue_path, upstream)
 
-    m3u_path = output_dir / "tracklist.m3u"
-    atomic_write_bytes(
-        m3u_path, render_m3u(entries, media_target=media_target or "audio").encode("utf-8")
-    )
-    write_completion_sidecar(m3u_path, upstream)
-
-    return ExportResult(json_path, markdown_path, entries, cue_path, m3u_path)
+    return ExportResult(json_path, markdown_path, entries, cue_path)
 
 
 def render_cue(entries: tuple[dict[str, Any], ...], *, title: str | None = None) -> str:

@@ -213,6 +213,15 @@ def _discover_sets(work_root: Path) -> list[AnalysedSet]:
     return [item for _, item in dated]
 
 
+def _fresh_sets(work_root: Path, config: AppConfig) -> list[AnalysedSet]:
+    """Refresh stale result bundles before their canonical summaries reach the library."""
+
+    sets = _discover_sets(work_root)
+    for item in sets:
+        ensure_fresh_page(item.media_dir, config=config)
+    return sets
+
+
 def _human_duration(milliseconds: int) -> str:
     """``1h 57m`` / ``58 min`` — the library's "music listened" figure."""
 
@@ -1335,10 +1344,12 @@ class _Handler(BaseHTTPRequestHandler):
             if self._app_active():
                 assert self.job_manager is not None
                 body = _home_html(
-                    _discover_sets(self.work_root), self.job_manager.recent(), self.csrf_token
+                    _fresh_sets(self.work_root, self.config),
+                    self.job_manager.recent(),
+                    self.csrf_token,
                 )
             else:
-                body = _index_html(_discover_sets(self.work_root))
+                body = _index_html(_fresh_sets(self.work_root, self.config))
             self._send(HTTPStatus.OK, body, _CONTENT_TYPES[".html"])
             return
         if self._app_active() and route == "/new":
