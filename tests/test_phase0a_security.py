@@ -168,7 +168,14 @@ def test_post_analyse_requires_the_token_and_a_loopback_origin(tmp_path: Path) -
         manager.shutdown()
 
 
-def test_rescan_post_is_origin_gated_even_on_the_read_only_server(tmp_path: Path) -> None:
+def test_unknown_post_is_origin_gated_even_on_the_read_only_server(tmp_path: Path) -> None:
+    """The loopback gate runs before routing, so it protects routes that do not even exist.
+
+    ``/rescan`` is the case that matters: §2.5 removed the route, and the removal must not be what
+    is doing the protecting — a foreign ``Origin`` is still refused with 403 *before* dispatch, and
+    only a same-origin request gets as far as the 404 that says the route is gone.
+    """
+
     running = serve_in_background(tmp_path, port=0)
     try:
         foreign = httpx.post(
@@ -178,9 +185,10 @@ def test_rescan_post_is_origin_gated_even_on_the_read_only_server(tmp_path: Path
             timeout=TIMEOUT,
         )
         assert foreign.status_code == 403
-        # Without a foreign Origin the gate passes and the route's own validation answers.
+        assert "cross-site request refused" in foreign.json()["error"]
+        # Without a foreign Origin the gate passes and routing answers: the route is gone (§2.5).
         local = httpx.post(running.base_url + "/rescan", content=b"", timeout=TIMEOUT)
-        assert local.status_code == 400 and local.json()["error"] == "bad length"
+        assert local.status_code == 404
         # The read-only server has no analyse route, token or not.
         token = httpx.get(running.base_url + "/csrf", timeout=TIMEOUT).json()["token"]
         absent = httpx.post(
@@ -246,10 +254,10 @@ def test_every_refused_post_delivers_its_answer_instead_of_resetting_the_connect
                 ).status_code
                 == 403
             )
-            # /rescan over its own length ceiling.
+            # The removed /rescan route, with a body the handler never reads (§2.5).
             assert (
                 httpx.post(read_only.base_url + "/rescan", content=big, timeout=TIMEOUT).status_code
-                == 400
+                == 404
             )
         assert manager.recent() == []
     finally:
@@ -284,8 +292,9 @@ def test_live_home_page_embeds_the_same_token_the_csrf_route_serves(tmp_path: Pa
         token = httpx.get(running.base_url + "/csrf", timeout=TIMEOUT).json()["token"]
         home = httpx.get(running.base_url + "/", timeout=TIMEOUT).text
         assert f'name="csrf_token" value="{token}"' in home
-        new = httpx.get(running.base_url + "/new", timeout=TIMEOUT).text
-        assert f'name="csrf_token" value="{token}"' in new
+        new = httpx.get(running.base_url + "/new", follow_redirects=True, timeout=TIMEOUT)
+        assert new.url.path == "/"
+        assert f'name="csrf_token" value="{token}"' in new.text
     finally:
         running.shutdown()
         manager.shutdown()

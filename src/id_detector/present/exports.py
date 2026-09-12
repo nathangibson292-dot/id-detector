@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal, NotRequired, TypedDict
@@ -765,3 +766,89 @@ def render_m3u(entries: tuple[dict[str, Any], ...], *, media_target: str) -> str
         lines.append(f"#EXTVLCOPT:start-time={_m3u_seconds(int(entry['start_ms']))}")
         lines.append(media_target)
     return "\n".join(lines) + "\n"
+
+
+# --------------------------------------------------------------------------------------------------
+# Reading a published projection back
+# --------------------------------------------------------------------------------------------------
+#: Confidence buckets, strongest first — the one order every surface prints them in.
+BADGE_ORDER: tuple[str, ...] = ("verified", "likely", "possible", "unclear")
+
+
+@dataclass(frozen=True)
+class ProjectedSummary:
+    """The figures of one published run, read back from its ``present/tracklist.json``.
+
+    ``tracklist.json`` *is* the canonical projection's shown entry list (``export_tracklist``
+    writes ``projection.shown_entries`` verbatim), so reading it is reading the projection — not
+    filtering a second time.  Every surface that needs a summary of a finished run (the library
+    card, the library totals, the completion screen) comes through here, so "N tracks" can only
+    ever mean one number.
+
+    ``badges`` counts **audio-supported** rows only: a crowd row (``hint_only``) is somebody's
+    comment, never evidence, so it must not move a confidence bar.  It is reported separately as
+    ``crowd`` so the surface can still say it is there.
+    """
+
+    tracks: int
+    crowd: int
+    duration_ms: int
+    badges: dict[str, int]
+    suppressed_count: int
+    status: str | None
+    reason: str | None
+    achieved: str | None
+
+    @property
+    def audio_tracks(self) -> int:
+        """Rows whose confidence came from the audio — the denominator of ``badges``."""
+
+        return sum(self.badges.values())
+
+    def majority_badge(self) -> tuple[str, int] | None:
+        """The largest audio-confidence bucket **only when it is an actual majority**.
+
+        "Mostly likely" over a 40 % plurality is a claim the numbers do not support (U-F13/F16), so
+        a plurality returns ``None`` and the caller words it as the mix it is.
+        """
+
+        total = self.audio_tracks
+        if not total:
+            return None
+        strongest = max(
+            BADGE_ORDER, key=lambda key: (self.badges.get(key, 0), -BADGE_ORDER.index(key))
+        )
+        count = self.badges.get(strongest, 0)
+        return (strongest, count) if count * 2 > total else None
+
+
+def read_projected_summary(path: Path) -> ProjectedSummary | None:
+    """Read one published ``tracklist.json`` as a :class:`ProjectedSummary` (``None`` if absent)."""
+
+    try:
+        document = json.loads(Path(path).read_text(encoding="utf-8"))
+        entries = [
+            entry
+            for entry in document.get("entries", ())
+            if isinstance(entry, dict) and entry.get("kind") == "track"
+        ]
+    except (OSError, ValueError, TypeError, AttributeError):
+        return None
+    badges: dict[str, int] = {}
+    crowd = 0
+    for entry in entries:
+        if entry.get("hint_only"):
+            crowd += 1
+            continue
+        badge = str(entry.get("badge", "unclear"))
+        badges[badge] = badges.get(badge, 0) + 1
+    return ProjectedSummary(
+        tracks=len(entries),
+        crowd=crowd,
+        duration_ms=int(document.get("duration_ms") or 0),
+        badges=badges,
+        suppressed_count=int(document.get("suppressed_count") or 0),
+        status=document.get("status"),
+        reason=document.get("reason"),
+        achieved=document.get("achieved"),
+    )

@@ -1,5 +1,10 @@
 # Stage 7 — "Web page"
 
+
+> **Superseded by v2 cycle 3a-ii (PLAN-v2 §2.5).** The web rescan control and the `POST /rescan`
+> route are both gone: on real mixes another generation buys zero recall, adds phantom rows and
+> costs hours. `idea rescan` remains as the CLI escape hatch over a queue a human wrote. The
+> progress bar is no longer stage-index arithmetic either — it is wall-clock, computed server-side.
 *docs/PLAN.md rev 5.2. Delivers the Stage 7 build-order row: player; timeline with evidence
 support, PI shading, unresolved zones, gaps; badges + version status + roles + acquire links; seek
 to `best_start_ms − lead_in`; local read-only server; rescan queue; CUE/JSON exports.*

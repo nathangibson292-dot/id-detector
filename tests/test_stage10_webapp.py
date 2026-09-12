@@ -332,12 +332,12 @@ def test_home_renders_library_when_analyse_enabled(tmp_path: Path) -> None:
     assert _wait_until(_no_worker_thread_alive)
 
 
-def test_new_page_renders_form_when_analyse_enabled(tmp_path: Path) -> None:
+def test_new_route_returns_to_the_single_home_form(tmp_path: Path) -> None:
     manager = JobManager(tmp_path, _fast_runner_factory(tmp_path))
     running = serve_in_background(tmp_path, port=0, job_manager=manager)
     try:
-        page = httpx.get(running.base_url + "/new", timeout=TIMEOUT)
-        assert page.status_code == 200
+        page = httpx.get(running.base_url + "/new", follow_redirects=True, timeout=TIMEOUT)
+        assert page.status_code == 200 and page.url.path == "/"
         assert 'action="/analyse"' in page.text
         assert "max_accuracy" in page.text
     finally:

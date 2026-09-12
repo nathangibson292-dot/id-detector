@@ -1,5 +1,10 @@
 # Stage 10 — Browser-driven web app
 
+
+> **Superseded by v2 cycle 3a-ii (PLAN-v2 §2.5).** The web rescan control and the `POST /rescan`
+> route are both gone: on real mixes another generation buys zero recall, adds phantom rows and
+> costs hours. `idea rescan` remains as the CLI escape hatch over a queue a human wrote. The
+> progress bar is no longer stage-index arithmetic either — it is wall-clock, computed server-side.
 *docs/PLAN.md rev 5.2, build-order row 10. Lets the owner (a non-programmer) run the whole pipeline
 from the browser: double-click a launcher, the browser opens, paste a mix URL, click **Analyse**,
 watch live progress, and land on the Stage 7 result page with click-to-seek and acquire links — all

@@ -15,6 +15,7 @@ from __future__ import annotations
 import html
 import json
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, quote, urlsplit
@@ -46,7 +47,7 @@ UNRESOLVED_CAP_MS = 120_000
 #: Bump when the page's look or behaviour changes: ``present.refresh.ensure_fresh_page`` re-renders
 #: any written page whose ``<meta name="id-detector-page">`` stamp is older, so already-analysed
 #: mixes pick up the new page the next time they are opened (no re-analysis).
-PAGE_VERSION = 21
+PAGE_VERSION = 23
 
 
 # --------------------------------------------------------------------------------------------------
@@ -341,9 +342,8 @@ def _acquire_links_html(acquire: dict[str, Any] | None) -> str:
             f'<a class="acq gate" target="_blank" rel="noopener" '
             f'href="{_esc(permalink or purchase)}">SoundCloud · Gate</a>'
         )
-    # A SoundCloud buy link points at the uploader's purchase_url, which is usually off on
-    # Bandcamp/Beatport and looks broken; send to the SoundCloud track page and buy from there.
-    buy_url = (permalink or purchase) if acquire.get("buy") else None
+    # A known product URL is more useful than a store search or the SoundCloud landing page.
+    buy_url = purchase if acquire.get("buy") else None
     buy_label = "SoundCloud · Buy"
     for link in acquire.get("direct") or ():
         if link.get("kind") == "purchase":
@@ -370,7 +370,7 @@ def _acquire_links_html(acquire: dict[str, Any] | None) -> str:
         source = link.get("source", "search")
         chips.append(
             f'<a class="acq search" target="_blank" rel="noopener" href="{_esc(link.get("url"))}">'
-            f"{_esc(source)}</a>"
+            f"Search {_esc(source)}</a>"
         )
     return "".join(chips) if chips else '<span class="acq none">—</span>'
 
@@ -381,8 +381,15 @@ def _alternatives_html(entry: dict[str, Any]) -> str:
     Everything is inline — the list is already in the page, so expanding it makes no request.
     """
 
-    alternatives = entry.get("alternatives") or ()
-    count = entry.get("also_count") or 0
+    from id_detector.present.grouping import work_key
+
+    primary_work = work_key(str(entry.get("artist", "")), str(entry.get("title", "")))
+    alternatives = tuple(
+        alt
+        for alt in (entry.get("alternatives") or ())
+        if work_key(str(alt.get("artist", "")), str(alt.get("title", ""))) != primary_work
+    )
+    count = len(alternatives)
     if not count:
         return ""
     items = "".join(
@@ -395,7 +402,7 @@ def _alternatives_html(entry: dict[str, Any]) -> str:
     summary = (
         f"▸ {count} other answer{plural} in the comments"
         if entry.get("hint_only")
-        else f"▸ {count} other version{plural}"
+        else f"▸ {count} other track{plural}"
     )
     return (
         f'<details class="alts"><summary>{summary}</summary>'
@@ -403,109 +410,96 @@ def _alternatives_html(entry: dict[str, Any]) -> str:
     )
 
 
-def _tags_html(entry: dict[str, Any], hidden: str | None = None) -> str:
-    """Small inline tags after the track name: an interesting role, a decided version, a hint.
+def _tags_html(entry: dict[str, Any]) -> str:
+    """At most one plain-language qualifier beside the row's confidence word."""
 
-    ``incoming``/``dominant`` are the normal case for a DJ mix, so only ``layer``/``outgoing``/
-    ``uncertain`` earn a tag; likewise ``unverified`` is the default and stays silent.
-    """
-
-    tags: list[str] = []
-    role = str(entry["primary_role"])
-    if role in {"layer", "outgoing", "uncertain"}:
-        tags.append(f'<span class="tag role-{_esc(role)}">{_esc(role)}</span>')
     version = str(entry["version_status"])
-    if version in {"verified", "contested"}:
-        tags.append(f'<span class="tag ver-{_esc(version)}">{_esc(version)}</span>')
     if entry.get("hint_only"):
-        tags.append(
-            '<span class="hint crowd" title="named in the comments — no engine matched the '
-            'audio here">from comments</span>'
-        )
-    elif entry["hint_supported"]:
-        tags.append('<span class="hint" title="supported by a text hint">hint</span>')
+        return ""
     if entry.get("engine_corroborated"):
-        tags.append(
-            '<span class="hint engine" title="a recogniser from a second, independent family '
-            "(catalogue, Shazam or the local index) matched this track at the same "
-            'moment">confirmed twice</span>'
+        # U-F31: the tooltip explains the *claim*, not which services made it.  Naming an engine
+        # tells a user nothing they can act on and leaks how the product is put together.
+        tag = (
+            '<span class="hint engine" title="two independent checks agreed on this track at the '
+            'same moment">confirmed twice</span>'
         )
-    if hidden == "short":
-        seconds = round(int(entry.get("on_air_ms") or 0) / 1000)
-        tags.append(f'<span class="tag short-tag">short · {seconds}s</span>')
-    elif hidden:
-        label = _HIDDEN_LABELS.get(hidden, hidden)
-        tags.append(f'<span class="tag short-tag">{_esc(label)}</span>')
-    return f'<span class="tags">{"".join(tags)}</span>' if tags else ""
+    elif version in {"verified", "contested"}:
+        tag = f'<span class="tag ver-{_esc(version)}">{_esc(version)}</span>'
+    else:
+        tag = ""
+    return f'<span class="tags">{tag}</span>' if tag else ""
 
 
 def _track_row_html(
-    entry: dict[str, Any], platform: str, index: int = 0, *, hidden: str | None = None
+    entry: dict[str, Any],
+    platform: str | None = None,
+    index: int = 0,
+    *,
+    hidden: str | None = None,
+    show_acquire: bool = True,
 ) -> str:
-    badge = _esc(entry["badge"])
-    version_status = _esc(entry["version_status"])
-    role = _esc(entry["primary_role"])
+    badge = "comments" if entry.get("hint_only") else _esc(entry["badge"])
+    badge_label = "from comments" if entry.get("hint_only") else badge
     label = f"{_esc(entry['artist'])} — {_esc(entry['title'])}"
     acquire = _acquire_links_html(entry.get("acquire"))
     best_start = int(entry["start_ms"])
     alternatives = _alternatives_html(entry)
-    # ``short`` is the CSS hook for every hidden-by-default row, whatever the reason.
     row_class = "track short" if hidden else "track"
     crowd_attr = ""
     if entry.get("hint_only"):
         row_class += " crowd"
         crowd_attr = 'data-crowd="1" '
-    # ``--i`` staggers the row entrance animation; the hidden ``ver``/``role`` cells keep the
-    # export-identical columns available to CSS/tests while the visible row stays uncluttered.
+    acquire_cell = (
+        f'<td class="acquire" data-label="Where to get it">{acquire}</td>' if show_acquire else ""
+    )
     return (
         f'<tr class="{row_class}" data-episode-id="{_esc(entry["episode_id"])}" '
         f'{crowd_attr}style="--i:{index}" '
         f'id="{_esc(entry["episode_id"])}" '
-        f'data-best-start-ms="{best_start}" tabindex="0" role="button" '
-        f'aria-label="Seek to {_esc(_format_time(best_start))} — {label}">'
-        f'<td class="time"><span class="eqi"><i></i><i></i><i></i></span>'
-        f"{_esc(_format_time(best_start))}</td>"
-        f'<td class="badge badge-{badge}"><span class="pill">{badge}</span></td>'
-        f'<td class="ver ver-{version_status}">{version_status}</td>'
-        f'<td class="role">{role}</td>'
-        f'<td class="label"><span class="ar">{_esc(entry["artist"])}</span>'
+        f'data-best-start-ms="{best_start}">'
+        f'<td class="time" data-label="Time"><button type="button" class="seek" '
+        f'aria-label="Play from {_esc(_format_time(best_start))} — {label}">'
+        '<span class="eqi" aria-hidden="true"><i></i><i></i><i></i></span>'
+        f"{_esc(_format_time(best_start))}</button></td>"
+        f'<td class="badge badge-{badge}" data-label="Confidence"><span class="pill">'
+        f"{badge_label}</span></td>"
+        f'<td class="label" data-label="Track"><span class="ar">{_esc(entry["artist"])}</span>'
         f'<span class="sep">—</span><span class="tt">{_esc(entry["title"])}</span>'
-        f"{_tags_html(entry, hidden)}{alternatives}</td>"
-        f'<td class="acquire">{acquire}</td>'
-        f'<td class="ops">{row_actions_html(entry) if not hidden else ""}'
-        f'<button type="button" class="rescan" '
-        f'title="Ask for a rescan around here" data-trigger="edge" '
-        f'data-start-ms="{best_start}" '
-        f'data-end-ms="{int(entry.get("end_ms") or best_start)}">rescan</button></td>'
+        f"{_tags_html(entry)}{alternatives}</td>"
+        f"{acquire_cell}"
+        f'<td class="ops" data-label="Save">{row_actions_html(entry) if not hidden else ""}</td>'
         "</tr>"
     )
 
 
-def _gap_row_html(entry: dict[str, Any]) -> str:
+def _gap_row_html(entry: dict[str, Any], *, show_acquire: bool = True) -> str:
     start = int(entry["start_ms"])
     end = int(entry["end_ms"])
     span = f"{_format_time(start)}–{_format_time(end)}"
     return (
         f'<tr class="gap" data-gap-id="{_esc(entry["gap_id"])}">'
-        f'<td class="time">{_esc(_format_time(start))}</td>'
-        f'<td class="badge badge-gap"><span class="pill">ID</span></td>'
-        f'<td class="ver">—</td><td class="role">gap</td>'
-        f'<td class="label"><span class="tt">ID</span><span class="sep">—</span>'
-        f'no evidence for {_esc(span)} <span class="tags"><span class="tag">'
-        f"{_esc(entry['reason'])}</span></span></td>"
-        f'<td class="acquire"><span class="acq none">—</span></td>'
-        f'<td class="ops"><button type="button" class="rescan" data-trigger="gap" '
-        f'data-start-ms="{start}" data-end-ms="{end}">rescan</button></td>'
+        f'<td class="time" data-label="Time">{_esc(_format_time(start))}</td>'
+        f'<td class="badge badge-gap" data-label="Confidence"><span class="pill">ID</span></td>'
+        f'<td class="label" data-label="Track"><span class="tt">Couldn\'t identify</span> '
+        f"{_esc(span)}</td>"
+        + (
+            '<td class="acquire" data-label="Where to get it"><span class="acq none">—</span></td>'
+            if show_acquire
+            else ""
+        )
+        + '<td class="ops" data-label="Save"></td>'
         "</tr>"
     )
 
 
 def _timeline_html(lanes: list[dict[str, Any]], gaps: list[dict[str, Any]]) -> str:
-    parts: list[str] = ['<div class="timeline" role="img" aria-label="Evidence timeline">']
+    parts: list[str] = ['<div class="timeline" aria-hidden="true">']
     for gap in gaps:
+        # U-F31: "windows", "no-match" and "error" are engine bookkeeping.  What a listener needs
+        # from a striped span is which part of the set it covers.
         title = (
-            f"gap {_format_time(gap['start_ms'])}–{_format_time(gap['end_ms'])}: "
-            f"{gap['n_windows']} windows, {gap['n_no_match']} no-match, {gap['n_error']} error"
+            "nothing identified here — "
+            f"{_format_time(gap['start_ms'])} to {_format_time(gap['end_ms'])}"
         )
         parts.append(
             f'<div class="tl-gap" style="left:{gap["left"]:.3f}%;width:{gap["width"]:.3f}%" '
@@ -540,7 +534,7 @@ def _timeline_html(lanes: list[dict[str, Any]], gaps: list[dict[str, Any]]) -> s
             )
         for solid in lane["solids"]:
             parts.append(
-                f'<div class="tl-solid" '
+                f'<div class="tl-solid" data-label="{_esc(lane["label"])}" '
                 f'style="left:{solid["left"]:.3f}%;width:{solid["width"]:.3f}%"></div>'
             )
         parts.append("</div>")
@@ -576,16 +570,71 @@ def _ruler_html(duration_ms: int) -> str:
 
 _BADGE_ORDER = ("verified", "likely", "possible", "unclear")
 
-#: Friendly labels for fusion's ``suppressed`` reason tokens (an unknown token is shown as-is).
-_HIDDEN_LABELS = {
-    "buried": "buried under a surer track",
-    "contradicted": "contradicted by comments",
-    "scatter": "scattered detections",
+
+def _human_duration(milliseconds: int) -> str:
+    minutes = max(0, int(milliseconds)) // 60_000
+    hours, minutes = divmod(minutes, 60)
+    return f"{hours} h {minutes:02d} m" if hours else f"{minutes} min"
+
+
+#: What each frozen §2.3.5 `degraded`/`partial` outcome really means, in plain words.  Keyed by
+#: ``status:reason`` first, then by ``status`` alone.  A run is `degraded` for several unrelated
+#: reasons — the commonest by far being "Deep ran fine, the free cross-check just did not cover
+#: enough of the set" (``reason=secondary_not_achieved``, ``achieved=deep``) — so a single sentence
+#: claiming Deep was unavailable and Free was used instead is wrong on most degraded runs.
+_STATUS_COPY: dict[str, str] = {
+    "degraded:secondary_not_achieved": (
+        "The Deep scan ran, but the free second opinion only reached part of the set, so fewer "
+        "tracks are double-checked than usual."
+    ),
+    "degraded:shazam_manual_off": (
+        "The Deep scan ran, but the free second opinion was switched off, so no track here is "
+        "double-checked."
+    ),
+    "degraded:provider_unavailable": (
+        "The paid engine was unavailable, so this set was scanned with the free engine instead."
+    ),
+    "degraded": (
+        "The Deep scan ran, but the free second opinion was paused, so fewer tracks are "
+        "double-checked than usual."
+    ),
+    "partial:primary_not_achieved": (
+        "The scan could not cover all of the set, so some music here was never checked."
+    ),
+    "partial:provider_unavailable_midrun": (
+        "A recognition service stopped part-way through, so the later part of the set was never "
+        "checked."
+    ),
+    "partial:reservation_exhausted": (
+        "The paid-scan limit was reached part-way through, so the rest of the set was never "
+        "checked."
+    ),
+    "partial": "Some of the set was never checked, so tracks may be missing from this tracklist.",
 }
 
 
+def _status_banner_html(status: str | None, reason: str | None, achieved: str | None) -> str:
+    """The run-status banner, rendered from the run's own frozen status, reason and recipe.
+
+    Shown for `degraded` and `partial` (plan §2.3.5: those are shown with a banner); `complete`
+    needs none.  The heading names what the user got — a Deep scan that lost its cross-check is
+    still a Deep scan — instead of asserting a fallback that mostly did not happen.
+    """
+
+    if status not in {"degraded", "partial"}:
+        return ""
+    copy = _STATUS_COPY.get(f"{status}:{reason}") or _STATUS_COPY[status]
+    if status == "degraded" and achieved == "free":
+        heading = "Free scan result."
+    elif achieved == "deep":
+        heading = "Deep scan, with gaps." if status == "partial" else "Deep scan, less confirmed."
+    else:
+        heading = "Partial result." if status == "partial" else "Degraded result."
+    return f'<div class="run-banner" role="status"><b>{_esc(heading)}</b> {_esc(copy)}</div>'
+
+
 def _stats_html(projection: CanonicalProjection, duration_ms: int) -> str:
-    """The hero stat tiles: tracks found, share of the set identified, confidence mix, ID gaps.
+    """The three useful hero tiles: tracks, duration and identified share.
 
     "Identified" is honest coverage — listening time backed by proved evidence (plus any
     calibrated predicted episode time) over the set's length — not a guess at how many tracks
@@ -595,30 +644,17 @@ def _stats_html(projection: CanonicalProjection, duration_ms: int) -> str:
 
     entries = projection.shown_entries
     tracks = [entry for entry in entries if entry["kind"] == "track"]
-    counts = dict.fromkeys(_BADGE_ORDER, 0)
-    for entry in tracks:
-        key = str(entry["badge"])
-        counts[key] = counts.get(key, 0) + 1
     n = len(tracks)
     crowd = sum(1 for entry in tracks if entry.get("hint_only"))
     crowd_note = f" · {crowd} from comments" if crowd else ""
     covered = projection.covered_ms
     pct = int(round(max(0.0, min(100.0, covered * 100.0 / duration_ms)))) if duration_ms else 0
-    bars = "".join(
-        f'<i class="c-{key}" style="width:{counts[key] * 100.0 / n:.2f}%"></i>'
-        for key in _BADGE_ORDER
-        if n and counts[key]
-    )
-    key_html = "".join(
-        f'<span style="--k:var(--{key})">{counts[key]} {key}</span>'
-        for key in _BADGE_ORDER
-        if counts[key]
-    )
-    gaps = projection.gap_count
     return (
         '<div class="stats">'
         f'<div class="stat"><div><span class="big">{n}</span>'
         f"<small>track{'s' if n != 1 else ''} found{crowd_note}</small></div></div>"
+        f'<div class="stat"><div><span class="big">{_esc(_human_duration(duration_ms))}</span>'
+        "<small>set length</small></div></div>"
         f'<div class="stat"><div class="ring" style="--p:{pct}">'
         '<svg viewBox="0 0 36 36" aria-hidden="true"><defs><linearGradient id="ringgrad" '
         'x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#ff3d8a"></stop>'
@@ -626,13 +662,29 @@ def _stats_html(projection: CanonicalProjection, duration_ms: int) -> str:
         "</stop></linearGradient></defs>"
         '<circle class="bg" cx="18" cy="18" r="15.5" pathLength="100"></circle>'
         '<circle class="fg" cx="18" cy="18" r="15.5" pathLength="100"></circle></svg>'
-        f"<b>{pct}%</b></div><div><b>of the set identified</b>"
-        "<small>listening time backed by evidence</small></div></div>"
-        f'<div class="stat"><div class="conf"><div class="conf-bar">{bars}</div>'
-        f'<div class="conf-key">{key_html}</div></div></div>'
-        f'<div class="stat"><div><span class="big">{gaps}</span>'
-        f"<small>ID gap{'s' if gaps != 1 else ''}</small></div></div>"
+        f"<b>{pct}%</b></div><div><b>of the set identified</b></div></div>"
         "</div>"
+    )
+
+
+def _confidence_html(projection: CanonicalProjection) -> str:
+    tracks = [entry for entry in projection.shown_entries if entry["kind"] == "track"]
+    counts = dict.fromkeys(_BADGE_ORDER, 0)
+    for entry in tracks:
+        if not entry.get("hint_only"):
+            key = str(entry["badge"])
+            counts[key] = counts.get(key, 0) + 1
+    total = sum(counts.values())
+    bars = "".join(
+        f'<i class="c-{key}" style="width:{counts[key] * 100.0 / total:.2f}%"></i>'
+        for key in _BADGE_ORDER
+        if total and counts[key]
+    )
+    summary = ", ".join(f"{counts[key]} {key}" for key in _BADGE_ORDER if counts[key])
+    return (
+        '<div class="confidence-summary"><b>Confidence mix</b>'
+        f'<div class="conf-bar" role="img" aria-label="{_esc(summary or "No matched tracks")}">'
+        f"{bars}</div><span>{_esc(summary or 'No matched tracks')}</span></div>"
     )
 
 
@@ -684,13 +736,22 @@ def _embed_html(embed: EmbedPlan, audio_src: str | None = None) -> str:
 
 # The page-specific styles; the shared tokens, top bar, buttons and chips come from ``theme``.
 _CSS = """
-:root{--pi:#a78bfa;--unresolved:#fbbf24;--extent:#7d7d99}
+:root{--dim:#9a9ab0;--unclear:#a3a3bd;--pi:#a78bfa;--unresolved:#fbbf24;
+--extent:#9a9ab0;--on-accent:#0a0a0f}
+@media (prefers-color-scheme:light){:root{color-scheme:light;--bg:#f7f7fb;--card:#fff;
+--card2:#f0f0f7;--fg:#17171f;--muted:#505064;--dim:#5e5e72;--line:#0000001f;
+--line2:#00000038;--pink:#be185d;--violet:#6d28d9;--cyan:#0e7490;--accent:#6d28d9;
+--verified:#047857;--likely:#0369a1;--possible:#92400e;--unclear:#52525b;--gap:#be123c;
+--ok:#047857;--bad:#be123c;--warn:#92400e;--on-accent:#fff}}
+.btn.primary{color:var(--on-accent)}
 /* hero */
 .hero{padding:26px 0 18px}
 .meta{display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-bottom:12px}
 h1{font:800 clamp(28px,4.2vw,44px)/1.08 var(--display);letter-spacing:-.03em;margin:0 0 20px;
 max-width:24ch}
 .stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:12px}
+.run-banner{border:1px solid var(--possible);border-radius:12px;padding:11px 14px;margin:0 0 14px;
+color:var(--fg);background:color-mix(in srgb,var(--possible) 10%,var(--card))}
 .stat{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:14px 16px;
 display:flex;align-items:center;gap:14px;min-height:84px;position:relative;overflow:hidden}
 .stat::after{content:"";position:absolute;inset:0;pointer-events:none;
@@ -715,6 +776,9 @@ font-variant-numeric:tabular-nums}
 font-variant-numeric:tabular-nums}
 .conf-key span::before{content:"";display:inline-block;width:7px;height:7px;border-radius:50%;
 margin-right:5px;background:var(--k)}
+.confidence-summary{display:grid;grid-template-columns:auto minmax(100px,220px) auto;gap:10px;
+align-items:center;color:var(--muted);font-size:12px;margin:10px 0 14px}
+.confidence-summary b{color:var(--fg)}
 /* player + exports */
 .player{background:var(--card);border:1px solid var(--line);border-radius:16px;padding:14px;
 margin:18px 0 14px;box-shadow:0 20px 50px -30px rgba(0,0,0,.9)}
@@ -742,7 +806,9 @@ padding:14px 16px 10px;margin:14px 0}
 .tl-head{display:flex;align-items:center;gap:14px;margin-bottom:10px;flex-wrap:wrap}
 .tl-head h2{font:700 12px/1 var(--display);letter-spacing:.14em;text-transform:uppercase;
 color:var(--muted);margin:0;flex:1}
-.controls{display:flex;gap:8px;align-items:center;font-size:12px;color:var(--muted)}
+.controls{font-size:12px;color:var(--muted)}
+.controls summary{cursor:pointer;padding:8px;border-radius:8px}.controls div{display:flex;gap:8px;
+align-items:center;margin-top:8px}
 .controls input{width:64px;padding:5px 8px;border:1px solid var(--line2);border-radius:8px;
 background:#ffffff08;color:var(--fg);font:inherit;font-variant-numeric:tabular-nums;
 text-align:center}
@@ -761,7 +827,7 @@ background-image:repeating-linear-gradient(90deg,transparent 0 calc(10% - 1px),
 .tl-extent{position:absolute;top:22px;height:30px;background:var(--lc);opacity:.22;
 border-radius:5px;transition:opacity .15s}
 .tl-solid{position:absolute;top:24px;height:26px;background:var(--lc);border-radius:4px;
-box-shadow:0 0 12px -3px var(--lc);transition:filter .15s}
+box-shadow:0 0 12px -3px var(--lc);transition:filter .15s;pointer-events:auto}
 .tl-pi{position:absolute;top:22px;height:30px;background:var(--pi);opacity:.4;border-radius:5px}
 .tl-unresolved{position:absolute;top:22px;height:30px;border-radius:5px;opacity:.75;
 background:repeating-linear-gradient(45deg,var(--unresolved),var(--unresolved) 3px,
@@ -776,7 +842,7 @@ rgba(251,113,133,.06) 6px 12px)}
 pointer-events:none;box-shadow:0 0 10px var(--pink),0 0 2px #fff}
 .playhead[hidden]{display:none}
 .playhead-time{position:absolute;top:4px;left:5px;font:700 10px/1.4 var(--mono);
-font-variant-numeric:tabular-nums;background:var(--pink);color:#fff;border-radius:4px;
+font-variant-numeric:tabular-nums;background:var(--pink);color:var(--on-accent);border-radius:4px;
 padding:1px 5px;white-space:nowrap;box-shadow:0 2px 8px rgba(0,0,0,.4)}
 .ruler{position:relative;height:18px;margin:4px 2px 0;font:10px/1 var(--mono);color:var(--dim);
 font-variant-numeric:tabular-nums}
@@ -795,22 +861,26 @@ var(--unclear))}
 var(--unresolved) 2px,transparent 2px,transparent 5px)}
 .lg-gap::before{background:repeating-linear-gradient(135deg,rgba(251,113,133,.6) 0 3px,
 transparent 3px 6px)}
+.timeline-label{min-height:18px;color:var(--muted);font-size:12px;margin-top:6px}
 /* tracklist */
 .list-head{display:flex;align-items:baseline;gap:14px;margin:26px 0 10px;flex-wrap:wrap}
 .list-head h2{font:800 22px/1 var(--display);letter-spacing:-.02em;margin:0}
 .list-head .hint-k{color:var(--dim);font-size:12px;margin-left:auto}
+.glossary{color:var(--muted);font-size:12px;margin:0}.glossary b{color:var(--fg)}
 .tablewrap{overflow-x:auto;border-radius:16px}
 table{width:100%;border-collapse:separate;border-spacing:0;background:var(--card);
 border:1px solid var(--line);border-radius:16px;overflow:hidden}
+caption{text-align:left;padding:0 0 8px;color:var(--muted);font-size:12px}
 th{font:700 10px/1 var(--display);letter-spacing:.14em;text-transform:uppercase;color:var(--dim);
 white-space:nowrap;padding:12px 12px 10px;text-align:left;border-bottom:1px solid var(--line);
 background:#ffffff04}
 td{padding:11px 12px;border-bottom:1px solid var(--line);vertical-align:middle}
 tbody tr:last-child td{border-bottom:none}
-tr.track{cursor:pointer;transition:background .12s;animation:rise .45s ease both;
+tr.track{transition:background .12s;animation:rise .45s ease both;
 animation-delay:calc(min(var(--i,0),40)*14ms)}
-tr.track:hover td,tr.track:focus td{background:#ffffff07}tr.track:focus{outline:none}
-tr.track:focus-visible td:first-child{box-shadow:inset 3px 0 0 var(--accent)}
+tr.track:hover td,tr.track:focus-within td{background:#ffffff07}
+button:focus-visible,a:focus-visible,summary:focus-visible,input:focus-visible,textarea:focus-visible{
+outline:3px solid var(--accent);outline-offset:3px}
 tr.track.current td{background:linear-gradient(90deg,rgba(255,61,138,.16),
 rgba(255,61,138,.03) 55%,transparent)}
 tr.track.current td:first-child{box-shadow:inset 3px 0 0 var(--pink)}
@@ -830,17 +900,15 @@ background:color-mix(in srgb,var(--bc) 16%,transparent);
 border:1px solid color-mix(in srgb,var(--bc) 35%,transparent)}
 .badge-verified{--bc:var(--verified)}.badge-likely{--bc:var(--likely)}
 .badge-possible{--bc:var(--possible)}.badge-unclear{--bc:var(--unclear)}.badge-gap{--bc:var(--gap)}
-.ver,.role{display:none}
 .label{min-width:0}
 .ar{color:var(--muted)}.sep{color:var(--dim);margin:0 6px}.tt{font-weight:600;color:var(--fg)}
 .tags{display:inline-flex;gap:6px;margin-left:10px;vertical-align:1px;flex-wrap:wrap}
 .tag{font:600 10px/1 var(--text);color:var(--dim);border:1px solid var(--line);border-radius:5px;
 padding:3px 6px;letter-spacing:.02em;text-transform:lowercase}
-.tag.role-outgoing{color:var(--violet);border-color:rgba(139,92,246,.4)}
-.tag.role-layer{color:var(--possible);border-color:rgba(251,191,36,.4)}
 .tag.ver-verified{color:var(--verified);border-color:rgba(52,211,153,.4)}
 .tag.ver-contested{color:var(--gap);border-color:rgba(251,113,133,.4)}
-.hint{font:700 10px/1 var(--display);background:var(--grad);color:#fff;border-radius:5px;
+.hint{font:700 10px/1 var(--display);background:var(--grad);color:var(--on-accent);
+border-radius:5px;
 padding:3px 6px;letter-spacing:.06em;text-transform:uppercase}
 .alts{margin-top:5px;font-size:12px}
 .alts>summary{cursor:pointer;color:var(--muted);list-style:none;display:inline-flex;
@@ -860,26 +928,13 @@ background:#ffffff06}
 .acq.free{border-color:rgba(52,211,153,.5);color:var(--verified)}
 .acq.buy,.acq.gate{border-color:rgba(251,191,36,.5);color:var(--possible)}
 .acq.none{border:none;color:var(--dim);background:none;padding-left:0}
+.seek{border:0;background:transparent;color:inherit;padding:8px;margin:-8px;cursor:pointer;
+border-radius:7px;font:inherit}
 .ops{width:1%;white-space:nowrap;text-align:right}
-.rescan{font:600 11px/1 var(--text);background:transparent;border:1px solid transparent;
-border-radius:7px;padding:6px 8px;color:var(--dim);cursor:pointer;opacity:0;
-transition:opacity .12s,color .12s}
-tr:hover .rescan,tr:focus-within .rescan{opacity:1}
-.rescan:hover{color:var(--fg);border-color:var(--line2);background:#ffffff08}
 tr.gap td{background:repeating-linear-gradient(135deg,rgba(251,113,133,.05) 0 8px,
 transparent 8px 16px)}
 tr.gap .label{color:var(--muted)}
 tr.gap .tt{color:var(--gap)}
-/* short matches (under the configured on-air floor): hidden until asked for */
-tr.track.short{display:none}body.show-short tr.track.short{display:table-row}
-body.show-short tr.track.short td{opacity:.72}
-.tl-lane[data-short="1"]{display:none}body.show-short .tl-lane[data-short="1"]{display:block}
-.tag.short-tag{color:var(--gap);border-color:rgba(251,113,133,.35)}
-.short-note{color:var(--muted);font-size:12px;display:inline-flex;gap:5px;align-items:center}
-.short-note b{color:var(--fg)}
-.linkish{background:none;border:0;padding:0;color:var(--accent);cursor:pointer;font:inherit;
-font-size:12px}
-.linkish:hover{text-decoration:underline}
 /* crowd IDs (named in the comments, no audio match): dashed, never drawn as proved evidence */
 .hint.crowd{background:none;border:1px dashed var(--accent);color:var(--accent)}
 .hint.engine{background:none;border:1px solid var(--verified);color:var(--verified)}
@@ -897,15 +952,35 @@ font-size:13px;cursor:pointer}
 border:1px solid rgba(255,61,138,.5);border-radius:6px;background:rgba(255,61,138,.08)}
 .now-t{font-family:var(--mono);font-variant-numeric:tabular-nums;color:var(--muted)}
 .now-l{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-weight:600}
-@media (max-width:720px){.now{display:none}.hint-k{display:none}
-th:nth-child(6),td.acquire{display:none}.stat .big{font-size:28px}.hero{padding-top:14px}
-.exports .lbl{display:none}.tl-wrap{padding:12px}}
+@media (max-width:720px){.hint-k{display:none}.stat .big{font-size:28px}.hero{padding-top:14px}
+/* One tile per row on a phone, stated rather than left to auto-fit arithmetic: a 200px minimum in
+   a ~360px content box already gives one column, but saying so means no rounding, zoom level or
+   font-size setting can ever produce a second column that runs off the screen. */
+.stats{grid-template-columns:1fr}
+.exports .lbl{display:none}.tl-wrap{padding:12px}.ruler span:nth-child(even){display:none}
+.tablewrap{overflow:visible}table{display:block;background:transparent;border:0}thead{position:absolute;
+width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;clip:rect(0,0,0,0);white-space:nowrap;
+border:0}tbody{display:grid;gap:10px}tr.track,tr.gap{display:grid;
+grid-template-columns:auto 1fr auto;
+gap:8px 12px;background:var(--card);border:1px solid var(--line);border-radius:14px;padding:12px}
+td{display:block;padding:0;border:0}.time{grid-column:1}.badge{grid-column:2}.ops{grid-column:3;
+grid-row:1}.label{grid-column:1/-1;grid-row:2}.acquire{grid-column:1/-1;grid-row:3;
+white-space:normal}
+/* Every control a thumb has to hit is at least 44x44 CSS px (WCAG 2.5.5 / U-F19-F20): the row's
+   seek button, each acquisition chip, the playlist buttons the playlists feature injects, every
+   export control, and each disclosure summary. ``inline-flex`` is what makes min-height apply to
+   the inline elements (links, summaries) at all. */
+.acq,.seek,.ops button,.ops a,.xbtn,.alts>summary,.controls>summary,.now,#leadin{
+min-height:44px;min-width:44px;display:inline-flex;align-items:center;justify-content:center}
+.alts>summary,.controls>summary{justify-content:flex-start}
+.exports{gap:10px;flex-wrap:wrap}.xbtn{padding:0 14px}
+.now{font-size:12px}.now-l{max-width:24vw}.confidence-summary{grid-template-columns:1fr}
+.confidence-summary span{display:block}}
 """
 
 
-# The page's own JavaScript.  Everything the tests pin (player bindings, playhead, current-row
-# highlight, timeline click-to-seek, the ``closest('a,button,details,summary')`` guard) is here
-# verbatim; on top of it: the NOW pill, copy-tracklist, arrow-key row navigation, row↔lane hover.
+# The page's own JavaScript: player bindings, playhead/current-row highlight, timeline and real seek
+# buttons; on top of those sit the NOW pill, copy-tracklist and row↔lane hover.
 _PAGE_JS = """
 let CURRENT_POSITION_MS = null, PLAYER_DURATION_MS = 0;
 // A row the user just clicked stays highlighted through its lead-in (the player is still in the
@@ -1084,7 +1159,7 @@ ready(function(){
   window.addEventListener('resize', function(){
     if(CURRENT_POSITION_MS !== null) updatePlayhead(CURRENT_POSITION_MS); });
   const rows = Array.prototype.slice.call(document.querySelectorAll('tr.track'));
-  rows.forEach(function(row, index){
+  rows.forEach(function(row){
     const id = row.getAttribute('data-episode-id');
     const ar = row.querySelector('.ar'), tt = row.querySelector('.tt');
     ROW_LABELS[id] = (ar ? ar.textContent + ' — ' : '') + (tt ? tt.textContent : '');
@@ -1095,49 +1170,29 @@ ready(function(){
       highlightCurrent(seekTargetMs(ms, LEAD_IN_MS));
       if(!seekToMs(ms)){ toast('Player not ready — open the set link'); }
     }
-    row.addEventListener('click', function(e){
-      if(e.target.closest('a,button,details,summary')) return; go(); });
-    row.addEventListener('keydown', function(e){
-      if(e.key==='Enter' || e.key===' '){ e.preventDefault(); go(); }
-      else if(e.key==='ArrowDown' && rows[index+1]){ e.preventDefault(); rows[index+1].focus(); }
-      else if(e.key==='ArrowUp' && rows[index-1]){ e.preventDefault(); rows[index-1].focus(); }
-    });
+    const seek = row.querySelector('button.seek');
+    if(seek) seek.addEventListener('click', go);
     const lane = document.querySelector('.tl-lane[data-episode-id="'+id+'"]');
     if(lane){
       row.addEventListener('mouseenter', function(){ lane.classList.add('hover'); });
       row.addEventListener('mouseleave', function(){ lane.classList.remove('hover'); });
     }
   });
-  document.querySelectorAll('button.rescan').forEach(function(btn){
-    btn.addEventListener('click', function(e){
-      e.stopPropagation();
-      requestRescan(btn.getAttribute('data-trigger'),
-        parseInt(btn.getAttribute('data-start-ms'),10)||0,
-        parseInt(btn.getAttribute('data-end-ms'),10)||0);
-    });
+  const timelineLabel = document.getElementById('timeline-label');
+  document.querySelectorAll('.tl-solid[data-label]').forEach(function(mark){
+    mark.addEventListener('mouseenter', function(){
+      if(timelineLabel) timelineLabel.textContent = mark.getAttribute('data-label'); });
+    mark.addEventListener('mouseleave', function(){
+      if(timelineLabel) timelineLabel.textContent = 'Move over a marker to see its track.'; });
   });
   const copy = document.getElementById('copy');
   if(copy) copy.addEventListener('click', copyTracklist);
-  const showShort = document.getElementById('show-short');
-  if(showShort) showShort.addEventListener('click', function(){
-    const on = document.body.classList.toggle('show-short');
-    showShort.textContent = on ? 'hide' : 'show';
-    if(CURRENT_POSITION_MS !== null) updatePlayhead(CURRENT_POSITION_MS);
-  });
   const now = document.getElementById('now');
   if(now) now.addEventListener('click', function(){
     const row = document.querySelector('tr.track.current');
     if(row){ row.scrollIntoView({block:'center', behavior:'smooth'}); }
   });
 });
-function requestRescan(trigger, startMs, endMs){
-  fetch('/rescan', {method:'POST', headers:{'Content-Type':'application/json'},
-    body: JSON.stringify({media_key: CONFIG.mediaKey, trigger: trigger,
-      start_ms: startMs, end_ms: endMs})})
-    .then(function(r){ return r.ok ? r.json() : Promise.reject(r.status); })
-    .then(function(){ toast('Rescan queued — run `idea rescan`'); })
-    .catch(function(){ toast('Rescan needs the local server (idea serve)'); });
-}
 """
 
 
@@ -1153,6 +1208,10 @@ def render_page(
     same_track_bridge_ms: int | None = None,
     min_track_ms: int = 0,
     projection: CanonicalProjection | None = None,
+    status: str = "complete",
+    reason: str | None = None,
+    achieved: str | None = None,
+    analysed_at: str | None = None,
 ) -> str:
     """Render the complete self-contained HTML page as a string.
 
@@ -1163,11 +1222,9 @@ def render_page(
     into one row.  The timeline lane, the current-row highlight and the seek all use that display
     track's primary.  ``collapse=False`` restores the one-lane-per-episode view.
 
-    ``min_track_ms`` (default ``0`` = off) marks track rows that played too briefly to be a real
-    track (see :func:`~id_detector.present.exports.short_track`): they stay in the page but are
-    hidden behind a "N matches hidden · show" toggle and are left out of the stats, the
-    timeline and the playhead partition; so are rows fusion marked ``suppressed``.  The
-    exports drop both outright.
+    ``min_track_ms`` (default ``0`` = off) removes track rows that played too briefly to be a real
+    track (see :func:`~id_detector.present.exports.short_track`) from every user-facing surface;
+    fusion-suppressed rows are removed the same way.  Their model data stays in the frozen run.
     """
 
     embed = plan_embed(source)
@@ -1182,15 +1239,8 @@ def render_page(
         same_track_bridge_ms=same_track_bridge_ms,
         min_track_ms=min_track_ms,
     )
-    # Every row, including short/suppressed ones: the page hides them itself (see hidden_by_id).
-    entries = projection.entries
+    entries = projection.shown_entries
     boundaries = _evidence_boundaries(list(episodes.episodes))
-    hidden_by_id = {
-        e["episode_id"]: e["hidden_reason"]
-        for e in entries
-        if e["kind"] == "track" and e["hidden_reason"] is not None
-    }
-    short_ids = set(hidden_by_id)
 
     # A display track is one collapsed row (primary + folded-in alternatives); ungrouped, it is one
     # episode.  Lanes, the highlight partition and the row all key off the primary's id so the
@@ -1220,9 +1270,7 @@ def render_page(
     ]
     crowd_ids = {episode.id for episode in lane_episodes if "hint_only" in episode.flags}
     for lane in lanes:
-        lane["short"] = lane["episode_id"] in short_ids
         lane["crowd"] = lane["episode_id"] in crowd_ids
-    span_items = [item for item in span_items if item[0] not in short_ids]
     shown_gap_ids = {
         entry.get("gap_id") for entry in projection.shown_entries if entry["kind"] == "id"
     }
@@ -1243,13 +1291,13 @@ def render_page(
             end = max(end_fallback, start + 1)
         episode_spans.append({"id": track_id, "start": start, "end": end})
 
+    show_acquire = any(entry["kind"] == "track" and bool(entry.get("acquire")) for entry in entries)
     rows: list[str] = []
     for index, entry in enumerate(entries):
         if entry["kind"] == "track":
-            hidden = hidden_by_id.get(entry["episode_id"])
-            rows.append(_track_row_html(entry, source.platform, index, hidden=hidden))
+            rows.append(_track_row_html(entry, index=index, show_acquire=show_acquire))
         else:
-            rows.append(_gap_row_html(entry))
+            rows.append(_gap_row_html(entry, show_acquire=show_acquire))
 
     title = source.title or "DJ set"
     platform_name = PLATFORM_NAMES.get(source.platform, source.platform)
@@ -1275,24 +1323,7 @@ def render_page(
             for entry in projection.shown_entries
         ]
     ).replace("</", "<\\/")
-    # The control shows whole seconds; the page converts back to milliseconds on change.
     lead_in_s = f"{lead_in_ms / 1000:g}"
-    short_note = ""
-    if short_ids:
-        n = len(short_ids)
-        n_short = sum(1 for reason in hidden_by_id.values() if reason == "short")
-        seconds = f"{min_track_ms / 1000:g}"
-        plural = "es" if n != 1 else ""
-        if n_short == n:
-            why = f"short match{plural} (under {seconds} s)"
-        elif n_short == 0:
-            why = f"suppressed match{plural}"
-        else:
-            why = f"matches ({n_short} short, {n - n_short} suppressed)"
-        short_note = (
-            f'<span class="short-note" id="short-note"><b>{n}</b> {why} hidden · '
-            '<button type="button" class="linkish" id="show-short">show</button></span>'
-        )
     now_pill = (
         '<div class="now" id="now" hidden title="Jump to the current track">'
         '<span class="now-k">NOW</span><span class="now-t" id="now-time"></span>'
@@ -1305,6 +1336,19 @@ def render_page(
         if episodes.generation
         else ""
     )
+    scan_name = (
+        "Deep scan"
+        if (achieved == "deep" or episodes.certification.profile == "max_accuracy")
+        else "Free scan"
+    )
+    analysed = ""
+    if analysed_at:
+        try:
+            moment = datetime.fromisoformat(analysed_at.replace("Z", "+00:00"))
+            analysed = f'<span class="chip">analysed <b>{moment.day} {moment:%b %Y}</b></span>'
+        except (ValueError, TypeError):
+            analysed = ""
+    status_banner = _status_banner_html(status, reason, achieved)
 
     body = f"""{topbar_html(back=True, new=True, middle=now_pill)}
 <main>
@@ -1313,10 +1357,12 @@ def render_page(
   <span class="chip plat-{_esc(source.platform)}"><span
 class="pd"></span>{_esc(platform_name)}</span>
   <span class="chip" id="dur">length <b>{_esc(_format_time(duration_ms))}</b></span>
-  <span class="chip">profile <b>{_esc(episodes.certification.profile)}</b></span>
+  <span class="chip"><b>{scan_name}</b></span>
+  {analysed}
   {gen_chip}
 </div>
 <h1>{_esc(title)}</h1>
+{status_banner}
 {_stats_html(projection, duration_ms)}
 </header>
 <section class="player">{_embed_html(embed, audio_src)}</section>
@@ -1329,33 +1375,35 @@ class="pd"></span>{_esc(platform_name)}</span>
 </div>
 <section class="tl-wrap">
 <div class="tl-head"><h2>Timeline</h2>
-<div class="controls">
+<details class="controls"><summary>Playback settings</summary><div>
   <label for="leadin">Lead-in</label>
   <input id="leadin" type="number" min="0" step="1" value="{lead_in_s}"
     aria-label="Seek lead-in in seconds"><span>s before each track</span>
-</div></div>
+</div></details></div>
 {_timeline_html(lanes, gap_markers)}
 {_ruler_html(duration_ms)}
+<div class="timeline-label" id="timeline-label">Move over a marker to see its track.</div>
 <div class="legend">
-  <span class="lg-solid">evidence (proved, coloured by confidence)</span>
-  <span class="lg-extent">episode extent</span>
-  <span class="lg-pi">prediction interval</span>
-  <span class="lg-unresolved">unresolved boundary</span>
-  <span class="lg-gap">ID gap</span>
-  <span class="lg-crowd">from comments (no audio match)</span>
+  <span class="lg-solid">colour = how sure we are</span>
+  <span class="lg-gap">striped = nothing identified here</span>
 </div>
 </section>
-<div class="list-head"><h2>Tracklist</h2>{short_note}
-<span class="hint-k">click a row to jump there · <kbd>↑</kbd><kbd>↓</kbd> move · <kbd>↵</kbd>
-play</span></div>
+<div class="list-head"><h2>Tracklist</h2>
+<span class="hint-k">use a time button to play from that track</span></div>
+<p class="glossary"><b>Likely</b> means we are confident. <b>Possible</b> means check it.
+<b>Unclear</b> means the match is weak. <b>ID</b> marks music we could not identify.</p>
+{_confidence_html(projection)}
 <div class="tablewrap"><table>
-<thead><tr><th>Time</th><th>Confidence</th><th class="ver">Version</th><th class="role">Role</th>
-<th>Track</th><th>Where to get it</th><th></th></tr></thead>
+<caption>Tracklist for {_esc(title)}</caption>
+<thead><tr><th scope="col">Time</th><th scope="col">Confidence</th>
+<th scope="col">Track</th>{'<th scope="col">Where to get it</th>' if show_acquire else ""}
+<th scope="col">Save</th></tr></thead>
 <tbody>
 {chr(10).join(rows)}
 </tbody>
 </table></div>
-<footer><span>🔒 ran entirely on this machine — nothing leaves 127.0.0.1</span>
+<footer><span>🔒 Audio stays local; only short recognition clips are sent to the selected
+services.</span>
 <span>ID&#39;er</span></footer>
 <div class="toast" id="toast" role="status" aria-live="polite"></div>
 </main>
@@ -1393,6 +1441,10 @@ def generate_page(
     same_track_bridge_ms: int | None = None,
     min_track_ms: int = 0,
     projection: CanonicalProjection | None = None,
+    status: str = "complete",
+    reason: str | None = None,
+    achieved: str | None = None,
+    analysed_at: str | None = None,
 ) -> Path:
     """Render and atomically write ``present/index.html`` with a completion sidecar."""
 
@@ -1407,6 +1459,10 @@ def generate_page(
         same_track_bridge_ms=same_track_bridge_ms,
         min_track_ms=min_track_ms,
         projection=projection,
+        status=status,
+        reason=reason,
+        achieved=achieved,
+        analysed_at=analysed_at,
     )
     index_path = (output_dir or media_dir / "present") / "index.html"
     atomic_write_bytes(index_path, html_text.encode("utf-8"))

@@ -1,5 +1,10 @@
 # Stage 14 — Web UI overhaul ("club mode")
 
+
+> **Superseded by v2 cycle 3a-ii (PLAN-v2 §2.5).** The web rescan control and the `POST /rescan`
+> route are both gone: on real mixes another generation buys zero recall, adds phantom rows and
+> costs hours. `idea rescan` remains as the CLI escape hatch over a queue a human wrote. The
+> progress bar is no longer stage-index arithmetic either — it is wall-clock, computed server-side.
 *Owner brief: "make this the best-looking website possible for what's intended … have fun while
 they're on it … gamify the progress … as sexy as humanly possible."  Built on top of Stage 10's
 web app and the multi-mix library (commit `4638027`).  Pure presentation: no analysis artefact,

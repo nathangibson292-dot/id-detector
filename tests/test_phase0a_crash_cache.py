@@ -290,8 +290,15 @@ def test_real_web_runner_fails_exit_3_without_attaching_stale_result(
         assert job.status == "failed"
         assert job.error and "exit code 3" in job.error
         assert job.result_path is None
-        assert cache_loads == 0
+        # The invariant is that a stale result is never ATTACHED, and it is asserted directly above
+        # and below.  The cache is consulted exactly once on the way out — to read this run's own
+        # journal entry so the failure UI can state the real cost (U-F15) — and never to look for a
+        # result to show, so the count is pinned at one rather than zero.
+        assert cache_loads == 1
         assert stale_index.read_text(encoding="utf-8") == "stale result"
+        assert job.result_path is None and str(stale_media) not in (job.result_path or "")
+        # ...and the run that never started spent nothing, stated as knowledge rather than a hedge.
+        assert job.spend_known is True and job.usd_e2_spent == 0
     finally:
         manager.shutdown()
 

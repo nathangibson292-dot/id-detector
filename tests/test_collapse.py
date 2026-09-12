@@ -446,7 +446,7 @@ def test_page_disclosure_and_playhead_present_against_collapsed_rows() -> None:
     )
     # The collapsed disclosure is inline (no extra requests).
     assert '<details class="alts">' in page
-    assert "other version" in page
+    assert "other track" in page
     assert "▸" in page
     # Exactly one tracklist row survives for the Work cluster.
     assert page.count('<tr class="track"') == 1
@@ -457,8 +457,9 @@ def test_page_disclosure_and_playhead_present_against_collapsed_rows() -> None:
     assert page.count('"id": "') == 1  # one display-track span (the primary's id)
     assert f'"id": "{episodes.episodes[3].id}"' in page  # the primary (ViP)
     assert "tr.track.current" in page
-    # The row seeks / the disclosure toggle does not.
-    assert "e.target.closest('a,button,details,summary')" in page
+    # A real time-cell button seeks; the disclosure retains its native, non-seeking behaviour.
+    assert "button.seek" in page
+    assert "if(seek) seek.addEventListener('click', go)" in page
     validator = _Validator()
     validator.feed(page)
     assert validator.errors == []

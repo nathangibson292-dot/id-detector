@@ -393,37 +393,62 @@ def _assert_surfaces(
     assert document["entries"] == shown
     assert document["suppressed_count"] == expected["suppressed"]
 
-    # --- hero tiles: count, honest coverage percentage, confidence mix, gap count ---
+    # --- three hero tiles, with the confidence mix moved under the Tracklist heading ---
     assert f'<span class="big">{expected["tracks"]}</span><small>track' in html
     crowd_note = f" · {expected['crowd']} from comments" if expected["crowd"] else ""
     assert f"found{crowd_note}</small>" in html
     # The percentage the hero prints, held to a figure computed by hand from the SHOWN rows only.
     assert f"<b>{expected['pct']}%</b></div><div><b>of the set identified</b>" in html
-    assert f'<span class="big">{expected["gaps"]}</span><small>ID gap' in html
-    for badge, count in expected["badges"].items():
-        assert f">{count} {badge}</span>" in html
-    shown_total = sum(expected["badges"].values())
-    for badge, count in expected["badges"].items():
+    assert "<small>ID gap" not in html
+    page_badges: dict[str, int] = {}
+    for entry in shown_tracks:
+        if not entry.get("hint_only"):
+            badge = str(entry["badge"])
+            page_badges[badge] = page_badges.get(badge, 0) + 1
+    confidence_text = ", ".join(
+        f"{page_badges[badge]} {badge}"
+        for badge in ("verified", "likely", "possible", "unclear")
+        if page_badges.get(badge)
+    )
+    assert f'aria-label="{confidence_text}"' in html
+    shown_total = sum(page_badges.values())
+    for badge, count in page_badges.items():
         assert f'<i class="c-{badge}" style="width:{count * 100.0 / shown_total:.2f}%"></i>' in html
-    # No badge the fixture does not expect may appear in the hero key at all.
+    # No badge the fixture does not expect may appear in the confidence summary at all.
     for badge in ("verified", "likely", "possible", "unclear"):
-        if badge not in expected["badges"]:
-            assert f'<span style="--k:var(--{badge})">' not in html
-    if expected["note"]:
-        assert expected["note"] in html
-    else:
-        assert 'id="short-note"' not in html
+        if badge not in page_badges:
+            assert f">0 {badge}</span>" not in html
+    assert 'id="short-note"' not in html
 
     # --- library card: count AND confidence bar, not merely the link ---
+    # The card reads the published projection through the ONE reader the completion screen uses, so
+    # its figures are the page's figures: same track count, same audio-confidence histogram, and
+    # crowd rows counted apart instead of moving the bar (U-F2/F13).
     summary = _set_summary(item)
     assert summary is not None
     assert summary.tracks == expected["tracks"]
-    assert summary.badges == expected["badges"]
+    assert summary.crowd == expected["crowd"]
+    assert summary.badges == page_badges
+    assert summary.suppressed_count == expected["suppressed"]
+    assert summary.duration_ms == fixture["duration_ms"]
+    # The fixture's own hand-written histogram still has to account for every shown track.
+    assert sum(expected["badges"].values()) == expected["tracks"]
     card = _mix_card_html(item)
     assert f"<b>{expected['tracks']}</b> track" in card
-    for badge, count in expected["badges"].items():
-        assert f'<i class="c-{badge}" style="width:{count * 100.0 / shown_total:.2f}%"></i>' in card
-    assert f'title="{html_title(expected["badges"])}"' in card
+    card_total = sum(page_badges.values())
+    for badge, count in page_badges.items():
+        assert f'<i class="c-{badge}" style="width:{count * 100.0 / card_total:.2f}%"></i>' in card
+    assert f'aria-label="{html_title(page_badges)}"' in card
+    # "Mostly <bucket>" only when that bucket really is a majority of the audio-backed rows.
+    majority = summary.majority_badge()
+    if majority:
+        assert f"mostly {majority[0]}" in card and majority[1] * 2 > card_total
+    else:
+        assert "mostly" not in card and "mixed &mdash;" not in card
+    if expected["crowd"]:
+        assert f"+{expected['crowd']} from comments" in card
+    else:
+        assert "from comments" not in card
     assert f"/{item.source_key}/{item.media_key}/present/index.html" in card
 
     # --- Copy button: the shipped function, executed ---
@@ -482,16 +507,13 @@ def _assert_surfaces(
         if entry.get("hint_only"):
             assert 'data-crowd="1"' in row
     for entry in hidden_entries:
-        row = _row_html(html, str(entry["episode_id"]), short=True)
-        assert "pl-actions" not in row
+        assert f'id="{entry["episode_id"]}"' not in html
     assert PLAYLIST_CSS.strip() in html and PLAYLIST_JS.strip() in html
     assert "location.protocol" in html and "el.style.display = 'none'" in html
 
     # --- the timeline is the projection's, not a second grouping pass of its own ---
     lane_ids = re.findall(r'<div class="tl-lane" data-episode-id="([0-9a-f]+)"', html)
-    assert lane_ids == [
-        str(entry["episode_id"]) for entry in projection.entries if entry["kind"] == "track"
-    ]
+    assert lane_ids == [str(entry["episode_id"]) for entry in shown_tracks]
     spans = json.loads(
         re.search(r"^const EPISODE_SPANS = (\[.*?\]);$", html, re.MULTILINE).group(1)
     )

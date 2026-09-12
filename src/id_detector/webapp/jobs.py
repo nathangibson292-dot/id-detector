@@ -34,8 +34,46 @@ LOG_RING = 200
 #: adaptive limiter in the recognise stage are reflected rather than assumed.
 SHAZAM_RATE_PER_MINUTE = 18
 #: Observed-rate ETA needs at least this many completed windows and this much listening time.
+#: The second floor only guards against a wild rate from a one-tick sample; keeping it low is what
+#: lets a warm cache (a whole recognise pass in seconds) be *observed* instead of assumed, so the
+#: bar collapses the remaining time rather than crawling through a cold-start estimate.
 _RATE_MIN_WINDOWS = 3
-_RATE_MIN_SECONDS = 5.0
+_RATE_MIN_SECONDS = 1.0
+#: Expected wall-clock **seconds** for each phase of a cold 60-minute run — the denominator behind
+#: the progress bar (U-F9: "10 % of the bar ≈ a tenth of the expected wall time").  Recognise
+#: dominates by an order of magnitude and is replaced by the *observed*-rate estimate the moment
+#: one exists, so these constants only matter before a phase has been measured.  A phase that does
+#: not run in this job (no reference index, no acquisition) is dropped from the denominator, and a
+#: phase that has already finished contributes the time it really took — so a cached ingest or a
+#: warm recognise pass shrinks the total instead of holding a tenth of the bar hostage.
+PHASE_EXPECTED_SECONDS: dict[str, float] = {
+    "build_index": 120.0,
+    "ingest": 60.0,
+    "decode": 30.0,
+    "windows": 15.0,
+    "recognise": 1_200.0,
+    "hints": 10.0,
+    "fuse": 20.0,
+    "enrich": 15.0,
+    "present": 5.0,
+}
+#: Pipeline order of the phases above (dict order is the pipeline order).
+PHASE_SEQUENCE: tuple[str, ...] = tuple(PHASE_EXPECTED_SECONDS)
+#: ``InvocationTimer`` stage keys in pipeline order, and the plain step each one finished.  Lets a
+#: failed run say how far it actually got without naming an internal phase key (U-F15/F31).  Shared
+#: by the live progress page and the durable failure card, so both tell the same story.
+STAGE_LABELS: tuple[tuple[str, str], ...] = (
+    ("ingest_ms", "fetching the mix"),
+    ("decode_ms", "preparing the audio"),
+    ("windows_ms", "preparing the scan"),
+    ("recognise_ms", "listening to the set"),
+    ("hints_ms", "reading tracklist clues"),
+    ("fuse_ms", "lining up the tracks"),
+    ("refuse_ms", "lining up the tracks"),
+    ("secondary_ms", "double-checking the matches"),
+    ("index_scan_ms", "checking the reference index"),
+    ("export_ms", "writing the page"),
+)
 QUEUED = "queued"
 RUNNING = "running"
 SUCCEEDED = "succeeded"
@@ -121,6 +159,32 @@ class Job:
     started_at: float | None = None
     finished_at: float | None = None
     recognise_started_at: float | None = None
+    resolved_title: str | None = None
+    failed_phase: str | None = None
+    #: Measured wall-clock seconds per phase, accumulated as each phase is left (a phase the
+    #: pipeline re-enters — a second ``fuse`` for the cross-check re-fuse — accumulates).  This is
+    #: what makes the bar wall-clock rather than step-index arithmetic: finished phases contribute
+    #: what they really cost, not what they were budgeted.
+    phase_seconds: dict[str, float] = field(default_factory=dict)
+    #: When the phase named by :attr:`phase` began, so time *inside* it is measured too.
+    phase_started_at: float | None = None
+    #: Highest percentage this job has ever reported: the bar must never move backwards, even if a
+    #: growing ETA would otherwise pull the computed value down.
+    progress_max: int = 0
+    #: The frozen §2.3.5 outcome of the run behind a terminal job, read back from its journal:
+    #: the status (``failed``/``provider_unavailable``/``budget_exhausted``/``source_changed``/
+    #: ``cancelled``), the machine reason, the last pipeline stage that completed, and the money
+    #: that was really settled.  ``spend_known`` is False only when the journal could not be read,
+    #: which is the one case the UI is allowed to hedge about cost.
+    run_status: str | None = None
+    run_reason: str | None = None
+    last_stage: str | None = None
+    usd_e2_spent: int | None = None
+    spend_known: bool = False
+    #: The canonical projection's own figures for the finished result — the count the tracklist
+    #: actually lists.  Never derived from a log line (U-F2/F3: one filtered entry list).
+    tracks_found: int | None = None
+    crowd_tracks: int = 0
     #: The fetched mix on disk (``ingest/original.*``) once ingest has completed and the
     #: server has resolved it — what the analysing page plays while the engines run.
     audio_path: str | None = None
@@ -143,6 +207,95 @@ class Job:
         if not remaining or self.status in TERMINAL_STATES:
             return 0
         return int(round(remaining / self.rate_per_minute(now) * 60))
+
+    # -- wall-clock progress (U-F9) -------------------------------------------------------------
+    def _phase_runs(self, phase: str) -> bool:
+        """Whether this job runs ``phase`` at all — a skipped phase is not part of the total."""
+
+        if phase == "build_index":
+            return self.build_index
+        if phase == "enrich":
+            return self.acquire
+        return True
+
+    def _speed_factor(self) -> float:
+        """How much faster (or slower) this job is running than the cold-run constants predict.
+
+        A run served from cache finishes ingest/decode/windows in a fraction of a cold run's time,
+        and the phases *after* recognise are cached in the same way — so leaving them at their full
+        cold expectation is what pins a warm run's bar near zero until it abruptly finishes.  The
+        ratio of measured to predicted time over the phases already done is the best available
+        estimate for the ones still to come; it is clamped so one freak phase cannot dominate.
+        """
+
+        measured = spent = 0.0
+        for phase, seconds in self.phase_seconds.items():
+            budget = PHASE_EXPECTED_SECONDS.get(phase)
+            if budget and phase != "recognise":
+                measured += seconds
+                spent += budget
+        if spent <= 0:
+            return 1.0
+        return min(4.0, max(0.05, measured / spent))
+
+    def _expected_seconds(self, phase: str) -> float:
+        """Expected wall-clock seconds for one phase of *this* job.
+
+        A phase already measured contributes what it really took (a cached ingest costs what the
+        cache cost, not a cold download).  Recognise prefers the observed window rate, which is the
+        only estimate that survives a warm cache, a changed rate limit or added concurrency; every
+        other unmeasured phase is scaled by how fast this run has actually been going.
+        """
+
+        measured = self.phase_seconds.get(phase)
+        if measured is not None:
+            return measured
+        if phase == "recognise":
+            if self.windows_total > 0:
+                return self.windows_total / self.rate_per_minute() * 60.0
+            return PHASE_EXPECTED_SECONDS["recognise"]
+        return PHASE_EXPECTED_SECONDS.get(phase, 0.0) * self._speed_factor()
+
+    def _remaining_seconds(self, current_elapsed: float, now: float) -> float:
+        """Expected seconds still to come: the rest of this phase plus every phase after it."""
+
+        phases = [phase for phase in PHASE_SEQUENCE if self._phase_runs(phase)]
+        if self.phase in phases:
+            index = phases.index(self.phase)
+            if self.phase == "recognise":
+                rest = float(self.eta_seconds(now))
+            else:
+                rest = max(0.0, self._expected_seconds(self.phase) - current_elapsed)
+        else:
+            # "starting", or an auxiliary phase the tracker does not list (the local-index scan):
+            # place it after the last phase that has already been measured.
+            measured = [phases.index(name) for name in phases if name in self.phase_seconds]
+            index, rest = (max(measured) if measured else -1), 0.0
+        return rest + sum(self._expected_seconds(phase) for phase in phases[index + 1 :])
+
+    def progress_percent(self, now: float | None = None) -> int:
+        """Percent of the job's expected **wall-clock** time that has elapsed (U-F9).
+
+        ``elapsed / (elapsed + remaining)`` over measured phase durations and an observed-rate
+        recognise estimate, so a tenth of the bar really is about a tenth of the expected time and
+        recognise — 90 %-plus of a cold run — dominates it.  Clamped monotonically and held below
+        100 until the job actually succeeds, so the bar never moves backwards and never lies.
+        """
+
+        if self.status == SUCCEEDED:
+            self.progress_max = 100
+            return 100
+        if self.status == QUEUED:
+            return self.progress_max
+        now = time.time() if now is None else now
+        current = max(0.0, now - self.phase_started_at) if self.phase_started_at else 0.0
+        elapsed = sum(self.phase_seconds.values()) + current
+        if self.status in TERMINAL_STATES:
+            return self.progress_max  # failed/cancelled/waiting: freeze where it stopped
+        total = elapsed + self._remaining_seconds(current, now)
+        value = int(elapsed * 100.0 / total) if total > 0 else 0
+        self.progress_max = max(self.progress_max, min(99, max(0, value)))
+        return self.progress_max
 
     def status_dict(self) -> dict[str, Any]:
         """A JSON-safe snapshot for ``GET /jobs/<id>/status`` — never contains a secret."""
@@ -167,7 +320,23 @@ class Job:
             "audio_url": f"/jobs/{self.id}/audio" if self.audio_path else None,
             "created_at": self.created_at,
             "started_at": self.started_at,
+            "recognise_started_at": self.recognise_started_at,
             "finished_at": self.finished_at,
+            "title": self.resolved_title,
+            "failed_phase": self.failed_phase,
+            # Wall-clock progress is computed here, once, so the progress page and the home cards
+            # cannot drift into two different bars (and so it is testable without a browser).
+            "progress_pct": self.progress_percent(),
+            # The §2.3.5 outcome and the money that was really settled, so the failure UI can state
+            # the cost instead of hedging (U-F15).
+            "run_status": self.run_status,
+            "run_reason": self.run_reason,
+            "last_stage": self.last_stage,
+            "usd_e2_spent": self.usd_e2_spent,
+            "spend_known": self.spend_known,
+            # The canonical projection's count for the finished result.
+            "tracks_found": self.tracks_found,
+            "crowd_tracks": self.crowd_tracks,
             "terminal": self.status in TERMINAL_STATES,
             "log": list(self.log),
         }
@@ -223,6 +392,12 @@ class JobContext:
         return self._manager.work_root
 
     @property
+    def started_at(self) -> float | None:
+        """When this attempt began — used to tell this run's journal entry from an earlier one."""
+
+        return self._job.started_at
+
+    @property
     def cancel_token(self) -> threading.Event:
         """The job's cancel flag, polled by the paid sweep before every dispatch (0b-iii).
 
@@ -242,6 +417,22 @@ class JobContext:
         self.check_cancel()
         safe = redact_text(message) if message else ""
         with self._manager.lock:
+            if phase != self._job.phase:
+                # Leaving a phase freezes its *measured* duration, which is what the wall-clock bar
+                # divides by from then on (U-F9).
+                now = time.time()
+                if self._job.phase_started_at is not None and self._job.phase:
+                    spent = max(0.0, now - self._job.phase_started_at)
+                    previous = self._job.phase
+                    # Rebind a NEW dict rather than mutating in place: the status route
+                    # reads ``phase_seconds`` from another thread without this lock, and a
+                    # reader summing a dict that grows underneath it raises.  Rebinding
+                    # means a reader sees the old mapping or the new one, never one in flux.
+                    self._job.phase_seconds = {
+                        **self._job.phase_seconds,
+                        previous: self._job.phase_seconds.get(previous, 0.0) + spent,
+                    }
+                self._job.phase_started_at = now
             self._job.phase = phase
             self._job.phase_done = done
             self._job.phase_total = total
@@ -251,6 +442,8 @@ class JobContext:
                 self._job.windows_total = total
                 if self._job.recognise_started_at is None:
                     self._job.recognise_started_at = time.time()
+            if phase == "ingest" and total > 0 and done >= total and safe:
+                self._job.resolved_title = safe
             # Log a phase when it starts and again when it completes with a new message, so the
             # outcome of each phase ("ingest: <set title>", "windows: 212 windows",
             # "fuse: 41 episodes") reaches the progress page — not just "started".
@@ -273,8 +466,42 @@ class JobContext:
             )
         except ValueError:
             return
+        # The count the finished page shows comes from the run's own canonical projection, read
+        # back from the bundle it just published — never from a log line (U-F2/F3).
+        summary = None
+        try:
+            from id_detector.present.exports import read_projected_summary
+
+            summary = read_projected_summary(index_html.parent / "tracklist.json")
+        except (ImportError, OSError, ValueError):  # pragma: no cover - defensive
+            summary = None
         with self._manager.lock:
             self._job.result_path = relative
+            if summary is not None:
+                self._job.tracks_found = summary.tracks
+                self._job.crowd_tracks = summary.crowd
+
+    def set_outcome(
+        self,
+        *,
+        run_status: str | None = None,
+        run_reason: str | None = None,
+        last_stage: str | None = None,
+        usd_e2_spent: int | None = None,
+        spend_known: bool = False,
+    ) -> None:
+        """Record a terminal run's frozen §2.3.5 outcome and its settled spend (U-F15).
+
+        Without this the UI can only guess from the *requested* profile, which is how a run that
+        spent nothing ends up hedging that paid checks "may still count".
+        """
+
+        with self._manager.lock:
+            self._job.run_status = run_status
+            self._job.run_reason = run_reason
+            self._job.last_stage = last_stage
+            self._job.usd_e2_spent = usd_e2_spent
+            self._job.spend_known = spend_known
 
 
 #: A runner takes a :class:`JobContext` and runs the work, raising to fail (or ``JobCancelled``).
@@ -354,6 +581,18 @@ class JobManager:
         self._wake.set()
         return True
 
+    def dismiss(self, job_id: str) -> bool:
+        """Remove one terminal local-user job card; running work is never affected."""
+
+        with self.lock:
+            job = self._jobs.get(job_id)
+            if job is None or job.status not in TERMINAL_STATES:
+                return False
+            self._jobs.pop(job_id, None)
+            if job_id in self._order:
+                self._order.remove(job_id)
+            return True
+
     # -- lifecycle -----------------------------------------------------------------------------
     def shutdown(self, timeout: float = 5.0) -> None:
         """Stop the worker and join it — cancelling any in-flight job so teardown never hangs."""
@@ -409,6 +648,7 @@ class JobManager:
             job.status = RUNNING
             job.started_at = time.time()
             job.phase = "starting"
+            job.phase_started_at = job.started_at
             job.log.append(f"{_stamp()} started")
         ctx = JobContext(self, job)
         outcome = SUCCEEDED
@@ -437,6 +677,7 @@ class JobManager:
                 job.message = error or WAITING
                 job.log.append(f"{_stamp()} waiting: {error}")
             elif outcome == FAILED:
+                job.failed_phase = job.phase
                 job.status = FAILED
                 job.phase = FAILED
                 job.error = error

@@ -472,10 +472,10 @@ def test_page_carries_its_version_stamp() -> None:
     assert f'<meta name="id-detector-page" content="{PAGE_VERSION}">' in page
 
 
-def test_short_low_confidence_matches_drop_from_exports_and_hide_on_the_page() -> None:
+def test_short_low_confidence_matches_drop_from_exports_and_the_page() -> None:
     """On-air duration separates real tracks from false positives: with ``min_track_ms`` a brief
-    low-confidence match is dropped from the exports and hidden (but kept, behind a toggle) on the
-    page — unless it is likely/verified or hint-supported.  ``0`` (the default) changes nothing."""
+    low-confidence match is dropped from the exports and page — unless it is likely/verified or
+    hint-supported.  ``0`` (the default) changes nothing."""
 
     from id_detector.present.exports import flatten_tracklist, short_track
 
@@ -508,10 +508,9 @@ def test_short_low_confidence_matches_drop_from_exports_and_hide_on_the_page() -
         collapse=False,
         min_track_ms=30_000,
     )
-    assert page.count('<tr class="track short"') == 1
-    assert f'<tr class="track short" data-episode-id="{short_unclear["id"]}"' in page
-    assert 'id="short-note"' in page and 'id="show-short"' in page
-    assert f'data-episode-id="{short_unclear["id"]}" data-badge="unclear" data-short="1"' in page
+    assert '<tr class="track short"' not in page
+    assert f'data-episode-id="{short_unclear["id"]}"' not in page
+    assert 'id="short-note"' not in page and 'id="show-short"' not in page
     assert f'"id": "{short_unclear["id"]}"' not in page  # not in the playhead partition
     assert f'"id": "{short_likely["id"]}"' in page
     validator = _Validator()
@@ -529,7 +528,7 @@ def test_short_low_confidence_matches_drop_from_exports_and_hide_on_the_page() -
 
 
 def test_hidden_reason_covers_suppressed_and_short_rows() -> None:
-    """``hidden_reason`` is the single predicate the exports drop by and the page tucks away by:
+    """``hidden_reason`` is the single predicate the exports and page drop by:
     a fusion-side ``suppressed`` token wins, then the on-air floor; gaps are never hidden."""
 
     from id_detector.present.exports import _support_ms, hidden_reason
@@ -547,9 +546,8 @@ def test_hidden_reason_covers_suppressed_and_short_rows() -> None:
     assert _support_ms([]) == 0
 
 
-def test_suppressed_episodes_drop_from_exports_and_tuck_on_the_page() -> None:
-    """A fusion-side ``suppressed`` reason is honoured like a short match: gone from the exports,
-    kept on the page behind the toggle with a friendly reason tag and counted in the note."""
+def test_suppressed_episodes_drop_from_exports_and_the_page() -> None:
+    """A fusion-side ``suppressed`` reason is retained in data but never shown to a user."""
 
     from id_detector.present.exports import flatten_tracklist
 
@@ -573,9 +571,9 @@ def test_suppressed_episodes_drop_from_exports_and_tuck_on_the_page() -> None:
         duration_ms=DURATION_MS,
         collapse=False,
     )
-    assert f'<tr class="track short" data-episode-id="{buried["id"]}"' in page
-    assert "buried under a surer track" in page
-    assert "<b>1</b> suppressed match hidden" in page
+    assert f'data-episode-id="{buried["id"]}"' not in page
+    assert "buried under a surer track" not in page
+    assert "suppressed match" not in page
     assert f'"id": "{buried["id"]}"' not in page  # out of the playhead partition
 
 
@@ -611,7 +609,8 @@ def test_hint_only_crowd_ids_render_distinctly_and_are_never_proved_evidence() -
     assert ">from comments</span>" in page
     assert f'data-episode-id="{crowd["id"]}" data-badge="possible" data-crowd="1"' in page
     assert "found · 1 from comments</small>" in page
-    assert 'class="lg-crowd"' in page
+    assert page.count('<div class="legend">') == 1
+    assert page.count('<span class="lg-') == 2
     validator = _Validator()
     validator.feed(page)
     assert validator.errors == []

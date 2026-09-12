@@ -409,6 +409,7 @@ def test_web_runner_passes_recipe_and_delivers_selected_bundle(
 
     monkeypatch.setattr(cli, "_analyse", fake_analyse)
     results = []
+    outcomes = []
     context = SimpleNamespace(
         target=str(AUDIO),
         build_index=False,
@@ -416,13 +417,18 @@ def test_web_runner_passes_recipe_and_delivers_selected_bundle(
         known_tracklist=None,
         acquire=False,
         cancel_token=None,
+        started_at=None,
         progress=lambda *args: None,
         set_result=results.append,
+        set_outcome=lambda **fields: outcomes.append(fields),
     )
     make_pipeline_runner(work, config_path=tmp_path / "missing.toml")(context)
     assert calls[0]["recipe"].name == name
     assert "primary_engine" not in calls[0]
     assert results == [selected / "index.html"]
+    # The run's frozen journal outcome reaches the job, so the UI never has to guess the cost.
+    assert len(outcomes) == 1 and outcomes[0]["spend_known"] is True
+    assert outcomes[0]["usd_e2_spent"] == 0
 
 
 def test_refetched_different_bytes_exit_5_before_publication(tmp_path, monkeypatch):
@@ -530,8 +536,10 @@ def test_web_acquisition_republishes_the_selected_bundle(tmp_path, monkeypatch):
         acquire=True,
         cancel_token=None,
         check_cancel=lambda: None,
+        started_at=None,
         progress=lambda *args: None,
         set_result=results.append,
+        set_outcome=lambda **fields: None,
     )
     make_pipeline_runner(work, config_path=tmp_path / "missing.toml")(context)
     delivered = read_bundle_manifest(results[0].parent)

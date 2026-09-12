@@ -1,12 +1,12 @@
-"""Stage 7 local server and rescan queue.
+"""The local ``127.0.0.1`` server: the web app and the result-bundle file server.
 
-A read-only, ``127.0.0.1``-only server over ``work/**/present/`` plus a single ``POST /rescan``
-endpoint that only ever *appends a request to a queue file* — it makes no provider calls and writes
-nothing else.  The queue (``present/rescan_queue.jsonl``) is later consumed by ``idea
-rescan <url>`` to run another generation.
+There is no ``POST /rescan``: §2.5 removed the rescan control **and** its route, because on real
+mixes another generation buys zero recall, adds phantom rows and costs hours.  The rescan queue
+helpers below remain for ``idea rescan``, which reads a queue a human wrote — nothing over HTTP can
+fill it.
 
-The index page lists analysed sets by their ``source.json`` title only — never a username or any
-comment text.
+The library lists analysed sets by their ``source.json`` title only — never a username, never any
+comment text, and never the submitted target (a private-share link is a secret).
 """
 
 from __future__ import annotations
@@ -17,10 +17,11 @@ import re
 import secrets
 import threading
 from dataclasses import dataclass
+from datetime import datetime
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import parse_qs, urlsplit
+from urllib.parse import parse_qs, quote, urlsplit
 
 from id_detector.contracts import (
     GENERATED_BY,
@@ -41,14 +42,25 @@ from id_detector.io import (
     read_text,
     sha256_file,
 )
-from id_detector.present.bundles import result_dir
-from id_detector.present.exports import _format_time
+from id_detector.present.bundles import result_dir, run_metadata
+from id_detector.present.exports import (
+    BADGE_ORDER,
+    ProjectedSummary,
+    _format_time,
+    read_projected_summary,
+)
 from id_detector.present.page import EmbedPlan, plan_embed_from_url
 from id_detector.present.refresh import ensure_fresh_page
 from id_detector.present.theme import PLATFORM_NAMES, head_html, platform_chip, topbar_html
 from id_detector.providers.base import AppConfig
 from id_detector.rescan import policy_for_trigger, priority_for_trigger
-from id_detector.webapp.jobs import TERMINAL_STATES, Job, JobManager, TargetValidationError
+from id_detector.webapp.jobs import (
+    STAGE_LABELS,
+    TERMINAL_STATES,
+    Job,
+    JobManager,
+    TargetValidationError,
+)
 
 _SHA = re.compile(r"^[0-9a-f]{64}$")
 _JOB_ID = re.compile(r"^[0-9a-f]{32}$")
@@ -179,6 +191,50 @@ class AnalysedSet:
     media_dir: Path
     title: str
     platform: str
+    analysed_at: float = 0.0
+
+
+@dataclass(frozen=True)
+class FailedRun:
+    """One durable terminal failure, with the cause and the money it really cost (U-F15/F33)."""
+
+    source_key: str
+    media_key: str
+    media_dir: Path
+    title: str
+    platform: str
+    analysed_at: float
+    #: The frozen §2.3.5 terminal status and machine reason of the attempt.
+    status: str = "failed"
+    reason: str | None = None
+    #: The last pipeline stage that completed, as a plain phrase ("listening to the set").
+    last_stage: str | None = None
+    #: Money settled for the attempt, in USD cents; ``None`` when the journal did not record it.
+    usd_e2_spent: int | None = None
+    #: Whether an earlier, still-openable result exists for the same mix.  When it does the attempt
+    #: is a note beside that result, not a removable library object of its own — deleting it must
+    #: never take the good result with it.
+    has_result: bool = False
+
+
+def _iso_epoch(value: object) -> float | None:
+    """Parse one ISO-8601 journal/manifest timestamp to epoch seconds, or ``None``."""
+
+    if not isinstance(value, str) or not value:
+        return None
+    try:
+        return datetime.fromisoformat(value.replace("Z", "+00:00")).timestamp()
+    except ValueError:
+        return None
+
+
+def _run_started_at(media_dir: Path) -> float | None:
+    """When the run behind this mix's shown result started, from its frozen bundle manifest."""
+
+    try:
+        return _iso_epoch(run_metadata(media_dir).get("started_at"))
+    except (OSError, ValueError, KeyError):  # pragma: no cover - defensive
+        return None
 
 
 def _discover_sets(work_root: Path) -> list[AnalysedSet]:
@@ -193,10 +249,12 @@ def _discover_sets(work_root: Path) -> list[AnalysedSet]:
             source = SourceRecord.model_validate_json(read_text(source_json))
         except (ValueError, OSError):
             continue
-        # "Analysed at" = when the set was ingested (source.json is written once and never touched
-        # on a re-render or an open, unlike present/index.html), so viewing a mix never reorders
-        # the library.  Newest first.
-        analysed_at = path_mtime(source_json)
+        # "Analysed at" = when the run that produced the SHOWN result started, taken from that
+        # bundle's frozen manifest (U-F24/§2.5 "analysed date").  The ingest timestamp is only a
+        # fallback for a pre-bundle result: it is when the audio was fetched, which for a mix
+        # re-analysed later is not when it was analysed.  Both are frozen, so opening a mix never
+        # rewrites its date and never reorders the library.  Newest first.
+        analysed_at = _run_started_at(source_json.parents[1]) or path_mtime(source_json)
         dated.append(
             (
                 analysed_at,
@@ -206,6 +264,7 @@ def _discover_sets(work_root: Path) -> list[AnalysedSet]:
                     media_dir=source_json.parents[1],
                     title=source.title or "(untitled set)",
                     platform=source.platform,
+                    analysed_at=analysed_at,
                 ),
             )
         )
@@ -222,55 +281,124 @@ def _fresh_sets(work_root: Path, config: AppConfig) -> list[AnalysedSet]:
     return sets
 
 
-def _human_duration(milliseconds: int) -> str:
-    """``1h 57m`` / ``58 min`` — the library's "music listened" figure."""
-
-    minutes = max(0, int(milliseconds)) // 60_000
-    hours, minutes = divmod(minutes, 60)
-    if hours:
-        return f"{hours}h {minutes:02d}m"
-    return f"{minutes} min"
+#: Terminal §2.3.5 statuses that produced no result: each one is a failed attempt a user tried and
+#: deserves to see a record of (U-F33).  ``cancelled`` is included — a run the user stopped after
+#: paid work had begun still cost money, so hiding it hides the cost.
+_TERMINAL_FAILURES = frozenset(
+    {"failed", "provider_unavailable", "budget_exhausted", "source_changed", "cancelled"}
+)
 
 
-@dataclass(frozen=True)
-class _SetSummary:
-    """Per-mix figures for a library card, read from the flattened ``present/tracklist.json``."""
+def _discover_failed_runs(work_root: Path) -> list[FailedRun]:
+    """Find durable terminal attempts, whether or not an older result exists for the same mix.
 
-    tracks: int
-    duration_ms: int
-    badges: dict[str, int]
+    U-F33: skipping any media directory that holds *a* result made a failed Deep attempt on a mix
+    with an older Free bundle completely invisible — the run the user actually just paid for. The
+    latest journal entry decides: a terminal failure is shown, and when a result also exists the
+    card says so and offers no delete of its own (removing it must not take the result with it).
+    """
+
+    failed: list[FailedRun] = []
+    for journal in work_root.glob("*/*/invocations.jsonl"):
+        media_dir = journal.parent
+        try:
+            entries = [json.loads(line) for line in read_text(journal).splitlines() if line.strip()]
+            latest = entries[-1]
+        except (OSError, ValueError, IndexError, TypeError):
+            continue
+        if latest.get("status") not in _TERMINAL_FAILURES:
+            continue
+        # The record's own keys are authoritative; the directory names are the fallback for a run
+        # that failed before ``ingest/source.json`` was written, and must still be well-formed
+        # because they are echoed back into a delete form.
+        source_key, media_key = media_dir.parent.name, media_dir.name
+        title, platform = "Unfinished mix", "file"
+        source_path = media_dir / "ingest" / "source.json"
+        identified = False
+        if path_is_file(source_path):
+            try:
+                source = SourceRecord.model_validate_json(read_text(source_path))
+                title = source.title or title
+                platform = source.platform
+                source_key, media_key = source.source_key, source.media_key
+                identified = True
+            except (OSError, ValueError):
+                identified = False
+        if not identified and (not _SHA.fullmatch(source_key) or not _SHA.fullmatch(media_key)):
+            continue
+        analysed_at = (
+            _iso_epoch(latest.get("finished_at"))
+            or _iso_epoch(latest.get("started_at"))
+            or path_mtime(journal)
+        )
+        spent = latest.get("usd_e2_spent")
+        timings = latest.get("timings") or {}
+        stage = next(
+            (label for key, label in reversed(STAGE_LABELS) if key in timings),
+            None,
+        )
+        failed.append(
+            FailedRun(
+                source_key,
+                media_key,
+                media_dir,
+                title,
+                platform,
+                analysed_at,
+                status=str(latest.get("status") or "failed"),
+                reason=str(latest["reason"]) if latest.get("reason") else None,
+                last_stage=stage,
+                usd_e2_spent=int(spent) if isinstance(spent, int) else None,
+                has_result=path_is_file(result_dir(media_dir) / "index.html"),
+            )
+        )
+    return sorted(failed, key=lambda item: item.analysed_at, reverse=True)
 
 
-def _set_summary(item: AnalysedSet) -> _SetSummary | None:
-    path = result_dir(item.media_dir) / "tracklist.json"
-    if not path_is_file(path):
-        return None
-    try:
-        document = json.loads(read_text(path))
-        entries = [e for e in document.get("entries", ()) if e.get("kind") == "track"]
-        badges: dict[str, int] = {}
-        for entry in entries:
-            badge = str(entry.get("badge", "unclear"))
-            badges[badge] = badges.get(badge, 0) + 1
-        return _SetSummary(len(entries), int(document.get("duration_ms") or 0), badges)
-    except (ValueError, OSError, TypeError, AttributeError):
-        return None
+def _set_summary(item: AnalysedSet) -> ProjectedSummary | None:
+    """This mix's figures, read straight off its published canonical projection.
+
+    ``read_projected_summary`` is the one reader of a published ``tracklist.json``, shared with the
+    completion screen, so the card and the result page cannot print two different track counts
+    (U-F2) and a crowd row cannot move the card's confidence bar (U-F13).
+    """
+
+    return read_projected_summary(result_dir(item.media_dir) / "tracklist.json")
 
 
-_BADGE_ORDER = ("verified", "likely", "possible", "unclear")
+_BADGE_ORDER = BADGE_ORDER
 
 
-def _conf_mini_html(badges: dict[str, int]) -> str:
-    total = sum(badges.get(key, 0) for key in _BADGE_ORDER)
+def _conf_mini_html(summary: ProjectedSummary) -> str:
+    """The card's confidence bar: audio-supported rows only, worded to the actual numbers.
+
+    "Mostly likely" is only said when likely really is a majority; a plurality is described as the
+    mix it is.  Crowd rows are named separately — they are comments, never audio evidence.
+    """
+
+    badges = summary.badges
+    total = summary.audio_tracks
+    crowd_note = ""
+    if summary.crowd:
+        crowd_note = (
+            f'<span class="conf-text">+{summary.crowd} from comments</span>'
+            if total
+            else f'<span class="conf-text">{summary.crowd} from comments only</span>'
+        )
     if not total:
-        return ""
+        return crowd_note
     bars = "".join(
         f'<i class="c-{key}" style="width:{badges[key] * 100.0 / total:.2f}%"></i>'
         for key in _BADGE_ORDER
         if badges.get(key)
     )
     title = " · ".join(f"{badges[key]} {key}" for key in _BADGE_ORDER if badges.get(key))
-    return f'<span class="conf-mini" title="{html.escape(title)}">{bars}</span>'
+    majority = summary.majority_badge()
+    wording = f"mostly {majority[0]}" if majority else f"mixed — {title}"
+    return (
+        f'<span class="conf-mini" role="img" aria-label="{html.escape(title)}">{bars}</span>'
+        f'<span class="conf-text">{html.escape(wording)}</span>{crowd_note}'
+    )
 
 
 def _index_html(sets: list[AnalysedSet]) -> bytes:
@@ -293,6 +421,15 @@ def _index_html(sets: list[AnalysedSet]) -> bytes:
 # Web-app pages (self-contained inline HTML/CSS/JS; no usernames or comment text)
 # --------------------------------------------------------------------------------------------------
 _APP_CSS = """
+:root{--dim:#9a9ab0;--unclear:#a3a3bd;--on-accent:#0a0a0f}
+@media (prefers-color-scheme:light){:root{color-scheme:light;--bg:#f7f7fb;--card:#fff;
+--card2:#f0f0f7;--fg:#17171f;--muted:#505064;--dim:#5e5e72;--line:#0000001f;
+--line2:#00000038;--pink:#be185d;--violet:#6d28d9;--cyan:#0e7490;--accent:#6d28d9;
+--verified:#047857;--likely:#0369a1;--possible:#92400e;--unclear:#52525b;--gap:#be123c;
+--ok:#047857;--bad:#be123c;--warn:#92400e;--on-accent:#fff}pre,.jp-wait{background:#eeeeF5}}
+.btn.primary{color:var(--on-accent)}
+button:focus-visible,a:focus-visible,summary:focus-visible,input:focus-visible,textarea:focus-visible{
+outline:3px solid var(--accent);outline-offset:3px}
 /* home hero + the drop-a-link form */
 .hero-home{padding:44px 0 26px;max-width:760px}
 .hero-home.compact{padding:26px 0 8px}
@@ -314,6 +451,7 @@ transition:color .15s}
 .urlbox input{flex:1;min-width:0;padding:12px 8px;border:0;background:transparent;color:var(--fg);
 font:15px/1.3 var(--text);outline:none}
 .urlbox input::placeholder{color:var(--dim)}
+.form-error{color:var(--bad);font-weight:600;margin:8px 4px 0}.form-error:empty{display:none}
 .opts{margin-top:12px}
 .opts>summary{list-style:none;cursor:pointer;display:inline-flex;align-items:center;gap:10px;
 font:600 13px/1 var(--text);color:var(--muted);padding:8px 12px;border-radius:9px;
@@ -373,6 +511,8 @@ opacity:0;transition:opacity .15s}
 .mix:hover{transform:translateY(-2px);border-color:var(--line2);
 box-shadow:0 20px 40px -24px rgba(139,92,246,.7)}
 .mix:hover::before{opacity:1}
+.mix.failed{padding:16px}.mix.failed::before{opacity:1;background:var(--bad)}
+.mix.failed .st{margin-bottom:10px}
 .mix-link{display:block;padding:16px 16px 14px;color:inherit}
 .mix-link:hover{text-decoration:none}
 .mix-top{display:flex;align-items:center;justify-content:space-between;gap:8px;margin-bottom:12px}
@@ -384,6 +524,9 @@ display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hi
 .conf-mini{display:flex;flex:1;height:6px;border-radius:4px;overflow:hidden;background:#ffffff10;
 gap:1px}
 .conf-mini i{display:block;height:100%}
+.conf-text{color:var(--muted);font-size:11px;margin-top:8px}
+.mix-actions{display:flex;justify-content:flex-end;padding:0 12px 12px}.link-danger{border:0;
+background:transparent;color:var(--bad);cursor:pointer;padding:8px;border-radius:8px}
 .c-verified{background:var(--verified)}.c-likely{background:var(--likely)}
 .c-possible{background:var(--possible)}.c-unclear{background:var(--unclear)}
 .go{color:var(--dim);font-size:16px;transition:transform .15s,color .15s}
@@ -394,6 +537,7 @@ color:var(--muted)}
 .acts{list-style:none;padding:0;margin:0;display:flex;flex-direction:column;gap:8px}
 .act{border:1px solid var(--line);border-radius:14px;background:var(--card);overflow:hidden}
 .act-link{display:block;padding:12px 16px;color:inherit}.act-link:hover{text-decoration:none}
+.act-actions{display:flex;justify-content:flex-end;padding:0 12px 10px}
 .act-row{display:flex;align-items:center;gap:12px;min-width:0}
 .act-title{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;
 font-weight:600;font-size:14px}
@@ -411,7 +555,7 @@ border-radius:4px}
 .how b{display:block;font:700 14px/1.2 var(--display);margin:8px 0 4px}
 .how small{color:var(--muted);font-size:12px}
 .how .n{display:inline-grid;place-items:center;width:26px;height:26px;border-radius:8px;
-background:var(--grad);color:#fff;font:800 12px/1 var(--display)}
+background:var(--grad);font:800 12px/1 var(--display)}
 /* progress page */
 .job-head{display:flex;align-items:flex-start;gap:16px;flex-wrap:wrap;padding:28px 0 18px}
 .job-head .titles{flex:1;min-width:0}
@@ -480,6 +624,8 @@ border:1.5px solid var(--dim);font:700 10px/1 var(--mono);color:var(--dim);font-
 background:linear-gradient(135deg,rgba(139,92,246,.16),rgba(34,211,238,.06))}
 .step.active .k i{border-color:var(--accent);color:var(--accent);
 animation:ringpulse 1.2s ease-out infinite}
+.step.failed{opacity:1;border-color:var(--bad);background:rgba(251,113,133,.08)}
+.step.failed .k i{border-color:var(--bad);color:var(--bad)}
 @keyframes ringpulse{0%{box-shadow:0 0 0 0 rgba(167,139,250,.55)}
 100%{box-shadow:0 0 0 8px rgba(167,139,250,0)}}
 .outcome{display:none;border-radius:18px;padding:26px;border:1px solid var(--line);
@@ -511,7 +657,9 @@ border-radius:10px;padding:12px;font:12px/1.6 var(--mono);color:var(--muted);max
 overflow:auto;margin:8px 0 0}
 @media (max-width:720px){.hero-home{padding:24px 0 18px}.urlbox{flex-wrap:wrap;padding:8px}
 .urlbox input{flex-basis:100%;order:-1;padding:10px 6px}.urlbox .btn{margin-left:auto}
-.opt-grid,.seg{grid-template-columns:1fr}.pct{font-size:48px}.job-head{padding-top:16px}}
+.opt-grid,.seg{grid-template-columns:1fr}.pct{font-size:48px}.job-head{padding-top:16px}
+.btn,.link-danger,.opts>summary,.segopt span,.tog{min-height:44px}
+.tiles{grid-template-columns:1fr 1fr}}
 """
 
 
@@ -538,15 +686,47 @@ _FORM_JS = """
   function summary(){
     if(!sum) return;
     var f = input.form, parts = [];
-    parts.push(f.querySelector('input[name=acquire]').checked
-      ? 'download links on' : 'download links off');
+    var mode = f.querySelector('input[name=profile]:checked');
+    parts.push(mode && mode.value === 'max_accuracy' ? 'Deep scan' : 'Free scan');
+    parts.push(f.querySelector('input[name=acquire]').checked ? 'links on' : 'links off');
+    var known = f.querySelector('textarea[name=known_tracklist]');
+    if(known && known.value.trim()) parts.push('tracklist added');
     sum.textContent = parts.join(' · ');
   }
   Array.prototype.forEach.call(input.form.querySelectorAll(
   'input[type=radio],input[type=checkbox]'),
     function(el){ el.addEventListener('change', summary); });
+  var known = input.form.querySelector('textarea[name=known_tracklist]');
+  if(known) known.addEventListener('input', summary);
+  input.form.addEventListener('submit', function(event){
+    var value = input.value.trim(), error = document.getElementById('form-error');
+    if(value && !/^[a-z][a-z0-9+.-]*:\\/\\//i.test(value) &&
+      /(^|\\.)((soundcloud|mixcloud)\\.com|youtu\\.be|youtube\\.com)(\\/|$)/i.test(value)){
+      value = 'https://' + value; input.value = value;
+    }
+    if(!value){ event.preventDefault();
+      error.textContent = 'Paste a mix link or choose a local file.';
+      input.focus(); return; }
+    if(/^(javascript|data|ftp):/i.test(value)){ event.preventDefault();
+      error.textContent = 'Use a SoundCloud, Mixcloud or YouTube web link.'; input.focus(); }
+  });
   summary();
 })();
+"""
+
+
+#: Wall-clock progress (U-F9).  The arithmetic lives server-side in ``Job.progress_percent`` — over
+#: *measured* phase durations and the observed-window-rate ETA — so a tenth of the bar really is a
+#: tenth of the expected wall time, recognise dominates it, a cached or skipped phase cannot claim
+#: time it never used, and the progress page and the home cards cannot drift into two bars.  All the
+#: browser does is smooth between polls and hold the monotonic floor a dropped/reordered response
+#: could otherwise breach.
+_PROGRESS_JS = """
+function wallProgress(j, previous){
+  if(j.status === 'succeeded') return 100;
+  var value = (typeof j.progress_pct === 'number') ? j.progress_pct : 0;
+  return Math.max(previous || 0, Math.max(0, Math.min(100, Math.round(value))));
+}
 """
 
 
@@ -555,9 +735,11 @@ _HOME_JS = """
   var cards = document.querySelectorAll('.act[data-job]'); if(!cards.length) return;
   function fmtPhase(j){
     if(j.status === 'queued') return 'waiting in the queue';
-    var t = j.phase; if(j.message) t += ' — ' + j.message;
-    if(j.windows_total) t += '  ·  ' + j.windows_done + ' / ' + j.windows_total + ' windows';
-    return t;
+    var labels = {starting:'Starting', ingest:'Fetching the mix', decode:'Preparing audio',
+      windows:'Preparing the scan', recognise:'Listening', hints:'Checking tracklist clues',
+      fuse:'Lining up the tracks', enrich:'Finding links', present:'Building the page',
+      failed:'Failed', cancelled:'Cancelled', waiting:'Waiting'};
+    return labels[j.phase] || 'Working';
   }
   function poll(card){
     var id = card.getAttribute('data-job');
@@ -566,8 +748,9 @@ _HOME_JS = """
   st.className = 'st st-' + j.status;
       card.setAttribute('data-status', j.status);
       card.querySelector('.act-phase').textContent = fmtPhase(j);
-      var total = j.windows_total || 0, done = j.windows_done || 0;
-      var pct = total ? Math.round(done * 100 / total) : (j.terminal ? 100 : 4);
+      if(j.title) card.querySelector('.act-title').textContent = j.title;
+      var pct = wallProgress(j, parseInt(card.getAttribute('data-pct'), 10) || 0);
+      card.setAttribute('data-pct', pct);
       card.querySelector('.bar>span').style.width = pct + '%';
       if(j.status === 'succeeded' && j.result_url){ window.location.reload(); return; }
       if(!j.terminal) setTimeout(function(){ poll(card); }, 2500);
@@ -582,28 +765,44 @@ _HOME_JS = """
 _JOB_JS = """
 var STEP_INDEX = {}; STEPS.forEach(function(s, i){ STEP_INDEX[s[0]] = i; });
 var FLAVOUR = {
-  queued: ['Waiting in the queue — one analysis at a time keeps Shazam happy.'],
+  queued: ['Waiting in the queue — one analysis runs at a time.'],
   starting: ['Warming up…'],
   build_index: ['Fingerprinting the uploader\\'s own tracks so unreleased ones match too.'],
   ingest: ['Fetching the mix from the platform — a long set can take a minute.',
     'Only the audio comes down; nothing about you goes up.'],
-  decode: ['Decoding to raw audio so every window sounds the same to the engines.'],
-  windows: ['Slicing the set into short, overlapping windows.'],
-  recognise: ['Every window is one question: what\\'s playing right now?',
+  decode: ['Preparing the audio for a consistent scan.'],
+  windows: ['Dividing the set into short listening sections.'],
+  recognise: ['Checking what is playing throughout the set.',
     'Working through the set clip by clip — a long mix takes a few minutes.',
-    'A window that matches nothing stays honest: it becomes an ID, never a guess.',
-    'Overlapping windows are how a track start gets pinned — only as far as evidence proves.',
-    'The same track heard across several windows gets stitched into one episode later.',
+    'A section that matches nothing stays honest: it becomes an ID, never a guess.',
+    'Overlapping checks help pin each track start only as far as the evidence proves.',
+    'Repeated matches are combined into one track later.',
     'Nod along. The machine is listening so you don\\'t have to rewind.'],
   hints: ['Reading the comments for tracklist clues — as hints, never as proof.'],
-  fuse: ['Stitching windows into track episodes with honest confidence tiers.',
+  fuse: ['Lining up matched tracks with honest confidence levels.',
     'Where a boundary is not proved, the page will say so rather than guess.'],
   enrich: ['Looking up where each track can be bought or downloaded.'],
   present: ['Writing your click-to-jump tracklist page.'],
   done: ['Done.'], failed: [''], cancelled: ['']
 };
-var cellCount = 0, lastDone = -1, flavourIx = 0, flavourPhase = '', redirectLeft = null;
-var LAST = null, celebrated = false;
+// OUTCOME_COPY is the server's own _OUTCOME_COPY table, so the live page and the durable failed
+// card cannot explain one run two different ways.
+function outcomeCopy(status, reason){
+  return OUTCOME_COPY[status + ':' + reason] || OUTCOME_COPY[status] || OUTCOME_COPY.failed;
+}
+function costSentence(j){
+  if(j.run_status === 'budget_exhausted' || j.run_status === 'provider_unavailable' ||
+    j.status === 'waiting')
+    return 'Nothing was spent — it stopped before any paid check ran.';
+  if(j.spend_known && typeof j.usd_e2_spent === 'number')
+    return j.usd_e2_spent > 0
+      ? '$' + (j.usd_e2_spent / 100).toFixed(2) + ' of paid checks was spent before it stopped.'
+      : 'Nothing was spent on this run.';
+  if(j.profile !== 'max_accuracy') return 'This was a Free scan, so nothing was spent.';
+  return "This run's cost record could not be read.";
+}
+var cellCount = 0, lastDone = -1, flavourIx = 0, flavourPhase = '';
+var LAST = null, celebrated = false, PROGRESS_MAX = 0;
 function fmt(s){ s = Math.max(0, Math.round(s)); var m = Math.floor(s / 60);
   return m ? (m + 'm ' + (s % 60 < 10 ? '0' : '') + (s % 60) + 's') : (s + 's'); }
 function colour(t){
@@ -632,35 +831,27 @@ function lightCells(done, total){
   }
   lastDone = lit;
 }
-function overall(j){
-  var ix = STEP_INDEX[j.phase]; var rec = STEP_INDEX['recognise'];
-  if(j.status === 'succeeded') return 100;
-  if(j.status === 'queued' || ix === undefined) return 0;
-  if(ix < rec) return 2 + ix * 2;
-  if(ix === rec){ var t = j.windows_total || 0; return 8 + (t ? Math.round(
-  j.windows_done * 82 / t) : 0); }
-  return 90 + Math.min(9, (ix - rec) * 3);
-}
 function setSteps(j){
-  var ix = STEP_INDEX[j.phase]; var terminal = j.terminal;
+  var phase = j.status === 'failed' ? j.failed_phase : j.phase;
+  var ix = STEP_INDEX[phase]; var terminal = j.terminal;
   Array.prototype.forEach.call(document.querySelectorAll('.step'), function(el, i){
-    el.classList.remove('done', 'active');
+    el.classList.remove('done', 'active', 'failed');
     if(j.status === 'succeeded' || (
   terminal === false && ix !== undefined && i < ix)) el.classList.add('done');
     else if(!terminal && ix === i) el.classList.add('active');
     else if(terminal && ix !== undefined && i < ix) el.classList.add('done');
+    else if(j.status === 'failed' && ix === i) el.classList.add('failed');
   });
 }
-function titleFromLog(j){
-  for(var i = 0; i < (j.log || []).length; i++){
-    var m = /ingest: (.+)$/.exec(j.log[i]);
-    var skip = {'resolving source': 1, 'started': 1, 'source ready': 1};
-    if(m && !skip[m[1]]) return m[1];
-  }
-  return null;
+function safeLog(j){
+  var labels = {build_index:'Reference check', ingest:'Fetch', decode:'Prepare audio',
+    windows:'Prepare scan', recognise:'Listen', hints:'Tracklist clues', fuse:'Line up tracks',
+    enrich:'Find links', present:'Build page', failed:'Scan stopped', cancelled:'Scan stopped'};
+  return (j.log || []).map(function(line){
+    var stamp = line.slice(0, 8), match = / (\\w+):/.exec(line), key = match && match[1];
+    return stamp + ' ' + (labels[key] || 'Working');
+  }).join('\\n');
 }
-function fromLog(j, re){ for(var i = 0; i < (j.log || []).length; i++){ var m = re.exec(
-  j.log[i]); if(m) return m[1]; } return null; }
 function rotateFlavour(){
   var j = LAST; if(!j) return;
   var pool = FLAVOUR[j.status === 'queued' ? 'queued' : j.phase] || [];
@@ -689,56 +880,47 @@ function showOutcome(j){
   var h = document.getElementById('o-title'), p = document.getElementById('o-sub'),
   row = document.getElementById('o-row');
   var err = document.getElementById('o-err'); err.style.display = 'none';
+  var again = '<a class="btn primary" href="' + RETRY_HREF + '">Try again</a>' +
+    '<a class="btn" href="/">Your mixes</a>';
   if(j.status === 'succeeded'){
     box.classList.add('ok');
-    var eps = fromLog(j, /fuse: (\\d+) episodes/), wins = fromLog(j, /windows: (\\d+) windows/);
     h.textContent = 'Tracklist ready';
-    p.textContent = (eps ? eps + ' track episodes found' : 'Analysis finished') + (
-  wins ? ' after listening to ' + wins + ' windows.' : '.');
+    // The count comes from the run's own canonical projection, so it is the number of rows the
+    // tracklist actually lists — never the raw fused-episode total (U-F2/F3).
+    if(typeof j.tracks_found === 'number'){
+      var word = j.tracks_found === 1 ? ' track' : ' tracks';
+      p.textContent = j.tracks_found + word + ' in your tracklist' +
+        (j.crowd_tracks ? ' (' + j.crowd_tracks + ' from the comments).' : '.');
+    } else { p.textContent = 'Analysis finished.'; }
     var open = '<a class="btn primary big" id="open" href="' + j.result_url +
-      '">Open the tracklist →</a><span class="countdown" id="countdown"></span>';
+      '">Open the tracklist →</a>';
     row.innerHTML = j.result_url ? open : '';
     confetti();
-    if(j.result_url && redirectLeft === null){ redirectLeft = 5; countdown(j.result_url); }
   } else if(j.status === 'waiting'){
-    h.textContent = 'Waiting for the free engine';
-    p.textContent = j.message || 'The free engine is paused, so this scan did not start. ' +
-      'Nothing was used up — try again once it is back.';
-    row.innerHTML = '<a class="btn primary" href="/new?url=' + encodeURIComponent(
-  DISPLAY) + '">Try again</a>' +
-      '<a class="btn" href="/">Your mixes</a>';
-  } else if(j.status === 'failed'){
-    box.classList.add('bad'); h.textContent = 'That one didn\\'t work';
-    p.textContent = 'The analysis stopped with an error. The log below has the details.';
-    if(j.error){ err.textContent = j.error; err.style.display = 'block'; }
-    row.innerHTML = '<a class="btn primary" href="/new?url=' + encodeURIComponent(
-  DISPLAY) + '">Try again</a>' +
-      '<a class="btn" href="/">Your mixes</a>';
+    var w = outcomeCopy('waiting', null);
+    h.textContent = 'Waiting for the free service';
+    p.textContent = w[0] + ' ' + costSentence(j) + ' ' + w[1];
+    row.innerHTML = again;
   } else {
-    h.textContent = 'Cancelled'; p.textContent = 'Stopped before it finished — nothing was saved.';
-    row.innerHTML = '<a class="btn primary" href="/new?url=' + encodeURIComponent(
-  DISPLAY) + '">Start again</a>' +
-      '<a class="btn" href="/">Your mixes</a>';
+    var failed = j.status === 'failed';
+    if(failed) box.classList.add('bad');
+    h.textContent = failed ? 'That one didn\\'t work' : 'Cancelled';
+    // Cause, remedy and cost all come from the run's frozen journal outcome, not from the profile
+    // that was requested: a run that spent nothing says so, and one that spent money names it.
+    var copy = outcomeCopy(j.run_status || j.status, j.run_reason || j.failed_phase);
+    var reached = j.last_stage ? ' It got as far as ' + j.last_stage + '.' : '';
+    p.textContent = copy[0] + reached + ' ' + costSentence(j) + ' ' + copy[1];
+    row.innerHTML = again;
   }
-}
-function countdown(url){
-  var el = document.getElementById('countdown'); if(!el) return;
-  if(redirectLeft <= 0){ window.location.href = url; return; }
-  el.innerHTML = 'opening in ' + redirectLeft + 's · <a href="#" id="stay">stay here</a>';
-  var stay = document.getElementById('stay');
-  if(stay) stay.addEventListener('click', function(e){ e.preventDefault(); redirectLeft = -1;
-  el.textContent = ''; });
-  redirectLeft -= 1;
-  setTimeout(function(){ if(redirectLeft >= 0) countdown(url); }, 1000);
 }
 function render(j){
   LAST = j;
   document.body.classList.toggle('analysing', !j.terminal);
   var st = document.getElementById('status'); st.textContent = j.status;
   st.className = 'st st-' + j.status;
-  var t = titleFromLog(j); if(t){ document.getElementById('title').textContent = t;
-  document.getElementById('url').style.display = 'block'; }
-  var pct = overall(j);
+  var t = j.title || null; if(t) document.getElementById('title').textContent = t;
+  PROGRESS_MAX = wallProgress(j, PROGRESS_MAX);
+  var pct = PROGRESS_MAX;
   document.getElementById('pct').innerHTML = pct + '<small>%</small>';
   var stepIx = STEP_INDEX[j.phase];
   var label = stepIx !== undefined ? STEPS[stepIx][1]
@@ -752,11 +934,10 @@ function render(j){
   if(total && total !== cellCount && (cellCount === 0 || Math.min(total,
   240) !== cellCount)) buildCells(total);
   if(total) lightCells(done, total); else document.getElementById('cells').classList.add('idle');
-  document.getElementById('t-windows').textContent = total ? (done + ' / ' + total) : '—';
   document.getElementById('t-eta').textContent = (j.eta_seconds && !j.terminal) ? '~' + fmt(
   j.eta_seconds) : (j.terminal ? '—' : '…');
-  document.getElementById('t-rate').textContent = (total && j.rate_per_minute) ?
-    (Math.round(j.rate_per_minute * 10) / 10) + '/min' : '…';
+  document.getElementById('t-step').textContent = stepIx !== undefined ?
+    (stepIx + 1) + ' of ' + STEPS.length : '—';
   var started = j.started_at, finished = j.finished_at;
   var elapsed = started ? ((finished || Date.now() / 1000) - started) : 0;
   document.getElementById('t-elapsed').textContent = started ? fmt(elapsed) : '—';
@@ -764,7 +945,7 @@ function render(j){
   document.title = (j.terminal ? (
   j.status === 'succeeded' ? 'Done' : j.status) : pct + '%') + ' · ' + (
   t || 'Analysing') + " — ID'er";
-  document.getElementById('log').textContent = (j.log || []).join('\\n');
+  document.getElementById('log').textContent = safeLog(j);
   document.getElementById('cancel').style.display = j.terminal ? 'none' : '';
   var eyebrow = {succeeded: 'Analysed', failed: 'Analysis failed', cancelled: 'Analysis cancelled',
   waiting: 'Not started'};
@@ -814,14 +995,27 @@ def _page_shell(title: str, body: str, script: str = "") -> bytes:
 
 def _footer_html() -> str:
     return (
-        "<footer><span>🔒 runs on your machine — no account, only short clips go to the "
-        "recognizers</span><span>ID&#39;er</span></footer>"
+        "<footer><span>🔒 Audio stays local; only short recognition clips are sent to the "
+        "selected services.</span><span>ID&#39;er</span></footer>"
     )
 
 
-def _form_html(prefill: str = "", csrf_token: str = "") -> str:
+@dataclass(frozen=True)
+class _FormState:
+    url: str = ""
+    profile: str = "free"
+    acquire: bool = True
+    known_tracklist: str = ""
+    error: str = ""
+
+
+def _form_html(prefill: str = "", csrf_token: str = "", *, state: _FormState | None = None) -> str:
     """The drop-a-link form: a hero input with platform detection and a collapsible options tray."""
 
+    current = state or _FormState(url=prefill)
+    free_checked = " checked" if current.profile != "max_accuracy" else ""
+    deep_checked = " checked" if current.profile == "max_accuracy" else ""
+    acquire_checked = " checked" if current.acquire else ""
     return (
         '<form method="post" action="/analyse" class="dropform" autocomplete="off">'
         f'<input type="hidden" name="{_CSRF_FIELD}" value="{html.escape(csrf_token)}">'
@@ -829,24 +1023,26 @@ def _form_html(prefill: str = "", csrf_token: str = "") -> str:
         '<span class="plat-ind" id="plat"><span class="pd"></span>'
         '<span id="plat-name">Paste a link</span></span>'
         '<input id="url" name="url" type="text" required autofocus spellcheck="false" '
-        f'value="{html.escape(prefill)}" '
+        f'value="{html.escape(current.url)}" '
         'placeholder="https://soundcloud.com/… — or a local audio file path">'
         '<button class="btn primary big" type="submit">Analyse</button></div>'
+        f'<p class="form-error" id="form-error" role="alert">{html.escape(current.error)}</p>'
         # Step 1 — the only choice most people make, always visible above the fold: Free or Paid.
         '<div class="seg modes" role="radiogroup" aria-label="Mode">'
-        '<label class="segopt"><input type="radio" name="profile" value="free" checked>'
-        "<span><b>Free</b><small>no key needed — identifies tracks and reads the crowd's "
+        f'<label class="segopt"><input type="radio" name="profile" value="free"{free_checked}>'
+        "<span><b>Free scan</b><small>no key needed — identifies tracks and reads the crowd's "
         "comments</small></span></label>"
-        '<label class="segopt"><input type="radio" name="profile" value="max_accuracy">'
-        "<span><b>Max accuracy</b><small>a paid engine leads and confirms the tracks "
-        "(about $2 a mix)</small></span></label>"
+        f'<label class="segopt"><input type="radio" name="profile" '
+        f'value="max_accuracy"{deep_checked}>'
+        "<span><b>Deep scan</b><small>checks more of the set with your configured paid provider; "
+        "provider charges can apply</small></span></label>"
         "</div>"
         # Step 2 — everything else, collapsed. Download links default on for both modes; the rest is
         # power-user territory.
         '<details class="opts"><summary><span>More options</span>'
-        '<span class="opt-sum" id="opt-sum">download links on</span></summary>'
+        '<span class="opt-sum" id="opt-sum">Free scan · links on</span></summary>'
         '<div class="opt-grid">'
-        '<label class="tog"><input type="checkbox" name="acquire" value="1" checked>'
+        f'<label class="tog"><input type="checkbox" name="acquire" value="1"{acquire_checked}>'
         '<span class="sw"></span>'
         "<span><b>Buy / download links</b>"
         "<small>on by default — where to get each track (free download, buy, or gated) on the "
@@ -857,18 +1053,86 @@ def _form_html(prefill: str = "", csrf_token: str = "") -> str:
         '"12:34 Artist - Title". Leave blank to analyse from the audio only.</small></span>'
         '<textarea name="known_tracklist" rows="4" spellcheck="false" '
         'placeholder="12:34 Artist - Title&#10;19:20 Another Artist - Another Title">'
-        "</textarea></label></div></details></form>"
+        f"{html.escape(current.known_tracklist)}</textarea></label></div></details></form>"
     )
 
 
+#: Plain cause + remedy for each frozen §2.3.5 terminal outcome (U-F15).  Keyed by the journalled
+#: status, or ``status:reason`` when the reason changes the story.  The same table feeds the live
+#: progress page (serialised into its script) and the durable failed-attempt card, so a user can
+#: never read two different explanations of one run.
+_OUTCOME_COPY: dict[str, tuple[str, str]] = {
+    "failed": ("The scan stopped before it could finish.", "Try again in a few minutes."),
+    "failed:ingest": (
+        "The platform would not hand over the audio.",
+        "Try again in a few minutes, or paste another link to the same set.",
+    ),
+    "failed:decode": (
+        "The downloaded audio could not be read.",
+        "Try again, or paste another link to the same set.",
+    ),
+    "provider_unavailable": (
+        "A recognition service was unavailable, so the scan never started.",
+        "Try again in a few minutes.",
+    ),
+    "budget_exhausted": (
+        "The paid-scan limit reached its ceiling before any paid check ran.",
+        "Raise the limit in your settings, or run a Free scan instead.",
+    ),
+    "source_changed": (
+        "The mix changed on the platform while it was being fetched.",
+        "Try it again.",
+    ),
+    "cancelled": ("You stopped this scan.", "Start it again whenever you like."),
+    "waiting": (
+        "The free recognition service is paused, so this scan did not start.",
+        "Try again once it is back.",
+    ),
+}
+
+
+def _outcome_copy(status: str | None, reason: str | None = None) -> tuple[str, str]:
+    """The plain cause and remedy for one terminal outcome, most specific match first."""
+
+    keys = [f"{status}:{reason}", str(status), "failed"]
+    for key in keys:
+        if key in _OUTCOME_COPY:
+            return _OUTCOME_COPY[key]
+    return _OUTCOME_COPY["failed"]
+
+
+def _cost_sentence(
+    *,
+    usd_e2_spent: int | None,
+    spend_known: bool,
+    status: str | None,
+    profile: str | None = None,
+) -> str:
+    """What this run really cost, stated exactly — never hedged (U-F15).
+
+    ``budget_exhausted`` and ``provider_unavailable`` spend nothing by definition (plan §2.3.5), so
+    they say so outright.  Otherwise the settled figure from the run's journal is quoted; a Free
+    scan can never spend; and only an unreadable cost record is admitted as unknown.
+    """
+
+    if status in {"budget_exhausted", "provider_unavailable"}:
+        return "Nothing was spent — it stopped before any paid check ran."
+    if spend_known and usd_e2_spent is not None:
+        if usd_e2_spent <= 0:
+            return "Nothing was spent on this run."
+        return f"${usd_e2_spent / 100:.2f} of paid checks was spent before it stopped."
+    if profile is not None and profile != "max_accuracy":
+        return "This was a Free scan, so nothing was spent."
+    return "This run's cost record could not be read."
+
+
 def _library_stats_html(sets: list[AnalysedSet]) -> str:
-    """Three big numbers for the library: mixes, tracks identified, music listened to."""
+    """The two useful local-library totals: mixes and tracks identified."""
 
     if not sets:
         return ""
     summaries = [_set_summary(item) for item in sets]
     tracks = sum(s.tracks for s in summaries if s)
-    listened = sum(s.duration_ms for s in summaries if s)
     mixes = len(sets)
     return (
         '<div class="stats">'
@@ -876,13 +1140,11 @@ def _library_stats_html(sets: list[AnalysedSet]) -> str:
         f"<small>mix{'es' if mixes != 1 else ''} analysed</small></div></div>"
         f'<div class="stat"><div><span class="big">{tracks}</span>'
         "<small>tracks identified</small></div></div>"
-        f'<div class="stat"><div><span class="big">{html.escape(_human_duration(listened))}</span>'
-        "<small>of music listened to</small></div></div>"
         "</div>"
     )
 
 
-def _mix_card_html(item: AnalysedSet) -> str:
+def _mix_card_html(item: AnalysedSet, csrf_token: str = "") -> str:
     href = f"/{html.escape(item.source_key)}/{html.escape(item.media_key)}/present/index.html"
     summary = _set_summary(item)
     duration = (
@@ -894,23 +1156,84 @@ def _mix_card_html(item: AnalysedSet) -> str:
     if summary:
         meta = (
             f'<div class="mix-meta"><span><b>{summary.tracks}</b> '
-            f"track{'s' if summary.tracks != 1 else ''}</span>{_conf_mini_html(summary.badges)}"
+            f"track{'s' if summary.tracks != 1 else ''}</span>{_conf_mini_html(summary)}"
             '<span class="go" aria-hidden="true">→</span></div>'
         )
     else:
         meta = '<div class="mix-meta"><span class="go" aria-hidden="true">→</span></div>'
+    analysed = datetime.fromtimestamp(item.analysed_at).strftime("%d %b %Y").lstrip("0")
+    remove = ""
+    if csrf_token:
+        remove = (
+            '<form class="mix-actions" method="post" action="/library/remove">'
+            f'<input type="hidden" name="{_CSRF_FIELD}" value="{html.escape(csrf_token)}">'
+            f'<input type="hidden" name="source_key" value="{html.escape(item.source_key)}">'
+            f'<input type="hidden" name="media_key" value="{html.escape(item.media_key)}">'
+            '<button class="link-danger" type="submit" '
+            "onclick=\"return confirm('Remove this mix from your library?')\">"
+            "Remove</button></form>"
+        )
     return (
         f'<li class="mix"><a class="mix-link" href="{href}">'
         f'<div class="mix-top">{platform_chip(item.platform)}{duration}</div>'
-        f'<div class="mix-title">{html.escape(item.title)}</div>{meta}</a></li>'
+        f'<div class="mix-title">{html.escape(item.title)}</div>'
+        f'<div class="conf-text">Analysed {html.escape(analysed)}</div>{meta}</a>{remove}</li>'
     )
 
 
-def _mixes_block(sets: list[AnalysedSet], *, allow_new: bool = True) -> str:
+def _failed_card_html(item: FailedRun, csrf_token: str) -> str:
+    """A durable failed attempt: when, why it stopped, how far it got and what it cost (U-F15/F33).
+
+    A card for an attempt that sits behind an older result carries no Remove button: the two share
+    one media directory, so deleting the attempt would delete the result the user can still open.
+    """
+
+    analysed = datetime.fromtimestamp(item.analysed_at).strftime("%d %b %Y").lstrip("0")
+    cause, remedy = _outcome_copy(item.status, item.reason)
+    reached = f" It got as far as {item.last_stage}." if item.last_stage else ""
+    cost = _cost_sentence(
+        usd_e2_spent=item.usd_e2_spent,
+        spend_known=item.usd_e2_spent is not None,
+        status=item.status,
+    )
+    note = (
+        " The result below is from an earlier scan of the same mix."
+        if item.has_result
+        else " No result was saved."
+    )
+    remove = ""
+    if not item.has_result:
+        remove = (
+            '<form class="mix-actions" method="post" action="/library/remove">'
+            f'<input type="hidden" name="{_CSRF_FIELD}" value="{html.escape(csrf_token)}">'
+            f'<input type="hidden" name="source_key" value="{html.escape(item.source_key)}">'
+            f'<input type="hidden" name="media_key" value="{html.escape(item.media_key)}">'
+            '<button class="link-danger" type="submit">Remove</button></form>'
+        )
+    label = "cancelled" if item.status == "cancelled" else "failed"
+    return (
+        f'<li class="mix failed"><span class="st st-{label}">{label}</span>'
+        f'<div class="mix-title">{html.escape(item.title)}</div>'
+        f'<div class="mix-meta">Tried {html.escape(analysed)}</div>'
+        f'<div class="conf-text">{html.escape(cause + reached)}</div>'
+        f'<div class="conf-text">{html.escape(cost)} {html.escape(remedy)}'
+        f"{html.escape(note)}</div>{remove}</li>"
+    )
+
+
+def _mixes_block(
+    sets: list[AnalysedSet],
+    *,
+    allow_new: bool = True,
+    csrf_token: str = "",
+    failed_runs: list[FailedRun] | None = None,
+) -> str:
     """The library grid of analysed mixes, or a friendly empty state."""
 
-    if sets:
-        cards = "".join(_mix_card_html(item) for item in sets)
+    failed_runs = failed_runs or []
+    if sets or failed_runs:
+        cards = "".join(_failed_card_html(item, csrf_token) for item in failed_runs)
+        cards += "".join(_mix_card_html(item, csrf_token) for item in sets)
         return f'<ul class="mixes">{cards}</ul>'
     cta = (
         "<p>Paste a link above and find out what is in it.</p>"
@@ -920,34 +1243,63 @@ def _mixes_block(sets: list[AnalysedSet], *, allow_new: bool = True) -> str:
     return f'<div class="empty"><b>No mixes yet</b>{cta}</div>'
 
 
-def _activity_item_html(job: Job) -> str:
+def _activity_item_html(job: Job, csrf_token: str = "") -> str:
     status = html.escape(job.status)
-    label = html.escape(job.display)
-    phase = job.message and f"{job.phase} — {job.message}" or job.phase
-    if job.status == "queued":
-        phase = "waiting in the queue"
-    total, done = job.windows_total, job.windows_done
-    pct = round(done * 100 / total) if total else (100 if job.status == "succeeded" else 4)
+    label = html.escape(_job_title(job))
+    phase_names = {
+        "queued": "Waiting in the queue",
+        "starting": "Starting",
+        "ingest": "Fetching the mix",
+        "decode": "Preparing audio",
+        "windows": "Preparing the scan",
+        "recognise": "Listening",
+        "hints": "Checking tracklist clues",
+        "fuse": "Lining up the tracks",
+        "enrich": "Finding links",
+        "present": "Building the page",
+        "failed": "Failed",
+        "cancelled": "Cancelled",
+        "waiting": "Waiting",
+    }
+    phase = phase_names.get(job.phase, "Working")
+    pct = 100 if job.status == "succeeded" else 0
     terminal = "1" if job.status in TERMINAL_STATES else "0"
+    dismiss = ""
+    if terminal == "1":
+        dismiss = (
+            '<form class="act-actions" method="post" action="/jobs/'
+            f'{html.escape(job.id)}/dismiss"><input type="hidden" name="{_CSRF_FIELD}" '
+            f'value="{html.escape(csrf_token)}"><button class="link-danger" '
+            'type="submit">Dismiss</button></form>'
+        )
     return (
         f'<li class="act" data-job="{html.escape(job.id)}" data-terminal="{terminal}" '
-        f'data-status="{status}">'
+        f'data-status="{status}" data-pct="{pct}">'
         f'<a class="act-link" href="/jobs/{html.escape(job.id)}">'
         f'<div class="act-row"><span class="st st-{status}">{status}</span>'
         f'<span class="act-title">{label}</span></div>'
         f'<div class="act-phase">{html.escape(phase)}</div>'
-        f'<div class="bar"><span style="width:{pct}%"></span></div></a></li>'
+        f'<div class="bar"><span style="width:{pct}%"></span></div></a>{dismiss}</li>'
     )
 
 
-def _home_html(sets: list[AnalysedSet], jobs: list[Job], csrf_token: str = "") -> bytes:
+def _home_html(
+    sets: list[AnalysedSet],
+    jobs: list[Job],
+    csrf_token: str = "",
+    *,
+    form_state: _FormState | None = None,
+    failed_runs: list[FailedRun] | None = None,
+) -> bytes:
     """The home: a drop-a-link hero, anything in flight, and the library of analysed mixes."""
 
     active = [job for job in jobs if job.status != "succeeded"]
+    rank = {"running": 0, "queued": 1, "waiting": 2, "failed": 3, "cancelled": 4}
+    active.sort(key=lambda job: (rank.get(job.status, 5), -job.created_at))
     activity = ""
     if active:
-        items = "".join(_activity_item_html(job) for job in active)
-        activity = f'<h2 class="sec">In progress</h2><ul class="acts">{items}</ul>'
+        items = "".join(_activity_item_html(job, csrf_token) for job in active)
+        activity = f'<h2 class="sec">Recent analyses</h2><ul class="acts">{items}</ul>'
     body = (
         topbar_html(back=False, new=True) + '<main class="home"><header class="hero-home">'
         '<p class="eyebrow">DJ-set track identifier · runs on this machine</p>'
@@ -955,45 +1307,24 @@ def _home_html(sets: list[AnalysedSet], jobs: list[Job], csrf_token: str = "") -
         '<p class="lede">Paste a SoundCloud, YouTube or Mixcloud link. It listens to the set in '
         "short windows, asks the recognition engines what is playing, and hands you a "
         "click-to-jump tracklist with honest confidence for every track.</p>"
-        + _form_html(csrf_token=csrf_token)
+        + _form_html(csrf_token=csrf_token, state=form_state)
+        + '<p class="lede reassurance">You can close this tab while the scan runs.</p>'
         + "</header>"
         + activity
         + '<h2 class="sec">Your mixes</h2>'
         + _library_stats_html(sets)
-        + _mixes_block(sets)
+        + _mixes_block(sets, csrf_token=csrf_token, failed_runs=failed_runs)
         + _footer_html()
         + "</main>"
     )
-    return _page_shell("ID'er — your mixes", body, _FORM_JS + _HOME_JS)
+    script = _PROGRESS_JS + _FORM_JS + _HOME_JS
+    return _page_shell("ID'er — your mixes", body, script)
 
 
 def _new_html(prefill: str = "", csrf_token: str = "") -> bytes:
-    """The New-mix page: the analyse form on its own (also the "try again" landing)."""
+    """Compatibility helper for tests/callers; ``/new`` redirects to this single home form."""
 
-    body = (
-        topbar_html(back=True, new=False) + '<main class="home"><header class="hero-home">'
-        '<p class="eyebrow">New mix</p>'
-        '<h1>What is in <span class="grad">this one</span>?</h1>'
-        '<p class="lede">Paste a mix link or a local audio file path, pick your options, and '
-        "hit Analyse. You can leave the page while it runs — it keeps going on this machine.</p>"
-        + _form_html(prefill, csrf_token)
-        + "</header>"
-        '<h2 class="sec">How it works</h2><div class="how">'
-        '<div><span class="n">1</span><b>Paste a mix</b>'
-        "<small>A SoundCloud, YouTube or an audio file on your machine.</small>"
-        "</div>"
-        '<div><span class="n">2</span><b>It gets identified</b>'
-        "<small>The set is analyzed track by track and also cross-checked against what the crowd "
-        "says in the comments.</small></div>"
-        '<div><span class="n">3</span><b>Your tracklist</b>'
-        "<small>Every track with its start time and an honest confidence rating. Unknown "
-        "stretches stay marked ID.</small></div>"
-        '<div><span class="n">4</span><b>Play &amp; grab it</b>'
-        "<small>Click any track to jump the player there, then follow the buy / free-download "
-        "links to get the ones you want.</small></div>"
-        "</div>" + _footer_html() + "</main>"
-    )
-    return _page_shell("ID'er — new mix", body, _FORM_JS)
+    return _home_html([], [], csrf_token, form_state=_FormState(url=prefill))
 
 
 def _job_steps(job: Job) -> list[tuple[str, str, str]]:
@@ -1005,10 +1336,10 @@ def _job_steps(job: Job) -> list[tuple[str, str, str]]:
     steps += [
         ("ingest", "Fetch", "download the mix"),
         ("decode", "Decode", "to raw audio"),
-        ("windows", "Slice", "into short windows"),
+        ("windows", "Prepare", "divide the set for listening"),
         ("recognise", "Listen", "ask the engines"),
         ("hints", "Hints", "read the comments"),
-        ("fuse", "Stitch", "build track episodes"),
+        ("fuse", "Line up", "put the tracks in order"),
     ]
     if job.acquire:
         steps.append(("enrich", "Links", "where to get each track"))
@@ -1096,8 +1427,26 @@ def _job_player_html(plan: EmbedPlan, job: Job) -> str:
     )
 
 
+def _job_title(job: Job) -> str:
+    """What to call this job on screen: its resolved set title, else a plain platform label.
+
+    Never the submitted target (U-F31): a SoundCloud private-share link is a secret token, and a
+    local path is the owner's filesystem — neither belongs in a heading, a document title or an
+    embedded script constant.  The same fallback the home activity cards use.
+    """
+
+    plan = plan_embed_from_url(job.target)
+    return job.resolved_title or f"{PLATFORM_NAMES.get(plan.kind, 'Local')} mix"
+
+
+def _outcome_copy_js() -> dict[str, list[str]]:
+    """:data:`_OUTCOME_COPY` in a JSON-safe shape for the progress page's script."""
+
+    return {key: list(value) for key, value in _OUTCOME_COPY.items()}
+
+
 def _job_page_html(job: Job, csrf_token: str = "") -> bytes:
-    label = html.escape(job.display)
+    label = html.escape(_job_title(job))
     plan = plan_embed_from_url(job.target)
     platform = plan.kind if plan.kind in ("soundcloud", "youtube", "mixcloud") else "file"
     steps = _job_steps(job)
@@ -1107,24 +1456,26 @@ def _job_page_html(job: Job, csrf_token: str = "") -> bytes:
         for n, (key, name, sub) in enumerate(steps, start=1)
     )
     tiles = (
-        '<div class="tiles"><span><b id="t-windows">—</b>windows</span>'
-        '<span><b id="t-eta">…</b>time left</span><span><b id="t-elapsed">—</b>elapsed</span>'
-        '<span><b id="t-rate">…</b>windows / min</span></div>'
+        '<div class="tiles"><span><b id="t-eta">…</b>time left</span>'
+        '<span><b id="t-step">—</b>progress</span></div>'
     )
     body = (
         topbar_html(back=True, new=True) + '<main><header class="job-head"><div class="titles">'
         '<p class="eyebrow" id="eyebrow">Analysing</p>'
-        f'<h1 id="title">{label}</h1><p class="job-url" id="url" style="display:none">{label}</p>'
+        f'<h1 id="title">{label}</h1>'
         f"{platform_chip(platform)}</div>"
         '<div class="job-actions"><span class="st" id="status">…</span>'
         '<button class="btn danger" id="cancel" type="button">Cancel</button></div></header>'
         + _job_player_html(plan, job)
-        + '<section class="scan" id="scan"><div class="scan-top">'
+        + '<section class="scan" id="scan" aria-live="polite"><div class="scan-top">'
         '<div class="pct" id="pct">0<small>%</small></div>'
         '<div class="phase-line"><div class="phase-name" id="phase-name">Starting</div>'
         '<div class="phase-msg" id="phase-msg"></div></div>' + tiles + "</div>"
         '<div class="cells idle" id="cells" aria-hidden="true"></div>'
-        '<p class="flavour" id="flavour"></p></section>'
+        '<p class="flavour" id="flavour"></p>'
+        '<p class="reassurance">You can close this tab — the scan will keep running.</p>'
+        '<details class="elapsed"><summary>Timing details</summary>'
+        '<span><b id="t-elapsed">—</b> elapsed</span></details></section>'
         '<section class="outcome" id="outcome"><div class="confetti" id="confetti"></div>'
         '<h2 id="o-title"></h2><p id="o-sub"></p><pre class="err" id="o-err"></pre>'
         '<div class="row" id="o-row"></div></section>'
@@ -1134,8 +1485,11 @@ def _job_page_html(job: Job, csrf_token: str = "") -> bytes:
         + "</main>"
     )
     script = (
-        f"var JOB_ID={json.dumps(job.id)};var DISPLAY={json.dumps(job.display)};"
+        f"var JOB_ID={json.dumps(job.id)};"
+        f"var RETRY_HREF={json.dumps(f'/?job={job.id}')};"
+        f"var OUTCOME_COPY={json.dumps(_outcome_copy_js())};"
         f"var STEPS={json.dumps(steps)};var CSRF_TOKEN={json.dumps(csrf_token)};"
+        + _PROGRESS_JS
         + _JOB_JS
         + _PLAYER_JS
     )
@@ -1343,10 +1697,22 @@ class _Handler(BaseHTTPRequestHandler):
         if route in ("/", "/index.html"):
             if self._app_active():
                 assert self.job_manager is not None
+                query = parse_qs(urlsplit(self.path).query)
+                prefill = (query.get("url") or [""])[0][:2048]
+                # "Try again" on a finished job links by job id, not by URL: the submitted target
+                # (which may be a private share token) is looked up here and never reaches the
+                # job page's markup or script (U-F31).
+                requested = (query.get("job") or [""])[0]
+                if not prefill and _JOB_ID.match(requested):
+                    earlier = self.job_manager.get(requested)
+                    if earlier is not None:
+                        prefill = earlier.target[:2048]
                 body = _home_html(
                     _fresh_sets(self.work_root, self.config),
                     self.job_manager.recent(),
                     self.csrf_token,
+                    form_state=_FormState(url=prefill),
+                    failed_runs=_discover_failed_runs(self.work_root),
                 )
             else:
                 body = _index_html(_fresh_sets(self.work_root, self.config))
@@ -1355,8 +1721,11 @@ class _Handler(BaseHTTPRequestHandler):
         if self._app_active() and route == "/new":
             query = parse_qs(urlsplit(self.path).query)
             prefill = (query.get("url") or [""])[0][:2048]
-            body = _new_html(prefill, self.csrf_token)
-            self._send(HTTPStatus.OK, body, _CONTENT_TYPES[".html"])
+            location = "/" + (f"?url={quote(prefill, safe='')}" if prefill else "")
+            self.send_response(HTTPStatus.SEE_OTHER)
+            self.send_header("Location", location)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
             return
         if self._app_active() and route.startswith("/jobs/"):
             self._handle_job_get(route)
@@ -1439,59 +1808,22 @@ class _Handler(BaseHTTPRequestHandler):
         if self._app_active() and route == "/analyse":
             self._handle_analyse()
             return
+        if self._app_active() and route == "/library/remove":
+            self._handle_library_remove()
+            return
+        if self._app_active() and route.startswith("/jobs/") and route.endswith("/dismiss"):
+            self._handle_job_dismiss(route)
+            return
         if self._app_active() and route.startswith("/jobs/") and route.endswith("/cancel"):
             self._handle_job_cancel(route)
             return
-        if route != "/rescan":
-            # A read-only server (no job manager) answers /analyse here; drain first so the 404
-            # reaches the client instead of an aborted connection.
-            self._drain_body()
-            self._send(HTTPStatus.NOT_FOUND, b"not found", "text/plain; charset=utf-8")
-            return
-        length = int(self.headers.get("Content-Length") or 0)
-        if length <= 0 or length > 8192:
-            self._drain_body()
-            self._send(HTTPStatus.BAD_REQUEST, b'{"error":"bad length"}', _CONTENT_TYPES[".json"])
-            return
-        self._body_read = True
-        try:
-            payload = json.loads(self.rfile.read(length).decode("utf-8"))
-            media_key = str(payload["media_key"])
-            trigger = str(payload["trigger"])
-            start_ms = int(payload["start_ms"])
-            end_ms = int(payload["end_ms"])
-        except (ValueError, KeyError, TypeError, UnicodeDecodeError):
-            self._send(HTTPStatus.BAD_REQUEST, b'{"error":"bad request"}', _CONTENT_TYPES[".json"])
-            return
-        if not _SHA.match(media_key):
-            body = b'{"error":"bad media_key"}'
-            self._send(HTTPStatus.BAD_REQUEST, body, _CONTENT_TYPES[".json"])
-            return
-        target = next(
-            (item for item in _discover_sets(self.work_root) if item.media_key == media_key), None
-        )
-        if target is None:
-            self._send(HTTPStatus.NOT_FOUND, b'{"error":"unknown set"}', _CONTENT_TYPES[".json"])
-            return
-        try:
-            source = SourceRecord.model_validate_json(
-                read_text(target.media_dir / "ingest" / "source.json")
-            )
-            request = build_rescan_request(
-                source=source,
-                media_dir=target.media_dir,
-                trigger=trigger,
-                start_ms=start_ms,
-                end_ms=end_ms,
-                config=self.config,
-            )
-            append_rescan_request(target.media_dir, request)
-        except (ValueError, OSError) as exc:
-            body = json.dumps({"error": str(exc)[:120]}).encode("utf-8")
-            self._send(HTTPStatus.BAD_REQUEST, body, _CONTENT_TYPES[".json"])
-            return
-        body = json.dumps({"queued": True, "id": request.id, "trigger": request.trigger}).encode()
-        self._send(HTTPStatus.OK, body, _CONTENT_TYPES[".json"])
+        # §2.5 removes the rescan button AND the route: on real mixes rescans buy zero recall, add
+        # phantoms and cost hours, so no web surface may start one.  ``idea rescan`` remains the CLI
+        # escape hatch and still reads a queue a human wrote, but nothing over HTTP can fill it.
+        # A read-only server (no job manager) answers /analyse here too; drain first so the 404
+        # reaches the client instead of an aborted connection.
+        self._drain_body()
+        self._send(HTTPStatus.NOT_FOUND, b"not found", "text/plain; charset=utf-8")
 
     def _read_body(self, limit: int = 8192) -> bytes | None:
         length = int(self.headers.get("Content-Length") or 0)
@@ -1502,13 +1834,16 @@ class _Handler(BaseHTTPRequestHandler):
 
     def _handle_analyse(self) -> None:
         assert self.job_manager is not None
+        content_type = (self.headers.get("Content-Type") or "").split(";", 1)[0].strip().lower()
+        wants_json = content_type == "application/json"
         raw = self._read_body()
         if raw is None:
             self._drain_body()
-            self._send_json(HTTPStatus.BAD_REQUEST, {"error": "bad length"})
+            if wants_json:
+                self._send_json(HTTPStatus.BAD_REQUEST, {"error": "bad length"})
+            else:
+                self._send_form_error(_FormState(error="That submission was too large."))
             return
-        content_type = (self.headers.get("Content-Type") or "").split(";", 1)[0].strip().lower()
-        wants_json = content_type == "application/json"
         # ``upload_consent`` is no longer read from any body (E-H8): the whole-file scan it used
         # to unlock is gone, so no client-controlled field can start a second, larger charge.
         try:
@@ -1530,16 +1865,31 @@ class _Handler(BaseHTTPRequestHandler):
                 known_tracklist = (form.get("known_tracklist") or [""])[0]
                 presented_token = (form.get(_CSRF_FIELD) or [None])[0]
         except (ValueError, UnicodeDecodeError):
-            self._send_json(HTTPStatus.BAD_REQUEST, {"error": "bad request"})
+            if wants_json:
+                self._send_json(HTTPStatus.BAD_REQUEST, {"error": "bad request"})
+            else:
+                self._send_form_error(_FormState(error="The form could not be read."))
             return
         if not self._csrf_ok(presented_token if isinstance(presented_token, str) else None):
-            self._send_json(
-                HTTPStatus.FORBIDDEN,
-                {"error": f"missing or invalid CSRF token (GET /csrf, then send {_CSRF_HEADER})"},
-            )
+            if wants_json:
+                self._send_json(HTTPStatus.FORBIDDEN, {"error": "CSRF token was invalid"})
+            else:
+                self._send_form_error(
+                    _FormState(
+                        url=url,
+                        profile=profile or "free",
+                        acquire=acquire,
+                        known_tracklist=str(known_tracklist or ""),
+                        error="This page expired. Reload it and try again.",
+                    ),
+                    status=HTTPStatus.FORBIDDEN,
+                )
             return
         if profile is not None and profile not in _PROFILES:
-            self._send_json(HTTPStatus.BAD_REQUEST, {"error": "unknown profile"})
+            if wants_json:
+                self._send_json(HTTPStatus.BAD_REQUEST, {"error": "unknown profile"})
+            else:
+                self._send_form_error(_FormState(url=url, error="Choose Free scan or Deep scan."))
             return
         # A pasted tracklist is an optional hint seed; blank/whitespace means "audio only".  Cap it
         # so an oversized paste can never balloon a job (a real tracklist is a few KB at most).
@@ -1548,6 +1898,16 @@ class _Handler(BaseHTTPRequestHandler):
         elif len(known_tracklist) > 64_000:
             known_tracklist = known_tracklist[:64_000]
         try:
+            if (
+                not wants_json
+                and "://" not in url
+                and re.search(
+                    r"(^|\.)(soundcloud\.com|mixcloud\.com|youtube\.com|youtu\.be)(/|$)",
+                    url,
+                    re.IGNORECASE,
+                )
+            ):
+                url = "https://" + url
             job_id = self.job_manager.submit(
                 url,
                 profile,
@@ -1556,7 +1916,18 @@ class _Handler(BaseHTTPRequestHandler):
                 known_tracklist=known_tracklist,
             )
         except TargetValidationError as exc:
-            self._send_json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
+            if wants_json:
+                self._send_json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
+            else:
+                self._send_form_error(
+                    _FormState(
+                        url=url,
+                        profile=profile or "free",
+                        acquire=acquire,
+                        known_tracklist=known_tracklist or "",
+                        error="Use a complete web link or choose an audio file that exists.",
+                    )
+                )
             return
         location = f"/jobs/{job_id}"
         if wants_json:
@@ -1566,6 +1937,19 @@ class _Handler(BaseHTTPRequestHandler):
         self.send_header("Location", location)
         self.send_header("Content-Length", "0")
         self.end_headers()
+
+    def _send_form_error(
+        self, state: _FormState, *, status: HTTPStatus = HTTPStatus.BAD_REQUEST
+    ) -> None:
+        assert self.job_manager is not None
+        body = _home_html(
+            _fresh_sets(self.work_root, self.config),
+            self.job_manager.recent(),
+            self.csrf_token,
+            form_state=state,
+            failed_runs=_discover_failed_runs(self.work_root),
+        )
+        self._send(status, body, _CONTENT_TYPES[".html"])
 
     def _handle_playlists_post(self, route: str) -> None:
         """Playlist mutations reuse the analyse route's guards: loopback Origin/Host (checked
@@ -1592,6 +1976,73 @@ class _Handler(BaseHTTPRequestHandler):
 
         status, body, content_type = playlists.handle_post(route, form, work_root=self.work_root)
         self._send(HTTPStatus(status), body, content_type)
+
+    def _handle_library_remove(self) -> None:
+        """Move one local user's result to recoverable trash and return to the library."""
+
+        raw = self._read_body()
+        if raw is None:
+            self._drain_body()
+            self._send(HTTPStatus.BAD_REQUEST, b"bad request", "text/plain; charset=utf-8")
+            return
+        try:
+            form = parse_qs(raw.decode("utf-8"), keep_blank_values=True)
+            token = (form.get(_CSRF_FIELD) or [None])[0]
+            source_key = (form.get("source_key") or [""])[0]
+            media_key = (form.get("media_key") or [""])[0]
+        except UnicodeDecodeError:
+            token = None
+            source_key = media_key = ""
+        if (
+            not self._csrf_ok(token)
+            or not _SHA.fullmatch(source_key)
+            or not _SHA.fullmatch(media_key)
+        ):
+            self._send(HTTPStatus.BAD_REQUEST, b"bad request", "text/plain; charset=utf-8")
+            return
+        items = [*_discover_sets(self.work_root), *_discover_failed_runs(self.work_root)]
+        item = next(
+            (
+                found
+                for found in items
+                if found.source_key == source_key and found.media_key == media_key
+            ),
+            None,
+        )
+        if item is None:
+            self._send(HTTPStatus.NOT_FOUND, b"not found", "text/plain; charset=utf-8")
+            return
+        root = self.work_root.resolve()
+        target = item.media_dir.resolve()
+        if target == root or root not in target.parents:
+            self._send(HTTPStatus.BAD_REQUEST, b"bad request", "text/plain; charset=utf-8")
+            return
+        trash = root / ".trash" / "library" / f"{source_key}-{media_key}-{secrets.token_hex(4)}"
+        trash.parent.mkdir(parents=True, exist_ok=True)
+        item.media_dir.replace(trash)
+        self.send_response(HTTPStatus.SEE_OTHER)
+        self.send_header("Location", "/")
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+
+    def _handle_job_dismiss(self, route: str) -> None:
+        assert self.job_manager is not None
+        parts = route.strip("/").split("/")
+        raw = self._read_body()
+        form = parse_qs(raw.decode("utf-8"), keep_blank_values=True) if raw is not None else {}
+        token = (form.get(_CSRF_FIELD) or [None])[0]
+        if (
+            len(parts) != 3
+            or not _JOB_ID.fullmatch(parts[1])
+            or not self._csrf_ok(token)
+            or not self.job_manager.dismiss(parts[1])
+        ):
+            self._send(HTTPStatus.BAD_REQUEST, b"bad request", "text/plain; charset=utf-8")
+            return
+        self.send_response(HTTPStatus.SEE_OTHER)
+        self.send_header("Location", "/")
+        self.send_header("Content-Length", "0")
+        self.end_headers()
 
     def _handle_job_cancel(self, route: str) -> None:
         assert self.job_manager is not None

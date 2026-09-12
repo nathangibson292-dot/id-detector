@@ -258,6 +258,7 @@ def publish_result(
                 "status": metadata["status"],
                 "reason": metadata.get("reason"),
                 "achieved": metadata.get("achieved"),
+                "started_at": metadata.get("started_at"),
             }
         )
     ).hexdigest()
@@ -334,7 +335,15 @@ def publish_result(
                 tracklist = json.loads(read_text(tracklist_path))
                 tracklist["analysis_key"] = metadata["analysis_key"]
                 atomic_write_json(tracklist_path, tracklist)
-            page.generate_page(**common, source=source, lead_in_ms=config.lead_in_ms)
+            page.generate_page(
+                **common,
+                source=source,
+                lead_in_ms=config.lead_in_ms,
+                status=metadata["status"],
+                reason=metadata.get("reason"),
+                achieved=metadata.get("achieved"),
+                analysed_at=metadata.get("started_at"),
+            )
             manifest = {
                 "run_id": run_id,
                 "analysis_key": metadata.get("analysis_key"),

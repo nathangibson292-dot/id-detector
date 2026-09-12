@@ -22,6 +22,7 @@ from id_detector.present.server import (
     consume_rescan_queue,
     make_server,
     read_rescan_queue,
+    rescan_queue_path,
     serve_in_background,
 )
 from tests.test_stage7_page import _episodes_file, _identities, _source
@@ -89,44 +90,35 @@ def test_server_serves_index_page_and_pages_and_blocks_traversal(tmp_path: Path)
     assert not running.thread.is_alive()
 
 
-def test_rescan_endpoint_appends_to_queue_without_provider_calls(tmp_path: Path) -> None:
+def test_no_http_route_can_queue_a_rescan(tmp_path: Path) -> None:
+    """§2.5 removes the rescan button **and** the route.
+
+    On real mixes a rescan buys zero recall, adds phantoms and costs hours, so no web surface may
+    start one: ``POST /rescan`` is gone for every payload, and the queue file it used to append to
+    is never created.  ``idea rescan`` stays as the CLI escape hatch over a queue a human wrote
+    (covered by the round-trip test below).
+    """
+
     source = _source("soundcloud")
     media_dir = _seed_work_root(tmp_path, source)
     running = serve_in_background(tmp_path, port=0)
     try:
-        body = {
-            "media_key": source.media_key,
-            "trigger": "gap",
-            "start_ms": 150_000,
-            "end_ms": 600_000,
-        }
-        first = httpx.post(running.base_url + "/rescan", json=body, timeout=TIMEOUT)
-        assert first.status_code == 200
-        assert first.json()["queued"] is True
-
-        queued = read_rescan_queue(media_dir)
-        assert len(queued) == 1
-        assert queued[0].trigger == "gap"
-        assert queued[0].start_ms == 150_000
-        assert queued[0].end_ms == 600_000
-
-        # Re-posting the identical request is de-duplicated by id.
-        again = httpx.post(running.base_url + "/rescan", json=body, timeout=TIMEOUT)
-        assert again.status_code == 200
-        assert len(read_rescan_queue(media_dir)) == 1
-
-        # A well-formed request for an unknown media_key is rejected.
-        bad = httpx.post(
-            running.base_url + "/rescan",
-            json={**body, "media_key": "f" * 64},
+        for body in (
+            {"media_key": source.media_key, "trigger": "gap", "start_ms": 1, "end_ms": 2},
+            {"media_key": "f" * 64, "trigger": "gap", "start_ms": 1, "end_ms": 2},
+            {"media_key": "nope"},
+            {},
+        ):
+            answer = httpx.post(running.base_url + "/rescan", json=body, timeout=TIMEOUT)
+            assert answer.status_code == 404, body
+        assert read_rescan_queue(media_dir) == []
+        assert not path_is_file(rescan_queue_path(media_dir))
+        # No page control offers one either.
+        page = httpx.get(
+            f"{running.base_url}/{source.source_key}/{source.media_key}/present/index.html",
             timeout=TIMEOUT,
         )
-        assert bad.status_code == 404
-        # A malformed media_key is a 400.
-        malformed = httpx.post(
-            running.base_url + "/rescan", json={**body, "media_key": "nope"}, timeout=TIMEOUT
-        )
-        assert malformed.status_code == 400
+        assert page.status_code == 200 and "rescan" not in page.text.casefold()
     finally:
         running.shutdown()
 

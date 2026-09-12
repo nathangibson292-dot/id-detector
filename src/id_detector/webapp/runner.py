@@ -10,13 +10,14 @@ pluggable: tests inject a fake runner instead and never touch the network.
 from __future__ import annotations
 
 import asyncio
+from contextlib import suppress
 from dataclasses import dataclass
 from hashlib import sha256
 from pathlib import Path
 
 from id_detector.providers.base import AppConfig
 from id_detector.shazam_breaker import ShazamBreaker
-from id_detector.webapp.jobs import JobContext, JobWaiting
+from id_detector.webapp.jobs import STAGE_LABELS, JobContext, JobWaiting
 
 #: Where the browser's "build index" step fingerprints the uploader's tracks, and the label the
 #: analysis then queries (D3: Panako kept; the index is built AND used).  Mirrors ``idea
@@ -32,8 +33,82 @@ _EXIT_STATUS = {
     3: "paid provider unavailable",
     4: "budget exhausted",
     5: "source changed",
-    WAITING_EXIT: "waiting: not queued locally; Shazam is paused (breaker open or kill-switch)",
+    # U-F31: this string reaches the progress page as the job's live message, so it names no
+    # engine.  The engine-level detail stays in the journal and in ``JobWaiting``'s docstring.
+    WAITING_EXIT: "waiting: not queued locally; the free recognition service is paused",
 }
+
+
+def _this_runs_entry(journal: Path, started_at: float | None) -> dict | None:
+    """The journal entry belonging to the run that started at ``started_at``, newest first.
+
+    A mix analysed twice has two entries; attributing an *earlier* run's spend to this attempt is
+    exactly the kind of made-up money figure U-F15 is about, so an entry that predates this job is
+    not this job's.
+    """
+
+    import json
+    from datetime import datetime
+
+    try:
+        lines = [line for line in journal.read_text(encoding="utf-8").splitlines() if line.strip()]
+    except OSError:
+        return None
+    for line in reversed(lines):
+        try:
+            entry = json.loads(line)
+            stamp = str(entry.get("started_at") or "")
+            moment = datetime.fromisoformat(stamp.replace("Z", "+00:00")).timestamp()
+        except (ValueError, TypeError, AttributeError):
+            continue
+        # One second of slack: the job clock and the pipeline clock are the same wall clock, but the
+        # journal stamp is second-resolution on some platforms.
+        if started_at is None or moment >= started_at - 1.0:
+            return entry
+    return None
+
+
+def _record_outcome(ctx: JobContext, work_root: Path, target: str) -> None:
+    """Read this run's terminal journal entry back onto the job (U-F15).
+
+    The journal is the frozen §2.3.5 record — status, reason and the money that was *settled* —
+    written on every terminal path that reached a media directory.  No media directory means the
+    run stopped before a single window could be reserved, so nothing was spent: that is knowledge,
+    not a guess, and only an unreadable journal leaves the cost genuinely unknown.
+    """
+
+    from id_detector import cli
+
+    # Bookkeeping must never mask the job's own outcome: this runs on the way out of a failure or a
+    # cancellation, so anything it raises would replace the real exception with an AttributeError.
+    record = getattr(ctx, "set_outcome", None)
+    if record is None:  # a duck-typed context that does not carry the outcome contract
+        return
+    try:
+        cached = cli._load_cached(Path(work_root).resolve(), target)
+        if cached is None:
+            record(usd_e2_spent=0, spend_known=True)
+            return
+        journal = Path(cached.media_dir) / "invocations.jsonl"
+        entry = _this_runs_entry(journal, getattr(ctx, "started_at", None))
+        if entry is None:
+            # Either nothing was journalled for this run, or only *earlier* runs are in the journal:
+            # in both cases this attempt never reached the point where money is admitted.
+            record(usd_e2_spent=0, spend_known=True)
+            return
+        timings = entry.get("timings") or {}
+        stage = next((label for key, label in reversed(STAGE_LABELS) if key in timings), None)
+        spent = entry.get("usd_e2_spent")
+        record(
+            run_status=str(entry.get("status")) if entry.get("status") else None,
+            run_reason=str(entry.get("reason")) if entry.get("reason") else None,
+            last_stage=stage,
+            usd_e2_spent=int(spent) if isinstance(spent, int) else None,
+            spend_known=isinstance(spent, int),
+        )
+    except Exception:  # noqa: BLE001 - an unreadable record is "cost unknown", never a new failure
+        with suppress(Exception):
+            record(spend_known=False)
 
 
 @dataclass(frozen=True)
@@ -130,7 +205,7 @@ def make_pipeline_runner(
 
     shazam_breaker = ShazamBreaker(AppConfig.load(config_file).shazam_breaker)
 
-    def runner(ctx: JobContext) -> None:
+    def _run_job(ctx: JobContext) -> None:
         target = ctx.target
 
         if ctx.build_index:
@@ -218,6 +293,21 @@ def make_pipeline_runner(
             index = shown_result_dir(cached.media_dir) / "index.html"
             if index.is_file():
                 ctx.set_result(index)
+
+    def runner(ctx: JobContext) -> None:
+        """Run the job, and whatever happens leave its frozen outcome on the job (U-F15).
+
+        Failure and cancellation both unwind through here, so the terminal status, reason, last
+        completed stage and settled spend are read back from the journal *once* — the UI then states
+        the cost instead of hedging about it.
+        """
+
+        try:
+            _run_job(ctx)
+        except BaseException:
+            _record_outcome(ctx, root, ctx.target)
+            raise
+        _record_outcome(ctx, root, ctx.target)
 
     return runner
 
