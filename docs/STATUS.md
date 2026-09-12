@@ -7,7 +7,7 @@ one-page answer to "what actually works, and what is only claimed?"*
 
 *Updated 2026-09-12. Plan: [PLAN-v2.md](PLAN-v2.md) rev 6; cycle log: [reviews/README.md](reviews/README.md).*
 
-**Phases 0, 1 and 2 are complete and committed, plus presentation cycle 3a-i.** Test suite: 1094 passed offline.
+**Phases 0, 1 and 2 are complete and committed, plus presentation cycles 3a-i and 3a-ii.** Test suite: 1119 passed offline.
 
 Phase 0 (cycles 0a-i, 0a-ii, 0a-iv+0a-iii, 0b-i+0b-iii, 0b-ii): the paid (Deep) path no longer crashes after
 spending; AudD error bodies are never cached; spend is reserved, admitted per request against a hard cap and
@@ -69,7 +69,17 @@ Phase 2 and the first presentation cycle (committed 2026-09-11/12):
 asset injection, controls on shown rows only, the result URL shape) is a standing constraint on every
 presentation cycle.
 
-**Not started:** 3a-ii (honesty, accessibility, mobile), 4a–4d (service API, FastAPI, worker, accounts,
+- **3a-ii — honesty, accessibility, mobile.** The pages say only what the projection supports: the completion
+  screen counts shown tracks, the `degraded` banner names the real reason from the run's frozen status, and a
+  failure states what failed, where, and what it actually cost. Library cards take confidence from audio
+  evidence alone and count crowd rows separately. `POST /rescan` is gone. Provider names, diagnostic tokens and
+  private URL slugs are out of the interface. Progress is a wall-clock model (recognise 89 of 100 points,
+  cached phases handled, never moving backwards). On a phone the "Where to get it" column is back with 44 px
+  targets; the table has real semantics and no colour-only meaning; contrast ≥ 4.5:1 in both themes. Failed runs
+  appear in the library with cause and cost. `scripts/check_page_js.py` node-checks every inline script across
+  21 page renders; screenshots and vendored `axe-core@4.10.2` are non-blocking evidence (axe: zero violations).
+
+**Not started:** 4a–4d (service API, FastAPI, worker, accounts,
 credits), 6a–6b (ingest policy, container, launch checklist), then M2 (billing, Stripe sandbox) — see
 PLAN-v2 §5.
 
