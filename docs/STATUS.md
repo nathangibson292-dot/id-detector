@@ -5,9 +5,9 @@ one-page answer to "what actually works, and what is only claimed?"*
 
 ## v2 (hosted product) — where the build stands
 
-*Updated 2026-09-12. Plan: [PLAN-v2.md](PLAN-v2.md) rev 6; cycle log: [reviews/README.md](reviews/README.md).*
+*Updated 2026-09-13. Plan: [PLAN-v2.md](PLAN-v2.md) rev 6; cycle log: [reviews/README.md](reviews/README.md).*
 
-**Phases 0, 1 and 2 are complete and committed, plus presentation cycles 3a-i and 3a-ii.** Test suite: 1119 passed offline.
+**Phases 0, 1 and 2 are complete and committed, plus presentation cycles 3a-i and 3a-ii and service cycle 4a-i.** Test suite: 1139 passed offline.
 
 Phase 0 (cycles 0a-i, 0a-ii, 0a-iv+0a-iii, 0b-i+0b-iii, 0b-ii): the paid (Deep) path no longer crashes after
 spending; AudD error bodies are never cached; spend is reserved, admitted per request against a hard cap and
@@ -79,7 +79,17 @@ presentation cycle.
   appear in the library with cause and cost. `scripts/check_page_js.py` node-checks every inline script across
   21 page renders; screenshots and vendored `axe-core@4.10.2` are non-blocking evidence (axe: zero violations).
 
-**Not started:** 4a–4d (service API, FastAPI, worker, accounts,
+Phase 4 has begun:
+- **4a-i — service API and packaging.** `id_detector.service.run(RunRequest) → RunResult` is the only way to
+  analyse a mix; the pipeline lives in `id_detector/pipeline.py` and the CLI and web runner are thin callers
+  sharing one status-to-exit mapping. The target is a typed union (platform URL, upload id, local path), with
+  local paths refused outside local mode and URLs validated at the seam so a filesystem path cannot arrive as a
+  link. Nine durable checkpoints mean a crash resumes rather than repeats: resuming from the primary sweep
+  issues zero AudD requests, recovered units are charged against the original reservation before any new
+  dispatch, and a clip whose outcome is already known is never re-sent. `src/idea_web/` is packaged and in the
+  wheel (no app yet — that is 4a-ii).
+
+**Not started:** 4a-ii onwards (service API, FastAPI, worker, accounts,
 credits), 6a–6b (ingest policy, container, launch checklist), then M2 (billing, Stripe sandbox) — see
 PLAN-v2 §5.
 
