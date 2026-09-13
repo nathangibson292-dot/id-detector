@@ -17,7 +17,7 @@ import httpx
 import pytest
 from typer.testing import CliRunner
 
-from id_detector import cli
+from id_detector import cli, pipeline
 from id_detector import scan as scan_module
 from id_detector.contracts import SourceRecord, Transform, WindowRecord, derive_source_key
 from id_detector.hints.pipeline import run_hints
@@ -329,7 +329,7 @@ def test_upload_consent_is_not_read_from_any_body_and_no_longer_exists(tmp_path:
 
 
 def test_whole_file_scanner_call_site_is_gone_from_analyse(tmp_path: Path, monkeypatch) -> None:
-    assert not hasattr(cli, "run_paid_scanners")
+    assert not hasattr(pipeline, "run_paid_scanners")
 
     async def forbidden(*_args: object, **_kwargs: object):
         raise AssertionError("the whole-file scanner ran")
@@ -354,7 +354,7 @@ def test_engine_acrcloud_is_refused_and_the_consent_flag_is_inert(monkeypatch) -
         captured.update(kwargs)
         return 0
 
-    monkeypatch.setattr(cli, "_analyse", fake_analyse)
+    monkeypatch.setattr(pipeline, "run_analysis", fake_analyse)
     runner = CliRunner()
     refused = runner.invoke(cli.app, ["analyse", "http://example/set", "--engine", "acrcloud"])
     assert refused.exit_code == 2
@@ -530,8 +530,9 @@ def test_web_runner_wires_the_built_index_into_the_analysis(
         captured.update(kwargs)
         return 0
 
-    monkeypatch.setattr(cli, "_analyse", capture_analyse)
+    monkeypatch.setattr(pipeline, "run_analysis", capture_analyse)
     monkeypatch.setattr(cli, "_load_cached", lambda _root, _target: None)
+    monkeypatch.setattr(pipeline, "_load_cached", lambda _root, _target: None)
     monkeypatch.setattr(
         runner_module,
         "_run_build_index",

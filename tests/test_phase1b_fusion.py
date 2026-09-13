@@ -23,7 +23,7 @@ import pytest
 import typer
 from typer.testing import CliRunner
 
-from id_detector import cli
+from id_detector import cli, pipeline
 from id_detector.contracts import (
     GENERATED_BY,
     EpisodeRecord,
@@ -746,7 +746,7 @@ def test_profile_max_accuracy_alone_selects_the_free_recipe(monkeypatch) -> None
         captured.update(kwargs)
         return 0
 
-    monkeypatch.setattr(cli, "_analyse", fake_analyse)
+    monkeypatch.setattr(pipeline, "run_analysis", fake_analyse)
     runner = CliRunner()
     for arguments, expected in (
         (["--profile", "max_accuracy"], "free"),

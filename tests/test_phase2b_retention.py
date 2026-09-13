@@ -12,7 +12,7 @@ from pathlib import Path
 import pytest
 from typer.testing import CliRunner
 
-from id_detector import cli, retention
+from id_detector import cli, pipeline, retention
 from id_detector.io import (
     atomic_write_json,
     native_path,
@@ -247,6 +247,7 @@ def test_refetch_after_pcm_expiry_reuses_source_changed_exit_5(tmp_path: Path, m
     collect(work, policy="hosted", apply=True, now=NOW)
     assert not (media / "decode/audio.pcm").exists() and not retained.original_path.exists()
     monkeypatch.setattr(cli, "_load_cached", lambda *args: retained)
+    monkeypatch.setattr(pipeline, "_load_cached", lambda *args: retained)
     monkeypatch.setattr(ingestion, "_load_cached", lambda *args: retained)
     monkeypatch.setattr(ingestion, "_load_ingest_cached", lambda *args: None)
 

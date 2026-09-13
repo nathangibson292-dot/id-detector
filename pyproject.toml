@@ -33,7 +33,7 @@ dev = [
 ]
 
 [tool.hatch.build.targets.wheel]
-packages = ["src/id_detector"]
+packages = ["src/id_detector", "src/idea_web"]
 
 # The single pricing authority lives at the repository root (plan §3.3). The wheel carries a
 # build-time copy so an installed `idea` prices runs identically; there is no second committed

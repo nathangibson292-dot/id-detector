@@ -13,7 +13,7 @@ from pathlib import Path
 import pytest
 from typer.testing import CliRunner
 
-from id_detector import cli
+from id_detector import cli, pipeline
 from id_detector.cli import _achieved, _run_status
 from id_detector.contracts import EpisodeRecord, EpisodesFile, Transform, WindowRecord
 from id_detector.present.bundles import shown_result_dir
@@ -338,7 +338,7 @@ def test_allow_degrade_cli_flag_is_threaded_and_off_by_default(monkeypatch) -> N
         captured.update(kwargs)
         return 0
 
-    monkeypatch.setattr(cli, "_analyse", fake_analyse)
+    monkeypatch.setattr(pipeline, "run_analysis", fake_analyse)
     runner = CliRunner()
     default = runner.invoke(cli.app, ["analyse", "http://example/set", "--recipe", "deep"])
     assert default.exit_code == 0, default.output
@@ -542,8 +542,9 @@ def test_web_runner_fails_every_non_zero_exit_without_attaching_a_result(
     def never_cached(_work_root: Path, _target: str):
         raise AssertionError("a refused run must not attach a cached result")
 
-    monkeypatch.setattr(cli, "_analyse", refused_analyse)
+    monkeypatch.setattr(pipeline, "run_analysis", refused_analyse)
     monkeypatch.setattr(cli, "_load_cached", never_cached)
+    monkeypatch.setattr(pipeline, "_load_cached", never_cached)
     runner = make_pipeline_runner(
         tmp_path, project_root=ROOT, config_path=tmp_path / "missing-idea.toml"
     )

@@ -16,7 +16,7 @@ from pathlib import Path
 
 import pytest
 
-from id_detector import cli
+from id_detector import cli, pipeline
 from id_detector.attempts import (
     AttemptJournal,
     AttemptLedger,
@@ -541,8 +541,9 @@ def test_web_runner_passes_the_jobs_cancel_event_as_the_cancel_token(
         captured.update(kwargs)
         return 0
 
-    monkeypatch.setattr(cli, "_analyse", capture_analyse)
+    monkeypatch.setattr(pipeline, "run_analysis", capture_analyse)
     monkeypatch.setattr(cli, "_load_cached", lambda _root, _target: None)
+    monkeypatch.setattr(pipeline, "_load_cached", lambda _root, _target: None)
     manager = JobManager(
         tmp_path,
         make_pipeline_runner(tmp_path, project_root=ROOT, config_path=tmp_path / "missing.toml"),

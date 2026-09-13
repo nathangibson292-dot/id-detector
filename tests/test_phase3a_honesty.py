@@ -48,7 +48,7 @@ from id_detector.webapp.jobs import (
     JobContext,
     JobManager,
 )
-from id_detector.webapp.runner import _this_runs_entry
+from id_detector.webapp.runner import _entry_by_run_id
 from tests.test_projection import _inputs, _publish, _source
 
 TIMEOUT = 5.0
@@ -712,6 +712,7 @@ def test_a_terminal_run_records_its_journalled_outcome_on_the_job(tmp_path: Path
             [
                 json.dumps(
                     {
+                        "invocation_id": "a" * 32,
                         "status": "complete",
                         "started_at": "2026-01-01T00:00:00Z",
                         "usd_e2_spent": 900,
@@ -719,6 +720,7 @@ def test_a_terminal_run_records_its_journalled_outcome_on_the_job(tmp_path: Path
                 ),
                 json.dumps(
                     {
+                        "invocation_id": "b" * 32,
                         "status": "failed",
                         "reason": "provider_unavailable_midrun",
                         "started_at": "2026-09-12T10:00:00Z",
@@ -732,14 +734,13 @@ def test_a_terminal_run_records_its_journalled_outcome_on_the_job(tmp_path: Path
         encoding="utf-8",
     )
     journal = media_dir / "invocations.jsonl"
-    this_run = datetime.fromisoformat("2026-09-12T10:00:00+00:00").timestamp()
-    entry = _this_runs_entry(journal, this_run)
+    entry = _entry_by_run_id(journal, "b" * 32)
     assert entry is not None and entry["usd_e2_spent"] == 42
 
-    # An earlier run's spend is never attributed to a later attempt.
-    later = _this_runs_entry(journal, this_run + 86_400)
-    assert later is None
-    assert _this_runs_entry(journal, None)["usd_e2_spent"] == 42
+    # An earlier run's spend is never attributed to another attempt: the match is on the run's own
+    # id, so a run that journalled nothing (a cache hit) gets no entry and no borrowed money.
+    assert _entry_by_run_id(journal, "a" * 32)["usd_e2_spent"] == 900
+    assert _entry_by_run_id(journal, "c" * 32) is None
 
     manager = JobManager(tmp_path, lambda context: None)
     try:

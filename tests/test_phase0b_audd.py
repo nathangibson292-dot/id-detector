@@ -16,7 +16,7 @@ from pathlib import Path
 import pytest
 from typer.testing import CliRunner
 
-from id_detector import cli
+from id_detector import cli, pipeline
 from id_detector import paid_clip as paid_clip_module
 from id_detector.attempts import AttemptState, attempts_path, load_attempt_ledger
 from id_detector.config_template import CONFIG_TEMPLATE, render_effective_config
@@ -498,7 +498,7 @@ def test_audd_requests_per_minute_is_a_deep_config_knob_carried_under_a_profile(
         captured.update(kwargs)
         return 0
 
-    monkeypatch.setattr(cli, "_analyse", fake_analyse)
+    monkeypatch.setattr(pipeline, "run_analysis", fake_analyse)
     result = CliRunner().invoke(
         cli.app,
         ["analyse", "http://example/set", "--profile", "free", "--config", str(config)],

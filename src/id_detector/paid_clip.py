@@ -124,6 +124,9 @@ class PaidScanResult:
     #: ``prepared`` without ``dispatched`` was never sent and is simply re-issued.
     resumed_ambiguous: int = 0
     resumed_reissued: int = 0
+    #: Clips THIS run had already resolved before it was interrupted: recovered from the
+    #: attempt journal and never dispatched again, so a resume cannot pay twice for one clip.
+    recovered_resolved: int = 0
 
     @property
     def ran(self) -> bool:
@@ -291,6 +294,24 @@ def _windows_in_targets(windows: WindowsResult, targets: tuple[Span, ...]) -> li
     return selected
 
 
+def _invocation_dir(media_dir: Path, run_id: str) -> Path:
+    """This pass's immutable output directory for ``run_id``.
+
+    Recognition artefacts are immutable per invocation (``recognise._write_jsonl`` refuses to
+    replace one), and a resumed run legitimately produces a LARGER observation set than the pass it
+    resumes: reusing the first pass's directory made every resume of a cancelled primary die of
+    ``FileExistsError`` — after paying for its provider calls. Each pass writes beside the last.
+    """
+
+    base = media_dir / "recognise" / "invocations" / f"live-audd-clip-{run_id[:12]}"
+    if not path_is_file(base / "observations.gen0.jsonl"):
+        return base
+    ordinal = 1
+    while path_is_file(Path(f"{base}-r{ordinal}") / "observations.gen0.jsonl"):
+        ordinal += 1
+    return Path(f"{base}-r{ordinal}")
+
+
 def _read_cached(raw_path: Path, refresh_states: frozenset[str]) -> dict[str, Any] | None:
     """A cached match/no-match body unless its state is one the caller wants re-queried."""
 
@@ -325,6 +346,7 @@ class _Sweep:
     provider_stopped: str | None = None
     resumed_ambiguous: int = 0
     resumed_reissued: int = 0
+    recovered_resolved: int = 0
     #: No further dispatch (terminal outcome, exhausted reservation, or a cancel).
     halted: bool = False
     cancelled: bool = False
@@ -361,6 +383,7 @@ async def run_paid_clip_recognition(
     cancel_token: CancelToken | None = None,
     on_window: WindowProgressFn | None = None,
     sleep: SleepFn | None = None,
+    attempt_journal: AttemptJournal | None = None,
 ) -> PaidScanResult:
     """Recognise the uncertain-region window clips with the paid engine and return observations.
 
@@ -371,6 +394,8 @@ async def run_paid_clip_recognition(
     ``log``, may raise ``asyncio.CancelledError`` to cancel the sweep.  Never raises for an
     unavailable engine; it is skipped and recorded.
     """
+
+    from id_detector.service import recover_paid_attempts
 
     emit_raw: LogFn = log or (lambda _message: None)
     if "audd" not in enabled_engines or not targets:
@@ -410,14 +435,18 @@ async def run_paid_clip_recognition(
     pause: SleepFn = sleep or asyncio.sleep
 
     cache_dir = media_dir / "recognise" / "invocations" / "live-audd-clip-v1" / "raw"
-    invocation_dir = media_dir / "recognise" / "invocations" / f"live-audd-clip-{run_id[:12]}"
-    ledger = load_attempt_ledger(attempts_path(media_dir))
-    journal = AttemptJournal(
+    invocation_dir = _invocation_dir(media_dir, run_id)
+    journal = attempt_journal or AttemptJournal(
         attempts_path(media_dir),
         run_id=run_id,
         provider="audd",
         unit_usd_e6=app_config.audd_usd_e6_per_request,
     )
+    # Plan §2.3.3: the journal the sweep WRITES to is the one recovery must READ. Reading the
+    # per-media default while dispatch wrote to an injected (hosted) journal made that journal's
+    # unresolved dispatches invisible on resume, so the next run re-billed them.
+    ledger = load_attempt_ledger(journal.path)
+    recovery = recover_paid_attempts(journal.path, run_id=run_id)
     limiter = TokenBucket(rate_per_minute=app_config.audd_requests_per_minute, capacity=concurrency)
     sweep = _Sweep(total=len(selected))
     queue: deque[WindowRecord] = deque(selected)
@@ -512,10 +541,27 @@ async def run_paid_clip_recognition(
         raw_path = cache_dir / f"{query.cache_key}.json"
         raw_ref = raw_path.relative_to(media_dir).as_posix()
         start_s = window.support_ms[0] // 1000
-        response = None if refresh else _read_cached(raw_path, refresh_states)
+        # A clip THIS run already resolved is never sent again, whatever ``refresh`` or
+        # ``refresh_states`` say: its answer is already paid for. Re-querying a cached ``no_match``
+        # (the default refresh state) is precisely how resuming an interrupted primary re-billed
+        # work the same run had settled.
+        already_resolved = query.cache_key in recovery.resolved_query_ids
+        if already_resolved:
+            response = _read_cached(raw_path, frozenset())
+        else:
+            response = None if refresh else _read_cached(raw_path, refresh_states)
         was_cached = response is not None
         if was_cached:
             sweep.cache_hits += 1
+            if already_resolved:
+                sweep.recovered_resolved += 1
+        elif already_resolved:
+            # Resolved by this run to an outcome that cached no reusable body (an error, or a
+            # malformed success). It is accounted for and must not be dispatched again.
+            sweep.recovered_resolved += 1
+            sweep.done += 1
+            _tick()
+            return
         else:
             wav = media_dir / window.wav_path
             # Plan §2.3.3 resume rule: an earlier run's unresolved attempt on this clip becomes
@@ -650,6 +696,11 @@ async def run_paid_clip_recognition(
             f"; resumed {sweep.resumed_ambiguous} ambiguous, "
             f"{sweep.resumed_reissued} re-issued attempt(s) from an earlier run"
         )
+    if sweep.recovered_resolved:
+        summary += (
+            f"; {sweep.recovered_resolved} clip(s) this run had already resolved were recovered, "
+            "not re-sent"
+        )
     if sweep.cancelled:
         summary += "; cancelled"
     emit(summary)
@@ -670,4 +721,5 @@ async def run_paid_clip_recognition(
         cancelled=sweep.cancelled,
         resumed_ambiguous=sweep.resumed_ambiguous,
         resumed_reissued=sweep.resumed_reissued,
+        recovered_resolved=sweep.recovered_resolved,
     )

@@ -8,6 +8,7 @@ from pathlib import Path
 import httpx
 import pytest
 
+from id_detector import pipeline
 from id_detector.cli import _load_cached
 from id_detector.io import read_bytes, read_text
 from id_detector.present.bundles import result_dir
@@ -156,7 +157,6 @@ def test_deleted_local_input_opens_by_path_and_rebuilds_missing_current(tmp_path
 
 
 def test_web_runner_publishes_bundle_result_url(tmp_path: Path, monkeypatch) -> None:
-    from id_detector import cli
     from id_detector.webapp.runner import make_pipeline_runner
     from scripts.make_golden import AUDIO, run_local_free
 
@@ -165,7 +165,7 @@ def test_web_runner_publishes_bundle_result_url(tmp_path: Path, monkeypatch) -> 
     async def analysed(*args, **kwargs):
         return 0
 
-    monkeypatch.setattr(cli, "_analyse", analysed)
+    monkeypatch.setattr(pipeline, "run_analysis", analysed)
 
     class Context:
         target = str(AUDIO)

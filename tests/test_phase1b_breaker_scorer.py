@@ -13,6 +13,7 @@ import pytest
 from typer.testing import CliRunner
 
 from id_detector import cli
+from id_detector import pipeline as service_pipeline
 from id_detector.jobs import BudgetExhausted
 from id_detector.profiles import effective_app_config, load_profile
 from id_detector.providers.base import AppConfig
@@ -405,7 +406,7 @@ def test_web_runner_owns_one_breaker_across_jobs_and_reports_waiting(tmp_path, m
         seen.append(kwargs["shazam_breaker"])
         return 6
 
-    monkeypatch.setattr(cli, "_analyse", refused)
+    monkeypatch.setattr(service_pipeline, "run_analysis", refused)
     context = SimpleNamespace(
         target=str(AUDIO),
         build_index=False,
@@ -535,7 +536,7 @@ def test_web_job_of_a_refused_request_is_waiting_not_failed(tmp_path, monkeypatc
     async def refused(*args, **kwargs):
         return 6
 
-    monkeypatch.setattr(cli, "_analyse", refused)
+    monkeypatch.setattr(service_pipeline, "run_analysis", refused)
     runner = make_pipeline_runner(tmp_path, config_path=tmp_path / "missing.toml")
     manager = jobs_module.JobManager(tmp_path, runner)
     try:

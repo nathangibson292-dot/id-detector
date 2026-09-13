@@ -8,6 +8,7 @@ from pathlib import Path
 
 import pytest
 
+from id_detector import pipeline
 from id_detector.io import canonical_json_bytes, native_path, read_bytes, read_text
 from id_detector.present import bundles, page, refresh
 from id_detector.providers.base import AppConfig
@@ -120,10 +121,9 @@ def test_failure_after_files_before_pointer_leaves_no_dangling_reference(
 
 
 def test_pipeline_journal_names_only_durable_files(tmp_path: Path, monkeypatch) -> None:
-    from id_detector import cli
     from scripts.make_golden import run_local_free
 
-    original_append = cli.append_invocation
+    original_append = pipeline.append_invocation
     observed = []
 
     def append(path, entry):
@@ -134,7 +134,7 @@ def test_pipeline_journal_names_only_durable_files(tmp_path: Path, monkeypatch) 
             observed.append(entry.bundle_id)
         original_append(path, entry)
 
-    monkeypatch.setattr(cli, "append_invocation", append)
+    monkeypatch.setattr(pipeline, "append_invocation", append)
     run_local_free(tmp_path / "work")
     assert len(observed) == 1
 

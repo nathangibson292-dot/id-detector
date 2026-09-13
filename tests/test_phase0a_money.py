@@ -12,7 +12,7 @@ import httpx
 import pytest
 from typer.testing import CliRunner
 
-from id_detector import cli
+from id_detector import cli, pipeline
 from id_detector.money import (
     BILLABLE_OUTCOMES,
     ZERO_COST_OUTCOMES,
@@ -424,7 +424,7 @@ def test_primary_stops_and_journals_partial_when_admission_cannot_dispatch(
             configured_max_usd_e2=None,
         )
 
-    monkeypatch.setattr(cli, "reserve_usd", undersized_reservation)
+    monkeypatch.setattr(pipeline, "reserve_usd", undersized_reservation)
     code, audd, shazam, entry, _media_dir = _run_deep(tmp_path, "gate0a-deep.json")
     assert code == 0
     assert audd.calls == 1
@@ -444,7 +444,7 @@ def test_recipe_cli_selects_deep_and_retires_max_paid_clips(monkeypatch) -> None
         captured.update(kwargs)
         return 0
 
-    monkeypatch.setattr(cli, "_analyse", fake_analyse)
+    monkeypatch.setattr(pipeline, "run_analysis", fake_analyse)
     runner = CliRunner()
     selected = runner.invoke(cli.app, ["analyse", "http://example/set", "--recipe", "deep"])
     assert selected.exit_code == 0, selected.output
@@ -550,7 +550,7 @@ def test_legacy_max_accuracy_profile_never_starts_paid_work_without_an_explicit_
         captured.update(kwargs)
         return 0
 
-    monkeypatch.setattr(cli, "_analyse", fake_analyse)
+    monkeypatch.setattr(pipeline, "run_analysis", fake_analyse)
     runner = CliRunner()
     bare = runner.invoke(cli.app, ["analyse", "http://example/set", "--profile", "max_accuracy"])
     assert bare.exit_code == 0, bare.output
@@ -580,8 +580,8 @@ def test_free_recipe_reaches_no_paid_call_path_even_with_consent_and_engines_ope
     def forbidden(*_args: object, **_kwargs: object):
         raise AssertionError("the free recipe reached a paid engine")
 
-    assert not hasattr(cli, "run_paid_scanners")  # the whole-file call site is gone (0a-iii)
-    monkeypatch.setattr(cli, "run_paid_clip_recognition", forbidden)
+    assert not hasattr(pipeline, "run_paid_scanners")  # the whole-file call site is gone (0a-iii)
+    monkeypatch.setattr(pipeline, "run_paid_clip_recognition", forbidden)
     script = SCRIPTS / "all-no-match.json"
     audd = FakeAudD(script)
     work_root = tmp_path / "work"

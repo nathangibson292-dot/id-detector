@@ -10,11 +10,14 @@ pluggable: tests inject a fake runner instead and never touch the network.
 from __future__ import annotations
 
 import asyncio
+import uuid
 from contextlib import suppress
 from dataclasses import dataclass
 from hashlib import sha256
 from pathlib import Path
 
+from id_detector.io import path_is_file
+from id_detector.money import ceil_e2
 from id_detector.providers.base import AppConfig
 from id_detector.shazam_breaker import ShazamBreaker
 from id_detector.webapp.jobs import STAGE_LABELS, JobContext, JobWaiting
@@ -39,16 +42,15 @@ _EXIT_STATUS = {
 }
 
 
-def _this_runs_entry(journal: Path, started_at: float | None) -> dict | None:
-    """The journal entry belonging to the run that started at ``started_at``, newest first.
+def _entry_by_run_id(journal: Path, run_id: str) -> dict | None:
+    """The journal entry this run wrote, matched on its own caller-supplied ``run_id``.
 
-    A mix analysed twice has two entries; attributing an *earlier* run's spend to this attempt is
-    exactly the kind of made-up money figure U-F15 is about, so an entry that predates this job is
-    not this job's.
+    Exact identity, not a clock heuristic: a mix analysed twice has two entries, and the old
+    "started within a second of the job" rule could hand an *earlier* run's entry — and its spend —
+    to a later attempt or a cache hit. That is the made-up money figure U-F15 is about.
     """
 
     import json
-    from datetime import datetime
 
     try:
         lines = [line for line in journal.read_text(encoding="utf-8").splitlines() if line.strip()]
@@ -57,27 +59,41 @@ def _this_runs_entry(journal: Path, started_at: float | None) -> dict | None:
     for line in reversed(lines):
         try:
             entry = json.loads(line)
-            stamp = str(entry.get("started_at") or "")
-            moment = datetime.fromisoformat(stamp.replace("Z", "+00:00")).timestamp()
-        except (ValueError, TypeError, AttributeError):
+        except ValueError:
             continue
-        # One second of slack: the job clock and the pipeline clock are the same wall clock, but the
-        # journal stamp is second-resolution on some platforms.
-        if started_at is None or moment >= started_at - 1.0:
+        if isinstance(entry, dict) and entry.get("invocation_id") == run_id:
             return entry
     return None
 
 
-def _record_outcome(ctx: JobContext, work_root: Path, target: str) -> None:
-    """Read this run's terminal journal entry back onto the job (U-F15).
+def _run_entry(work_root: Path, target: str, run_id: str) -> dict | None:
+    """This run's journal entry, or ``None``.
 
-    The journal is the frozen §2.3.5 record — status, reason and the money that was *settled* —
-    written on every terminal path that reached a media directory.  No media directory means the
-    run stopped before a single window could be reserved, so nothing was spent: that is knowledge,
-    not a guess, and only an unreadable journal leaves the cost genuinely unknown.
+    The service already reports the run's status, reason and settled money, so the journal is read
+    for one thing only: which stage the run reached.
     """
 
     from id_detector import cli
+
+    try:
+        cached = cli._load_cached(Path(work_root).resolve(), target)
+    except (OSError, ValueError):
+        return None
+    if cached is None:
+        return None
+    return _entry_by_run_id(Path(cached.media_dir) / "invocations.jsonl", run_id)
+
+
+def _record_outcome(
+    ctx: JobContext, work_root: Path, target: str, outcome: RunOutcome | None
+) -> None:
+    """Put this run's frozen outcome on the job (U-F15).
+
+    ``outcome`` is what :func:`id_detector.service.run` reported: the §2.3.5 status, its reason and
+    the money that was *settled*, taken from the run itself rather than looked up afterwards. A run
+    that never reached the service (an exception on the way in) reports nothing, and a run that
+    reached it but never reserved reports a known zero — that is knowledge, not a guess.
+    """
 
     # Bookkeeping must never mask the job's own outcome: this runs on the way out of a failure or a
     # cancellation, so anything it raises would replace the real exception with an AttributeError.
@@ -85,30 +101,32 @@ def _record_outcome(ctx: JobContext, work_root: Path, target: str) -> None:
     if record is None:  # a duck-typed context that does not carry the outcome contract
         return
     try:
-        cached = cli._load_cached(Path(work_root).resolve(), target)
-        if cached is None:
-            record(usd_e2_spent=0, spend_known=True)
+        if outcome is None:
+            record(spend_known=False)
             return
-        journal = Path(cached.media_dir) / "invocations.jsonl"
-        entry = _this_runs_entry(journal, getattr(ctx, "started_at", None))
-        if entry is None:
-            # Either nothing was journalled for this run, or only *earlier* runs are in the journal:
-            # in both cases this attempt never reached the point where money is admitted.
-            record(usd_e2_spent=0, spend_known=True)
-            return
-        timings = entry.get("timings") or {}
+        entry = _run_entry(work_root, target, outcome.run_id)
+        timings = (entry or {}).get("timings") or {}
         stage = next((label for key, label in reversed(STAGE_LABELS) if key in timings), None)
-        spent = entry.get("usd_e2_spent")
         record(
-            run_status=str(entry.get("status")) if entry.get("status") else None,
-            run_reason=str(entry.get("reason")) if entry.get("reason") else None,
+            run_status=outcome.status or None,
+            run_reason=outcome.reason or None,
             last_stage=stage,
-            usd_e2_spent=int(spent) if isinstance(spent, int) else None,
-            spend_known=isinstance(spent, int),
+            usd_e2_spent=outcome.usd_e2_spent,
+            spend_known=True,
         )
     except Exception:  # noqa: BLE001 - an unreadable record is "cost unknown", never a new failure
         with suppress(Exception):
             record(spend_known=False)
+
+
+@dataclass(frozen=True)
+class RunOutcome:
+    """The part of a :class:`id_detector.service.RunResult` a browser job reports."""
+
+    run_id: str
+    status: str
+    reason: str | None
+    usd_e2_spent: int
 
 
 @dataclass(frozen=True)
@@ -205,7 +223,7 @@ def make_pipeline_runner(
 
     shazam_breaker = ShazamBreaker(AppConfig.load(config_file).shazam_breaker)
 
-    def _run_job(ctx: JobContext) -> None:
+    def _run_job(ctx: JobContext, seen: list[RunOutcome]) -> None:
         target = ctx.target
 
         if ctx.build_index:
@@ -227,36 +245,79 @@ def make_pipeline_runner(
             if ctx.profile == "max_accuracy"
             else 1,
         )
-        result_paths: list[Path] = []
-        exit_code = asyncio.run(
-            cli._analyse(
-                target,
-                work_root=root,
-                print_raw=False,
-                refresh=False,
+        from id_detector.service import (
+            LocalCheckpointStore,
+            LocalPath,
+            PipelineOptions,
+            PlatformUrl,
+            RunRequest,
+            exit_code_for,
+            run,
+        )
+
+        service_target = LocalPath(Path(target)) if Path(target).is_file() else PlatformUrl(target)
+        store = LocalCheckpointStore(
+            root,
+            options=PipelineOptions(
+                project_root=project,
                 max_requests=settings.max_requests,
-                tracklist=tracklist_path,
                 no_hints=settings.no_hints,
                 app_config=settings.config,
                 max_generations=settings.max_generations,
                 novelty=settings.novelty,
                 calibrator=settings.calibrator,
                 enabled_engines=settings.enabled_engines,
-                # The recipe owns engine selection and the shared compatible-result lookup.
-                recipe=selected_recipe,
                 shazam_breaker=shazam_breaker,
-                result_paths=result_paths,
-                # The index this job just built (or one an earlier job built) is queried over the
-                # still-uncertain spans; without a label the build was paid for and never used.
                 local_index_label=WEB_INDEX_LABEL if ctx.build_index else None,
                 index_root=WEB_INDEX_ROOT,
                 panako_tool_dir=WEB_PANAKO_TOOL_DIR,
+            ),
+        )
+        run_id = uuid.uuid4().hex
+        service_result = run(
+            RunRequest(
+                run_id=run_id,
+                analysis_key="",
+                target=service_target,
+                recipe=selected_recipe,
+                accept_degraded=False,
+                hints_snapshot_policy="disabled" if settings.no_hints else "reuse",
+                manual_tracklist=(
+                    tracklist_path.read_bytes() if tracklist_path is not None else None
+                ),
+                checkpoint_store=store,
+                attempt_journal=None,
+                usd_admitter=None,
                 progress=progress,
-                # The paid sweep polls this before each dispatch so a cancel stops new AudD
-                # requests while the clips in flight resolve (their spend is journalled).
                 cancel_token=ctx.cancel_token,
             )
         )
+        # The service reported the outcome; this runner renders it.  One mapping (§2.3.5) lives
+        # in the service, and the status/spend the job shows are the run's own, never a lookup.
+        seen.append(
+            RunOutcome(
+                run_id=run_id,
+                status=service_result.status,
+                reason=service_result.reason,
+                usd_e2_spent=ceil_e2(service_result.usd_e6_spent),
+            )
+        )
+        exit_code = exit_code_for(service_result)
+        # The bundle the service selected, addressed directly under this media's own directory.
+        # A recursive glob over the work root cannot be trusted here: the bundle path passes
+        # Windows' 260-character limit, where pathlib's globbing quietly matches nothing.
+        result_paths: list[Path] = []
+        if service_result.bundle_id is not None:
+            cached = cli._load_cached(root.resolve(), target)
+            if cached is not None:
+                bundle = Path(cached.media_dir) / "present" / "bundles" / service_result.bundle_id
+                if path_is_file(bundle / "manifest.json"):
+                    result_paths.append(bundle)
+        if service_result.status == "cancelled":
+            # The paid sweep let its in-flight clips resolve and the service journalled
+            # ``cancelled``; re-raise so the manager records a cancellation, not a failure.
+            ctx.check_cancel()
+            raise asyncio.CancelledError("analysis cancelled")
         if exit_code == WAITING_EXIT:
             # Plan §2.3.5: the breaker (or the kill-switch) refused a new Free request. The job
             # waits — it did not fail — so the manager records ``waiting``, not ``failed``.
@@ -302,12 +363,13 @@ def make_pipeline_runner(
         the cost instead of hedging about it.
         """
 
+        seen: list[RunOutcome] = []
         try:
-            _run_job(ctx)
+            _run_job(ctx, seen)
         except BaseException:
-            _record_outcome(ctx, root, ctx.target)
+            _record_outcome(ctx, root, ctx.target, seen[-1] if seen else None)
             raise
-        _record_outcome(ctx, root, ctx.target)
+        _record_outcome(ctx, root, ctx.target, seen[-1] if seen else None)
 
     return runner
 

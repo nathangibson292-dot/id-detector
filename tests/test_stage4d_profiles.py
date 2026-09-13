@@ -8,6 +8,7 @@ import pytest
 from typer.testing import CliRunner
 
 from id_detector import cli as cli_module
+from id_detector import pipeline as pipeline_module
 from id_detector.contracts import ProfileRecord
 from id_detector.io import atomic_write_json, read_bytes, read_text
 from id_detector.profiles import (
@@ -177,7 +178,7 @@ def test_analyse_accepts_a_frozen_profile_and_derives_its_config(monkeypatch) ->
         captured.update(kwargs)
         return 0
 
-    monkeypatch.setattr(cli_module, "_analyse", fake_analyse)
+    monkeypatch.setattr(pipeline_module, "run_analysis", fake_analyse)
     result = CliRunner().invoke(
         cli_module.app, ["analyse", "http://example/set", "--profile", "max_accuracy"]
     )

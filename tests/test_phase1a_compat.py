@@ -11,7 +11,7 @@ from pathlib import Path
 import pytest
 from typer.testing import CliRunner
 
-from id_detector import cli, compat
+from id_detector import cli, compat, pipeline
 from id_detector.compat import (
     AnalysisInputs,
     RunRequest,
@@ -151,13 +151,13 @@ def run(work, recipe="free", density=1, *, audio=AUDIO, config=None, **kwargs):
 
 def test_free_to_deep_primary_only_and_frozen_secondary(tmp_path, monkeypatch):
     fused_inputs = []
-    fuse = cli.run_generation_loop
+    fuse = pipeline.run_generation_loop
 
     async def record_fuse(**kwargs):
         fused_inputs.append(kwargs)
         return await fuse(**kwargs)
 
-    monkeypatch.setattr(cli, "run_generation_loop", record_fuse)
+    monkeypatch.setattr(pipeline, "run_generation_loop", record_fuse)
     work = tmp_path / "work"
     _, _, _, free_paths = run(work)
     free = free_paths[0]
@@ -344,7 +344,8 @@ def test_cached_analysis_needs_no_original_decode_or_provider(tmp_path, monkeypa
         pytest.fail("compatible lookup must precede re-fetch/decode")
 
     monkeypatch.setattr(cli, "ingest", forbidden)
-    monkeypatch.setattr(cli, "decode", forbidden)
+    monkeypatch.setattr(pipeline, "ingest", forbidden)
+    monkeypatch.setattr(pipeline, "decode", forbidden)
     code, audd, shazam, reused = run(work)
     assert code == 0 and reused == paths and audd.calls == shazam.requests == 0
 
@@ -365,6 +366,7 @@ def test_used_hints_and_manual_scope_control_lookup(tmp_path, monkeypatch):
         return SimpleNamespace(hints=tuple(used), hints_path=path)
 
     monkeypatch.setattr(cli, "run_hints", fake_hints)
+    monkeypatch.setattr(pipeline, "run_hints", fake_hints)
     _, _, _, first = run(work, tracklist=tracklist, no_hints=False)
     manifest = read_bundle_manifest(first[0])
     assert manifest["compatibility"]["tenant_scope"] == "user:local"
@@ -407,7 +409,7 @@ def test_web_runner_passes_recipe_and_delivers_selected_bundle(
         kwargs["result_paths"].append(selected)
         return 0
 
-    monkeypatch.setattr(cli, "_analyse", fake_analyse)
+    monkeypatch.setattr(pipeline, "run_analysis", fake_analyse)
     results = []
     outcomes = []
     context = SimpleNamespace(
@@ -440,6 +442,7 @@ def test_refetched_different_bytes_exit_5_before_publication(tmp_path, monkeypat
     retained = cli._load_cached(work, str(AUDIO))
     before = read_bytes(paths[0] / "manifest.json")
     monkeypatch.setattr(cli, "_load_cached", lambda *args: retained)
+    monkeypatch.setattr(pipeline, "_load_cached", lambda *args: retained)
     monkeypatch.setattr(ingestion, "_load_cached", lambda *args: retained)
     monkeypatch.setattr(ingestion, "_load_ingest_cached", lambda *args: None)
 
@@ -525,7 +528,7 @@ def test_web_acquisition_republishes_the_selected_bundle(tmp_path, monkeypatch):
             },
         )
 
-    monkeypatch.setattr(cli, "_analyse", fake_analyse)
+    monkeypatch.setattr(pipeline, "run_analysis", fake_analyse)
     monkeypatch.setattr(cli, "enrich_media_dir", fake_enrich)
     results = []
     context = SimpleNamespace(

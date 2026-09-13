@@ -16,7 +16,7 @@ import httpx
 import pytest
 from typer.testing import CliRunner
 
-from id_detector import cli, orchestrate
+from id_detector import cli, orchestrate, pipeline
 from id_detector.contracts import EpisodesFile
 from id_detector.present.bundles import shown_result_dir
 from id_detector.profiles import (
@@ -146,13 +146,13 @@ def _capture_loop(monkeypatch: pytest.MonkeyPatch) -> list[dict[str, object]]:
     """Record every ``run_generation_loop`` call ``_analyse`` makes (one per fuse)."""
 
     calls: list[dict[str, object]] = []
-    real = cli.run_generation_loop
+    real = pipeline.run_generation_loop
 
     async def wrapper(**kwargs: object) -> object:
         calls.append(kwargs)
         return await real(**kwargs)  # type: ignore[arg-type]
 
-    monkeypatch.setattr(cli, "run_generation_loop", wrapper)
+    monkeypatch.setattr(pipeline, "run_generation_loop", wrapper)
     return calls
 
 
@@ -214,7 +214,7 @@ def test_cli_analyse_and_the_web_runner_carry_the_five_knobs_and_agree(
         captured.update(kwargs)
         return 0
 
-    monkeypatch.setattr(cli, "_analyse", fake_analyse)
+    monkeypatch.setattr(pipeline, "run_analysis", fake_analyse)
     args = ["analyse", "http://example/set", "--config", str(config)]
     if via == "--profile":
         args += ["--profile", "free"]

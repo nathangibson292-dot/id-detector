@@ -15,6 +15,7 @@ from urllib.request import urlopen
 
 from typer.testing import CliRunner
 
+from id_detector import pipeline
 from id_detector.cli import _analyse
 from id_detector.io import native_path
 from id_detector.present.bundles import shown_result_dir
@@ -145,7 +146,7 @@ def test_paid_no_match_is_resolved_cached_and_gap_counts_accumulate(
     tmp_path: Path, monkeypatch
 ) -> None:
     # Exercise raw response refresh below the independently tested derived-result cache.
-    monkeypatch.setattr("id_detector.cli.find_result", lambda *args, **kwargs: None)
+    monkeypatch.setattr("id_detector.pipeline.find_result", lambda *args, **kwargs: None)
     exit_code, audd, shazam = _run_analysis(tmp_path, "all-no-match.json")
 
     media_dir, entry = _entry(tmp_path / "work")
@@ -175,7 +176,7 @@ def test_shazam_no_match_refresh_gets_a_fresh_allowance_after_exhausting_budget(
     tmp_path: Path,
     monkeypatch,
 ) -> None:
-    monkeypatch.setattr("id_detector.cli.find_result", lambda *args, **kwargs: None)
+    monkeypatch.setattr("id_detector.pipeline.find_result", lambda *args, **kwargs: None)
 
     async def analyse_with(client: FakeShazamHTTP, run_id: str) -> int:
         del run_id
@@ -272,8 +273,9 @@ def test_real_web_runner_fails_exit_3_without_attaching_stale_result(
         cache_loads += 1
         return type("Cached", (), {"media_dir": stale_media})()
 
-    monkeypatch.setattr(cli, "_analyse", unavailable_analyse)
+    monkeypatch.setattr(pipeline, "run_analysis", unavailable_analyse)
     monkeypatch.setattr(cli, "_load_cached", stale_cached)
+    monkeypatch.setattr(pipeline, "_load_cached", stale_cached)
     runner = make_pipeline_runner(
         tmp_path,
         project_root=ROOT,
@@ -331,7 +333,7 @@ def test_fake_provider_cli_is_hidden_guarded_and_injects_both_boundaries(
         captured.update(kwargs)
         return 0
 
-    monkeypatch.setattr(cli, "_analyse", fake_analyse)
+    monkeypatch.setattr(pipeline, "run_analysis", fake_analyse)
     monkeypatch.setenv("IDEA_TEST_MODE", "1")
     monkeypatch.setenv("IDEA_FAKE_SCRIPT", str(SCRIPTS / "gate0a-deep.json"))
     accepted = runner.invoke(
