@@ -1,6 +1,7 @@
 # ADR 0001: Web framework
 
-Status: Proposed — awaiting owner decision (plan spike S4)
+Status: **Accepted** 2026-09-13 by the owner (plan spike S4). Owner's words: "whatever you recommend i agree
+with, the priority is making this work for me, we may roll it out to others in future."
 
 ## Decision
 
@@ -60,4 +61,11 @@ Moderate and intentionally bounded. The 4a-i `id_detector.service` request/resul
 
 ## Owner decision
 
-**Owner: approve FastAPI + Jinja2 + uvicorn as recommended, or name the alternative: ____________________.**
+**Owner decision (2026-09-13): APPROVED as recommended — FastAPI + Jinja2 + uvicorn.**
+
+The same message set a priority that outranks the framework choice: **the tool has to work for the owner
+first; rolling it out to other people is a possibility, not a commitment.** That does not change this
+decision — the recommendation is also the cheapest path for a single-user local app, and `idea serve` runs the
+same application — but it does change the order of what gets built. Multi-tenant work (accounts, credits,
+tenancy, the container, billing) is now explicitly *later*, and anything that improves the owner's own use of
+the tool comes first. Recorded in `docs/reviews/README.md` and `docs/STATUS.md`.
