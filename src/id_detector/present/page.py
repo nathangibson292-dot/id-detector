@@ -47,7 +47,7 @@ UNRESOLVED_CAP_MS = 120_000
 #: Bump when the page's look or behaviour changes: ``present.refresh.ensure_fresh_page`` re-renders
 #: any written page whose ``<meta name="id-detector-page">`` stamp is older, so already-analysed
 #: mixes pick up the new page the next time they are opened (no re-analysis).
-PAGE_VERSION = 23
+PAGE_VERSION = 24
 
 
 # --------------------------------------------------------------------------------------------------
@@ -323,53 +323,76 @@ def _esc(value: object) -> str:
     return html.escape(str(value), quote=True)
 
 
+def _safe_href(value: object) -> str | None:
+    """An escaped ``href`` for a third-party link, or ``None`` unless it is a plain web URL.
+
+    Buy, download, stream and search links arrive verbatim from SoundCloud, stores and lookups, and
+    an uploader writes their own purchase link.  Escaping stops attribute breakout but not a
+    ``javascript:`` URL, which would run in this page's origin when clicked.
+    """
+
+    if not isinstance(value, str) or not value.strip():
+        return None
+    try:
+        parts = urlsplit(value.strip())
+    except ValueError:
+        return None
+    if parts.scheme.casefold() not in {"http", "https"} or not parts.netloc:
+        return None
+    return _esc(value.strip())
+
+
 def _acquire_links_html(acquire: dict[str, Any] | None) -> str:
     if not acquire:
         return '<span class="acq none">—</span>'
     chips: list[str] = []
     soundcloud = acquire.get("soundcloud") or {}
-    permalink = soundcloud.get("permalink_url")
-    purchase = soundcloud.get("purchase_url")
+    permalink = _safe_href(soundcloud.get("permalink_url"))
+    purchase = _safe_href(soundcloud.get("purchase_url"))
     if acquire.get("free_download") and permalink:
         chips.append(
             f'<a class="acq free" target="_blank" rel="noopener" '
-            f'href="{_esc(permalink)}">SoundCloud · Free</a>'
+            f'href="{permalink}">SoundCloud · Free</a>'
         )
     if acquire.get("gate") and (permalink or purchase):
         # Land on the SoundCloud track page (where the Free Download button lives) rather than
         # bouncing straight to the off-SoundCloud gate host, which reads like a broken link.
         chips.append(
             f'<a class="acq gate" target="_blank" rel="noopener" '
-            f'href="{_esc(permalink or purchase)}">SoundCloud · Gate</a>'
+            f'href="{permalink or purchase}">SoundCloud · Gate</a>'
         )
     # A known product URL is more useful than a store search or the SoundCloud landing page.
     buy_url = purchase if acquire.get("buy") else None
     buy_label = "SoundCloud · Buy"
     for link in acquire.get("direct") or ():
-        if link.get("kind") == "purchase":
-            buy_url = link.get("url")
+        if link.get("kind") == "purchase" and _safe_href(link.get("url")):
+            buy_url = _safe_href(link.get("url"))
             buy_label = f"{link.get('source', 'link')} · Buy"
             break
     if acquire.get("buy") and buy_url:
         chips.append(
             f'<a class="acq buy" target="_blank" rel="noopener" '
-            f'href="{_esc(buy_url)}">{_esc(buy_label)}</a>'
+            f'href="{buy_url}">{_esc(buy_label)}</a>'
         )
     # "Where to get it" means where to hear or buy the track — so keep streaming links (Deezer) but
     # drop pure-database entries (MusicBrainz) that a normal user can't get the track from.
     for link in acquire.get("direct") or ():
-        if link.get("kind") == "stream":
+        href = _safe_href(link.get("url"))
+        if link.get("kind") == "stream" and href:
             source = link.get("source", "link")
             chips.append(
                 f'<a class="acq direct" target="_blank" rel="noopener" '
-                f'href="{_esc(link.get("url"))}">{_esc(source)}</a>'
+                f'href="{href}">{_esc(source)}</a>'
             )
     # Search fallbacks are the least specific, so cap them (2) to keep the row scannable — for this
     # music Bandcamp/Beatport are the useful stores, ordered as the enrichment ranked them.
     for link in (acquire.get("search_links") or ())[:2]:
         source = link.get("source", "search")
+        href = _safe_href(link.get("url"))
+        if not href:
+            continue
         chips.append(
-            f'<a class="acq search" target="_blank" rel="noopener" href="{_esc(link.get("url"))}">'
+            f'<a class="acq search" target="_blank" rel="noopener" href="{href}">'
             f"Search {_esc(source)}</a>"
         )
     return "".join(chips) if chips else '<span class="acq none">—</span>'
@@ -689,9 +712,11 @@ def _confidence_html(projection: CanonicalProjection) -> str:
 
 
 def _embed_html(embed: EmbedPlan, audio_src: str | None = None) -> str:
+    href = _safe_href(embed.link_url)
     link = (
-        f'<a class="setlink" target="_blank" rel="noopener" '
-        f'href="{_esc(embed.link_url)}">Open the set ↗</a>'
+        f'<a class="setlink" target="_blank" rel="noopener" href="{href}">Open the set ↗</a>'
+        if href
+        else ""
     )
     if audio_src:
         # Play the fetched original locally: robust (works even when the platform video is removed
@@ -1310,8 +1335,8 @@ def render_page(
             "durationMs": duration_ms,
             "leadInMs": lead_in_ms,
         }
-    )
-    episode_spans_js = json.dumps(episode_spans)
+    ).replace("</", "<\\/")
+    episode_spans_js = json.dumps(episode_spans).replace("</", "<\\/")
     copy_entries_js = json.dumps(
         [
             {

@@ -868,39 +868,44 @@ def serve(
     import threading
     import webbrowser
 
-    from id_detector.present.server import make_server
-    from id_detector.webapp.jobs import JobManager
-    from id_detector.webapp.runner import make_pipeline_runner
+    from idea_web.server import make_server, require_loopback
 
     def _open() -> None:
         with contextlib.suppress(Exception):
             webbrowser.open(url)
 
-    manager: JobManager | None = None
-    if analyse:
-        runner = make_pipeline_runner(work_root, project_root=PROJECT_ROOT, config_path=config)
-        manager = JobManager(work_root, runner)
     try:
-        server = make_server(work_root, host=host, port=port, job_manager=manager)
+        require_loopback(host)
     except ValueError as exc:
         typer.echo(str(exc), err=True)
         raise typer.Exit(2) from None
+    # The web process never runs a pipeline (plan §4.2): it enqueues into the durable local queue,
+    # and a worker process that this command starts, restarts and stops runs the analyses.
+    jobs = supervisor = None
+    if analyse:
+        from idea_web.jobs.local import LocalJobs, LocalWorkerSupervisor
+
+        jobs = LocalJobs(work_root)
+        supervisor = LocalWorkerSupervisor(work_root, config_path=config, jobs=jobs)
+    server = make_server(work_root, host=host, port=port, jobs=jobs)
     bound_host, bound_port = server.server_address[0], server.server_address[1]
     url = f"http://{bound_host}:{bound_port}"
     mode = "analyse + read-only" if analyse else "read-only"
-    typer.echo(f"serving {work_root} at {url} ({mode}; Ctrl-C to stop)")
-    if open_browser:
-        # Open after the server is listening; a browser failure must never stop the server.
-        threading.Timer(0.4, _open).start()
     try:
+        if supervisor is not None:
+            supervisor.start()
+        typer.echo(f"serving {work_root} at {url} ({mode}; Ctrl-C to stop)")
+        if open_browser:
+            # Open after the server is listening; a browser failure must never stop the server.
+            threading.Timer(0.4, _open).start()
         server.serve_forever()
     except KeyboardInterrupt:
         typer.echo("stopping", err=True)
     finally:
         server.shutdown()
         server.server_close()
-        if manager is not None:
-            manager.shutdown()
+        if supervisor is not None:
+            supervisor.stop()
 
 
 @app.command()
@@ -1725,11 +1730,8 @@ def truth_review(
     import threading
     import webbrowser
 
-    from id_detector.truth_review import (
-        TruthReviewSession,
-        find_truth_path,
-        make_truth_review_server,
-    )
+    from id_detector.truth_review import TruthReviewSession, find_truth_path
+    from idea_web.truth_review import make_truth_review_server
 
     try:
         # The work tree is regenerable cache that idea gc prunes: a truth record resolving
@@ -1758,6 +1760,7 @@ def truth_review(
         typer.echo("stopping", err=True)
     finally:
         server.shutdown()
+        server.server_close()
         server.server_close()
 
 

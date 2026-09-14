@@ -27,8 +27,8 @@ from id_detector.truth_review import (
     preview_bulk_offset,
     reconciled_role_segments,
     reviewed_record,
-    serve_truth_review_in_background,
 )
+from idea_web.truth_review import serve_truth_review_in_background
 from scripts import audit_fixtures
 from scripts.check_page_js import _inline_scripts
 from scripts.make_audio_fixtures import generate

@@ -28,7 +28,6 @@ from id_detector.present.page import (
     seek_target_ms,
 )
 from id_detector.present.server import (
-    RunningServer,
     append_rescan_request,
     build_rescan_request,
     consume_rescan_queue,
@@ -67,3 +66,13 @@ __all__ = [
     "seek_target_ms",
     "serve_in_background",
 ]
+
+
+def __getattr__(name: str) -> object:
+    # ``RunningServer`` lives in the web layer; resolving it lazily keeps ``import
+    # id_detector.present`` (and so the CLI and the analysis worker) free of any HTTP framework.
+    if name == "RunningServer":
+        from idea_web.server import RunningServer
+
+        return RunningServer
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

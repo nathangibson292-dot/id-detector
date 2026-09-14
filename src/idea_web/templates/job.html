@@ -1,0 +1,24 @@
+{{ head | safe }}<body>{{ topbar | safe }}<main>
+<header class="job-head"><div class="titles"><p class="eyebrow" id="eyebrow">Analysing</p>
+<h1 id="title">{{ title }}</h1>{{ platform_chip | safe }}</div>
+<div class="job-actions"><span class="st" id="status">…</span>
+<button class="btn danger" id="cancel" type="button">Cancel</button></div></header>
+{{ player | safe }}
+<section class="scan" id="scan" aria-live="polite"><div class="scan-top">
+<div class="pct" id="pct">0<small>%</small></div>
+<div class="phase-line"><div class="phase-name" id="phase-name">Starting</div>
+<div class="phase-msg" id="phase-msg"></div></div>
+<div class="tiles"><span><b id="t-eta">…</b>time left</span>
+<span><b id="t-step">—</b>progress</span></div></div>
+<div class="cells idle" id="cells" aria-hidden="true"></div>
+<p class="flavour" id="flavour"></p>
+<p class="reassurance">You can close this tab — the scan will keep running.</p>
+<details class="elapsed"><summary>Timing details</summary>
+<span><b id="t-elapsed">—</b> elapsed</span></details></section>
+<section class="outcome" id="outcome"><div class="confetti" id="confetti"></div>
+<h2 id="o-title"></h2><p id="o-sub"></p><pre class="err" id="o-err"></pre>
+<div class="row" id="o-row"></div></section>
+<div class="steps">{% for key, name, sub in steps %}<div class="step" data-step="{{ key }}">
+<div class="k"><i>{{ loop.index }}</i>{{ name }}</div><small>{{ sub }}</small></div>{% endfor %}</div>
+<details class="log"><summary>Show the log</summary><pre id="log"></pre></details>
+{{ footer | safe }}</main><script>{{ script | safe }}</script></body></html>

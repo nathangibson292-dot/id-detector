@@ -1,4 +1,7 @@
-"""The local ``127.0.0.1`` server: the web app and the result-bundle file server.
+"""Presentation fragments for the local web app, and the rescan-queue helpers.
+
+The stdlib HTTP server that used to live here is retired (4a-ii): ``idea serve`` runs the one
+FastAPI application in :mod:`idea_web`, which renders its pages from these fragments.
 
 There is no ``POST /rescan``: §2.5 removed the rescan control **and** its route, because on real
 mixes another generation buys zero recall, adds phantom rows and costs hours.  The rescan queue
@@ -14,14 +17,10 @@ from __future__ import annotations
 import html
 import json
 import re
-import secrets
-import threading
 from dataclasses import dataclass
 from datetime import datetime
-from http import HTTPStatus
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import parse_qs, quote, urlsplit
+from typing import Any
 
 from id_detector.contracts import (
     GENERATED_BY,
@@ -32,7 +31,7 @@ from id_detector.contracts import (
     compose_natural_key,
     make_id,
 )
-from id_detector.ingest import _load_cached, _load_ingest_cached
+from id_detector.ingest import _load_ingest_cached
 from id_detector.io import (
     atomic_write_bytes,
     canonical_json_bytes,
@@ -58,8 +57,6 @@ from id_detector.webapp.jobs import (
     STAGE_LABELS,
     TERMINAL_STATES,
     Job,
-    JobManager,
-    TargetValidationError,
 )
 
 _SHA = re.compile(r"^[0-9a-f]{64}$")
@@ -1496,572 +1493,13 @@ def _job_page_html(job: Job, csrf_token: str = "") -> bytes:
     return _page_shell("Analysing — ID'er", body, script)
 
 
-class _Handler(BaseHTTPRequestHandler):
-    server_version = "id-detector-present/1.0"
-    work_root: Path
-    config: AppConfig | None = None
-    job_manager: JobManager | None = None
-    analyse_enabled: bool = False
-    csrf_token: str = ""
-    #: Whether this request's body has already been taken off the socket (see ``_drain_body``).
-    #: Reset per request because one handler instance serves a whole keep-alive connection.
-    _body_read: bool = False
-
-    def log_message(self, *args: object) -> None:  # noqa: D401 - silence default stderr logging
-        return
-
-    def _loopback_authorities(self) -> frozenset[str]:
-        port = self.server.server_address[1]
-        return frozenset({f"127.0.0.1:{port}", f"localhost:{port}", f"[::1]:{port}"})
-
-    def _cross_site(self) -> str | None:
-        """Why a POST must be refused: a non-loopback ``Host`` or a foreign ``Origin`` (U-F5).
-
-        Browsers send ``Origin`` on every cross-site POST, so a page on any other site cannot
-        reach ``/analyse`` even from the owner's own browser; the ``Host`` check defeats DNS
-        rebinding.  The token check on the app routes covers what these headers cannot.
-        """
-
-        allowed = self._loopback_authorities()
-        host = (self.headers.get("Host") or "").strip().casefold()
-        if host not in allowed:
-            return "host"
-        origin = (self.headers.get("Origin") or "").strip()
-        if origin:
-            parts = urlsplit(origin)
-            if parts.scheme != "http" or (parts.netloc or "").casefold() not in allowed:
-                return "origin"
-        return None
-
-    def _csrf_ok(self, presented: str | None) -> bool:
-        token = (self.headers.get(_CSRF_HEADER) or presented or "").strip()
-        return bool(token) and secrets.compare_digest(token, self.csrf_token)
-
-    def _drain_body(self, limit: int = 1 << 20) -> None:
-        """Consume a refused request's body (bounded) so the client reads the answer, not a reset.
-
-        Closing the socket with unread bytes in flight makes Windows report the refusal as an
-        aborted connection instead of delivering the response, so every POST that answers without
-        reading its body (403, 404, "bad length") drains first.  Draining twice would block on a
-        keep-alive connection waiting for the *next* request's bytes, so it happens at most once
-        per request.
-        """
-
-        if self._body_read:
-            return
-        self._body_read = True
-        try:
-            remaining = min(max(int(self.headers.get("Content-Length") or 0), 0), limit)
-        except ValueError:
-            return
-        while remaining > 0:
-            chunk = self.rfile.read(min(65536, remaining))
-            if not chunk:
-                break
-            remaining -= len(chunk)
-
-    def _send(self, status: HTTPStatus, body: bytes, content_type: str) -> None:
-        self.send_response(status)
-        self.send_header("Content-Type", content_type)
-        self.send_header("Content-Length", str(len(body)))
-        self.send_header("X-Content-Type-Options", "nosniff")
-        self.end_headers()
-        if self.command != "HEAD":
-            self.wfile.write(body)
-
-    def _send_file_range(self, path: Path, content_type: str) -> None:
-        """Serve a file with HTTP Range support (206) — what makes <audio> seeking work."""
-
-        size = path.stat().st_size
-        start, end = 0, size - 1
-        status = HTTPStatus.OK
-        header = self.headers.get("Range") or ""
-        match = re.match(r"bytes=(\d*)-(\d*)$", header.strip())
-        if match and size:
-            first, last = match.group(1), match.group(2)
-            if first:
-                start = int(first)
-                end = min(int(last), size - 1) if last else size - 1
-            elif last:  # a suffix range: the final N bytes
-                start = max(0, size - int(last))
-            if start > end or start >= size:
-                self.send_response(HTTPStatus.REQUESTED_RANGE_NOT_SATISFIABLE)
-                self.send_header("Content-Range", f"bytes */{size}")
-                self.send_header("Content-Length", "0")
-                self.end_headers()
-                return
-            status = HTTPStatus.PARTIAL_CONTENT
-        length = end - start + 1
-        self.send_response(status)
-        self.send_header("Content-Type", content_type)
-        self.send_header("Content-Length", str(length))
-        self.send_header("Accept-Ranges", "bytes")
-        self.send_header("Cache-Control", "no-store")
-        if status == HTTPStatus.PARTIAL_CONTENT:
-            self.send_header("Content-Range", f"bytes {start}-{end}/{size}")
-        self.end_headers()
-        if self.command == "HEAD":
-            return
-        with open(native_path(path), "rb") as handle:
-            handle.seek(start)
-            remaining = length
-            while remaining > 0:
-                chunk = handle.read(min(65536, remaining))
-                if not chunk:
-                    break
-                try:
-                    self.wfile.write(chunk)
-                except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
-                    return  # the browser seeked away or closed the player
-                remaining -= len(chunk)
-
-    def _resolve_served_file(self, path: str) -> Path | None:
-        """Map a URL path to a file strictly inside ``work_root`` and under a ``present/`` dir."""
-
-        segments = [segment for segment in path.split("/") if segment not in ("", ".")]
-        if any(segment == ".." or "\\" in segment or ":" in segment for segment in segments):
-            return None
-        candidate = self.work_root
-        for segment in segments:
-            candidate = candidate / segment
-        if not Path(native_path(candidate)).is_relative_to(Path(native_path(self.work_root))):
-            return None
-        if len(segments) == 4 and segments[2] == "present":
-            media_dir = self.work_root / segments[0] / segments[1]
-            if segments[3] == "index.html":
-                ensure_fresh_page(media_dir, config=self.config)
-            candidate = result_dir(media_dir) / segments[3]
-        try:
-            resolved = Path(native_path(candidate))
-            root = Path(native_path(self.work_root))
-        except OSError:
-            return None
-        if root != resolved and root not in resolved.parents:
-            return None
-        if "present" not in resolved.parts:
-            return None
-        if resolved.suffix.lower() not in _CONTENT_TYPES:
-            return None
-        return resolved if path_is_file(resolved) else None
-
-    def _resolve_served_audio(self, path: str) -> Path | None:
-        """Map a URL to an audio file strictly inside ``work_root`` (the result page's <audio> src).
-
-        Mirrors :meth:`_resolve_served_file`'s traversal guard, but allows the fetched original
-        (under ``ingest/``, not ``present/``) so a persistent result page can play + seek it.
-        """
-
-        segments = [segment for segment in path.split("/") if segment not in ("", ".")]
-        if any(segment == ".." for segment in segments):
-            return None
-        candidate = self.work_root
-        for segment in segments:
-            candidate = candidate / segment
-        try:
-            resolved = Path(native_path(candidate))
-            root = Path(native_path(self.work_root))
-        except OSError:
-            return None
-        if root != resolved and root not in resolved.parents:
-            return None
-        if resolved.suffix.lstrip(".").casefold() not in _AUDIO_TYPES:
-            return None
-        return resolved if path_is_file(resolved) else None
-
-    def _send_json(self, status: HTTPStatus, payload: object) -> None:
-        body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
-        self._send(status, body, _CONTENT_TYPES[".json"])
-
-    def _app_active(self) -> bool:
-        return self.analyse_enabled and self.job_manager is not None
-
-    def do_GET(self) -> None:  # noqa: N802 - stdlib naming
-        route = self.path.split("?", 1)[0]
-        if route == "/healthz":
-            self._send_json(HTTPStatus.OK, {"ok": True})
-            return
-        if route == "/csrf":
-            # Readable only by this origin's own scripts (no CORS header is ever sent).
-            self._send_json(HTTPStatus.OK, {"token": self.csrf_token})
-            return
-        if route == "/playlists" or route.startswith("/playlists/"):
-            # The playlists feature is a self-contained module with its own storage; the server
-            # only routes to it (see ``id_detector.playlists``).  Available in read-only mode too.
-            from id_detector import playlists
-
-            status, body, content_type = playlists.handle_get(
-                route, parse_qs(urlsplit(self.path).query), work_root=self.work_root
-            )
-            self._send(HTTPStatus(status), body, content_type)
-            return
-        if route in ("/", "/index.html"):
-            if self._app_active():
-                assert self.job_manager is not None
-                query = parse_qs(urlsplit(self.path).query)
-                prefill = (query.get("url") or [""])[0][:2048]
-                # "Try again" on a finished job links by job id, not by URL: the submitted target
-                # (which may be a private share token) is looked up here and never reaches the
-                # job page's markup or script (U-F31).
-                requested = (query.get("job") or [""])[0]
-                if not prefill and _JOB_ID.match(requested):
-                    earlier = self.job_manager.get(requested)
-                    if earlier is not None:
-                        prefill = earlier.target[:2048]
-                body = _home_html(
-                    _fresh_sets(self.work_root, self.config),
-                    self.job_manager.recent(),
-                    self.csrf_token,
-                    form_state=_FormState(url=prefill),
-                    failed_runs=_discover_failed_runs(self.work_root),
-                )
-            else:
-                body = _index_html(_fresh_sets(self.work_root, self.config))
-            self._send(HTTPStatus.OK, body, _CONTENT_TYPES[".html"])
-            return
-        if self._app_active() and route == "/new":
-            query = parse_qs(urlsplit(self.path).query)
-            prefill = (query.get("url") or [""])[0][:2048]
-            location = "/" + (f"?url={quote(prefill, safe='')}" if prefill else "")
-            self.send_response(HTTPStatus.SEE_OTHER)
-            self.send_header("Location", location)
-            self.send_header("Content-Length", "0")
-            self.end_headers()
-            return
-        if self._app_active() and route.startswith("/jobs/"):
-            self._handle_job_get(route)
-            return
-        if route.startswith("/media/"):
-            match = re.fullmatch(r"/media/([a-f0-9]{64})/audio", route)
-            audio = None
-            if match:
-                cached = _load_cached(self.work_root, match.group(1))
-                if cached is not None:
-                    candidate = cached.original_path.resolve()
-                    if candidate.is_relative_to(cached.media_dir.resolve()) and path_is_file(
-                        candidate
-                    ):
-                        audio = candidate
-            if audio is None:
-                self._send(HTTPStatus.NOT_FOUND, b"not found", "text/plain; charset=utf-8")
-            else:
-                self._send_file_range(audio, _audio_content_type(audio))
-            return
-        served_audio = self._resolve_served_audio(route)
-        if served_audio is not None:
-            # The result page's <audio> points at the fetched original; serve it Range-capable so
-            # scrubbing/seeking works (a plain send would force a full download and break seeking).
-            self._send_file_range(served_audio, _audio_content_type(served_audio))
-            return
-        served = self._resolve_served_file(route)
-        if served is None:
-            self._send(HTTPStatus.NOT_FOUND, b"not found", "text/plain; charset=utf-8")
-            return
-        with open(native_path(served), "rb") as handle:
-            body = handle.read()
-        self._send(HTTPStatus.OK, body, _CONTENT_TYPES[served.suffix.lower()])
-
-    def _handle_job_get(self, route: str) -> None:
-        assert self.job_manager is not None
-        segments = route.strip("/").split("/")
-        if len(segments) == 2 and _JOB_ID.match(segments[1]):
-            job = self.job_manager.get(segments[1])
-            if job is None:
-                self._send(HTTPStatus.NOT_FOUND, b"unknown job", "text/plain; charset=utf-8")
-                return
-            body = _job_page_html(job, self.csrf_token)
-            self._send(HTTPStatus.OK, body, _CONTENT_TYPES[".html"])
-            return
-        if len(segments) == 3 and _JOB_ID.match(segments[1]) and segments[2] == "status":
-            job = self.job_manager.get(segments[1])
-            if job is None:
-                self._send_json(HTTPStatus.NOT_FOUND, {"error": "unknown job"})
-                return
-            _resolve_job_audio(job, self.work_root)
-            self._send_json(HTTPStatus.OK, job.status_dict())
-            return
-        if len(segments) == 3 and _JOB_ID.match(segments[1]) and segments[2] == "audio":
-            job = self.job_manager.get(segments[1])
-            audio = _resolve_job_audio(job, self.work_root) if job is not None else None
-            if audio is None:
-                self._send(HTTPStatus.NOT_FOUND, b"no audio yet", "text/plain; charset=utf-8")
-                return
-            self._send_file_range(audio, _audio_content_type(audio))
-            return
-        self._send(HTTPStatus.NOT_FOUND, b"not found", "text/plain; charset=utf-8")
-
-    def do_HEAD(self) -> None:  # noqa: N802
-        self.do_GET()
-
-    def do_POST(self) -> None:  # noqa: N802
-        route = self.path.split("?", 1)[0]
-        self._body_read = False
-        refusal = self._cross_site()
-        if refusal is not None:
-            self._drain_body()
-            self._send_json(
-                HTTPStatus.FORBIDDEN, {"error": f"cross-site request refused ({refusal})"}
-            )
-            return
-        if route == "/playlists" or route.startswith("/playlists/"):
-            self._handle_playlists_post(route)
-            return
-        if self._app_active() and route == "/analyse":
-            self._handle_analyse()
-            return
-        if self._app_active() and route == "/library/remove":
-            self._handle_library_remove()
-            return
-        if self._app_active() and route.startswith("/jobs/") and route.endswith("/dismiss"):
-            self._handle_job_dismiss(route)
-            return
-        if self._app_active() and route.startswith("/jobs/") and route.endswith("/cancel"):
-            self._handle_job_cancel(route)
-            return
-        # §2.5 removes the rescan button AND the route: on real mixes rescans buy zero recall, add
-        # phantoms and cost hours, so no web surface may start one.  ``idea rescan`` remains the CLI
-        # escape hatch and still reads a queue a human wrote, but nothing over HTTP can fill it.
-        # A read-only server (no job manager) answers /analyse here too; drain first so the 404
-        # reaches the client instead of an aborted connection.
-        self._drain_body()
-        self._send(HTTPStatus.NOT_FOUND, b"not found", "text/plain; charset=utf-8")
-
-    def _read_body(self, limit: int = 8192) -> bytes | None:
-        length = int(self.headers.get("Content-Length") or 0)
-        if length < 0 or length > limit:
-            return None
-        self._body_read = True
-        return self.rfile.read(length) if length else b""
-
-    def _handle_analyse(self) -> None:
-        assert self.job_manager is not None
-        content_type = (self.headers.get("Content-Type") or "").split(";", 1)[0].strip().lower()
-        wants_json = content_type == "application/json"
-        raw = self._read_body()
-        if raw is None:
-            self._drain_body()
-            if wants_json:
-                self._send_json(HTTPStatus.BAD_REQUEST, {"error": "bad length"})
-            else:
-                self._send_form_error(_FormState(error="That submission was too large."))
-            return
-        # ``upload_consent`` is no longer read from any body (E-H8): the whole-file scan it used
-        # to unlock is gone, so no client-controlled field can start a second, larger charge.
-        try:
-            if wants_json:
-                payload = json.loads(raw.decode("utf-8")) if raw else {}
-                url = str(payload.get("url", ""))
-                profile = payload.get("profile")
-                profile = str(profile) if profile is not None else None
-                acquire = bool(payload.get("acquire"))
-                build_index = bool(payload.get("build_index"))
-                known_tracklist = payload.get("known_tracklist")
-                presented_token = payload.get(_CSRF_FIELD)
-            else:
-                form = parse_qs(raw.decode("utf-8"), keep_blank_values=True)
-                url = (form.get("url") or [""])[0]
-                profile = (form.get("profile") or [None])[0]
-                acquire = bool(form.get("acquire"))
-                build_index = bool(form.get("build_index"))
-                known_tracklist = (form.get("known_tracklist") or [""])[0]
-                presented_token = (form.get(_CSRF_FIELD) or [None])[0]
-        except (ValueError, UnicodeDecodeError):
-            if wants_json:
-                self._send_json(HTTPStatus.BAD_REQUEST, {"error": "bad request"})
-            else:
-                self._send_form_error(_FormState(error="The form could not be read."))
-            return
-        if not self._csrf_ok(presented_token if isinstance(presented_token, str) else None):
-            if wants_json:
-                self._send_json(HTTPStatus.FORBIDDEN, {"error": "CSRF token was invalid"})
-            else:
-                self._send_form_error(
-                    _FormState(
-                        url=url,
-                        profile=profile or "free",
-                        acquire=acquire,
-                        known_tracklist=str(known_tracklist or ""),
-                        error="This page expired. Reload it and try again.",
-                    ),
-                    status=HTTPStatus.FORBIDDEN,
-                )
-            return
-        if profile is not None and profile not in _PROFILES:
-            if wants_json:
-                self._send_json(HTTPStatus.BAD_REQUEST, {"error": "unknown profile"})
-            else:
-                self._send_form_error(_FormState(url=url, error="Choose Free scan or Deep scan."))
-            return
-        # A pasted tracklist is an optional hint seed; blank/whitespace means "audio only".  Cap it
-        # so an oversized paste can never balloon a job (a real tracklist is a few KB at most).
-        if not isinstance(known_tracklist, str) or not known_tracklist.strip():
-            known_tracklist = None
-        elif len(known_tracklist) > 64_000:
-            known_tracklist = known_tracklist[:64_000]
-        try:
-            if (
-                not wants_json
-                and "://" not in url
-                and re.search(
-                    r"(^|\.)(soundcloud\.com|mixcloud\.com|youtube\.com|youtu\.be)(/|$)",
-                    url,
-                    re.IGNORECASE,
-                )
-            ):
-                url = "https://" + url
-            job_id = self.job_manager.submit(
-                url,
-                profile,
-                acquire=acquire,
-                build_index=build_index,
-                known_tracklist=known_tracklist,
-            )
-        except TargetValidationError as exc:
-            if wants_json:
-                self._send_json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
-            else:
-                self._send_form_error(
-                    _FormState(
-                        url=url,
-                        profile=profile or "free",
-                        acquire=acquire,
-                        known_tracklist=known_tracklist or "",
-                        error="Use a complete web link or choose an audio file that exists.",
-                    )
-                )
-            return
-        location = f"/jobs/{job_id}"
-        if wants_json:
-            self._send_json(HTTPStatus.OK, {"id": job_id, "location": location})
-            return
-        self.send_response(HTTPStatus.SEE_OTHER)
-        self.send_header("Location", location)
-        self.send_header("Content-Length", "0")
-        self.end_headers()
-
-    def _send_form_error(
-        self, state: _FormState, *, status: HTTPStatus = HTTPStatus.BAD_REQUEST
-    ) -> None:
-        assert self.job_manager is not None
-        body = _home_html(
-            _fresh_sets(self.work_root, self.config),
-            self.job_manager.recent(),
-            self.csrf_token,
-            form_state=state,
-            failed_runs=_discover_failed_runs(self.work_root),
-        )
-        self._send(status, body, _CONTENT_TYPES[".html"])
-
-    def _handle_playlists_post(self, route: str) -> None:
-        """Playlist mutations reuse the analyse route's guards: loopback Origin/Host (checked
-        in ``do_POST``) plus the CSRF token.  All logic lives in ``id_detector.playlists``."""
-
-        raw = self._read_body()
-        if raw is None:
-            self._drain_body()
-            self._send_json(HTTPStatus.BAD_REQUEST, {"error": "bad length"})
-            return
-        try:
-            parsed = parse_qs(raw.decode("utf-8"), keep_blank_values=True)
-        except (ValueError, UnicodeDecodeError):
-            self._send_json(HTTPStatus.BAD_REQUEST, {"error": "bad request"})
-            return
-        form = {key: values[0] for key, values in parsed.items()}
-        if not self._csrf_ok(form.get(_CSRF_FIELD)):
-            self._send_json(
-                HTTPStatus.FORBIDDEN,
-                {"error": f"missing or invalid CSRF token (GET /csrf, then send {_CSRF_HEADER})"},
-            )
-            return
-        from id_detector import playlists
-
-        status, body, content_type = playlists.handle_post(route, form, work_root=self.work_root)
-        self._send(HTTPStatus(status), body, content_type)
-
-    def _handle_library_remove(self) -> None:
-        """Move one local user's result to recoverable trash and return to the library."""
-
-        raw = self._read_body()
-        if raw is None:
-            self._drain_body()
-            self._send(HTTPStatus.BAD_REQUEST, b"bad request", "text/plain; charset=utf-8")
-            return
-        try:
-            form = parse_qs(raw.decode("utf-8"), keep_blank_values=True)
-            token = (form.get(_CSRF_FIELD) or [None])[0]
-            source_key = (form.get("source_key") or [""])[0]
-            media_key = (form.get("media_key") or [""])[0]
-        except UnicodeDecodeError:
-            token = None
-            source_key = media_key = ""
-        if (
-            not self._csrf_ok(token)
-            or not _SHA.fullmatch(source_key)
-            or not _SHA.fullmatch(media_key)
-        ):
-            self._send(HTTPStatus.BAD_REQUEST, b"bad request", "text/plain; charset=utf-8")
-            return
-        items = [*_discover_sets(self.work_root), *_discover_failed_runs(self.work_root)]
-        item = next(
-            (
-                found
-                for found in items
-                if found.source_key == source_key and found.media_key == media_key
-            ),
-            None,
-        )
-        if item is None:
-            self._send(HTTPStatus.NOT_FOUND, b"not found", "text/plain; charset=utf-8")
-            return
-        root = self.work_root.resolve()
-        target = item.media_dir.resolve()
-        if target == root or root not in target.parents:
-            self._send(HTTPStatus.BAD_REQUEST, b"bad request", "text/plain; charset=utf-8")
-            return
-        trash = root / ".trash" / "library" / f"{source_key}-{media_key}-{secrets.token_hex(4)}"
-        trash.parent.mkdir(parents=True, exist_ok=True)
-        item.media_dir.replace(trash)
-        self.send_response(HTTPStatus.SEE_OTHER)
-        self.send_header("Location", "/")
-        self.send_header("Content-Length", "0")
-        self.end_headers()
-
-    def _handle_job_dismiss(self, route: str) -> None:
-        assert self.job_manager is not None
-        parts = route.strip("/").split("/")
-        raw = self._read_body()
-        form = parse_qs(raw.decode("utf-8"), keep_blank_values=True) if raw is not None else {}
-        token = (form.get(_CSRF_FIELD) or [None])[0]
-        if (
-            len(parts) != 3
-            or not _JOB_ID.fullmatch(parts[1])
-            or not self._csrf_ok(token)
-            or not self.job_manager.dismiss(parts[1])
-        ):
-            self._send(HTTPStatus.BAD_REQUEST, b"bad request", "text/plain; charset=utf-8")
-            return
-        self.send_response(HTTPStatus.SEE_OTHER)
-        self.send_header("Location", "/")
-        self.send_header("Content-Length", "0")
-        self.end_headers()
-
-    def _handle_job_cancel(self, route: str) -> None:
-        assert self.job_manager is not None
-        self._drain_body()  # cancel carries no body, but a client's is never left on the socket
-        segments = route.strip("/").split("/")
-        if len(segments) != 3 or not _JOB_ID.match(segments[1]) or segments[2] != "cancel":
-            self._send(HTTPStatus.NOT_FOUND, b"not found", "text/plain; charset=utf-8")
-            return
-        if not self._csrf_ok(None):
-            self._send_json(
-                HTTPStatus.FORBIDDEN,
-                {"error": f"missing or invalid CSRF token (GET /csrf, then send {_CSRF_HEADER})"},
-            )
-            return
-        cancelled = self.job_manager.cancel(segments[1])
-        if self.job_manager.get(segments[1]) is None:
-            self._send_json(HTTPStatus.NOT_FOUND, {"error": "unknown job"})
-            return
-        self._send_json(HTTPStatus.OK, {"cancelled": cancelled})
+# --------------------------------------------------------------------------------------------------
+# Retired server entry points (4a-ii)
+# --------------------------------------------------------------------------------------------------
+# The stdlib ``ThreadingHTTPServer`` and its request handler are gone: ``idea serve``, ``idea truth
+# review`` and every test reach the one FastAPI/uvicorn application in :mod:`idea_web`.  These names
+# remain only because callers still import them from here, and they import the web layer lazily so
+# the CLI, the pipeline and the analysis worker process never load an HTTP framework.
 
 
 def make_server(
@@ -2070,51 +1508,15 @@ def make_server(
     host: str = "127.0.0.1",
     port: int = 8765,
     config: AppConfig | None = None,
-    job_manager: JobManager | None = None,
-) -> ThreadingHTTPServer:
-    """Create a ``127.0.0.1``-bound threading server (never binds a routable interface).
+    job_manager: Any = None,
+) -> Any:
+    """Compatibility alias for :func:`idea_web.server.make_server`."""
 
-    When ``job_manager`` is supplied the home page becomes the analyse form and the ``/analyse`` /
-    ``/jobs/<id>`` routes are enabled; without it the server stays the read-only Stage 7 index.
-    """
+    from idea_web.server import make_server as make_loopback_server
 
-    if host not in {"127.0.0.1", "localhost", "::1"}:
-        raise ValueError("the present server only binds the loopback interface")
-
-    handler = type(
-        "BoundHandler",
-        (_Handler,),
-        {
-            "work_root": work_root.resolve(),
-            "config": config,
-            "job_manager": job_manager,
-            "analyse_enabled": job_manager is not None,
-            "csrf_token": secrets.token_urlsafe(32),
-        },
+    return make_loopback_server(
+        work_root, host=host, port=port, config=config, job_manager=job_manager
     )
-    server = ThreadingHTTPServer((host, port), handler)
-    server.daemon_threads = True
-    return server
-
-
-@dataclass
-class RunningServer:
-    server: ThreadingHTTPServer
-    thread: threading.Thread
-
-    @property
-    def port(self) -> int:
-        return self.server.server_address[1]
-
-    @property
-    def base_url(self) -> str:
-        host, port = self.server.server_address[0], self.server.server_address[1]
-        return f"http://{host}:{port}"
-
-    def shutdown(self) -> None:
-        self.server.shutdown()
-        self.server.server_close()
-        self.thread.join(timeout=5)
 
 
 def serve_in_background(
@@ -2123,11 +1525,20 @@ def serve_in_background(
     host: str = "127.0.0.1",
     port: int = 0,
     config: AppConfig | None = None,
-    job_manager: JobManager | None = None,
-) -> RunningServer:
-    """Start the server on a background thread (port 0 picks a free port). For tests and the CLI."""
+    job_manager: Any = None,
+) -> Any:
+    """Compatibility alias for :func:`idea_web.server.serve_in_background`."""
 
-    server = make_server(work_root, host=host, port=port, config=config, job_manager=job_manager)
-    thread = threading.Thread(target=server.serve_forever, name="present-server", daemon=True)
-    thread.start()
-    return RunningServer(server, thread)
+    from idea_web.server import serve_in_background as serve_loopback_in_background
+
+    return serve_loopback_in_background(
+        work_root, host=host, port=port, config=config, job_manager=job_manager
+    )
+
+
+def __getattr__(name: str) -> Any:
+    if name == "RunningServer":
+        from idea_web.server import RunningServer
+
+        return RunningServer
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

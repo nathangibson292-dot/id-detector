@@ -1,0 +1,13 @@
+{{ head | safe }}<body>{{ topbar | safe }}<main class="home"><header class="hero-home">
+<p class="eyebrow">DJ-set track identifier · runs on this machine</p>
+<h1>Drop a mix.<br><span class="grad">Get the tracklist.</span></h1>
+<p class="lede">Paste a SoundCloud, YouTube or Mixcloud link. It listens to the set in short windows,
+asks the recognition engines what is playing, and hands you a click-to-jump tracklist with honest
+confidence for every track.</p>
+{{ form | safe }}
+<p class="lede reassurance">You can close this tab while the scan runs.</p>
+</header>
+{% if activity %}<h2 class="sec">Recent analyses</h2><ul class="acts">{% for item in activity %}{{ item | safe }}{% endfor %}</ul>{% endif %}
+<h2 class="sec">Your mixes</h2>
+{{ stats | safe }}{{ mixes | safe }}{{ footer | safe }}</main>
+<script>{{ script | safe }}</script></body></html>

@@ -9,12 +9,9 @@ import html
 import json
 import os
 import re
-import secrets
 import threading
 from collections.abc import Callable
 from datetime import UTC, datetime
-from http import HTTPStatus
-from http.server import ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 
@@ -30,7 +27,6 @@ from id_detector.contracts import (
 from id_detector.io import atomic_write_json, path_is_file, read_text, sha256_file
 from id_detector.present.exports import _candidate_label
 from id_detector.present.index import media_dir_for_key_read_only
-from id_detector.present.server import RunningServer, _audio_content_type, _Handler
 from id_detector.present.theme import head_html, topbar_html
 from id_detector.truth import _annotation_path, truth_write_lock, verify_truth
 
@@ -702,84 +698,5 @@ def _format_ms(value: int) -> str:
     return f"{hours}:{minutes:02d}:{seconds:02d}" if hours else f"{minutes}:{seconds:02d}"
 
 
-class _TruthReviewHandler(_Handler):
-    session: TruthReviewSession
-
-    def do_GET(self) -> None:  # noqa: N802
-        route = self.path.split("?", 1)[0]
-        if route in {"/", "/index.html"}:
-            self._send(
-                HTTPStatus.OK, _page(self.session, self.csrf_token), "text/html; charset=utf-8"
-            )
-            return
-        if route == "/csrf":
-            # Defence in depth against DNS rebinding: a POST already requires a loopback Host,
-            # but there is no reason to hand the token to a request that could not use it.
-            if self._cross_site() is not None:
-                self._send_json(HTTPStatus.FORBIDDEN, {"error": "cross-site request refused"})
-                return
-            self._send_json(HTTPStatus.OK, {"token": self.csrf_token})
-            return
-        expected = f"/media/{self.session.truth.source.media_key}/audio"
-        if route == expected and self.session.audio_path is not None:
-            self._send_file_range(
-                self.session.audio_path, _audio_content_type(self.session.audio_path)
-            )
-            return
-        self._send(HTTPStatus.NOT_FOUND, b"not found", "text/plain; charset=utf-8")
-
-    def do_POST(self) -> None:  # noqa: N802
-        self._body_read = False
-        refusal = self._cross_site()
-        if refusal is not None:
-            self._drain_body()
-            self._send_json(
-                HTTPStatus.FORBIDDEN, {"error": f"cross-site request refused ({refusal})"}
-            )
-            return
-        raw = self._read_body(_MAX_BODY)
-        if raw is None:
-            self._drain_body()
-            self._send_json(HTTPStatus.BAD_REQUEST, {"error": "bad length"})
-            return
-        if not self._csrf_ok(None):
-            self._send_json(HTTPStatus.FORBIDDEN, {"error": "CSRF token was invalid"})
-            return
-        route = self.path.split("?", 1)[0]
-        if route == "/predictions":
-            self._send_json(HTTPStatus.OK, {"predictions": self.session.reveal_predictions()})
-            return
-        if route != "/save":
-            self._send(HTTPStatus.NOT_FOUND, b"not found", "text/plain; charset=utf-8")
-            return
-        try:
-            payload = json.loads(raw.decode("utf-8")) if raw else {}
-            saved = self.session.save(payload)
-        except (OSError, ValueError, UnicodeDecodeError, json.JSONDecodeError) as exc:
-            self._send_json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
-            return
-        self._send_json(HTTPStatus.OK, {"saved": True, "episodes": len(saved.episodes)})
-
-
-def make_truth_review_server(
-    session: TruthReviewSession, *, host: str = "127.0.0.1", port: int = 8797
-) -> ThreadingHTTPServer:
-    if host not in {"127.0.0.1", "localhost", "::1"}:
-        raise ValueError("the truth review server only binds the loopback interface")
-    handler = type(
-        "BoundTruthReviewHandler",
-        (_TruthReviewHandler,),
-        {"session": session, "csrf_token": secrets.token_urlsafe(32)},
-    )
-    server = ThreadingHTTPServer((host, port), handler)
-    server.daemon_threads = True
-    return server
-
-
-def serve_truth_review_in_background(
-    session: TruthReviewSession, *, host: str = "127.0.0.1", port: int = 0
-) -> RunningServer:
-    server = make_truth_review_server(session, host=host, port=port)
-    thread = threading.Thread(target=server.serve_forever, name="truth-review", daemon=True)
-    thread.start()
-    return RunningServer(server, thread)
+# HTTP routing for this screen lives in :mod:`idea_web.truth_review` (4a-ii): the retired stdlib
+# handler is gone, and every file decision above stays here, in one place.

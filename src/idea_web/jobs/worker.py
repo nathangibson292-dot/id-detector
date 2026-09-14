@@ -573,6 +573,7 @@ class JobQueue:
         run_id: str | None = None,
         tenant_scope: str | None = None,
         log_path: Path | None = None,
+        progress: Mapping[str, object] | None = None,
     ) -> str:
         document = _target_document(target, local_mode=self.local_mode)
         scope = tenant_scope or (
@@ -585,7 +586,7 @@ class JobQueue:
         with self.database.write() as connection:
             connection.execute(
                 "INSERT INTO jobs(id, run_id, target, recipe_id, state, log_path, tenant_scope, "
-                "created_at, updated_at) VALUES (?, ?, ?, ?, 'intake', ?, ?, ?, ?)",
+                "progress, created_at, updated_at) VALUES (?, ?, ?, ?, 'intake', ?, ?, ?, ?, ?)",
                 (
                     identifier,
                     run_id,
@@ -593,6 +594,7 @@ class JobQueue:
                     recipe.recipe_id,
                     str(Path(log_path).resolve()) if log_path is not None else None,
                     scope,
+                    _json(dict(progress or {})),
                     now,
                     now,
                 ),
@@ -787,6 +789,39 @@ class JobQueue:
                 == 1
             )
 
+    def cancel_unclaimed(self, job_id: str, progress: Mapping[str, object]) -> bool:
+        """Settle a job no worker holds as ``cancelled`` at once, in one fenced transaction.
+
+        Only an intake job with no run and no claim qualifies: the moment a worker claims it the
+        fence fails and the caller falls back to :meth:`request_cancel`, which that worker honours.
+        """
+
+        now = self.clock()
+        with self.database.write() as connection:
+            return (
+                connection.execute(
+                    "UPDATE jobs SET state='cancelled', cancel_requested=1, progress=?, "
+                    "lease_owner=NULL, lease_until=NULL, heartbeat_at=NULL, updated_at=? "
+                    "WHERE id=? AND state='intake' AND run_id IS NULL AND claim_token IS NULL",
+                    (_json(dict(progress)), now, job_id),
+                ).rowcount
+                == 1
+            )
+
+    def dismiss(self, job_id: str) -> bool:
+        """Hide one terminal job from the owner's activity list; running work is never touched."""
+
+        now = self.clock()
+        with self.database.write() as connection:
+            return (
+                connection.execute(
+                    "UPDATE jobs SET progress=json_set(progress, '$.dismissed', 1), updated_at=? "
+                    f"WHERE id=? AND state NOT IN {_ACTIVE_SQL}",
+                    (now, job_id),
+                ).rowcount
+                == 1
+            )
+
     def request_cancel(self, job_id: str) -> bool:
         now = self.clock()
         with self.database.write() as connection:
@@ -861,6 +896,7 @@ class JobQueue:
         result: RunResult,
         *,
         bundle_path: Path | None,
+        progress: Mapping[str, object] | None = None,
     ) -> bool:
         if result.status not in TERMINAL_STATES:
             raise ValueError(f"not a terminal status: {result.status}")
@@ -912,8 +948,16 @@ class JobQueue:
                 bundle_id = result.bundle_id
             changed = connection.execute(
                 "UPDATE jobs SET state=?, result_bundle_id=?, lease_owner=NULL, lease_until=NULL, "
-                "heartbeat_at=NULL, claim_token=NULL, updated_at=? WHERE id=? AND claim_token=?",
-                (result.status, bundle_id, now, job_id, claim_token),
+                "heartbeat_at=NULL, claim_token=NULL, progress=COALESCE(?, progress), updated_at=? "
+                "WHERE id=? AND claim_token=?",
+                (
+                    result.status,
+                    bundle_id,
+                    _json(dict(progress)) if progress is not None else None,
+                    now,
+                    job_id,
+                    claim_token,
+                ),
             ).rowcount
             return changed == 1
 

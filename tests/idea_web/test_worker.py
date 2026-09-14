@@ -3,6 +3,8 @@ from __future__ import annotations
 import json
 import multiprocessing
 import sqlite3
+import subprocess
+import sys
 import threading
 import time
 from hashlib import sha256
@@ -1049,12 +1051,27 @@ def test_shazam_attempts_reach_the_ledger_and_are_fenced(tmp_path: Path) -> None
 
 def test_worker_contract_has_ten_second_heartbeat_and_no_http_framework() -> None:
     assert HEARTBEAT_SECONDS == 10
-    sources = list((ROOT / "src" / "idea_web").rglob("*.py"))
-    assert sources
-    for path in sources:
+    # 4a-ii adds the HTTP application to ``idea_web``.  The boundary is that neither the worker
+    # package nor the pipeline package ever imports an HTTP framework: not in their source text,
+    # and not at runtime when the worker process loads everything it runs.
+    worker_sources = list((ROOT / "src" / "idea_web" / "jobs").rglob("*.py"))
+    pipeline_sources = list((ROOT / "src" / "id_detector").rglob("*.py"))
+    assert worker_sources and pipeline_sources
+    for path in [*worker_sources, *pipeline_sources]:
         text = path.read_text(encoding="utf-8")
         for name in ("fastapi", "starlette", "uvicorn"):
             assert f"import {name}" not in text and f"from {name}" not in text, path
+    probe = (
+        "import sys\n"
+        "import idea_web.jobs, idea_web.jobs.local, id_detector.cli, id_detector.present\n"
+        "import id_detector.webapp.runner, id_detector.truth_review\n"
+        "print(','.join(m for m in ('fastapi', 'starlette', 'uvicorn') if m in sys.modules))\n"
+    )
+    finished = subprocess.run(
+        [sys.executable, "-c", probe], capture_output=True, text=True, cwd=ROOT, timeout=120
+    )
+    assert finished.returncode == 0, finished.stderr
+    assert finished.stdout.strip() == "", f"worker-side imports loaded: {finished.stdout.strip()}"
 
 
 def test_draining_worker_claims_no_new_job(tmp_path: Path) -> None:
