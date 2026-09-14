@@ -28,7 +28,7 @@ def _tree_stamp(root: Path) -> list[list[Any]]:
     ]
 
 
-def rebuild_index(work_root: Path) -> dict[str, Any]:
+def _build_index_document(work_root: Path) -> dict[str, Any]:
     root = Path(native_path(work_root))
     entries = {}
     for source_path in sorted(root.glob("*/*/ingest/source.json")):
@@ -68,7 +68,12 @@ def rebuild_index(work_root: Path) -> dict[str, Any]:
             }
         else:
             entry["aliases"].append(alias)
-    document = {"media": entries, "tree_stamp": _tree_stamp(root)}
+    return {"media": entries, "tree_stamp": _tree_stamp(root)}
+
+
+def rebuild_index(work_root: Path) -> dict[str, Any]:
+    root = Path(native_path(work_root))
+    document = _build_index_document(root)
     try:
         atomic_write_json(root / "index.json", document)
         fsync_directory(root)
@@ -78,6 +83,38 @@ def rebuild_index(work_root: Path) -> dict[str, Any]:
         # be written is slow once, not once per lookup.
         _MEMORY[str(root)] = document
     return document
+
+
+def load_index_read_only(work_root: Path) -> dict[str, Any]:
+    """Load or rebuild the media map without ever writing beneath ``work_root``.
+
+    Owner tooling uses this path when ``work/`` is an input rather than application state.  A
+    current on-disk index is still preferred, but a missing or stale index is rebuilt in memory.
+    """
+
+    root = Path(native_path(work_root))
+    stamp = _tree_stamp(root)
+    try:
+        on_disk = json.loads(read_text(root / "index.json"))
+    except (OSError, ValueError):
+        on_disk = None
+    for document in (on_disk, _MEMORY.get(str(root))):
+        if document is not None and _usable(root, document, stamp):
+            return document
+    return _build_index_document(root)
+
+
+def media_dir_for_key_read_only(work_root: Path, media_key: str) -> Path | None:
+    """Resolve one indexed media key without refreshing or otherwise mutating ``work_root``."""
+
+    root = Path(native_path(work_root))
+    entry = load_index_read_only(root)["media"].get(media_key)
+    if not isinstance(entry, dict) or not isinstance(entry.get("media_dir"), str):
+        return None
+    candidate = (root / entry["media_dir"]).resolve()
+    if candidate == root or not candidate.is_relative_to(root) or candidate.name != media_key:
+        return None
+    return candidate
 
 
 def _usable(root: Path, document: Any, stamp: list[list[Any]]) -> bool:

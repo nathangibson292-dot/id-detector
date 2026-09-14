@@ -1706,6 +1706,61 @@ def truth_verify(
     typer.echo(f"saved {len(updated.episodes)} episodes to {truth}")
 
 
+@truth_app.command("review")
+def truth_review(
+    set_id: Annotated[str, typer.Option("--set", help="The ground-truth record's set_id.")],
+    corpus: Annotated[Path, typer.Option("--corpus", help="Corpus directory to search.")] = Path(
+        "data/corpus/release-1"
+    ),
+    work_root: Annotated[Path, typer.Option("--work-root")] = DEFAULT_WORK_ROOT,
+    port: Annotated[int, typer.Option("--port", min=0, max=65535)] = 8797,
+    open_browser: Annotated[
+        bool,
+        typer.Option("--open/--no-open", help="Open the review page in the default browser."),
+    ] = True,
+) -> None:
+    """Review and first-pass verify one truth set in a loopback-only browser screen."""
+
+    import contextlib
+    import threading
+    import webbrowser
+
+    from id_detector.truth_review import (
+        TruthReviewSession,
+        find_truth_path,
+        make_truth_review_server,
+    )
+
+    try:
+        # The work tree is regenerable cache that idea gc prunes: a truth record resolving
+        # inside it would be the one corpus loss nothing can undo, so --corpus is checked, not
+        # trusted.
+        truth_path = find_truth_path(corpus, set_id, work_root=work_root)
+        session = TruthReviewSession(truth_path, work_root=work_root)
+        server = make_truth_review_server(session, port=port)
+    except (OSError, ValueError, json.JSONDecodeError) as exc:
+        typer.echo(str(exc), err=True)
+        raise typer.Exit(2) from None
+    bound_host, bound_port = server.server_address[0], server.server_address[1]
+    url = f"http://{bound_host}:{bound_port}"
+    audio = "audio ready" if session.audio_path is not None else "audio unavailable; editing works"
+    typer.echo(f"reviewing {set_id} at {url} ({audio}; Ctrl-C to stop)")
+    if open_browser:
+
+        def _open() -> None:
+            with contextlib.suppress(Exception):
+                webbrowser.open(url)
+
+        threading.Timer(0.4, _open).start()
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        typer.echo("stopping", err=True)
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
 @truth_app.command("second-pass")
 def truth_second_pass(
     truth: Annotated[Path, typer.Option("--truth")],

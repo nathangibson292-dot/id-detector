@@ -18,9 +18,13 @@ import sys
 import tempfile
 from html.parser import HTMLParser
 from pathlib import Path
+from types import SimpleNamespace
 
+from id_detector.contracts import GroundTruthRecord
+from id_detector.io import read_text
 from id_detector.present import page, server
 from id_detector.present.exports import build_projection
+from id_detector.truth_review import _page as truth_review_page
 from id_detector.webapp.jobs import Job
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -116,6 +120,18 @@ def _pages() -> list[tuple[str, str | bytes]]:
         failed_phase="ingest",
         error="boom",
     )
+    truth = GroundTruthRecord.model_validate_json(
+        read_text(
+            Path(__file__).resolve().parents[1]
+            / "tests/fixtures/truth-review/fixture-set/ground_truth.json"
+        )
+    )
+    review = SimpleNamespace(
+        truth=truth,
+        suggested_offset_ms=None,
+        audio_path=None,
+        predictions_visible=False,
+    )
     # Every committed fixture, on every embed platform: the embed branch decides which player script
     # the page loads, and a fixture decides which row/lane/copy payloads it inlines.
     results = [
@@ -138,6 +154,7 @@ def _pages() -> list[tuple[str, str | bytes]]:
         ("read-only index", server._index_html([])),
         ("job page (running)", server._job_page_html(running, "test-token")),
         ("job page (failed)", server._job_page_html(failed, "test-token")),
+        ("truth review", truth_review_page(review, "test-token")),
     ]
 
 

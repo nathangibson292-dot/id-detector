@@ -106,3 +106,7 @@ its five-point result-page contract is a constraint on every presentation cycle)
 
 **Owner direction (2026-09-13):** the S4 ADR is **accepted** (FastAPI + Jinja2 + uvicorn, `docs/adr/0001-web-framework.md`), and the owner set a **local-first priority**: "the priority is making this work for me, we may roll it out to others in future." Multi-tenant cycles (4c accounts, 4d credits/tenancy, 6a container, M2 billing) therefore rank below anything that improves the owner's own use. Next up is owner tooling for verifying the `release-1` truth corpus — the bottleneck standing between us and a real accuracy claim — then the hosted track resumes.
 
+| Out-of-plan owner cycle | Build report | Review | Outcome | Commit |
+|---|---|---|---|---|
+| owner truth review | [build-truth-review](build-truth-review.md) | [review + fix pass](build-truth-review.md#review--fix-pass-sol-xhigh-review-folded-in) (2 P0 + 5 P1 fixed; 4 P2 noted) | `idea truth review --set <set-id>`; keyboard-first single-set first-pass review, range audio, explicit/atomic save through `truth.py`, bulk-offset preview/apply/undo with scorer suggestions, prediction independence + durable provenance; 1198 passed | uncommitted |
+

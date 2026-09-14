@@ -3,15 +3,21 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 import subprocess
-from collections.abc import Callable
+import tempfile
+import threading
+import time
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from hashlib import sha256
 from pathlib import Path
 from typing import Any
 
 from id_detector.contracts import GroundTruthRecord, TruthRoleSegment
 from id_detector.io import (
+    atomic_write_bytes,
     atomic_write_json,
     canonical_json_bytes,
     path_is_file,
@@ -322,6 +328,109 @@ def _annotation_path(truth_path: Path, pass_name: str) -> Path:
     return truth_path.with_name(f"annotation-{pass_name}.json")
 
 
+class _TruthLock:
+    """One reentrant, cross-process advisory lock over a single truth record.
+
+    A ``threading`` lock alone only serialises writers inside *one* interpreter, so two ``idea
+    truth review`` processes (or a review and a ``truth verify``) could both read the same
+    ``ground_truth.json`` digest, both believe nothing had changed, and then overwrite each
+    other's annotation pass — and each other's rollback.  The OS lock below is what actually
+    serialises them; the thread lock keeps the same process reentrant and cheap.
+
+    The lock file lives in the system temp directory, keyed by a digest of the record's resolved
+    path.  Nothing is created beside the corpus record itself, so locking never adds a file to a
+    corpus set and never writes beneath ``work/``.
+    """
+
+    def __init__(self, key: str) -> None:
+        self._guard = threading.RLock()
+        self._depth = 0
+        self._handle: Any = None
+        digest = sha256(key.encode("utf-8")).hexdigest()[:32]
+        self._path = Path(tempfile.gettempdir()) / f"idea-truth-{digest}.lock"
+
+    def _lock_os(self, timeout: float) -> None:
+        handle = open(self._path, "a+b")  # noqa: SIM115 - held for the lock's lifetime
+        deadline = time.monotonic() + timeout
+        while True:
+            try:
+                if os.name == "nt":
+                    import msvcrt
+
+                    handle.seek(0)
+                    msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+                else:
+                    import fcntl
+
+                    fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except OSError:
+                if time.monotonic() >= deadline:
+                    handle.close()
+                    raise ValueError(
+                        "another truth writer holds this set; close the other review and retry"
+                    ) from None
+                time.sleep(0.05)
+                continue
+            self._handle = handle
+            return
+
+    def _unlock_os(self) -> None:
+        handle, self._handle = self._handle, None
+        if handle is None:
+            return
+        try:
+            if os.name == "nt":
+                import msvcrt
+
+                handle.seek(0)
+                msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+            else:
+                import fcntl
+
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        finally:
+            handle.close()
+
+    def acquire(self, timeout: float) -> None:
+        self._guard.acquire()
+        if self._depth == 0:
+            try:
+                self._lock_os(timeout)
+            except BaseException:
+                self._guard.release()
+                raise
+        self._depth += 1
+
+    def release(self) -> None:
+        self._depth -= 1
+        if self._depth == 0:
+            self._unlock_os()
+        self._guard.release()
+
+
+_TRUTH_LOCKS: dict[str, _TruthLock] = {}
+_TRUTH_LOCK_REGISTRY = threading.Lock()
+
+
+@contextmanager
+def truth_write_lock(truth_path: Path, *, timeout: float = 20.0) -> Iterator[None]:
+    """Serialise every writer of one truth record, across threads *and* across processes.
+
+    Callers that re-check state before committing (a digest, an annotation pass) must do that
+    check inside this block, so the window between "nothing changed" and the replacement cannot
+    be used by a second process.  Re-entering is safe: the writer helpers take it again.
+    """
+
+    key = os.path.normcase(str(Path(os.path.realpath(truth_path))))
+    with _TRUTH_LOCK_REGISTRY:
+        lock = _TRUTH_LOCKS.setdefault(key, _TruthLock(key))
+    lock.acquire(timeout)
+    try:
+        yield
+    finally:
+        lock.release()
+
+
 def _episode_content(episode: Any) -> dict[str, Any]:
     payload = episode.model_dump(mode="json") if hasattr(episode, "model_dump") else dict(episode)
     for key in ("annotator_ref", "second_pass_ref", "disagreement_resolution", "draft"):
@@ -353,6 +462,7 @@ def _write_annotation_pass(
     annotator_ref: str,
     mode: str,
     content: dict[str, Any],
+    provenance: dict[str, Any] | None = None,
 ) -> None:
     digest = sha256(canonical_json_bytes(content)).hexdigest()
     atomic_write_json(
@@ -366,8 +476,71 @@ def _write_annotation_pass(
             "mode": mode,
             "content_sha256": digest,
             **content,
+            **({"review_provenance": provenance} if provenance is not None else {}),
         },
     )
+
+
+def _write_first_pass_atomically(
+    truth_path: Path,
+    updated: GroundTruthRecord,
+    *,
+    annotator_ref: str,
+    mode: str,
+    content: dict[str, Any],
+    provenance: dict[str, Any] | None = None,
+) -> None:
+    """Replace first-pass annotation then truth, rolling annotation back if truth cannot replace.
+
+    Each file replacement is atomic.  Ordering them this way means an injected failure can never
+    transition ``ground_truth.json`` without its annotation pass already durable.  The whole
+    sequence — displace, commit, roll back — runs under :func:`truth_write_lock`, so a rollback
+    can never restore over an annotation another process wrote in the meantime.
+    """
+
+    annotation_path = _annotation_path(truth_path, "first")
+    with truth_write_lock(truth_path):
+        _replace_first_pass(
+            truth_path,
+            annotation_path,
+            updated,
+            annotator_ref=annotator_ref,
+            mode=mode,
+            content=content,
+            provenance=provenance,
+        )
+
+
+def _replace_first_pass(
+    truth_path: Path,
+    annotation_path: Path,
+    updated: GroundTruthRecord,
+    *,
+    annotator_ref: str,
+    mode: str,
+    content: dict[str, Any],
+    provenance: dict[str, Any] | None,
+) -> None:
+    # Read the bytes to roll back to *inside* the caller's lock, so the restore below can only
+    # ever put back an annotation this writer actually displaced.
+    previous = annotation_path.read_bytes() if path_is_file(annotation_path) else None
+    try:
+        _write_annotation_pass(
+            truth_path,
+            "first",
+            set_id=updated.set_id,
+            annotator_ref=annotator_ref,
+            mode=mode,
+            content=content,
+            provenance=provenance,
+        )
+        atomic_write_json(truth_path, updated)
+    except BaseException:
+        if previous is None:
+            annotation_path.unlink(missing_ok=True)
+        else:
+            atomic_write_bytes(annotation_path, previous)
+        raise
 
 
 def _read_annotation_pass(truth_path: Path, pass_name: str) -> dict[str, Any]:
@@ -386,8 +559,9 @@ def _read_annotation_pass(truth_path: Path, pass_name: str) -> dict[str, Any]:
     return payload
 
 
-def _load_independent_annotation(annotation_path: Path, base: GroundTruthRecord) -> dict[str, Any]:
-    annotation = GroundTruthRecord.model_validate_json(read_text(annotation_path))
+def _independent_annotation_content(
+    annotation: GroundTruthRecord, base: GroundTruthRecord
+) -> dict[str, Any]:
     if annotation.set_id != base.set_id:
         raise ValueError("annotation set_id differs from the seeded truth")
     if annotation.source.media_key != base.source.media_key:
@@ -398,6 +572,11 @@ def _load_independent_annotation(annotation_path: Path, base: GroundTruthRecord)
         if episode.draft or episode.verified_against is None:
             raise ValueError(f"annotation episode {index} is not a completed work annotation")
     return _annotation_content(annotation)
+
+
+def _load_independent_annotation(annotation_path: Path, base: GroundTruthRecord) -> dict[str, Any]:
+    annotation = GroundTruthRecord.model_validate_json(read_text(annotation_path))
+    return _independent_annotation_content(annotation, base)
 
 
 def _truth_with_content(
@@ -436,10 +615,18 @@ def verify_truth(
     annotation_path: Path | None = None,
     input_fn: Input = input,
     output_fn: Output = print,
+    annotation_provenance: dict[str, Any] | None = None,
+    annotation_record: GroundTruthRecord | None = None,
 ) -> GroundTruthRecord:
     truth = GroundTruthRecord.model_validate_json(read_text(truth_path))
-    if annotation_path is not None:
-        content = _load_independent_annotation(annotation_path, truth)
+    if annotation_path is not None and annotation_record is not None:
+        raise ValueError("provide annotation_path or annotation_record, not both")
+    if annotation_path is not None or annotation_record is not None:
+        content = (
+            _load_independent_annotation(annotation_path, truth)
+            if annotation_path is not None
+            else _independent_annotation_content(annotation_record, truth)
+        )
         updated = _truth_with_content(
             truth,
             content,
@@ -447,14 +634,13 @@ def verify_truth(
             second_ref=None,
             resolution=None,
         )
-        atomic_write_json(truth_path, updated)
-        _write_annotation_pass(
+        _write_first_pass_atomically(
             truth_path,
-            "first",
-            set_id=truth.set_id,
+            updated,
             annotator_ref=annotator_ref,
             mode="independent",
             content=content,
+            provenance=annotation_provenance,
         )
         return updated
     retained: list[Any] = []
@@ -515,14 +701,13 @@ def verify_truth(
         )
     updated = truth.model_copy(update={"episodes": retained})
     updated = GroundTruthRecord.model_validate(updated.model_dump(mode="json"))
-    atomic_write_json(truth_path, updated)
-    _write_annotation_pass(
+    _write_first_pass_atomically(
         truth_path,
-        "first",
-        set_id=truth.set_id,
+        updated,
         annotator_ref=annotator_ref,
         mode="seed-review",
         content=_annotation_content(updated),
+        provenance=annotation_provenance,
     )
     return updated
 
@@ -588,14 +773,6 @@ def second_pass_truth(
             GroundTruthRecord.model_validate(guided.model_dump(mode="json"))
         )
         mode = "guided"
-    _write_annotation_pass(
-        truth_path,
-        "second",
-        set_id=truth.set_id,
-        annotator_ref=annotator_ref,
-        mode=mode,
-        content=second_content,
-    )
     first_content = _pass_content(first)
     agrees = canonical_json_bytes(first_content) == canonical_json_bytes(second_content)
     resolution = "agreed" if agrees else "unresolved:third-annotator-required"
@@ -606,7 +783,18 @@ def second_pass_truth(
         second_ref=annotator_ref,
         resolution=resolution,
     )
-    atomic_write_json(truth_path, updated)
+    # One writer at a time per record: the annotation pass and the truth it justifies land
+    # together, whichever command is writing them.
+    with truth_write_lock(truth_path):
+        _write_annotation_pass(
+            truth_path,
+            "second",
+            set_id=truth.set_id,
+            annotator_ref=annotator_ref,
+            mode=mode,
+            content=second_content,
+        )
+        atomic_write_json(truth_path, updated)
     return updated
 
 
@@ -629,14 +817,6 @@ def resolve_truth(
     if canonical_json_bytes(first_content) == canonical_json_bytes(second_content):
         raise ValueError("matching passes do not need third-annotator resolution")
     resolved_content = _load_independent_annotation(annotation_path, truth)
-    _write_annotation_pass(
-        truth_path,
-        "resolution",
-        set_id=truth.set_id,
-        annotator_ref=resolver_ref,
-        mode="independent",
-        content=resolved_content,
-    )
     updated = _truth_with_content(
         truth,
         resolved_content,
@@ -644,7 +824,16 @@ def resolve_truth(
         second_ref=str(second["annotator_ref"]),
         resolution=f"resolved-by:{resolver_ref}",
     )
-    atomic_write_json(truth_path, updated)
+    with truth_write_lock(truth_path):
+        _write_annotation_pass(
+            truth_path,
+            "resolution",
+            set_id=truth.set_id,
+            annotator_ref=resolver_ref,
+            mode="independent",
+            content=resolved_content,
+        )
+        atomic_write_json(truth_path, updated)
     return updated
 
 
