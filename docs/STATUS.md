@@ -101,7 +101,7 @@ throwaway host to replace the **provisional 2,000/day Shazam attempt budget** wi
 
 **Update 2026-09-14.** Also committed: **4b-i** durable queue and worker (`8e937ab`); **`idea truth review`** (`ef94b70`) plus a corpus furniture fix and audit check (`362ae10`); and **4a-ii** FastAPI parity (`3cb5dc2`): one FastAPI/uvicorn server for `idea serve` and `idea truth review`, a durable local job queue at `work/.idea/app.db` with a worker process supervised by `idea serve`, no writes on GET, bounded request bodies, streamed audio, and `http`/`https`-only buy and download links. Test suite: 1287 passed offline.
 
-**Open:** sol-xhigh retro-reviews of 4a-i, 4b-i and the truth tool found blockers (see `docs/reviews/retro-review-*.md`); follow-up fix cycles are next. Until they land, do not run resumable Deep scans and do not freeze or certify the corpus.
+**Open:** sol-xhigh retro-reviews of 4a-i, 4b-i and the truth tool found blockers (see `docs/reviews/retro-review-*.md`); follow-up fix cycles are next. Until they land: **do not run any paid Deep scan** (a worker restart behind idea serve can currently re-send paid clips and lose recorded spend), **do not freeze or certify the corpus**, and **do not run idea gc --apply** (a plain idea gc preview is safe; the apply path can follow links out of the work folder). Verifying truth rows in idea truth review is still fine.
 
 ## Acceptance status at a glance
 
