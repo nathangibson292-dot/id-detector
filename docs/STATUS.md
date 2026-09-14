@@ -99,6 +99,10 @@ rate plus a ~$20 top-up (covers Deep scoring of the whole corpus); run `scripts/
 throwaway host to replace the **provisional 2,000/day Shazam attempt budget** with a measured ceiling, and
 `scripts/spike_ingest_vps.sh` (S2) before any hosting work.
 
+**Update 2026-09-14.** Also committed: **4b-i** durable queue and worker (`8e937ab`); **`idea truth review`** (`ef94b70`) plus a corpus furniture fix and audit check (`362ae10`); and **4a-ii** FastAPI parity (`3cb5dc2`): one FastAPI/uvicorn server for `idea serve` and `idea truth review`, a durable local job queue at `work/.idea/app.db` with a worker process supervised by `idea serve`, no writes on GET, bounded request bodies, streamed audio, and `http`/`https`-only buy and download links. Test suite: 1287 passed offline.
+
+**Open:** sol-xhigh retro-reviews of 4a-i, 4b-i and the truth tool found blockers (see `docs/reviews/retro-review-*.md`); follow-up fix cycles are next. Until they land, do not run resumable Deep scans and do not freeze or certify the corpus.
+
 ## Acceptance status at a glance
 
 Legend: **met** = the stage's plan gate is satisfied as written · **met (controlled only)** = proven
