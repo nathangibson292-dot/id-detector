@@ -128,3 +128,18 @@ rewritten — this note is the correction of record. **Remedy:** from 4a-ii onwa
 its model and effort explicitly and the orchestrator checks the log header before reporting what ran; the
 first 4a-ii review, which also started on astra medium, was stopped and relaunched on `gpt-5.6-sol` xhigh; and
 read-only sol-xhigh retro-reviews of `02d08b9`, `8e937ab` and `ef94b70` are queued.
+
+**Retro-reviews on sol xhigh (2026-09-14): all three FOLLOW_UP_REQUIRED.** The read-only retro-reviews queued by the correction above ran on
+`gpt-5.6-sol` at xhigh (each log header verified) against the committed code, and each found blockers that both
+the astra-medium first pass and the Opus fix pass had missed. Findings are inspection-only until verified by
+running, and are fixed in follow-up cycles committed on top, after 4a-ii lands (4a-ii is editing some of the
+same files).
+
+| Committed cycle | Retro-review | P0 | P1 | Headline blockers |
+|---|---|---|---|---|
+| 4a-i `02d08b9` | [retro-review-4a-i](retro-review-4a-i.md) | 3 | 6 | on automatic resume a dispatched-but-unresolved attempt can be re-dispatched instead of treated as ambiguous and spent; the original reservation is recomputed from current pricing or caps instead of restored; same-run money is not recovered before a compatible-result early return |
+| 4b-i `8e937ab` | [retro-review-4b-i](retro-review-4b-i.md) | 4 | 6 | run-side fences are not bound to the driving job's token, state and unexpired lease at every write; the attempt journal's creation is not durable before provider I/O; a resumed ambiguous attempt can reuse its ordinal; cancellation or dead-letter settlement can miss spend when `primary` was never checkpointed |
+| truth review `ef94b70` | [retro-review-truth-review](retro-review-truth-review.md) | 3 | 4 | `freeze` and certification paths do not reject prediction-exposed sets; destinations are not validated after link resolution (reparse points); a bulk offset does not shift role-segment endpoints identically |
+
+**Until the follow-ups land:** do not run resumable Deep (paid AudD) scans, and do not freeze or certify the
+`release-1` corpus.
