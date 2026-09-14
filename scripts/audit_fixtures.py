@@ -276,6 +276,35 @@ def _audit_derived(relative: Path, text: str) -> list[str]:
     return failures
 
 
+#: Tracklist furniture that must never survive seeding into a committed truth record.  A row like
+#: "0:17:09 - Royal-T - Tokyo Dub" carries a bullet after the timestamp; the seed parser strips it
+#: (`truth._TRACKLIST`), but a record seeded by an older parser keeps it, and the owner then reviews
+#: 25 rows whose artist reads "- Mall Grab".  The parser is tested; this catches stale
+#: committed data.
+_SEED_FURNITURE = re.compile(r"^\s*[-–—•*]")
+
+
+def _audit_truth_record(relative: Path, text: str) -> list[str]:
+    """Ground-truth records must not carry seed furniture in the fields a human reads."""
+
+    if relative.name != "ground_truth.json":
+        return []
+    try:
+        record = json.loads(text)
+    except ValueError:
+        return [f"{relative}: is not valid JSON"]
+    failures: list[str] = []
+    for index, episode in enumerate(record.get("episodes") or []):
+        work = episode.get("work") or {}
+        for field in ("artist", "title"):
+            value = work.get(field)
+            if isinstance(value, str) and _SEED_FURNITURE.match(value):
+                failures.append(
+                    f"{relative}: episode {index} {field} keeps tracklist furniture: {value[:40]!r}"
+                )
+    return failures
+
+
 def audit() -> list[str]:
     failures: list[str] = []
     raw_fragments = _raw_fragments()
@@ -293,6 +322,7 @@ def audit() -> list[str]:
             text = path.read_text(encoding="utf-8", errors="replace")
             if relative.is_relative_to(_DERIVED_PATH):
                 failures.extend(_audit_derived(relative, text))
+            failures.extend(_audit_truth_record(relative, text))
             if not _pattern_exempt(relative):
                 acquisition = _acquisition_artifact(relative)
                 # `enrich/acquire.json` and the tracklist exports may carry public catalogue URLs
