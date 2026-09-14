@@ -110,3 +110,21 @@ its five-point result-page contract is a constraint on every presentation cycle)
 |---|---|---|---|---|
 | owner truth review | [build-truth-review](build-truth-review.md) | [review + fix pass](build-truth-review.md#review--fix-pass-sol-xhigh-review-folded-in) (2 P0 + 5 P1 fixed; 4 P2 noted) | `idea truth review --set <set-id>`; keyboard-first single-set first-pass review, range audio, explicit/atomic save through `truth.py`, bulk-offset preview/apply/undo with scorer suggestions, prediction independence + durable provenance; 1198 passed | uncommitted |
 
+**Correction (2026-09-14): three first-pass reviews did not run on sol xhigh.** Codex's user-level default (`~/.codex/config.toml`) changed on 2026-09-13 at 10:56 from
+`gpt-5.6-sol`/`xhigh` to `gpt-6-astra`/`medium` — not by the orchestrator. Review launches that relied on that
+default instead of passing `-m` therefore ran on astra medium, as each log's header line records:
+
+| Cycle | Commit | First-pass review actually ran on | Stated in the commit message and table above |
+|---|---|---|---|
+| 4a-i — service API and packaging | `02d08b9` | `gpt-6-astra`, medium | "Codex gpt-5.6-sol at xhigh" — **incorrect** |
+| 4b-i — durable queue, intake, worker | `8e937ab` | `gpt-6-astra`, medium | "Codex gpt-5.6-sol at xhigh" — **incorrect** |
+| owner truth-review tooling | `ef94b70` | `gpt-6-astra`, medium | "Codex gpt-5.6-sol at xhigh" — **incorrect** |
+
+Every earlier first-pass review (0a-i through 3a-ii) genuinely ran on `gpt-5.6-sol` at xhigh. The builds are
+unaffected: each passed its model explicitly. On all three affected cycles the independent Claude Opus
+review-and-fix pass still ran in full and every gate was re-run by the orchestrator, so the committed fixes and
+test results stand; what is overstated is only the strength of the first reviewer. Commit history is not
+rewritten — this note is the correction of record. **Remedy:** from 4a-ii onwards every Codex invocation passes
+its model and effort explicitly and the orchestrator checks the log header before reporting what ran; the
+first 4a-ii review, which also started on astra medium, was stopped and relaunched on `gpt-5.6-sol` xhigh; and
+read-only sol-xhigh retro-reviews of `02d08b9`, `8e937ab` and `ef94b70` are queued.
