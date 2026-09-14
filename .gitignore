@@ -59,3 +59,6 @@ data/local/controlled/
 # Local source media and provider/MixesDB response caches.
 data/local/
 data/corpus/**/media/
+
+# Agent git worktrees (each holds a full checkout and .venv); never commit them.
+.claude/worktrees/
