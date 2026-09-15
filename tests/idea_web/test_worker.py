@@ -150,6 +150,21 @@ def _publish_bundle(
     return identifier, directory
 
 
+def _claim_run(database: Database, intake: PreparedIntake, run_id: str, recipe=FREE_RECIPE) -> str:
+    """A run driven by a live claim, returning its token.
+
+    The run-side fence (follow-up cycle, 4b-i retro P0) requires the run's token to belong to an
+    active job with an unexpired lease; a token written onto ``analysis_runs`` alone is refused.
+    """
+
+    queue = JobQueue(database)
+    queue.enqueue(PlatformUrl(MIX), recipe, run_id=run_id)
+    _insert_run(database, intake, run_id=run_id, status="analysis")
+    job = queue.claim("fence-owner", lease_seconds=600)
+    assert job is not None
+    return job.token
+
+
 def _run_row(database: Database, run_id: str) -> sqlite3.Row:
     with database.read() as connection:
         row = connection.execute("SELECT * FROM analysis_runs WHERE run_id=?", (run_id,)).fetchone()
@@ -166,7 +181,7 @@ def _job_row(database: Database, job_id: str) -> sqlite3.Row:
 
 def test_migrations_go_up_and_down_and_enable_wal_and_foreign_keys(tmp_path: Path) -> None:
     database = _database(tmp_path)
-    assert database.version() == 1
+    assert database.version() == 3
     with database.read() as connection:
         assert connection.execute("PRAGMA journal_mode").fetchone()[0] == "wal"
         assert connection.execute("PRAGMA foreign_keys").fetchone()[0] == 1
@@ -213,10 +228,10 @@ def test_simultaneous_migrators_are_serialised(tmp_path: Path) -> None:
     for thread in threads:
         thread.join(60)
     assert not errors
-    assert versions == [1, 1, 1, 1]
+    assert versions == [3, 3, 3, 3]
     with Database(path).read() as connection:
         applied = connection.execute("SELECT COUNT(*) FROM schema_migrations").fetchone()[0]
-    assert applied == 1
+    assert applied == 3
 
 
 def test_intake_transitions_to_analysis_before_the_service_runs(tmp_path: Path) -> None:
@@ -374,7 +389,9 @@ def test_a_reclaimed_claim_cannot_write_checkpoints_money_or_attempts(tmp_path: 
         assert stolen is not None and stolen.id == job_id
         replacement["job"] = stolen
         assert JobQueue(database, clock=lambda: now[0]).begin_analysis(job_id, stolen.token)
-        SQLiteCheckpointStore(database, tmp_path / "work", claim_token=stolen.token).write(
+        SQLiteCheckpointStore(
+            database, tmp_path / "work", claim_token=stolen.token, clock=lambda: now[0]
+        ).write(
             request.run_id,
             "primary",
             artefacts=(artifact,),
@@ -932,11 +949,7 @@ def test_local_path_is_refused_in_hosted_mode_on_write_and_untrusted_read(tmp_pa
 def test_provider_attempt_events_are_append_only(tmp_path: Path) -> None:
     database = _database(tmp_path)
     intake = _intake(tmp_path, DEEP_RECIPE)
-    _insert_run(database, intake, run_id="attempt-run", status="analysis")
-    with database.write() as connection:
-        connection.execute(
-            "UPDATE analysis_runs SET claim_token='token-one' WHERE run_id='attempt-run'"
-        )
+    token = _claim_run(database, intake, "attempt-run", DEEP_RECIPE)
     journal = SQLiteAttemptJournal(
         tmp_path / "attempts.jsonl",
         database=database,
@@ -944,7 +957,8 @@ def test_provider_attempt_events_are_append_only(tmp_path: Path) -> None:
         provider="audd",
         unit_usd_e6=5_000,
         egress_id="egress-one",
-        claim_token="token-one",
+        claim_token=token,
+        hosted=False,  # the queue's local mode: hosted paid dispatch is refused (round 6)
     )
     attempt = journal.prepare(
         query_id="a" * 64, window_id="b" * 40, ordinal=1, parent_attempt_id=None
@@ -969,11 +983,7 @@ def test_attempt_projection_is_backfilled_from_the_durable_journal(tmp_path: Pat
 
     database = _database(tmp_path)
     intake = _intake(tmp_path, DEEP_RECIPE)
-    _insert_run(database, intake, run_id="crash-run", status="analysis")
-    with database.write() as connection:
-        connection.execute(
-            "UPDATE analysis_runs SET claim_token='token-two' WHERE run_id='crash-run'"
-        )
+    token = _claim_run(database, intake, "crash-run", DEEP_RECIPE)
     path = tmp_path / "attempts.jsonl"
     orphan = AttemptJournal(path, run_id="crash-run", provider="audd", unit_usd_e6=5_000)
     attempt = orphan.prepare(
@@ -991,7 +1001,7 @@ def test_attempt_projection_is_backfilled_from_the_durable_journal(tmp_path: Pat
         provider="audd",
         unit_usd_e6=5_000,
         egress_id="egress-one",
-        claim_token="token-two",
+        claim_token=token,
     )
     assert journal.backfill() == 3
     assert journal.backfill() == 3  # idempotent: the rows are already there
@@ -1008,20 +1018,32 @@ def test_attempt_projection_is_backfilled_from_the_durable_journal(tmp_path: Pat
 def test_shazam_attempts_reach_the_ledger_and_are_fenced(tmp_path: Path) -> None:
     database = _database(tmp_path)
     intake = _intake(tmp_path)
-    _insert_run(database, intake, run_id="shazam-run", status="analysis")
-    with database.write() as connection:
-        connection.execute(
-            "UPDATE analysis_runs SET claim_token='token-three' WHERE run_id='shazam-run'"
+    token = _claim_run(database, intake, "shazam-run")
+    # Round 4: ONE Shazam attempt identity. The journal's own event (deterministic attempt id, the
+    # clip query id) is what reaches the ledger; the process breaker writes no rows of its own.
+    journal = SQLiteAttemptJournal(
+        tmp_path / "shazam.jsonl",
+        database=database,
+        run_id="shazam-run",
+        provider="shazam",
+        unit_usd_e6=0,
+        egress_id="egress-one",
+        claim_token=token,
+    )
+    query_id = "e" * 64
+    for ordinal, outcome in enumerate(("http_429", "match")):
+        attempt = journal.prepare(
+            query_id=query_id, window_id="f" * 40, ordinal=ordinal, parent_attempt_id=None
         )
+        journal.dispatched(attempt)
+        journal.resolved(attempt, outcome)
     breaker = LedgerShazamBreaker(
         None,
         database=database,
         run_id="shazam-run",
         egress_id="egress-one",
-        claim_token="token-three",
+        claim_token=token,
     )
-    breaker.dispatch(running_free=True)
-    breaker.resolved("http_429")
     breaker.dispatch(running_free=True)
     breaker.resolved("match")
     with database.read() as connection:
@@ -1037,16 +1059,16 @@ def test_shazam_attempts_reach_the_ledger_and_are_fenced(tmp_path: Path) -> None
         "prepared",
         "dispatched",
         "resolved",
-    ]
+    ]  # the breaker's dispatch/resolve added nothing
     resolved = [row for row in rows if row["state"] == "resolved"]
     assert [row["outcome"] for row in resolved] == ["http_429", "match"]
     assert resolved[0]["http_status"] == 429
-    assert all(row["query_id"] is None and row["unit_usd_e6"] == 0 for row in rows)
+    assert all(row["query_id"] == query_id and row["unit_usd_e6"] == 0 for row in rows)
 
     with database.write() as connection:
         connection.execute("UPDATE analysis_runs SET claim_token='token-four'")
     with pytest.raises(StaleClaim):
-        breaker.dispatch(running_free=True)
+        journal.prepare(query_id=query_id, window_id="f" * 40, ordinal=2, parent_attempt_id=None)
 
 
 def test_worker_contract_has_ten_second_heartbeat_and_no_http_framework() -> None:

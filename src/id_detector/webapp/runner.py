@@ -10,7 +10,6 @@ pluggable: tests inject a fake runner instead and never touch the network.
 from __future__ import annotations
 
 import asyncio
-import uuid
 from contextlib import suppress
 from dataclasses import dataclass
 from hashlib import sha256
@@ -212,8 +211,35 @@ def make_pipeline_runner(
     *,
     project_root: Path | None = None,
     config_path: Path | None = None,
+    paid_scan_adapters: object | None = None,
+    shazam_http_client: object | None = None,
+    paid_sleep: object | None = None,
+    configure: object | None = None,
 ):
-    """Build a runner that executes the real analyse pipeline for a submitted job."""
+    """Build a runner that executes the real analyse pipeline for a submitted job.
+
+    The keyword-only provider overrides exist for offline tests of the supervised local worker
+    (``IDEA_TEST_MODE`` runner specs); production passes none of them and runs exactly as before.
+    Supplying any of them outside ``IDEA_TEST_MODE=1`` is refused: a real job must never run
+    against substitute providers, a substitute sleeper or a rewritten configuration.
+    """
+
+    import os
+
+    supplied = sorted(
+        name
+        for name, value in (
+            ("paid_scan_adapters", paid_scan_adapters),
+            ("shazam_http_client", shazam_http_client),
+            ("paid_sleep", paid_sleep),
+            ("configure", configure),
+        )
+        if value is not None
+    )
+    if supplied and os.environ.get("IDEA_TEST_MODE") != "1":
+        raise PermissionError(
+            "offline provider overrides require IDEA_TEST_MODE=1: " + ", ".join(supplied)
+        )
 
     from id_detector import cli
 
@@ -232,6 +258,10 @@ def make_pipeline_runner(
             ctx.check_cancel()
 
         settings = _resolve_settings(project, config_file, ctx.profile)
+        if callable(configure):
+            from dataclasses import replace as _replace
+
+            settings = _replace(settings, config=configure(settings.config))
         tracklist_path = _materialise_tracklist(root, ctx.known_tracklist)
 
         def progress(phase: str, done: int, total: int, message: str = "") -> None:
@@ -271,9 +301,21 @@ def make_pipeline_runner(
                 local_index_label=WEB_INDEX_LABEL if ctx.build_index else None,
                 index_root=WEB_INDEX_ROOT,
                 panako_tool_dir=WEB_PANAKO_TOOL_DIR,
+                paid_scan_adapters=paid_scan_adapters,
+                shazam_http_client=shazam_http_client,
+                paid_sleep=paid_sleep,
+                # The supervised local worker's queue-aware guards (none outside it).
+                dispatch_admission=getattr(ctx, "dispatch_admission", None),
+                settlement_writer=getattr(ctx, "settlement_writer", None),
             ),
         )
-        run_id = uuid.uuid4().hex
+        # The job's ONE durable service run: a restart after the worker process died resumes it,
+        # so the shared attempt ledger, reservation and settlement apply (never a fresh uuid).
+        run_id = getattr(ctx, "run_id", None)
+        if not run_id:
+            # Fail closed: a fallback id is not bound to the job, so a restart would resume a
+            # different run and re-bill what this one already paid for.
+            raise RuntimeError("this job has no durable run id; its analysis was not started")
         service_result = run(
             RunRequest(
                 run_id=run_id,
@@ -322,6 +364,10 @@ def make_pipeline_runner(
             # Plan §2.3.5: the breaker (or the kill-switch) refused a new Free request. The job
             # waits — it did not fail — so the manager records ``waiting``, not ``failed``.
             raise JobWaiting(_EXIT_STATUS[WAITING_EXIT])
+        if service_result.status == "failed" and service_result.reason:
+            # A real failure comes back as a RunResult with its settled spend (§4.3); the job still
+            # shows the failure's own message, exactly as it did when the exception propagated.
+            raise RuntimeError(service_result.reason)
         if exit_code != 0:
             meaning = _EXIT_STATUS.get(exit_code, "error")
             raise RuntimeError(f"analysis failed: {meaning} (exit code {exit_code})")

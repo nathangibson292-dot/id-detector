@@ -26,6 +26,7 @@ from typing import Any
 from urllib.parse import urlsplit
 
 from id_detector.io import redact_text, url_has_credentials
+from id_detector.run_ledger import new_run_id
 
 #: Ring-buffer size for a job's human-readable log tail.
 LOG_RING = 200
@@ -146,6 +147,11 @@ class Job:
     #: An optional tracklist the user pasted (e.g. from 1001tracklists / a YouTube description) to
     #: seed positioned hints — the same corroboration/recovery path as the CLI's ``--tracklist``.
     known_tracklist: str | None = None
+    #: The ONE service ``run_id`` this job analyses under, minted when the job is created and
+    #: reused by every execution of it — a restart after the worker process died resumes the same
+    #: run (its checkpoints, attempt ledger, reservation and settlement) instead of starting a new
+    #: one that would re-bill the clips the first pass already paid for.
+    run_id: str | None = None
     status: str = QUEUED
     phase: str = QUEUED
     phase_done: int = 0
@@ -190,6 +196,10 @@ class Job:
     audio_path: str | None = None
     log: deque[str] = field(default_factory=lambda: deque(maxlen=LOG_RING))
     cancel_event: threading.Event = field(default_factory=threading.Event)
+    #: Queue-aware guards the supervised local worker attaches for ONE execution: the dispatch
+    #: admission check and the settlement fence. Runtime objects, never snapshotted.
+    dispatch_admission: Any = field(default=None, repr=False, compare=False)
+    settlement_writer: Any = field(default=None, repr=False, compare=False)
 
     def rate_per_minute(self, now: float | None = None) -> float:
         """Windows completed per minute — observed while recognising, else the fallback constant."""
@@ -388,6 +398,20 @@ class JobContext:
         return self._job.known_tracklist
 
     @property
+    def run_id(self) -> str | None:
+        """The job's durable service run id (``None`` only for a job built without one)."""
+
+        return self._job.run_id
+
+    @property
+    def dispatch_admission(self) -> Any:
+        return self._job.dispatch_admission
+
+    @property
+    def settlement_writer(self) -> Any:
+        return self._job.settlement_writer
+
+    @property
     def work_root(self) -> Path:
         return self._manager.work_root
 
@@ -546,6 +570,7 @@ class JobManager:
             acquire=acquire,
             build_index=build_index,
             known_tracklist=known_tracklist,
+            run_id=new_run_id(),
         )
         with self.lock:
             self._jobs[job.id] = job

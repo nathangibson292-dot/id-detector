@@ -5,11 +5,15 @@ from __future__ import annotations
 import os
 from collections import deque
 from collections.abc import Callable
+from contextvars import ContextVar
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
 from threading import RLock
 
 FAILURES = frozenset({"http_429", "http_503", "http_5xx", "malformed", "timeout_post"})
+#: The clip cache key of the Shazam query the current task is recognising. Set by the recognise
+#: job runner around each query so the hosted ledger records every attempt's ``query_id``.
+SHAZAM_QUERY_ID: ContextVar[str | None] = ContextVar("idea_shazam_query_id", default=None)
 
 
 def shazam_off() -> bool:
@@ -104,6 +108,13 @@ class ShazamBreaker:
                 raise ShazamBlocked(reason)
             self._daily_attempts += 1
             return self._day
+
+    def sent(self) -> None:
+        """The admitted request is about to enter network I/O.
+
+        A no-op for the process policy; the hosted ledger records ``dispatched`` here, so a worker
+        killed after transmission can never leave an attempt that looks as if it was never sent.
+        """
 
     def resolved(self, outcome: str) -> None:
         if shazam_off():

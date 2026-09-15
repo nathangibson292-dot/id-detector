@@ -299,33 +299,78 @@ async def _run_job(
     media_dir: Path,
     raw_dir: Path,
     owner: str,
+    journal: Any = None,
+    resume: Any = None,
 ) -> None:
     raw_path = raw_dir / f"{query.cache_key}.json"
     relative_path = raw_path.relative_to(media_dir).as_posix()
+    from id_detector.shazam_breaker import SHAZAM_QUERY_ID
+
     heartbeat = asyncio.create_task(_heartbeat(store, job.id, owner))
+    # The clip identity the hosted ledger records on every Shazam attempt of this query (§2.3.3).
+    query_token = SHAZAM_QUERY_ID.set(query.cache_key)
     try:
         await store.submission_started(job.id, owner)
         response: dict[str, Any] | None = None
         last_error: Exception | None = None
+        from id_detector.attempts import DispatchRefused
+        from id_detector.shazam import shazam_outcome
+
+        ordinal = resume.next_ordinal if resume is not None else 0
+        parent = (
+            resume.parent_attempt_id
+            if resume is not None and resume.action in {"retry", "reissue"}
+            else None
+        )
         for retry_index in range(MAX_RETRIES + 1):
-            try:
-                response = await adapter.recognize_once(
-                    media_dir / window.wav_path,
-                    lambda: store.begin_physical_attempt(job.id),
+            attempt_id = (
+                journal.prepare(
+                    query_id=query.cache_key,
+                    window_id=window.id,
+                    ordinal=ordinal,
+                    parent_attempt_id=parent,
                 )
+                if journal is not None
+                else None
+            )
+            sent = [False]
+
+            async def on_attempt(attempt_id: str | None = attempt_id, sent: list = sent) -> None:
+                await store.begin_physical_attempt(job.id)
+                if journal is not None and attempt_id is not None:
+                    journal.dispatched(attempt_id)  # durable before the request leaves
+                sent[0] = True
+
+            def settle(
+                outcome: str, attempt_id: str | None = attempt_id, sent: list = sent
+            ) -> None:
+                if journal is not None and attempt_id is not None and sent[0]:
+                    journal.resolved(attempt_id, outcome)  # type: ignore[arg-type]
+
+            parent, ordinal = attempt_id, ordinal + 1
+            try:
+                response = await adapter.recognize_once(media_dir / window.wav_path, on_attempt)
+                settle("match" if response.get("matches") and response.get("track") else "no_match")
                 break
             except ShazamHTTPError as exc:
+                settle(shazam_outcome(exc))
                 last_error = exc
                 retryable = exc.status_code == 0 or exc.status_code == 429 or exc.status_code >= 500
                 if not retryable or retry_index == MAX_RETRIES:
                     break
                 await asyncio.sleep(retry_delay(retry_index, exc.retry_after))
+            except DispatchRefused:
+                # The job's claim fence refused this dispatch (cancelled, reclaimed or past its
+                # lease): no request left, and the query must not be recorded as a failure.
+                raise asyncio.CancelledError("Shazam dispatch refused by the job's claim") from None
             except BudgetExhausted as exc:
+                settle("malformed")
                 last_error = exc
                 break
             except Exception as exc:
                 # Signature-generation failures happen before ``on_attempt`` and therefore do
                 # not consume a request. They are deterministic for this WAV and are not retried.
+                settle(shazam_outcome(exc))
                 last_error = exc
                 break
         if response is None:
@@ -349,6 +394,7 @@ async def _run_job(
         status = "succeeded" if response.get("matches") and response.get("track") else "no_match"
         await store.finish(job.id, status, result_path=relative_path)
     finally:
+        SHAZAM_QUERY_ID.reset(query_token)
         heartbeat.cancel()
         await asyncio.gather(heartbeat, return_exceptions=True)
 
@@ -373,6 +419,7 @@ async def recognise_generation(
     process_breaker: ShazamBreaker | None = None,
     running_free: bool = True,
     refresh_states: frozenset[str] = frozenset(),
+    attempt_journal: Any = None,
 ) -> RecognitionResult:
     config, config_name = load_provider_config(project_root)
     queries = build_queries(media_key, windows, config, generation)
@@ -410,6 +457,31 @@ async def recognise_generation(
     cache_hits = 0
     initial_physical = 0
     initial_by_query: dict[str, int] = {}
+    # Plan §2.3.3 for Shazam: every request of this run label is journalled (prepared ->
+    # dispatched before network I/O -> resolved) with its clip query id. On resume, a query whose
+    # newest attempt was dispatched and never resolved is NEVER sent again automatically — from
+    # this journal, or from the hosted SQLite ledger (``ambiguous_query_ids``) — even when the
+    # per-media job store that used to protect it has been lost.
+    from id_detector.attempts import AttemptJournal
+
+    shazam_journal = attempt_journal or AttemptJournal(
+        media_dir / "recognise" / SHAZAM_ATTEMPTS_FILENAME,
+        run_id=run_id,
+        provider="shazam",
+        unit_usd_e6=0,
+    )
+    shazam_ledger = shazam_journal.run_ledger()
+
+    def _never_resend(cache_key: str) -> bool:
+        action = shazam_ledger.resume(cache_key).action
+        if action in {"ambiguous", "settled"}:
+            return True  # unresolved (maybe answered) or a terminal refusal: never re-asked
+        # Answered by this run: re-served from its raw body, never asked again -- even when the
+        # body is not in this invocation's directory and the job store that held it is gone.
+        return action == "reuse" and not path_is_file(raw_dir / f"{cache_key}.json")
+
+    unresolved = {query.cache_key for query in queries if _never_resend(query.cache_key)}
+    leasable = frozenset(query.id for query in queries if query.cache_key not in unresolved)
     async with AsyncJobStore(media_dir / "jobs.sqlite") as store:
         await store.ensure_budget(media_key, "shazam", max_requests=max_requests)
         refresh_allowance_added = False
@@ -466,6 +538,22 @@ async def recognise_generation(
             ):
                 _write_immutable_bytes(raw_path, read_bytes(cached_raw_path))
                 cache_hits += 1
+            elif (
+                job.state == "pending"
+                and shazam_ledger.resume(query.cache_key).action == "reuse"
+                and path_is_file(raw_path)
+            ):
+                # This run already received this answer and the job store that recorded it was
+                # lost: serve the run's own raw answer instead of asking Shazam again.
+                stored_answer = json.loads(read_text(raw_path))
+                await store.finish(
+                    job.id,
+                    "succeeded"
+                    if stored_answer.get("matches") and stored_answer.get("track")
+                    else "no_match",
+                    result_path=raw_path.relative_to(media_dir).as_posix(),
+                )
+                cache_hits += 1
             elif job.state == "pending" and query.cache_key in cached_by_content:
                 stored_path, stored_state = cached_by_content[query.cache_key]
                 _write_immutable_bytes(raw_path, read_bytes(media_dir / stored_path))
@@ -499,7 +587,7 @@ async def recognise_generation(
                     run_id,
                     media_key=media_key,
                     provider="shazam",
-                    query_ids=frozenset(query_by_id),
+                    query_ids=leasable,
                 )
                 if job is None:
                     return
@@ -515,6 +603,8 @@ async def recognise_generation(
                     media_dir=media_dir,
                     raw_dir=raw_dir,
                     owner=run_id,
+                    journal=shazam_journal,
+                    resume=shazam_ledger.resume(query.cache_key),
                 )
                 if on_window is not None:
                     window_done = min(window_done + 1, window_total)
@@ -605,6 +695,56 @@ async def recognise_generation(
         cache_hits=cache_hits,
         blocked_reason=adapter.blocked_reason,
     )
+
+
+#: The per-media Shazam attempt journal (one file; every event carries its run label).
+SHAZAM_ATTEMPTS_FILENAME = "shazam-attempts.jsonl"
+
+
+def restore_run_answers(
+    *,
+    media_key: str,
+    media_dir: Path,
+    windows: WindowsResult,
+    project_root: Path,
+    run_labels: tuple[str, ...] | list[str],
+    generation: int = 0,
+) -> tuple[ObservationRecord, ...]:
+    """The Shazam answers an earlier pass of THIS run already received, rebuilt from its raw bodies.
+
+    Reads only the run's own invocation directories (one per ``run_labels`` entry) — never the
+    shared job store, never the network — and writes nothing. A resumed run uses it to keep evidence
+    a crash left without a completed checkpoint, before any breaker decision can discard it. Error
+    payloads (a refused or failed request) are not answers and are skipped.
+    """
+
+    config, _config_name = load_provider_config(project_root)
+    queries = build_queries(media_key, windows, config, generation)
+    windows_by_cache: dict[str, list[Any]] = {}
+    for window in windows.records:
+        cache_key = clip_cache_key(window.wav_sha256, "shazam", config.version)
+        windows_by_cache.setdefault(cache_key, []).append(window)
+    restored: dict[str, ObservationRecord] = {}
+    for label in run_labels:
+        invocation_key = sha256(label.encode("utf-8")).hexdigest()[:20]
+        raw_dir = media_dir / "recognise" / "invocations" / invocation_key / "raw"
+        for query in queries:
+            raw_path = raw_dir / f"{query.cache_key}.json"
+            if not path_is_file(raw_path):
+                continue
+            try:
+                response = json.loads(read_text(raw_path))
+            except (OSError, ValueError):
+                continue
+            if not isinstance(response, dict) or "matches" not in response:
+                continue
+            relative_path = raw_path.relative_to(media_dir).as_posix()
+            for window in windows_by_cache.get(query.cache_key, ()):
+                observation = response_to_observation(
+                    response, query, window, config, relative_path, media_key
+                )
+                restored[observation.id] = observation
+    return tuple(sort_records(list(restored.values())))
 
 
 async def recognise_generation_zero(**kwargs: Any) -> RecognitionResult:

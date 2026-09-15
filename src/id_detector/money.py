@@ -156,6 +156,28 @@ class UsdAdmitter:
                 self._remaining += self.reservation.unit_usd_e6
                 self._refunded += 1
 
+    def restore_spent(self, spent_usd_e6: int) -> bool:
+        """Charge durable spend a previous pass of this run already made, exactly and idempotently.
+
+        The amount is the ledger's own µUSD sum (each attempt at the price its event recorded), so
+        a price change between passes can never re-price spent money. Charging to the same figure
+        twice is a no-op. ``False`` means the reservation cannot cover what is already spent: the
+        remainder is then zero and no further request may be admitted.
+        """
+
+        if spent_usd_e6 < 0:
+            raise ValueError("spent_usd_e6 must be non-negative")
+        with self._lock:
+            if self._settled is not None:
+                raise RuntimeError("USD reservation is already settled")
+            delta = spent_usd_e6 - self._spent
+            if delta <= 0:
+                return True
+            self._spent += delta
+            taken = min(delta, self._remaining)
+            self._remaining -= taken
+            return taken == delta
+
     def settle(self) -> UsdSettlement:
         """Release the unspent reservation; a dispatched-but-unresolved unit settles as spent.
 

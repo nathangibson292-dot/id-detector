@@ -17,7 +17,7 @@ from __future__ import annotations
 
 import asyncio
 import json
-import uuid
+import os
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from hashlib import sha256
@@ -43,9 +43,15 @@ from id_detector.fuse.episodes import (
 )
 from id_detector.hints.pipeline import run_hints
 from id_detector.ingest import SourceChanged, _load_cached, ingest
-from id_detector.io import atomic_write_json, path_is_file, read_text, sha256_file
+from id_detector.io import (
+    atomic_write_json,
+    native_path,
+    path_is_file,
+    read_text,
+    sha256_file,
+)
 from id_detector.jobs import ProcessLock
-from id_detector.journal import InvocationTimer, append_invocation
+from id_detector.journal import InvocationTimer, append_invocation, has_invocation
 from id_detector.local_index import run_local_index_recognition
 from id_detector.money import (
     UNREACHABLE_OUTCOMES,
@@ -69,8 +75,15 @@ from id_detector.paid_clip import (
 from id_detector.providers.audd import DEFAULT_ANCHOR_MAX_MS, DEFAULT_ANCHOR_SLACK_MS
 from id_detector.providers.base import AppConfig
 from id_detector.recipes import Recipe, get_recipe
-from id_detector.recognise import recognise_generation
+from id_detector.recognise import _write_jsonl, recognise_generation, restore_run_answers
 from id_detector.rescan import DEFAULT_MAX_GENERATIONS
+from id_detector.run_ledger import (
+    RecoveredMoney,
+    ReservationRecord,
+    new_run_id,
+    recovered_money,
+    restore_admitter,
+)
 from id_detector.scan import PAID_FILE_SCANNERS
 from id_detector.scan_targeting import select_scan_targets
 from id_detector.secondary_targeting import (
@@ -85,11 +98,6 @@ from id_detector.secondary_targeting import (
     secondary_reserve,
     select_secondary_candidates,
     serve_confirmations,
-)
-from id_detector.service import (
-    charge_restored_units,
-    recover_paid_attempts,
-    restored_settlement,
 )
 from id_detector.shazam import HTTPClientInterface
 from id_detector.shazam_breaker import ShazamBreaker, shazam_off
@@ -404,6 +412,9 @@ async def run_analysis(
     injected_usd_admitter: UsdAdmitter | None = None,
     project_root: Path | None = None,
     outcome: PipelineOutcome | None = None,
+    presentation_local: bool = True,
+    dispatch_admission: Callable[[], None] | None = None,
+    settlement_writer: Callable[[Path, object], object] | None = None,
 ) -> int:
     """Run one analysis and return its exit code (plan §2.3.5).
 
@@ -427,7 +438,10 @@ async def run_analysis(
     shazam_breaker = shazam_breaker or ShazamBreaker(app_config.shazam_breaker)
     if not shazam_off():
         shazam_breaker.configure(app_config.shazam_breaker)
-    run_id = supplied_run_id or uuid.uuid4().hex
+    if not supplied_run_id and (dispatch_admission is not None or settlement_writer is not None):
+        # A job-driven run never mints a fallback id: a crash would resume a DIFFERENT run.
+        raise ValueError("a job-driven analysis must carry its durable run id")
+    run_id = supplied_run_id or new_run_id()
     timer = InvocationTimer(run_id, ["analyse", url], keep_intermediates=keep_intermediates)
     media_dir: Path | None = None
     ffmpeg_version: str | None = None
@@ -444,6 +458,24 @@ async def run_analysis(
         "cache_hits": 0,
     }
     report = outcome if outcome is not None else PipelineOutcome()
+    #: What every durable record says THIS run already reserved and spent: an earlier pass's
+    #: attempt ledger, its reservation record and its primary checkpoint. Filled in as soon as the
+    #: media directory is known; every settlement below is merged with it, so no terminal path —
+    #: a cancel, a refusal, a failure, a served compatible result — can report less (§2.3.2).
+    recovered = RecoveredMoney()
+    journal: AttemptJournal | None = attempt_journal
+
+    def _settle() -> UsdSettlement:
+        return recovered.merged(_settle_money(usd_admitter))
+
+    def _append_settlement(path: Path, entry: object) -> None:
+        # SQLite is the single authority: a job-driven run's settlement is a row written under
+        # its claim fence in one transaction, and invocations.jsonl is projected from it after
+        # commit. A worker whose claim was reclaimed (or lease lost) writes NOTHING.
+        if settlement_writer is not None:
+            settlement_writer(path, entry)
+            return
+        append_invocation(path, entry)  # type: ignore[arg-type]
 
     def _finish(
         *,
@@ -495,7 +527,7 @@ async def run_analysis(
         reason = "shazam_manual_off" if shazam_off() else shazam_breaker.reason()
         if reason is None:
             return False
-        settlement = _settle_money(usd_admitter)
+        settlement = _settle()
         entry = timer.entry(
             status="waiting",
             reason=reason,
@@ -506,7 +538,7 @@ async def run_analysis(
             ffmpeg_version=ffmpeg_version,
             **_money_journal_fields(settlement, requested_recipe, app_config),
         )
-        append_invocation((media_dir or work_root) / "invocations.jsonl", entry)
+        _append_settlement((media_dir or work_root) / "invocations.jsonl", entry)
         _finish(exit_code=6, status="waiting", reason=reason, settlement=settlement)
         typer.echo(
             f"waiting ({reason}): not queued locally; retry after re-enable or recovery", err=True
@@ -527,6 +559,28 @@ async def run_analysis(
         acquired_media_lock.acquire()
         media_lock = acquired_media_lock
         source_ids = [f"source:{ingested.record.source_key}"]
+        # Plan §2.3.2/§2.3.3: recover THIS run's money before anything can return early. The
+        # journal the sweep writes to is the one recovery reads (the caller's, when injected).
+        if journal is None:
+            journal = AttemptJournal(
+                attempts_path(media_dir),
+                run_id=run_id,
+                provider="audd",
+                unit_usd_e6=app_config.audd_usd_e6_per_request,
+            )
+        if dispatch_admission is not None and getattr(journal, "admission", None) is None:
+            journal.admission = dispatch_admission  # the queue's ONE admission check
+        durable_reservation = journal.durable_reservation()
+        primary_floor = (checkpoint_state or {}).get("primary", {})
+        recovered = recovered_money(
+            journal.run_ledger(),
+            durable_reservation,
+            RecoveredMoney(
+                int(primary_floor.get("usd_e6_reserved", 0) or 0),
+                int(primary_floor.get("usd_e6_spent", 0) or 0),
+                int(primary_floor.get("attempts", 0) or 0),
+            ),
+        )
         _report(progress, "ingest", 1, 1, ingested.record.title or "source ready")
         # The phase's durable artefact is the immutable source record.  The fetched original is
         # checkpointed only when it is still there: retention deliberately prunes it while the
@@ -615,13 +669,45 @@ async def run_analysis(
             if result_paths is not None:
                 result_paths.append(compatible)
             typer.echo(f"cached; tracklist={compatible / 'tracklist.json'}")
+            served_status = str(served.get("status") or "complete")
+            served_reason = str(served["reason"]) if served.get("reason") is not None else None
+            served_achieved = (
+                str(served["achieved"]) if served.get("achieved") is not None else None
+            )
+            served_settlement = _settle()
+            if (
+                settlement_writer is not None
+                or recovered.any
+                or has_invocation(media_dir / "invocations.jsonl", run_id)
+            ):
+                # A job-owned run ALWAYS settles (its SQLite row), even a zero-money cache hit.
+                # Any earlier settlement of THIS run is replaced, even at zero money (a run
+                # cancelled before reserving that is later served must not stay `cancelled`).
+                # A resumed run that already reserved or spent (e.g. killed after its bundle was
+                # published and before its settlement): the run settles exactly once, with the
+                # money it really spent — never the zero a fresh cache hit reports.
+                served_entry = timer.entry(
+                    status=served_status,
+                    reason=served_reason,
+                    achieved=served_achieved,
+                    exit_code=0,
+                    counts=counts,
+                    costs={"usd_e2": served_settlement.usd_e2_spent},
+                    source_ids=source_ids,
+                    ffmpeg_version=ffmpeg_version,
+                    **_money_journal_fields(served_settlement, requested_recipe, app_config),
+                )
+                _append_settlement(
+                    media_dir / "invocations.jsonl",
+                    served_entry.model_copy(update={"bundle_id": compatible.name}),
+                )
             return _finish(
                 exit_code=0,
-                status=str(served.get("status") or "complete"),
-                reason=(str(served["reason"]) if served.get("reason") is not None else None),
-                achieved=(str(served["achieved"]) if served.get("achieved") is not None else None),
+                status=served_status,
+                reason=served_reason,
+                achieved=served_achieved,
                 bundle=compatible,
-                settlement=_settle_money(None),
+                settlement=served_settlement,
                 served_compatible=True,
             )
         # Submission order (§3.4): the compatible result above is served even while the breaker is
@@ -687,11 +773,6 @@ async def run_analysis(
         # authority is the journal the sweep writes to (the caller's, when one was injected):
         # recovering it before any new paid request means resuming cannot re-bill resolved work
         # and cannot omit earlier spend from this run's settlement.
-        journal_path = (
-            attempt_journal.path if attempt_journal is not None else attempts_path(media_dir)
-        )
-        paid_recovery = recover_paid_attempts(journal_path, run_id=run_id)
-        restored_units = paid_recovery.billed_units
         restored_over_cap = False
 
         # The frozen generation-0 window set is what every recipe plans against (§2.3.1): the
@@ -703,19 +784,51 @@ async def run_analysis(
         if requested_recipe.name == "deep":
             planned = primary_planned
             counts["paid_planned"] = planned
+            if usd_admitter is not None and durable_reservation is None:
+                # The caller's admitter (or one restored from a primary checkpoint written before
+                # reservation records existed) carries the run's original reservation.
+                durable_reservation = ReservationRecord.from_reservation(
+                    run_id, usd_admitter.reservation
+                )
+            if durable_reservation is None and journal.dispatch_without_reservation():
+                # Fail closed: the SQLite authority proves this run already dispatched, yet holds
+                # no reservation. Recomputing one from today's price or cap could authorise spend
+                # the run never reserved, so no further paid request is made at all.
+                missing_settlement = _settle()
+                entry = timer.entry(
+                    status="failed",
+                    reason="reservation_missing",
+                    exit_code=1,
+                    counts=counts,
+                    costs={"usd_e2": missing_settlement.usd_e2_spent},
+                    source_ids=source_ids,
+                    ffmpeg_version=ffmpeg_version,
+                    **_money_journal_fields(missing_settlement, requested_recipe, app_config),
+                )
+                _report(progress, "recognise", 0, planned, "refused: no durable reservation")
+                _append_settlement(media_dir / "invocations.jsonl", entry)
+                return _finish(
+                    exit_code=1,
+                    status="failed",
+                    reason="reservation_missing",
+                    settlement=missing_settlement,
+                )
             try:
-                reservation = reserve_usd(
-                    planned=planned,
-                    unit_usd_e6=app_config.audd_usd_e6_per_request,
-                    recipe_max_usd_e2=requested_recipe.max_usd_e2,
-                    configured_max_usd_e2=app_config.max_usd_e2,
-                )
+                if durable_reservation is not None:
+                    # Plan §2.3.2 on resume: the reservation this run made before its first
+                    # dispatch is restored verbatim — never recomputed from today's price or cap.
+                    reservation = durable_reservation.reservation()
+                else:
+                    reservation = reserve_usd(
+                        planned=planned,
+                        unit_usd_e6=app_config.audd_usd_e6_per_request,
+                        recipe_max_usd_e2=requested_recipe.max_usd_e2,
+                        configured_max_usd_e2=app_config.max_usd_e2,
+                    )
             except BudgetExhausted as exc:
-                # A refusal must still report what this run already spent: a cap lowered between
-                # a crash and its resume would otherwise erase the earlier pass's money.
-                refused_settlement = restored_settlement(
-                    restored_units, app_config.audd_usd_e6_per_request
-                )
+                # A refusal must still report what this run already spent — the exact µUSD its own
+                # attempt events recorded, never units × today's price.
+                refused_settlement = _settle()
                 entry = timer.entry(
                     status="budget_exhausted",
                     reason="reservation_exceeds_cap",
@@ -727,19 +840,24 @@ async def run_analysis(
                     **_money_journal_fields(refused_settlement, requested_recipe, app_config),
                 )
                 _report(progress, "recognise", 0, planned, str(exc))
-                append_invocation(media_dir / "invocations.jsonl", entry)
+                _append_settlement(media_dir / "invocations.jsonl", entry)
                 return _finish(
                     exit_code=4,
                     status="budget_exhausted",
                     reason="reservation_exceeds_cap",
                     settlement=refused_settlement,
                 )
-            if usd_admitter is None:
-                usd_admitter = UsdAdmitter(reservation)
-                # Charge the recovered units against the ORIGINAL cap before anything new is
-                # admitted.  A reservation that cannot even cover them means no further paid
-                # request may be made at all.
-                restored_over_cap = not charge_restored_units(usd_admitter, restored_units)
+            # Durable BEFORE any dispatch (§2.3.2): a crash from here on resumes against exactly
+            # this reservation, and an existing record for the run always wins.
+            durable_reservation = journal.record_reservation(reservation)
+            journal.unit_usd_e6 = durable_reservation.unit_usd_e6
+            # Charge what this run already spent — the ledger's exact µUSD — against the ORIGINAL
+            # reservation before anything new is admitted, an injected admitter included. A
+            # reservation that cannot even cover it means no further paid request may be made.
+            usd_admitter, covered = restore_admitter(
+                durable_reservation.reservation(), recovered.usd_e6_spent, usd_admitter
+            )
+            restored_over_cap = not covered
 
         timer.start_stage("recognise_ms")
         # The latest per-window tick, so a log line in the same phase repeats the real
@@ -752,6 +870,30 @@ async def run_analysis(
 
         def _recognise_log(message: str) -> None:
             _report(progress, "recognise", recognise_progress[0], recognise_progress[1], message)
+
+        # A same-run resume never re-sends a Shazam answer THIS run already received: its cached
+        # no_match is this run's own evidence, not a stale entry to refresh (4a-i retro P1).
+        # Evidence of an earlier pass of THIS run, not merely any checkpoint: queue intake writes
+        # `ingest`/`decode` before a run's first pass, and a genuinely fresh run must still refresh
+        # another run's cached no_match as configured (second-model review P1).
+        same_run_evidence = (
+            recovered.any
+            or journal.run_ledger().any
+            or bool(set(completed_phases) - {"ingest", "decode"})
+            or os.path.isdir(
+                native_path(
+                    media_dir
+                    / "recognise"
+                    / "invocations"
+                    / sha256(run_id.encode("utf-8")).hexdigest()[:20]
+                )
+            )
+        )
+        recognise_refresh_states = frozenset() if same_run_evidence else refresh_states
+        # ONE Shazam attempt identity for this run: the journal's own events (deterministic ids,
+        # the clip query id), projected into SQLite by the hosted journal. Recognise consumes the
+        # whole fold -- answered, refused and unresolved -- so no lost store can cause a resend.
+        shazam_journal = journal.for_provider("shazam")
 
         async def recognise_windows(
             *, windows: object, generation: int, run_label: str | None = None
@@ -777,7 +919,8 @@ async def run_analysis(
                 http_client=shazam_http_client,
                 process_breaker=shazam_breaker,
                 running_free=achieved_recipe.name == "free",
-                refresh_states=refresh_states,
+                refresh_states=recognise_refresh_states,
+                attempt_journal=shazam_journal,
             )
 
         # Which engine identifies the WHOLE mix first (generation 0).  Free = the rate-limited free
@@ -863,12 +1006,13 @@ async def run_analysis(
                 )
                 # Reused Free evidence replaces all new Shazam allocation; a restored one likewise.
                 max_generations = 0
-        elif paid_first and restored_over_cap:
-            # The recovered spend already fills this run's reservation: no further paid request
-            # may be dispatched, and the run ends `partial`/`reservation_exhausted`.
-            primary_clip = PaidScanResult(reservation_exhausted=True)
-            _recognise_log("audd primary not resumed: the reservation is already spent")
         elif paid_first:
+            if restored_over_cap:
+                # The recovered spend already fills the reservation. The sweep still runs: it
+                # reuses every clip this run resolved (so the primary has its evidence file) and
+                # its exhausted admitter refuses any new dispatch, ending `partial`. Skipping it
+                # left no observation file and fusion crashed.
+                _recognise_log("audd primary resumed with its reservation already spent")
             audd_retry = requested_recipe.retry_policy.get("audd")
             primary_clip = await run_paid_clip_recognition(
                 media_key=ingested.record.media_key,
@@ -895,7 +1039,7 @@ async def run_analysis(
                 cancel_token=cancel_token,
                 on_window=_on_recognise_window if progress is not None else None,
                 sleep=paid_sleep,
-                attempt_journal=attempt_journal,
+                attempt_journal=journal,
             )
             counts.update(
                 {
@@ -930,7 +1074,12 @@ async def run_analysis(
                 # anything, so once one has been billed the request may no longer be restarted
                 # as the Free recipe — that would report `degraded` (settled at 100 %, servable
                 # with accept_degraded) on top of money already spent.  Stop with the true spend.
-                if allow_degrade and primary_clip.billable_units:
+                # Cumulative, not this pass's: a resumed run whose earlier pass was billed may
+                # not restart as Free either (4a-i retro P1).
+                already_billed = bool(primary_clip.billable_units) or (
+                    usd_admitter is not None and usd_admitter.usd_e6_spent > 0
+                )
+                if allow_degrade and already_billed:
                     _report(
                         progress,
                         "recognise",
@@ -939,8 +1088,8 @@ async def run_analysis(
                         f"--allow-degrade not applied: {primary_clip.billable_units} paid "
                         f"request(s) were already billed before {reason}",
                     )
-                if not allow_degrade or primary_clip.billable_units:
-                    settlement = _settle_money(usd_admitter)
+                if not allow_degrade or already_billed:
+                    settlement = _settle()
                     entry = timer.entry(
                         status="provider_unavailable",
                         reason=reason,
@@ -951,7 +1100,7 @@ async def run_analysis(
                         ffmpeg_version=ffmpeg_version,
                         **_money_journal_fields(settlement, requested_recipe, app_config),
                     )
-                    append_invocation(media_dir / "invocations.jsonl", entry)
+                    _append_settlement(media_dir / "invocations.jsonl", entry)
                     return _finish(
                         exit_code=3,
                         status="provider_unavailable",
@@ -1210,6 +1359,39 @@ async def run_analysis(
 
         if not resume_secondary and paid_first and free_bundle is None:
             secondary_blocked = "shazam_manual_off" if shazam_off() else shazam_breaker.reason()
+            if secondary_blocked is not None and completed_phases:
+                # The breaker is open on a same-run resume whose secondary never checkpointed.
+                # What this run's probes already received is evidence: restore it from the run's
+                # own raw answers BEFORE the refusal can discard it. No request is sent.
+                restored = restore_run_answers(
+                    media_key=ingested.record.media_key,
+                    media_dir=media_dir,
+                    windows=WindowsResult(
+                        records=tuple(frozen_windows(windows.records)),
+                        record_path=windows.record_path,
+                        cached=windows.cached,
+                    ),
+                    project_root=pipeline_project_root,
+                    run_labels=(run_id, f"{run_id}:secondary-2"),
+                )
+                if restored:
+                    restored_key = sha256(f"{run_id}:secondary-restored".encode()).hexdigest()[:20]
+                    restored_path = (
+                        media_dir
+                        / "recognise"
+                        / "invocations"
+                        / restored_key
+                        / "observations.gen0.jsonl"
+                    )
+                    _write_jsonl(restored_path, list(restored))
+                    secondary_scan = PaidScanResult(
+                        observations=restored, observation_paths=(restored_path,)
+                    )
+                    secondary_resolved = len(restored)
+                    secondary_allocated = len(restored)
+                    counts["secondary_restored"] = len(restored)
+                    counts["secondary_resolved"] = len(restored)
+                    await _refuse_with(secondary_scan)
         if (
             not resume_secondary
             and paid_first
@@ -1419,7 +1601,7 @@ async def run_analysis(
         timer.start_stage("export_ms")
         from id_detector.present.bundles import publish_result
 
-        settlement = _settle_money(usd_admitter)
+        settlement = _settle()
         if achieved_recipe.name == "free":
             shazam_observations = [
                 json.loads(line)
@@ -1448,6 +1630,7 @@ async def run_analysis(
                 **_money_journal_fields(settlement, requested_recipe, app_config, achieved_recipe),
             },
             config=app_config,
+            local=presentation_local,
         )
         timer.finish_stage("export_ms")
         _report(progress, "present", 1, 1, "result page ready")
@@ -1498,7 +1681,7 @@ async def run_analysis(
                 },
             }
         )
-        append_invocation(media_dir / "invocations.jsonl", entry)
+        _append_settlement(media_dir / "invocations.jsonl", entry)
         if result_paths is not None:
             result_paths.append(bundle)
         return _finish(
@@ -1512,7 +1695,7 @@ async def run_analysis(
     except SourceChanged as exc:
         # Source identity is proven before any window is cut, so nothing can be reserved here yet;
         # settling the admitter regardless keeps the journal honest if that order ever moves.
-        settlement = _settle_money(usd_admitter)
+        settlement = _settle()
         entry = timer.entry(
             status="source_changed",
             reason="media_key_mismatch",
@@ -1523,7 +1706,7 @@ async def run_analysis(
             ffmpeg_version=ffmpeg_version,
             **_money_journal_fields(settlement, requested_recipe, app_config),
         )
-        append_invocation(exc.media_dir / "invocations.jsonl", entry)
+        _append_settlement(exc.media_dir / "invocations.jsonl", entry)
         typer.echo("source_changed: source bytes no longer match the stored media", err=True)
         return _finish(
             exit_code=5,
@@ -1532,9 +1715,9 @@ async def run_analysis(
             settlement=settlement,
         )
     except asyncio.CancelledError:
-        _finish(exit_code=130, status="cancelled", settlement=_settle_money(usd_admitter))
+        _finish(exit_code=130, status="cancelled", settlement=_settle())
         if media_dir is not None:
-            settlement = _settle_money(usd_admitter)
+            settlement = _settle()
             entry = timer.entry(
                 status="cancelled",
                 reason=None,
@@ -1545,12 +1728,12 @@ async def run_analysis(
                 ffmpeg_version=ffmpeg_version,
                 **_money_journal_fields(settlement, requested_recipe, app_config),
             )
-            append_invocation(media_dir / "invocations.jsonl", entry)
+            _append_settlement(media_dir / "invocations.jsonl", entry)
         raise
     except Exception:
-        _finish(exit_code=1, status="failed", settlement=_settle_money(usd_admitter))
+        _finish(exit_code=1, status="failed", settlement=_settle())
         if media_dir is not None:
-            settlement = _settle_money(usd_admitter)
+            settlement = _settle()
             entry = timer.entry(
                 status="failed",
                 reason=None,
@@ -1561,7 +1744,7 @@ async def run_analysis(
                 ffmpeg_version=ffmpeg_version,
                 **_money_journal_fields(settlement, requested_recipe, app_config),
             )
-            append_invocation(media_dir / "invocations.jsonl", entry)
+            _append_settlement(media_dir / "invocations.jsonl", entry)
         raise
     finally:
         if media_lock is not None:

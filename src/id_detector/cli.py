@@ -7,7 +7,6 @@ import json
 import os
 import sys
 import tomllib
-import uuid
 from collections.abc import Mapping
 from dataclasses import replace
 from decimal import Decimal
@@ -694,7 +693,9 @@ def analyse(
         )
 
         target = LocalPath(Path(url)) if Path(url).is_file() else PlatformUrl(url)
-        run_id = uuid.uuid4().hex
+        from id_detector.run_ledger import new_run_id
+
+        run_id = new_run_id()
         store = LocalCheckpointStore(
             work_root,
             options=PipelineOptions(
@@ -744,6 +745,8 @@ def analyse(
         # One mapping, in the service (§2.3.5): this command renders a RunResult, it does not
         # decide what a status means.
         exit_code = exit_code_for(result)
+        if result.status == "failed" and result.reason:
+            typer.echo(f"failed: {result.reason}", err=True)
     except KeyboardInterrupt:
         typer.echo("cancelled; safe job states were restored", err=True)
         raise typer.Exit(130) from None
@@ -883,9 +886,13 @@ def serve(
     # and a worker process that this command starts, restarts and stops runs the analyses.
     jobs = supervisor = None
     if analyse:
-        from idea_web.jobs.local import LocalJobs, LocalWorkerSupervisor
+        from idea_web.jobs.local import LocalJobs, LocalWorkerSupervisor, MigrationRefused
 
-        jobs = LocalJobs(work_root)
+        try:
+            jobs = LocalJobs(work_root)
+        except MigrationRefused as exc:
+            typer.echo(str(exc), err=True)
+            raise typer.Exit(2) from None
         supervisor = LocalWorkerSupervisor(work_root, config_path=config, jobs=jobs)
     server = make_server(work_root, host=host, port=port, jobs=jobs)
     bound_host, bound_port = server.server_address[0], server.server_address[1]

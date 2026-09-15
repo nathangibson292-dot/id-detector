@@ -99,7 +99,7 @@ def _request(
 
 
 def _entries(work: Path, run_id: str) -> list[dict]:
-    """Every journal entry this run wrote, oldest first (a resumed run writes more than one)."""
+    """This run's journal entries: exactly one settlement per run (a resume replaces it)."""
 
     found: list[dict] = []
     for path in sorted(work.rglob("invocations.jsonl")):
@@ -458,8 +458,9 @@ def _crashed_deep_run(
 
     audd = FakeAudD(SCRIPT)
     store = _store(work, audd=audd, refresh_states=frozenset({"no_match"}))
-    with pytest.raises(_Boom):
-        run(_request(store, run_id=run_id, progress=_crash_after(4), attempt_journal=journal))
+    # §4.3: a real failure is a RunResult with its settled spend, no longer an exception.
+    crashed = run(_request(store, run_id=run_id, progress=_crash_after(4), attempt_journal=journal))
+    assert crashed.status == "failed", crashed
     assert 0 < audd.calls < DEEP_CLIPS, audd.calls
     assert "primary" not in store.completed_phases(run_id)
     return audd, store
@@ -527,8 +528,15 @@ def test_recovery_reads_the_injected_attempt_journal(tmp_path: Path) -> None:
     assert second.usd_e6_spent == DEEP_CLIPS * UNIT_USD_E6
 
 
-def test_a_lowered_cap_refuses_the_resume_without_erasing_its_spend(tmp_path: Path) -> None:
-    """Plan §2.3.2: a refusal journals the money this run already spent, never zero."""
+def test_a_lowered_cap_resumes_against_the_durable_reservation_and_keeps_its_spend(
+    tmp_path: Path,
+) -> None:
+    """Plan §2.3.2: the reservation a run made before its first dispatch is restored verbatim.
+
+    Follow-up cycle (4a-i retro P0): a cap lowered between a crash and its resume no longer
+    recomputes — and refuses — that reservation. The resume stays inside the reservation already
+    made, and its spend is neither erased nor re-priced. A FRESH run is still refused by the cap.
+    """
 
     work = tmp_path / "work"
     run_id = "lowered-cap"
@@ -540,12 +548,22 @@ def test_a_lowered_cap_refuses_the_resume_without_erasing_its_spend(tmp_path: Pa
         refresh_states=frozenset({"no_match"}),
         app_config=AppConfig(max_usd_e2=1),
     )
-    refused = run(_request(resumed, run_id=run_id))
-    assert refused.status == "budget_exhausted"
-    assert refused.reason == "reservation_exceeds_cap"
-    assert audd.calls == 0
-    assert refused.usd_e6_spent == first.calls * UNIT_USD_E6
-    assert _entries(work, run_id)[-1]["usd_e6_spent"] == first.calls * UNIT_USD_E6
+    second = run(_request(resumed, run_id=run_id))
+    assert second.status != "budget_exhausted", second
+    assert audd.calls == DEEP_CLIPS - first.calls
+    assert second.usd_e6_spent == DEEP_CLIPS * UNIT_USD_E6
+    assert second.usd_e6_reserved == (DEEP_CLIPS * UNIT_USD_E6 * 105 + 99) // 100
+    assert _entries(work, run_id)[-1]["usd_e6_spent"] == DEEP_CLIPS * UNIT_USD_E6
+
+    fresh = run(
+        _request(
+            _store(tmp_path / "fresh", audd=FakeAudD(SCRIPT), app_config=AppConfig(max_usd_e2=1)),
+            run_id="fresh-lowered-cap",
+        )
+    )
+    assert fresh.status == "budget_exhausted"
+    assert fresh.reason == "reservation_exceeds_cap"
+    assert fresh.usd_e6_spent == 0
 
 
 # ------------------------------------------------------------ P1-5: a cancelled primary resumes
@@ -644,8 +662,10 @@ def test_a_resumed_free_run_re_recognises_nothing(tmp_path: Path) -> None:
     run_id = "resume-free-primary"
     first_shazam = FakeShazamHTTP(SCRIPT)
     store = _store(work, recipe=FREE_RECIPE, shazam=first_shazam)
-    with pytest.raises(_Boom):
-        run(_request(store, run_id=run_id, recipe=FREE_RECIPE, progress=_crash_at_phase("fuse")))
+    failed = run(
+        _request(store, run_id=run_id, recipe=FREE_RECIPE, progress=_crash_at_phase("fuse"))
+    )
+    assert failed.status == "failed", failed
     assert first_shazam.requests > 0
     completed = store.completed_phases(run_id)
     assert {"primary", "hints"} <= completed and "fuse1" not in completed
@@ -672,8 +692,8 @@ def test_a_completed_secondary_is_restored_and_an_open_breaker_cannot_degrade_it
     audd = FakeAudD(SCRIPT)
     shazam = FakeShazamHTTP(SCRIPT)
     store = _store(work, audd=audd, shazam=shazam)
-    with pytest.raises(_Boom):
-        run(_request(store, run_id=run_id, progress=_crash_at_phase("present")))
+    failed = run(_request(store, run_id=run_id, progress=_crash_at_phase("present")))
+    assert failed.status == "failed", failed
     completed = store.completed_phases(run_id)
     assert {"secondary", "fuse2"} <= completed and "present" not in completed
     first_secondary_requests = shazam.requests
@@ -722,8 +742,8 @@ def test_a_degraded_free_primary_resumes_as_free_and_never_as_deep(tmp_path: Pat
     audd = FakeAudD(unavailable)
     shazam = FakeShazamHTTP(SCRIPT)
     store = _store(work, audd=audd, shazam=shazam, allow_degrade=True)
-    with pytest.raises(_Boom):
-        run(_request(store, run_id=run_id, progress=_crash_at_phase("fuse")))
+    failed = run(_request(store, run_id=run_id, progress=_crash_at_phase("fuse")))
+    assert failed.status == "failed", failed
     state = store.state(run_id, "primary")
     assert state["achieved"] == "free"
     assert state["paid_first"] is False

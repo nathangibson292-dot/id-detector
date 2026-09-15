@@ -168,6 +168,7 @@ def test_web_runner_publishes_bundle_result_url(tmp_path: Path, monkeypatch) -> 
     monkeypatch.setattr(pipeline, "run_analysis", analysed)
 
     class Context:
+        run_id = "cached-open-job"  # the job's durable run id (the runner fails closed without)
         target = str(AUDIO)
         build_index = False
         profile = None

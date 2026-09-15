@@ -31,7 +31,12 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Protocol
 
-from id_detector.attempts import AttemptJournal, attempts_path, load_attempt_ledger
+from id_detector.attempts import (
+    AttemptJournal,
+    DispatchRefused,
+    attempts_path,
+    load_attempt_ledger,
+)
 from id_detector.contracts import (
     GENERATED_BY,
     SCHEMA_VERSION,
@@ -127,6 +132,8 @@ class PaidScanResult:
     #: Clips THIS run had already resolved before it was interrupted: recovered from the
     #: attempt journal and never dispatched again, so a resume cannot pay twice for one clip.
     recovered_resolved: int = 0
+    #: Clips THIS run dispatched and never saw resolved: ambiguous, counted as spent, never re-sent.
+    recovered_ambiguous: int = 0
 
     @property
     def ran(self) -> bool:
@@ -347,6 +354,7 @@ class _Sweep:
     resumed_ambiguous: int = 0
     resumed_reissued: int = 0
     recovered_resolved: int = 0
+    recovered_ambiguous: int = 0
     #: No further dispatch (terminal outcome, exhausted reservation, or a cancel).
     halted: bool = False
     cancelled: bool = False
@@ -395,8 +403,6 @@ async def run_paid_clip_recognition(
     unavailable engine; it is skipped and recorded.
     """
 
-    from id_detector.service import recover_paid_attempts
-
     emit_raw: LogFn = log or (lambda _message: None)
     if "audd" not in enabled_engines or not targets:
         return PaidScanResult()
@@ -442,11 +448,17 @@ async def run_paid_clip_recognition(
         provider="audd",
         unit_usd_e6=app_config.audd_usd_e6_per_request,
     )
+    if usd_admitter is not None:
+        # One price per request: the ledger records exactly what the admitter charges, which is
+        # the run's durable reservation price — never whatever the configuration says today.
+        journal.unit_usd_e6 = usd_admitter.reservation.unit_usd_e6
     # Plan §2.3.3: the journal the sweep WRITES to is the one recovery must READ. Reading the
     # per-media default while dispatch wrote to an injected (hosted) journal made that journal's
     # unresolved dispatches invisible on resume, so the next run re-billed them.
-    ledger = load_attempt_ledger(journal.path)
-    recovery = recover_paid_attempts(journal.path, run_id=run_id)
+    ledger = load_attempt_ledger(journal.path)  # every run: an earlier run's dangling parent
+    # THIS run's verified fold (the JSONL plus, for a hosted journal, its SQLite projection): the
+    # shared resume rule of :mod:`id_detector.run_ledger` decides each query below.
+    run_ledger = journal.run_ledger()
     limiter = TokenBucket(rate_per_minute=app_config.audd_requests_per_minute, capacity=concurrency)
     sweep = _Sweep(total=len(selected))
     queue: deque[WindowRecord] = deque(selected)
@@ -498,7 +510,14 @@ async def run_paid_clip_recognition(
                 usd_admitter.admit()
             # Plan §2.3.3: `dispatched` is durable before the request enters network I/O, so a
             # crash from here on leaves an attempt the resume rule treats as ambiguous (spent).
-            journal.dispatched(attempt_id)
+            # The job queue's admission check runs immediately before that write: a cancel (or a
+            # lost lease) committed after the last halt check still stops THIS request.
+            try:
+                journal.dispatched(attempt_id)
+            except DispatchRefused:
+                if usd_admitter is not None:
+                    usd_admitter.resolve("timeout_pre")  # admitted, never sent: refunded
+                raise
             admitted = True
             sweep.attempts += 1
 
@@ -506,6 +525,12 @@ async def run_paid_clip_recognition(
             response = await adapter.recognize_clip(wav, on_attempt=_admit)
         except ReservationExhausted:
             raise
+        except DispatchRefused:
+            # Nothing was sent; the attempt stays `prepared`. The job was cancelled or lost its
+            # claim, so the sweep stops dispatching and the run ends `cancelled`.
+            sweep.cancel()
+            emit("audd primary stopped: the job queue refused the dispatch")
+            return None, None, False
         except ProviderUnavailable as exc:
             emit(f"audd clip error @{start_s}s: {type(exc).__name__}")
             return _unavailable_outcome(exc), None, admitted
@@ -541,35 +566,50 @@ async def run_paid_clip_recognition(
         raw_path = cache_dir / f"{query.cache_key}.json"
         raw_ref = raw_path.relative_to(media_dir).as_posix()
         start_s = window.support_ms[0] // 1000
-        # A clip THIS run already resolved is never sent again, whatever ``refresh`` or
-        # ``refresh_states`` say: its answer is already paid for. Re-querying a cached ``no_match``
-        # (the default refresh state) is precisely how resuming an interrupted primary re-billed
-        # work the same run had settled.
-        already_resolved = query.cache_key in recovery.resolved_query_ids
-        if already_resolved:
-            response = _read_cached(raw_path, frozenset())
-        else:
-            response = None if refresh else _read_cached(raw_path, refresh_states)
-        was_cached = response is not None
-        if was_cached:
-            sweep.cache_hits += 1
-            if already_resolved:
+        # Plan §2.3.3, decided once for both layers by `run_ledger.RunLedger.resume`: what an
+        # earlier pass of THIS run already did to this clip.
+        resume = run_ledger.resume(query.cache_key)
+        if resume.action in {"settled", "ambiguous"}:
+            # `settled`: resolved billable-ambiguous (timeout_post/http_5xx/malformed) or terminal
+            # (auth/quota) — spent or refused, never automatically retried. `ambiguous`: dispatched
+            # and never resolved — the provider may have billed it, so it is spent and NOT re-sent.
+            if resume.action == "ambiguous":
+                sweep.recovered_ambiguous += 1
+            else:
                 sweep.recovered_resolved += 1
-        elif already_resolved:
-            # Resolved by this run to an outcome that cached no reusable body (an error, or a
-            # malformed success). It is accounted for and must not be dispatched again.
-            sweep.recovered_resolved += 1
             sweep.done += 1
             _tick()
             return
+        if resume.action == "reuse":
+            # Resolved match/no_match: never sent again, whatever ``refresh`` or ``refresh_states``
+            # say — re-querying a cached ``no_match`` is how a resume used to re-bill settled work.
+            response = _read_cached(raw_path, frozenset())
+            sweep.recovered_resolved += 1
+            if response is None:
+                sweep.done += 1
+                _tick()
+                return
+        elif resume.action == "fresh" and not refresh:
+            response = _read_cached(raw_path, refresh_states)
+        else:
+            response = None  # `retry` / `reissue` (zero-cost or never sent) and ``--refresh``
+        was_cached = response is not None
+        if was_cached:
+            sweep.cache_hits += 1
         else:
             wav = media_dir / window.wav_path
-            # Plan §2.3.3 resume rule: an earlier run's unresolved attempt on this clip becomes
-            # this run's parent — ambiguous if it was dispatched (that run charged it), a plain
-            # re-issue if it was only prepared.
-            dangling = ledger.dangling(query.cache_key)
-            parent: str | None = dangling.attempt_id if dangling is not None else None
-            ordinal = 0
+            if resume.action == "fresh":
+                # An EARLIER RUN's unresolved attempt on this clip becomes this run's parent —
+                # ambiguous if it was dispatched (that run charged it), a re-issue if only prepared.
+                dangling = ledger.dangling(query.cache_key)
+                parent: str | None = dangling.attempt_id if dangling is not None else None
+            else:
+                # This run's own zero-cost or never-sent attempt: retried under a fresh ordinal,
+                # so the new attempt id cannot collide with the old one and never parents itself.
+                dangling = None
+                parent = resume.parent_attempt_id
+            ordinal = resume.next_ordinal
+            first_ordinal = ordinal
             sent = False
             while True:
                 await limiter.acquire()
@@ -602,7 +642,7 @@ async def run_paid_clip_recognition(
                     sweep.requests += 1
                     if dangling is not None and dangling.classification == "ambiguous":
                         sweep.resumed_ambiguous += 1
-                    elif dangling is not None:
+                    elif dangling is not None or resume.action == "reissue":
                         sweep.resumed_reissued += 1
                 journal.resolved(attempt_id, outcome)  # type: ignore[arg-type]
                 if usd_admitter is not None:
@@ -622,11 +662,12 @@ async def run_paid_clip_recognition(
                     break
                 if outcome in THROTTLE_OUTCOMES:
                     limiter.penalize()
-                if outcome not in retryable or ordinal >= max_retries or _halt_requested():
+                retries_used = ordinal - first_ordinal
+                if outcome not in retryable or retries_used >= max_retries or _halt_requested():
                     break
-                delay = backoff[min(ordinal, len(backoff) - 1)] if backoff else 0
+                delay = backoff[min(retries_used, len(backoff) - 1)] if backoff else 0
                 emit(
-                    f"audd clip retry {ordinal + 1}/{max_retries} @{start_s}s "
+                    f"audd clip retry {retries_used + 1}/{max_retries} @{start_s}s "
                     f"after {outcome} in {delay}s"
                 )
                 await pause(delay)
@@ -701,6 +742,11 @@ async def run_paid_clip_recognition(
             f"; {sweep.recovered_resolved} clip(s) this run had already resolved were recovered, "
             "not re-sent"
         )
+    if sweep.recovered_ambiguous:
+        summary += (
+            f"; {sweep.recovered_ambiguous} ambiguous clip(s) this run had already dispatched were "
+            "counted as spent, not re-sent"
+        )
     if sweep.cancelled:
         summary += "; cancelled"
     emit(summary)
@@ -722,4 +768,5 @@ async def run_paid_clip_recognition(
         resumed_ambiguous=sweep.resumed_ambiguous,
         resumed_reissued=sweep.resumed_reissued,
         recovered_resolved=sweep.recovered_resolved,
+        recovered_ambiguous=sweep.recovered_ambiguous,
     )

@@ -125,6 +125,105 @@ def fsync_directory(path: Path) -> None:
         os.close(descriptor)
 
 
+def fsync_file(path: Path) -> None:
+    """Flush one existing file's bytes to the device."""
+
+    descriptor = os.open(native_path(Path(path)), os.O_RDWR | getattr(os, "O_BINARY", 0))
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def ensure_directory_durable(path: Path) -> None:
+    """Create ``path`` (and missing parents) so every new directory entry is on the device.
+
+    ``os.makedirs`` alone leaves a new directory's own entry in its parent's unsynced metadata: a
+    power cut can then lose the directory and everything later written inside it (on POSIX).
+    """
+
+    path = Path(path).resolve()
+    missing: list[Path] = []
+    probe = path
+    while not os.path.isdir(native_path(probe)):
+        missing.append(probe)
+        if probe.parent == probe:
+            break
+        probe = probe.parent
+    os.makedirs(native_path(path), exist_ok=True)
+    for created in reversed(missing):
+        fsync_directory(created.parent)
+
+
+def _move_write_through(source: Path, destination: Path, *, replace: bool) -> bool:
+    """Windows ``MoveFileExW`` with WRITE_THROUGH; ``False`` if ``destination`` already exists."""
+
+    import ctypes
+
+    move = ctypes.WinDLL("kernel32", use_last_error=True).MoveFileExW
+    move.argtypes = [ctypes.c_wchar_p, ctypes.c_wchar_p, ctypes.c_uint32]
+    move.restype = ctypes.c_int
+    flags = 0x8 | (0x1 if replace else 0)  # WRITE_THROUGH [| REPLACE_EXISTING]
+    if move(native_path(source), native_path(destination), flags):
+        return True
+    error = ctypes.get_last_error()
+    if not replace and error in {80, 183}:  # ERROR_FILE_EXISTS / ERROR_ALREADY_EXISTS
+        return False
+    raise ctypes.WinError(error)
+
+
+def durable_replace(source: Path, destination: Path) -> None:
+    """Atomically move an already-written file into place and make the move itself durable.
+
+    The source's bytes are flushed first. On Windows the rename uses ``MOVEFILE_WRITE_THROUGH`` —
+    the operation Microsoft documents as returning only once the move is on disk — because there
+    is no directory fsync; on POSIX the containing directory is fsynced after ``os.replace``.
+    """
+
+    fsync_file(source)
+    if os.name == "nt":
+        _move_write_through(Path(source), Path(destination), replace=True)
+    else:
+        os.replace(native_path(Path(source)), native_path(Path(destination)))
+        fsync_directory(Path(destination).parent)
+
+
+def create_file_durably(path: Path) -> bool:
+    """Create an empty file whose directory entry is durable; ``False`` if it already existed.
+
+    Create-if-absent, never replace: a concurrent creator that already appended a line keeps it.
+    """
+
+    path = Path(path).resolve()
+    ensure_directory_durable(path.parent)
+    if path_is_file(path):
+        return False
+    with tempfile.NamedTemporaryFile(
+        mode="wb",
+        prefix=f".{path.name}.",
+        suffix=".tmp",
+        dir=native_path(path.parent),
+        delete=False,
+    ) as handle:
+        temporary = Path(handle.name)
+        handle.flush()
+        os.fsync(handle.fileno())
+    try:
+        if os.name == "nt":
+            created = _move_write_through(temporary, path, replace=False)
+        else:
+            try:
+                os.link(native_path(temporary), native_path(path))
+                created = True
+            except FileExistsError:
+                created = False
+            fsync_directory(path.parent)
+    finally:
+        with contextlib.suppress(FileNotFoundError):
+            os.unlink(native_path(temporary))
+    return created
+
+
 def atomic_write_json(path: Path, value: Any) -> None:
     atomic_write_bytes(path, canonical_json_bytes(value))
 

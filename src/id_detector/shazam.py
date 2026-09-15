@@ -390,6 +390,8 @@ class ShazamAdapter:
                 raise
             try:
                 await on_attempt()
+                # Immediately before network I/O: the ledger's `dispatched` is durable first.
+                self.process_breaker.sent()
             except BaseException:
                 self.process_breaker.release_dispatch(dispatch_day)
                 raise

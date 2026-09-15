@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import importlib.metadata
+import json
 import os
 import time
 from dataclasses import dataclass, field
@@ -14,6 +15,7 @@ from id_detector.contracts import GENERATED_BY, SCHEMA_VERSION, InvocationJourna
 from id_detector.io import (
     atomic_write_bytes,
     canonical_json_bytes,
+    create_file_durably,
     fsync_directory,
     native_path,
     path_is_file,
@@ -39,10 +41,91 @@ def tool_versions(ffmpeg_version: str | None = None) -> dict[str, str]:
     return result
 
 
-def append_invocation(path: Path, entry: InvocationJournalEntry) -> None:
+_MONEY_FIELDS = ("usd_e6_reserved", "usd_e6_spent", "usd_e2_reserved", "usd_e2_spent")
+
+
+def _monotonic(entry: InvocationJournalEntry, prior: dict[str, Any]) -> InvocationJournalEntry:
+    """``entry`` never reporting less money than an earlier settlement of the same run."""
+
+    update: dict[str, Any] = {}
+    for name in _MONEY_FIELDS:
+        earlier = prior.get(name)
+        if isinstance(earlier, int) and not isinstance(earlier, bool):
+            update[name] = max(int(getattr(entry, name)), earlier)
+    costs = dict(entry.costs)
+    earlier_costs = prior.get("costs")
+    if isinstance(earlier_costs, dict):
+        earlier_e2 = earlier_costs.get("usd_e2")
+        if isinstance(earlier_e2, int) and not isinstance(earlier_e2, bool):
+            costs["usd_e2"] = max(int(costs.get("usd_e2", 0)), earlier_e2)
+    update["costs"] = costs
+    return entry.model_copy(update=update)
+
+
+#: Public name of the monotonic settlement merge (the SQLite settlement row uses it too).
+merge_monotonic = _monotonic
+
+
+def append_invocation(path: Path, entry: InvocationJournalEntry) -> InvocationJournalEntry:
+    """Record ``entry`` as THE terminal settlement of its run: one line per ``invocation_id``.
+
+    A run that is cancelled (or waits, or fails) and is later resumed under the same ``run_id``
+    settles again. Appending a second line would report two settlements — and anything that sums
+    the journal would count the money twice — so the earlier line is replaced and the new one is
+    appended last (the newest entry stays the last line every reader expects). The money on the
+    written line is monotonic: never less than any earlier settlement of the same run reported.
+    """
+
     existing = read_bytes(path) if path_is_file(path) else b""
-    atomic_write_bytes(path, existing + canonical_json_bytes(entry) + b"\n")
+    kept: list[bytes] = []
+    merged = entry
+    for line in existing.splitlines():
+        if not line.strip():
+            continue
+        try:
+            value = json.loads(line)
+        except ValueError:
+            kept.append(line)
+            continue
+        if isinstance(value, dict) and value.get("invocation_id") == entry.invocation_id:
+            merged = _monotonic(merged, value)
+            continue
+        kept.append(line)
+    body = b"".join(line + b"\n" for line in kept) + canonical_json_bytes(merged) + b"\n"
+    atomic_write_bytes(path, body)
     fsync_directory(path.parent)
+    return merged
+
+
+def invocation_lines(path: Path, invocation_id: str) -> list[dict[str, Any]]:
+    """EVERY settlement line ``path`` holds for ``invocation_id``, in file order."""
+
+    if not path_is_file(path):
+        return []
+    found: list[dict[str, Any]] = []
+    for line in read_bytes(path).splitlines():
+        try:
+            value = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(value, dict) and value.get("invocation_id") == invocation_id:
+            found.append(value)
+    return found
+
+
+def has_invocation(path: Path, invocation_id: str) -> bool:
+    """True when the journal already holds a settlement line for ``invocation_id``."""
+
+    if not path_is_file(path):
+        return False
+    for line in read_bytes(path).splitlines():
+        try:
+            value = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(value, dict) and value.get("invocation_id") == invocation_id:
+            return True
+    return False
 
 
 def append_line(path: Path, record: Any) -> None:
@@ -51,10 +134,13 @@ def append_line(path: Path, record: Any) -> None:
     The attempt journal (plan §2.3.3) needs every event on disk *before* the next step — most
     importantly ``dispatched`` before network I/O — so this is a true append with a flush and an
     ``fsync``, not the read-and-replace :func:`append_invocation` uses for its one line per run.
+    A new journal's directory entry is made durable first (create-if-absent with write-through on
+    Windows, a directory fsync on POSIX): a fsynced line in a file whose name was lost is lost.
     """
 
     path = path.resolve()
-    os.makedirs(native_path(path.parent), exist_ok=True)
+    if create_file_durably(path):
+        fsync_directory(path.parent)
     with open(native_path(path), "ab") as handle:
         handle.write(canonical_json_bytes(record) + b"\n")
         handle.flush()

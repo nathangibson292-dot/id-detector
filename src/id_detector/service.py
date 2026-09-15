@@ -20,16 +20,26 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import json
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from hashlib import sha256
 from pathlib import Path
 from typing import Any, Literal, Protocol
 from urllib.parse import urlsplit
 
-from id_detector.attempts import AttemptJournal, load_attempt_ledger
-from id_detector.io import atomic_write_bytes, atomic_write_json, path_is_file, read_text
+from id_detector.attempts import AttemptJournal, attempts_path
+from id_detector.io import (
+    atomic_write_bytes,
+    atomic_write_json,
+    fsync_directory,
+    fsync_file,
+    path_is_file,
+    path_size,
+    read_text,
+    redact_text,
+    sha256_file,
+)
 from id_detector.money import (
-    BILLABLE_OUTCOMES,
     UsdAdmitter,
     UsdReservation,
     UsdSettlement,
@@ -37,6 +47,13 @@ from id_detector.money import (
 )
 from id_detector.paid_clip import CancelToken
 from id_detector.recipes import Recipe
+from id_detector.run_ledger import (
+    AttemptEvent,
+    RecoveredMoney,
+    events_from_jsonl,
+    fold_run_ledger,
+    recovered_money,
+)
 
 CheckpointPhase = Literal[
     "ingest",
@@ -117,11 +134,14 @@ def validate_platform_url(url: str) -> str:
 
     if not isinstance(url, str) or not url.strip():
         raise TargetRefused("platform URL is empty")
+    # Every C0 control and DEL, anywhere. ``urlsplit`` silently deletes tab, CR and LF (the WHATWG
+    # rule), so ``https://exa\tmple.com`` parses as ``example.com`` while the bytes handed onward
+    # still carry the tab: a parser differential between this check and the fetcher.
+    if any(ord(character) < 0x20 or ord(character) == 0x7F for character in url):
+        raise TargetRefused("platform URL contains a control character")
     candidate = url.strip()
     if candidate != url:
         raise TargetRefused("platform URL has surrounding whitespace")
-    if "\n" in candidate or "\r" in candidate or "\x00" in candidate:
-        raise TargetRefused("platform URL contains a control character")
     if candidate.startswith("\\\\") or candidate.startswith("//"):
         raise TargetRefused("platform URL is a UNC path")
     parts = urlsplit(candidate)
@@ -211,6 +231,85 @@ class PipelineOptions:
     panako_tool_dir: Path = Path("data/local/panako")
     paid_sleep: object | None = None
     keep_intermediates: bool = False
+    #: Queue-aware guards a supervised local worker supplies for one execution: the ONE
+    #: dispatch-admission check and the claim fence for terminal settlement (plan §4.6).
+    dispatch_admission: object | None = None
+    settlement_writer: object | None = None
+
+
+def durable_artefact_records(
+    artefacts: tuple[Path, ...] | list[Path],
+    *,
+    flush: Callable[[Path], None] | None = None,
+) -> list[dict[str, Any]]:
+    """Flush every artefact (bytes, and its directory on POSIX) and record what it was.
+
+    §3.4: a checkpoint row may name an artefact only once that artefact is durable. Existence is
+    not durability — a producer that renamed a temporary into place without flushing it can leave a
+    committed checkpoint naming a file a power cut never wrote — so the checkpoint boundary flushes
+    what it is about to reference, and records each file's size and SHA-256 so a later read can
+    prove the phase is still intact instead of trusting its key. Shared by the local JSON store and
+    the queue's SQLite store.
+    """
+
+    records: list[dict[str, Any]] = []
+    for item in artefacts:
+        path = Path(item)
+        if not path_is_file(path):
+            raise ValueError(f"checkpoint artefacts are not durable: {path}")
+        try:
+            if flush is not None:
+                flush(path)
+            else:
+                fsync_file(path)
+                fsync_directory(path.parent)
+        except OSError as exc:
+            raise ValueError(f"checkpoint artefact could not be flushed: {path} ({exc})") from exc
+        records.append(
+            {"path": str(path.resolve()), "size": path_size(path), "sha256": sha256_file(path)}
+        )
+    return records
+
+
+#: Phases whose checkpointed artefacts are the flat fuse working copies (``fuse/final.json`` and
+#: friends): every later fuse of the same run rewrites them, and resume never restores a fuse from
+#: them — it always re-fuses from restored evidence — so their bar is presence, not content.
+WORKING_COPY_PHASES: frozenset[str] = frozenset({"fuse1", "fuse2"})
+
+
+def checkpoint_entry_valid(entry: object, *, phase: str | None = None) -> bool:
+    """True only while every artefact a checkpoint names is present with its recorded content.
+
+    A phase whose artefact is gone (a lost rename, retention, a hand-deleted file) or changed is
+    NOT complete: resume redoes it rather than loading something that is not there. An entry
+    written before hashes were recorded is held to the weaker existence check it was written with.
+    """
+
+    if not isinstance(entry, dict):
+        return False
+    records = entry.get("artefact_records")
+    if records is None:
+        # Written before artefacts were hashed: it proves only that files existed. That is the
+        # exact trust the retro-review removed, so the phase is incomplete and is rebuilt.
+        return False
+    if not isinstance(records, list):
+        return False
+    for record in records:
+        if not isinstance(record, dict):
+            return False
+        path = Path(str(record.get("path", "")))
+        try:
+            if not path_is_file(path):
+                return False
+            if phase in WORKING_COPY_PHASES:
+                continue
+            if path_size(path) != record.get("size"):
+                return False
+            if sha256_file(path) != record.get("sha256"):
+                return False
+        except OSError:
+            return False
+    return True
 
 
 class LocalCheckpointStore:
@@ -246,8 +345,12 @@ class LocalCheckpointStore:
         return value
 
     def completed_phases(self, run_id: str) -> frozenset[CheckpointPhase]:
-        known = set(CHECKPOINT_PHASES)
-        return frozenset(self._document(run_id)["phases"].keys() & known)  # type: ignore[return-value]
+        phases = self._document(run_id)["phases"]
+        return frozenset(
+            phase  # type: ignore[misc]
+            for phase in CHECKPOINT_PHASES
+            if phase in phases and checkpoint_entry_valid(phases[phase], phase=phase)
+        )
 
     def write(
         self,
@@ -259,12 +362,11 @@ class LocalCheckpointStore:
     ) -> None:
         if phase not in CHECKPOINT_PHASES:
             raise ValueError(f"unknown checkpoint phase: {phase}")
-        missing = [str(path) for path in artefacts if not path_is_file(Path(path))]
-        if missing:
-            raise ValueError(f"checkpoint artefacts are not durable: {', '.join(missing)}")
+        records = durable_artefact_records(artefacts)
         document = self._document(run_id)
         document["phases"][phase] = {
-            "artefacts": [str(Path(path).resolve()) for path in artefacts],
+            "artefacts": [record["path"] for record in records],
+            "artefact_records": records,
             "state": state or {},
         }
         atomic_write_json(self._path(run_id), document)
@@ -345,6 +447,8 @@ class PaidRecovery:
     billed_units: int = 0
     resolved_query_ids: frozenset[str] = frozenset()
     ambiguous_query_ids: frozenset[str] = frozenset()
+    #: Exact µUSD already spent: each attempt at the price its own event recorded.
+    spent_usd_e6: int = 0
 
     @property
     def any(self) -> bool:
@@ -352,7 +456,11 @@ class PaidRecovery:
 
 
 def recover_paid_attempts(
-    journal_path: Path, *, run_id: str, provider: str = "audd"
+    journal_path: Path,
+    *,
+    run_id: str,
+    provider: str = "audd",
+    extra_events: tuple[AttemptEvent, ...] | list[AttemptEvent] = (),
 ) -> PaidRecovery:
     """Fold the attempt journal into what ``run_id`` already spent and resolved.
 
@@ -361,25 +469,15 @@ def recover_paid_attempts(
     unresolved dispatches invisible on recovery, and a recovered run would re-bill them.
     """
 
-    del provider  # one journal per provider today; the ledger does not record it per attempt
-    ledger = load_attempt_ledger(Path(journal_path))
-    billed = 0
-    resolved: set[str] = set()
-    ambiguous: set[str] = set()
-    for attempt in ledger.attempts:
-        if attempt.run_id != run_id:
-            continue
-        if attempt.outcome is not None:
-            resolved.add(attempt.query_id)
-            if attempt.outcome in BILLABLE_OUTCOMES:
-                billed += 1
-        elif attempt.dispatched:
-            ambiguous.add(attempt.query_id)
-            billed += 1
+    # The shared fold (id_detector.run_ledger): the same resume rule the sweep and the queue use.
+    ledger = fold_run_ledger(
+        run_id, events_from_jsonl(Path(journal_path)), extra_events, provider=provider
+    )
     return PaidRecovery(
-        billed_units=billed,
-        resolved_query_ids=frozenset(resolved),
-        ambiguous_query_ids=frozenset(ambiguous - resolved),
+        billed_units=ledger.billed_units,
+        resolved_query_ids=ledger.resolved_query_ids,
+        ambiguous_query_ids=ledger.ambiguous_query_ids,
+        spent_usd_e6=ledger.spent_usd_e6,
     )
 
 
@@ -439,8 +537,134 @@ def admitter_from_state(state: dict[str, Any], *, unit_usd_e6: int) -> UsdAdmitt
             effective_cap_e2=int(state.get("effective_cap_e2", ceil_e2(reserved))),
         )
     )
-    charge_restored_units(admitter, spent // unit)
+    # Exact µUSD, not units: a price change between passes can never re-price spent money.
+    admitter.restore_spent(spent)
     return admitter
+
+
+class SettlementMiss(RuntimeError):
+    """The run's media cannot be located right now: a settlement sweep retries, never gives up."""
+
+
+def settlement_line(
+    work_root: Path, target: str, run_id: str
+) -> tuple[Path, dict[str, Any] | None]:
+    """The run's ``invocations.jsonl`` and its existing line, if any; a miss raises."""
+
+    from id_detector.ingest import _load_cached
+
+    try:
+        cached = _load_cached(Path(work_root).resolve(), target)
+    except (OSError, ValueError):
+        cached = None
+    if cached is None:
+        raise SettlementMiss(f"media for {target!r} is not available")
+    path = Path(cached.media_dir) / "invocations.jsonl"
+    if path_is_file(path):
+        for line in read_text(path).splitlines():
+            with contextlib.suppress(ValueError):
+                value = json.loads(line)
+                if isinstance(value, dict) and value.get("invocation_id") == run_id:
+                    return path, value
+    return path, None
+
+
+def settlement_lines(
+    work_root: Path, target: str, run_id: str
+) -> tuple[Path, list[dict[str, Any]]]:
+    """The run's ``invocations.jsonl`` and EVERY line it holds for the run; a miss raises."""
+
+    from id_detector.journal import invocation_lines
+
+    path, _first = settlement_line(work_root, target, run_id)
+    return path, invocation_lines(path, run_id)
+
+
+def interrupted_entry(
+    run_id: str, target: str, status: str, money: RecoveredMoney, source_ids: list[str]
+) -> Any:
+    """The settlement entry of a run stopped outside the pipeline, carrying ``money`` exactly."""
+
+    from id_detector.journal import InvocationTimer
+
+    settlement = money.settlement()
+    return InvocationTimer(run_id, ["analyse", target]).entry(
+        status=status,
+        exit_code=STATUS_EXIT_CODES.get(status, 1),
+        counts={"paid_attempts": money.attempts},
+        costs={"usd_e2": settlement.usd_e2_spent},
+        source_ids=source_ids,
+        ffmpeg_version=None,
+        usd_e6_reserved=settlement.usd_e6_reserved,
+        usd_e6_spent=settlement.usd_e6_spent,
+        usd_e2_reserved=settlement.usd_e2_reserved,
+        usd_e2_spent=settlement.usd_e2_spent,
+    )
+
+
+def settle_interrupted_run(
+    work_root: Path,
+    target: str,
+    run_id: str,
+    *,
+    status: str = "cancelled",
+    write: bool = True,
+    only_unsettled: bool = False,
+    settlement_writer: Callable[[Path, Any], Any] | None = None,
+    dispatch_events: Any = (),
+    reservation: Any = None,
+) -> RecoveredMoney:
+    """What an interrupted local run of ``run_id`` durably spent — settled when ``write``.
+
+    The money is the shared fold of the run's attempt JSONL, its authoritative SQLite dispatch rows
+    (``dispatch_events``), its durable reservation and its primary checkpoint. With a
+    ``settlement_writer`` the settlement is an SQLite row written first (under the writer's fence)
+    and projected into ``invocations.jsonl`` after commit, ALWAYS -- a zero-money job-owned run
+    still gets its row. ``reservation`` is the authoritative SQLite reservation (read before the
+    JSON projection beside the journal). Without a writer, ``only_unsettled`` settles only a run
+    that holds spend.
+    A media directory that cannot be located raises :class:`SettlementMiss` — a miss to retry,
+    never "nothing was spent".
+    """
+
+    from id_detector.ingest import _load_cached
+    from id_detector.journal import append_invocation, has_invocation
+
+    root = Path(work_root).resolve()
+    try:
+        cached = _load_cached(root, target)
+    except (OSError, ValueError):
+        cached = None
+    if cached is None:
+        raise SettlementMiss(f"media for {target!r} is not available; settlement must be retried")
+    media_dir = Path(cached.media_dir)
+    journal = AttemptJournal(
+        attempts_path(media_dir), run_id=run_id, provider="audd", unit_usd_e6=1
+    )
+    primary = LocalCheckpointStore(root).state(run_id, "primary")
+    money = recovered_money(
+        fold_run_ledger(run_id, journal.durable_events(), list(dispatch_events)),
+        reservation if reservation is not None else journal.durable_reservation(),
+        RecoveredMoney(
+            int(primary.get("usd_e6_reserved", 0) or 0),
+            int(primary.get("usd_e6_spent", 0) or 0),
+            int(primary.get("attempts", 0) or 0),
+        ),
+    )
+    path = media_dir / "invocations.jsonl"
+    if settlement_writer is not None:
+        needed = True  # every job-owned terminal run has its row, zero money included
+    else:
+        needed = money.any if only_unsettled else (money.any or has_invocation(path, run_id))
+    if write and needed:
+        entry = interrupted_entry(
+            run_id, target, status, money, [f"source:{cached.record.source_key}"]
+        )
+        if settlement_writer is not None:
+            settlement_writer(path, entry)
+        else:
+            append_invocation(path, entry)
+    return money
 
 
 def _target_value(request: RunRequest) -> tuple[str, str]:
@@ -502,6 +726,13 @@ def run(request: RunRequest) -> RunResult:
         )
     result_paths: list[Path] = []
     outcome = pipeline.PipelineOutcome()
+    # Terminal settlement is fenced like every other run-side write: the store's own claim
+    # fence (hosted), or the one the supervised local worker supplied.
+    store_writer = getattr(store, "settlement_writer", None)
+    settlement_writer = (
+        store_writer(request.run_id) if callable(store_writer) else options.settlement_writer
+    )
+    failure: Exception | None = None
 
     def checkpoint(
         phase: str,
@@ -550,15 +781,28 @@ def run(request: RunRequest) -> RunResult:
             "injected_usd_admitter": resumed_admitter,
             "project_root": options.project_root,
             "outcome": outcome,
+            # A hosted store never publishes the local ``present/current`` pointer or index (§3.4).
+            "presentation_local": store.mode == "local",
+            "dispatch_admission": options.dispatch_admission,
+            "settlement_writer": settlement_writer,
         }
         if options.cli_confirmation is not None:
             analysis_kwargs["cli_confirmation"] = options.cli_confirmation
         if options.primary_engine is not None:
             analysis_kwargs["primary_engine"] = options.primary_engine
-        returned = asyncio.run(pipeline.run_analysis(target, **analysis_kwargs))
-        if not outcome.recorded:
-            outcome.exit_code = int(returned)
-            outcome.status = _STATUS_FOR_EXIT.get(int(returned), "failed")
+        try:
+            returned = asyncio.run(pipeline.run_analysis(target, **analysis_kwargs))
+        except Exception as exc:
+            # Plan §4.3: a real terminal failure is still a RunResult. The pipeline recorded
+            # ``failed`` and settled its money before re-raising; only a failure that never
+            # reached a terminal path (nothing recorded) propagates — there is nothing to report.
+            if not outcome.recorded:
+                raise
+            failure = exc
+        else:
+            if not outcome.recorded:
+                outcome.exit_code = int(returned)
+                outcome.status = _STATUS_FOR_EXIT.get(int(returned), "failed")
     bundle = (
         outcome.bundle
         if outcome.bundle is not None
@@ -567,7 +811,11 @@ def run(request: RunRequest) -> RunResult:
     return RunResult(
         run_id=request.run_id,
         status=outcome.status,
-        reason=outcome.reason,
+        reason=(
+            outcome.reason
+            if outcome.reason is not None or failure is None
+            else (redact_text(str(failure))[:500] or type(failure).__name__)
+        ),
         achieved=outcome.achieved,
         bundle_id=bundle.name if bundle is not None else None,
         usd_e6_reserved=outcome.usd_e6_reserved,

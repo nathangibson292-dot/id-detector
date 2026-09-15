@@ -413,6 +413,8 @@ def test_web_runner_passes_recipe_and_delivers_selected_bundle(
     results = []
     outcomes = []
     context = SimpleNamespace(
+        # A job-driven run always carries its durable run id; the runner fails closed without one.
+        run_id=f"web-runner-{name}",
         target=str(AUDIO),
         build_index=False,
         profile=profile,
@@ -532,6 +534,7 @@ def test_web_acquisition_republishes_the_selected_bundle(tmp_path, monkeypatch):
     monkeypatch.setattr(cli, "enrich_media_dir", fake_enrich)
     results = []
     context = SimpleNamespace(
+        run_id="web-acquisition-job",  # the job's durable run id (the runner fails closed without)
         target=str(AUDIO),
         build_index=False,
         profile=None,

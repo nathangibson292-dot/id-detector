@@ -36,9 +36,11 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
-from id_detector.io import redact_text
+from id_detector.io import path_is_file, read_text, redact_text
 from id_detector.jobs import JobStoreLocked, ProcessLock
+from id_detector.money import ceil_e2
 from id_detector.recipes import DEEP_RECIPE, FREE_RECIPE
+from id_detector.run_ledger import RecoveredMoney, fold_run_ledger, recovered_money
 from id_detector.service import LocalPath, PlatformUrl, RunResult, TargetRefused
 from id_detector.webapp.jobs import (
     CANCELLED,
@@ -54,13 +56,21 @@ from id_detector.webapp.jobs import (
     TargetValidationError,
     validate_target,
 )
-from idea_web.database import Database
+from idea_web.database import Database, MigrationRefused  # noqa: F401 - re-exported for idea serve
 from idea_web.jobs.worker import (
     ACTIVE_RUN_STATES,
     DEFAULT_LEASE_SECONDS,
     HEARTBEAT_SECONDS,
+    MONEY_AUTHORITY,
+    DispatchAdmission,
     JobQueue,
+    LegacyRecoveryLedger,
+    SchemaTooNew,
+    SettlementLedger,
     StaleClaim,
+    dispatch_events,
+    new_run_id,
+    stored_reservation,
 )
 from idea_web.jobs.worker import Job as QueueJob
 
@@ -70,13 +80,34 @@ SUPERVISOR_LOCK = Path(".idea") / "worker-supervisor.lock"
 ABANDONED = "stopped when ID'er was closed"
 #: How often the worker publishes a changed progress snapshot (the page polls every 2.5 s).
 FLUSH_SECONDS = 0.5
+#: How often the worker re-derives missing settlements (it also sweeps once at start).
+SWEEP_SECONDS = 120.0
+#: Stopped queue states whose run may hold spend, and the status their settlement carries.
+_SWEEP_STATUS = {
+    "dead_letter": "failed",
+    "failed": "failed",
+    "quota_exceeded": "failed",
+    "cancelled": "cancelled",
+    "provider_unavailable": "provider_unavailable",
+    "budget_exhausted": "budget_exhausted",
+    "source_changed": "source_changed",
+    "complete": "complete",
+    "degraded": "degraded",
+    "partial": "partial",
+}
+#: A settlement miss is retried at every sweep this many times, then with capped backoff — for as
+#: long as the worker runs, and again at every start. It is never dropped.
+IMMEDIATE_RETRIES = 3
+MAX_RETRY_SECONDS = 1800.0
+#: The worker's exit code when newer ID'er code has upgraded the database: the supervisor stops.
+EXIT_SCHEMA_TOO_NEW = 3
 #: A worker told to stop gets this long to settle its job before the process exits regardless.
 EXIT_GRACE_SECONDS = 30.0
 _LOCAL = "local"
 _SNAPSHOT_FIELDS = tuple(
     item.name
     for item in dataclasses.fields(Job)
-    if item.name not in {"target", "log", "cancel_event"}
+    if item.name not in {"target", "log", "cancel_event", "dispatch_admission", "settlement_writer"}
 )
 _TO_QUEUE = {
     SUCCEEDED: "complete",
@@ -94,11 +125,48 @@ _FROM_QUEUE = {
 }
 
 
+def _row_holds_money(row: Any) -> bool:
+    try:
+        entry = json.loads(row["entry"])
+    except (TypeError, ValueError):
+        return True  # unreadable: keep it scheduled rather than call it settled
+    counts = entry.get("counts") if isinstance(entry.get("counts"), dict) else {}
+    return bool(
+        entry.get("usd_e6_reserved") or entry.get("usd_e6_spent") or counts.get("paid_attempts")
+    )
+
+
+def _epoch(at: str) -> float:
+    """An attempt event's ISO-8601 ``at`` as epoch seconds; NaN when unreadable."""
+
+    from datetime import datetime
+
+    try:
+        return datetime.fromisoformat(at.replace("Z", "+00:00")).timestamp()
+    except (TypeError, ValueError):
+        return float("nan")
+
+
 def _stamp() -> str:
     return time.strftime("%H:%M:%S")
 
 
+def retry_delay_seconds(misses: int) -> float:
+    """How long a run waits after its ``misses``-th settlement miss before the next attempt."""
+
+    if misses <= IMMEDIATE_RETRIES:
+        return 0.0
+    return min(SWEEP_SECONDS * 2 ** (misses - IMMEDIATE_RETRIES), MAX_RETRY_SECONDS)
+
+
 def local_database(work_root: Path) -> Database:
+    """The work folder's queue database, migrated to this code's schema.
+
+    ``Database.migrate`` itself refuses with ``MigrationRefused`` (re-exported here for
+    ``idea serve``) while another ID'er holds the supervisor lock or an older claim is still live,
+    so no caller can bypass that exclusion.
+    """
+
     database = Database(Path(work_root).resolve() / LOCAL_DATABASE)
     database.migrate()
     return database
@@ -129,6 +197,8 @@ def job_view(row: QueueJob) -> Job | None:
         return None
     values = {name: document[name] for name in _SNAPSHOT_FIELDS if name in document}
     values["id"] = row.id
+    # The normalised column is the ONLY authority for the run id; the snapshot never is.
+    values["run_id"] = row.run_id
     try:
         job = Job(target=_target_text(row.target), **values)
     except (TypeError, TargetRefused):
@@ -196,6 +266,8 @@ class LocalJobs:
             build_index=build_index,
             known_tracklist=known_tracklist,
             created_at=self.clock(),
+            # ONE durable service run for this job, reused by every worker process that runs it.
+            run_id=new_run_id(),
         )
         try:
             queue_target = LocalPath(Path(validated)) if is_file else PlatformUrl(validated)
@@ -203,6 +275,9 @@ class LocalJobs:
                 queue_target,
                 DEEP_RECIPE if profile == "max_accuracy" else FREE_RECIPE,
                 job_id=job_id,
+                # Normalised queue state, not only the snapshot: the queue itself can then settle
+                # this run's shared ledger when it quarantines or dead-letters the row.
+                run_id=job.run_id,
                 progress={_LOCAL: snapshot(job)},
             )
         except TargetRefused as exc:
@@ -343,19 +418,29 @@ class LocalWorker:
         heartbeat_seconds: float = HEARTBEAT_SECONDS,
         flush_seconds: float = FLUSH_SECONDS,
         clock: Callable[[], float] = time.time,
+        monotonic: Callable[[], float] = time.monotonic,
     ) -> None:
         self.database = database
         self.work_root = Path(work_root)
         self.runner = runner
+        self.monotonic = monotonic
+        #: Set when newer code upgraded the database: the worker exits with EXIT_SCHEMA_TOO_NEW.
+        self.schema_too_new = False
         self.worker_id = worker_id or f"local-worker-{uuid.uuid4().hex}"
         self.lease_seconds = lease_seconds
         self.heartbeat_seconds = heartbeat_seconds
         self.flush_seconds = flush_seconds
         self.clock = clock
-        self.queue = JobQueue(database, local_mode=True, clock=clock)
+        self.queue = JobQueue(
+            database, local_mode=True, clock=clock, on_abandon=self._settle_abandoned
+        )
         self.stopped = threading.Event()
         self._current_lock = threading.Lock()
         self._current: Job | None = None
+        self._swept: set[str] = set()
+        self._recovered_jobs: set[str] = set()
+        #: run id -> (consecutive misses, monotonic time of the next attempt)
+        self._retry: dict[str, tuple[int, float]] = {}
 
     def stop(self) -> None:
         """Claim nothing more and cancel the job in hand (it settles as ``cancelled``)."""
@@ -366,12 +451,166 @@ class LocalWorker:
         if current is not None:
             current.cancel_event.set()
 
+    def sweep_settlements(self) -> int:
+        """Derive every missing settlement from SQLite, the single authority (idempotent).
+
+        For every stopped job in ANY terminal state (``complete`` included) whose run has no
+        ``run_settlements`` row, it adopts an existing ``invocations.jsonl`` line, or settles what
+        the run's durable ledger proves it spent. A row whose projection is missing is
+        re-projected. A run whose media cannot be located is settled from SQLite alone when its
+        authority rows (or its provenance stamp) prove the money; otherwise it waits. Every miss
+        stays scheduled — immediately for the first few, then with capped backoff — for as long as
+        the worker runs. Pre-upgrade stopped jobs with no run id are recovered from the run ids
+        their attempt ledger names.
+        """
+
+        settled = self._recover_unidentified()
+        now = self.monotonic()
+        for job_id, run_id, target, state in self.queue.settlement_candidates(
+            frozenset(_SWEEP_STATUS)
+        ):
+            if run_id in self._swept:
+                continue
+            misses, due = self._retry.get(run_id, (0, 0.0))
+            if now < due:
+                continue
+            try:
+                settled += int(self._settle_run(job_id, run_id, target, _SWEEP_STATUS[state]))
+            except Exception:  # noqa: BLE001 - a miss or a failure stays scheduled, never dropped
+                misses += 1
+                self._retry[run_id] = (misses, now + retry_delay_seconds(misses))
+                continue
+            self._retry.pop(run_id, None)
+            self._swept.add(run_id)
+        return settled
+
+    def _settle_run(
+        self, job_id: str, run_id: str, target: str, status: str, *, legacy: bool = False
+    ) -> bool:
+        from id_detector.service import (
+            SettlementMiss,
+            interrupted_entry,
+            settle_interrupted_run,
+            settlement_lines,
+        )
+
+        # ``legacy``: a pre-upgrade job with no ``jobs.run_id``, recovered through the separate,
+        # explicitly validated association; every other writer requires the job to own the run.
+        ledger_type = LegacyRecoveryLedger if legacy else SettlementLedger
+        ledger = ledger_type(self.database, job_id=job_id, clock=self.clock, only_if_missing=True)
+        existing = ledger.row(run_id)
+        if existing is not None and existing["journal_path"]:
+            ledger.reproject(run_id)  # the file is a projection of the row: missing or different
+            return False
+        try:
+            path, lines = settlement_lines(self.work_root, target, run_id)
+        except SettlementMiss:
+            if existing is not None:
+                if _row_holds_money(existing):
+                    raise  # settled from SQLite; its projection waits for the media
+                return False
+            money = self._authority_money(job_id, run_id)
+            if money is None:
+                raise  # no SQLite proof either way: wait for the media, never "nothing was spent"
+            ledger.settle(None, interrupted_entry(run_id, target, status, money, []))
+            if money.any:
+                raise SettlementMiss(
+                    f"run {run_id} settled from SQLite; its projection waits"
+                ) from None
+            return False
+        authority = {
+            "dispatch_events": self._dispatch_events(run_id),
+            "reservation": self._stored_reservation(run_id),
+        }
+        if existing is not None:
+            # Settled while its media was missing: now project it, raised to the full fold.
+            money = settle_interrupted_run(
+                self.work_root, target, run_id, status=status, write=False, **authority
+            )
+            ledger.attach(run_id, path, money)
+            return False
+        if lines:
+            # Written before SQLite held settlements: every line, reconciled with the durable fold.
+            money = settle_interrupted_run(
+                self.work_root, target, run_id, status=status, write=False, **authority
+            )
+            ledger.adopt(run_id, path, lines, money)
+            return False
+        money = settle_interrupted_run(
+            self.work_root,
+            target,
+            run_id,
+            status=status,
+            only_unsettled=True,
+            settlement_writer=ledger,
+            **authority,
+        )
+        return bool(money.any)
+
+    def _recover_unidentified(self) -> int:
+        """Settle runs of stopped pre-upgrade jobs that have no ``jobs.run_id``.
+
+        Such a job's runs are the run ids its media's attempt ledger names inside the job's own
+        time window. Each is settled at most once, through the same unique settlement row.
+        """
+
+        from id_detector.attempts import attempts_path
+        from id_detector.run_ledger import parse_journal_lines
+        from id_detector.service import SettlementMiss, settlement_line
+
+        settled = 0
+        for row in self.queue.unidentified_terminal_rows():
+            if row["job_id"] in self._recovered_jobs:
+                continue
+            try:
+                journal_path, _line = settlement_line(self.work_root, row["target"], "")
+                ledger_path = attempts_path(journal_path.parent)
+                records = (
+                    parse_journal_lines(read_text(ledger_path)) if path_is_file(ledger_path) else []
+                )
+            except SettlementMiss:
+                continue
+            except Exception:  # noqa: BLE001 - retried at the next sweep
+                continue
+            low, high = row["start"] - 5.0, row["end"] + 5.0
+            runs = sorted({record.run_id for record in records if low <= _epoch(record.at) <= high})
+            complete = True
+            for run_id in runs:
+                try:
+                    settled += int(
+                        self._settle_run(
+                            row["job_id"],
+                            run_id,
+                            row["target"],
+                            _SWEEP_STATUS.get(row["state"], "failed"),
+                            legacy=True,
+                        )
+                    )
+                except Exception:  # noqa: BLE001 - a miss or failure: this job is retried
+                    complete = False
+            if complete:
+                self._recovered_jobs.add(row["job_id"])
+        return settled
+
     def run_forever(self, *, poll_seconds: float = 0.5) -> None:
-        while not self.stopped.is_set():
+        last_sweep = -SWEEP_SECONDS
+        while True:
+            if time.monotonic() - last_sweep >= SWEEP_SECONDS:
+                with contextlib.suppress(Exception):
+                    self.sweep_settlements()
+                last_sweep = time.monotonic()
+            if self.stopped.is_set():
+                return
             try:
                 claimed = self.run_once()
             except (KeyboardInterrupt, SystemExit):
                 raise
+            except SchemaTooNew as exc:
+                # Newer code upgraded the database: claim nothing more and exit cleanly.
+                print(str(exc), file=sys.stderr, flush=True)
+                self.schema_too_new = True
+                self.stopped.set()
+                return
             except Exception:  # noqa: BLE001 - one bad row or a busy database never ends the loop
                 claimed = None
             if claimed is None:
@@ -391,8 +630,13 @@ class LocalWorker:
                 return row.id
             if row.cancel_requested or self.stopped.is_set():
                 message = "cancelled before it started" if job.started_at is None else ABANDONED
-                self._settle(row.id, token, _mark_stopped(job, message, self.clock()))
+                self._settle(
+                    row.id, token, _mark_stopped(job, message, self.clock()), interrupted=True
+                )
                 return row.id
+            # The ONE run id, adopted from (or minted into) the normalised column and the snapshot
+            # together, durably, BEFORE the run starts: a worker death from here on resumes it.
+            job.run_id = self.queue.adopt_run_id(row.id, token)
             if row.attempt > 1:
                 job = self._restarted(job)
             self._execute(row, token, job)
@@ -413,6 +657,7 @@ class LocalWorker:
             build_index=job.build_index,
             known_tracklist=job.known_tracklist,
             created_at=job.created_at,
+            run_id=job.run_id,
         )
         restarted.log = deque(job.log, maxlen=LOG_RING)
         restarted.log.append(f"{_stamp()} restarted after the analysis worker stopped unexpectedly")
@@ -425,6 +670,23 @@ class LocalWorker:
         machine = JobManager(self.work_root, self.runner)
         with machine.lock:
             machine._jobs[job.id] = job
+        # The ONE dispatch-admission check (claim, lease, active AND not cancelled), evaluated
+        # at the paid dispatch itself; the progress relay's 0.5 s cadence is not a fence.
+        job.dispatch_admission = DispatchAdmission(
+            self.database, job_id=row.id, claim_token=token, clock=self.clock
+        )
+        claim = DispatchAdmission(
+            self.database,
+            job_id=row.id,
+            claim_token=token,
+            clock=self.clock,
+            require_not_cancelled=False,
+        )
+        # Terminal settlement: its SQLite row is written under the same claim check in one
+        # transaction; invocations.jsonl is projected from that row after commit.
+        job.settlement_writer = SettlementLedger(
+            self.database, fence=claim.check, job_id=row.id, clock=self.clock
+        )
         with self._current_lock:
             self._current = job
         if self.stopped.is_set():
@@ -448,21 +710,135 @@ class LocalWorker:
                 self._current = None
         self._settle(row.id, token, job, lock=machine.lock)
 
-    def _settle(self, job_id: str, token: str, job: Job, *, lock: Any = None) -> None:
+    def _settle_abandoned(self, job_id: str, run_id: str | None, target: str) -> None:
+        """The queue quarantined or dead-lettered this job: settle its run once, as ``failed``."""
+
+        if not run_id or not target:
+            return
+        from id_detector.service import settle_interrupted_run
+
+        # A fast path only: it inserts the settlement row only when none exists. The derived sweep
+        # is the guarantee, so a crash here loses nothing.
+        settle_interrupted_run(
+            self.work_root,
+            target,
+            run_id,
+            status="failed",
+            only_unsettled=True,
+            settlement_writer=SettlementLedger(
+                self.database, job_id=job_id, clock=self.clock, only_if_missing=True
+            ),
+            dispatch_events=self._dispatch_events(run_id),
+            reservation=self._stored_reservation(run_id),
+        )
+
+    def _dispatch_events(self, run_id: str) -> list[Any]:
+        with self.database.read() as connection:
+            return dispatch_events(connection, run_id, paid_only=True)
+
+    def _stored_reservation(self, run_id: str) -> Any:
+        with self.database.read() as connection:
+            return stored_reservation(connection, run_id)
+
+    def _authority_money(self, job_id: str, run_id: str) -> RecoveredMoney | None:
+        """What SQLite alone proves ``run_id`` spent, for a run whose media cannot be located.
+
+        Any paid ``run_dispatches`` or ``run_reservations`` row: the conservative fold of those rows
+        (an unresolved dispatch counts as spent; the reservation is the row's own). No such row:
+        zero — but ONLY for a job stamped ``money_authority = 3``, i.e. every claim of it was made
+        by code that writes those rows first. Anything else is ``None``: wait for the media.
+        """
+
+        with self.database.read() as connection:
+            job = connection.execute(
+                "SELECT money_authority FROM jobs WHERE id=?", (job_id,)
+            ).fetchone()
+            events = dispatch_events(connection, run_id, paid_only=True)
+            reservation = stored_reservation(connection, run_id)
+        if events or reservation is not None:
+            return recovered_money(fold_run_ledger(run_id, events, provider=None), reservation)
+        if job is not None and job["money_authority"] == MONEY_AUTHORITY:
+            return RecoveredMoney()
+        return None
+
+    def _run_money(self, job: Job, *, interrupted: bool, settlement_writer: Any = None) -> Any:
+        """The job's service run money from the shared ledger; settled there when interrupted."""
+
+        # Not gated on ``started_at``: a worker can die after paying for clips and before its
+        # first 0.5 s progress flush, and the ledger — not the snapshot — says what was spent.
+        if not job.run_id:
+            return None
+        from id_detector.service import SettlementMiss, interrupted_entry, settle_interrupted_run
+
+        try:
+            return settle_interrupted_run(
+                self.work_root,
+                job.target,
+                job.run_id,
+                status="cancelled",
+                write=interrupted,
+                settlement_writer=settlement_writer,
+                dispatch_events=self._dispatch_events(job.run_id),
+                reservation=self._stored_reservation(job.run_id),
+            )
+        except SettlementMiss:
+            if not (interrupted and settlement_writer is not None):
+                return None
+            with contextlib.suppress(Exception):
+                money = self._authority_money(job.id, job.run_id)
+                if money is not None:
+                    # Media not located: SQLite proves the money (or the stamped run's zero); the
+                    # sweep projects the row once the media is found.
+                    settlement_writer.settle(
+                        None, interrupted_entry(job.run_id, job.target, "cancelled", money, [])
+                    )
+                    return money
+            return None  # the derived sweep retries it
+        except Exception:  # noqa: BLE001 - money bookkeeping never masks the job's own outcome
+            return None
+
+    def _settle(
+        self, job_id: str, token: str, job: Job, *, lock: Any = None, interrupted: bool = False
+    ) -> None:
+        writer = (
+            SettlementLedger(
+                self.database,
+                fence=DispatchAdmission(
+                    self.database,
+                    job_id=job_id,
+                    claim_token=token,
+                    clock=self.clock,
+                    require_not_cancelled=False,
+                ).check,
+                job_id=job_id,
+                clock=self.clock,
+            )
+            if interrupted
+            else None
+        )
+        money = self._run_money(job, interrupted=interrupted, settlement_writer=writer)
         with lock if lock is not None else contextlib.nullcontext():
+            if interrupted and money is not None:
+                # A job stopped before its restart settles what its dead worker really spent.
+                job.usd_e2_spent = ceil_e2(money.usd_e6_spent)
+                job.spend_known = True
+                job.run_status = job.run_status or "cancelled"
             job.progress_percent()
             document = snapshot(job)
             status = job.status
         reason = job.error if status == FAILED else (job.message if status == WAITING else None)
+        exact = money is not None and money.any
         result = RunResult(
-            run_id="",
+            run_id=job.run_id or "",
             status=_TO_QUEUE.get(status, "failed"),
             reason=reason,
             achieved=None,
             bundle_id=None,
-            usd_e6_reserved=0,
-            usd_e6_spent=max(0, int(job.usd_e2_spent or 0)) * 10_000,
-            attempts=0,
+            usd_e6_reserved=money.usd_e6_reserved if exact else 0,
+            usd_e6_spent=(
+                money.usd_e6_spent if exact else max(0, int(job.usd_e2_spent or 0)) * 10_000
+            ),
+            attempts=money.attempts if exact else 0,
         )
         self.queue.terminal(job_id, token, result, bundle_path=None, progress={_LOCAL: document})
 
@@ -637,6 +1013,12 @@ class LocalWorkerSupervisor:
                 process = self._process
             if process is None or process.poll() is None:
                 continue
+            if process.returncode == EXIT_SCHEMA_TOO_NEW:
+                self._log(
+                    "a newer ID'er has upgraded this work folder's database, so this one has "
+                    "stopped running analyses: close it and start the newer ID'er"
+                )
+                return
             if time.monotonic() - self._started_at > 60.0:
                 delay = self.restart_delay_seconds
             self._log(
@@ -747,4 +1129,4 @@ def main(argv: list[str] | None = None) -> int:
     worker = LocalWorker(local_database(args.work_root), args.work_root, runner)
     _install_stop_triggers(worker, parent_pid=args.parent_pid, parent_pipe=args.parent_pipe)
     worker.run_forever()
-    return 0
+    return EXIT_SCHEMA_TOO_NEW if worker.schema_too_new else 0

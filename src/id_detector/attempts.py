@@ -8,8 +8,10 @@ billed) and ``resolved`` (the frozen money outcome).  A retry is a new attempt w
 
 On a later run the ledger classifies what an earlier run left behind: ``prepared`` without
 ``dispatched`` was never sent and is simply re-issued; ``dispatched`` without ``resolved`` is
-ambiguous — it may have been billed, so it counts as spent and is re-run as a fresh attempt that
-names it as its parent.  The journal is per media, shared by every run over that media.
+ambiguous — it may have been billed, so it counts as spent and is never sent again
+automatically.  The journal is per media, shared by every run over that media.  A queue-driven run
+first commits each dispatch to SQLite (the authority) under its job's claim fence; the JSONL line
+is that row's projection.
 """
 
 from __future__ import annotations
@@ -18,6 +20,7 @@ import json
 from dataclasses import dataclass
 from hashlib import sha256
 from pathlib import Path
+from typing import Any
 
 from id_detector.contracts import (
     ATTEMPT_EVENT_SEQ,
@@ -30,6 +33,14 @@ from id_detector.io import path_is_file, read_text
 from id_detector.journal import append_line, timestamp
 
 ATTEMPTS_FILENAME = "attempts.jsonl"
+
+
+class DispatchRefused(RuntimeError):
+    """The job queue refused to admit a dispatch: cancelled, reclaimed or past its lease.
+
+    Raised before the ``dispatched`` event is written, so nothing was sent and the attempt
+    stays ``prepared`` (re-issued by a later pass).
+    """
 
 
 def attempts_path(media_dir: Path) -> Path:
@@ -51,6 +62,16 @@ class AttemptJournal:
         self.provider = provider
         self.unit_usd_e6 = unit_usd_e6
         self._open: dict[str, tuple[str, str, int, str | None]] = {}
+        self._known_attempts: set[str] | None = None
+        #: The ONE dispatch-admission check (plan §4.6), evaluated immediately before a
+        #: ``dispatched`` event is durably written. The supervised local worker attaches its
+        #: queue-aware guard here; the hosted journal runs the same check in its transaction.
+        self.admission: Any = None
+
+    def _durable_attempt_ids(self) -> set[str]:
+        if self._known_attempts is None:
+            self._known_attempts = {event.attempt_id for event in self.durable_events()}
+        return self._known_attempts
 
     def prepare(
         self,
@@ -61,9 +82,111 @@ class AttemptJournal:
         parent_attempt_id: str | None,
     ) -> str:
         attempt_id = attempt_id_for(self.run_id, query_id, ordinal)
+        if parent_attempt_id is not None and parent_attempt_id == attempt_id:
+            raise ValueError(f"attempt {attempt_id} cannot name itself as its parent")
+        if attempt_id in self._open or attempt_id in self._durable_attempt_ids():
+            # Two requests under one id would fold into one ledger attempt and hide a charge —
+            # whether this writer made the first one or another writer already made it durable.
+            raise ValueError(f"attempt id already used in this run: {attempt_id}")
         self._open[attempt_id] = (query_id, window_id, ordinal, parent_attempt_id)
         self._write("prepared", attempt_id, None)
         return attempt_id
+
+    # ------------------------------------------------------ recovery (id_detector.run_ledger)
+
+    def durable_events(self) -> list[Any]:
+        """Every durable event this journal can read back (the JSONL; a projection adds more)."""
+
+        from id_detector.run_ledger import events_from_jsonl
+
+        events = events_from_jsonl(self.path)
+        # The dispatch authority's rows: a committed dispatch whose JSONL projection was lost is
+        # still spent and still never re-sent.
+        reader = getattr(self.admission, "dispatched_events", None)
+        if callable(reader):
+            events.extend(reader(self.run_id, self.provider))
+        return events
+
+    def for_provider(self, provider: str) -> AttemptJournal:
+        """This run's journal for another provider: same run identity, its own file."""
+
+        journal = AttemptJournal(
+            self.path.parent / f"{provider}-{self.path.name}",
+            run_id=self.run_id,
+            provider=provider,
+            unit_usd_e6=0,
+        )
+        # The SAME claim fence (claim, lease, not cancelled): a Shazam attempt identity is inserted
+        # under it before its request leaves, and a second writer's insert of that identity refuses.
+        journal.admission = self.admission
+        return journal
+
+    def events_for(self, provider: str) -> list[Any]:
+        """Durable events another provider's attempts left in this journal's store (none here)."""
+
+        del provider
+        return []
+
+    def run_ledger(self) -> Any:
+        """This run's verified attempt fold — the one resume rule both layers share."""
+
+        from id_detector.run_ledger import fold_run_ledger
+
+        return fold_run_ledger(self.run_id, self.durable_events(), provider=self.provider)
+
+    def _reservation_authority(self) -> Any:
+        """The SQLite reservation authority of a queue-driven run, or ``None`` (the direct CLI)."""
+
+        admission = self.admission
+        if callable(getattr(admission, "reserve", None)) and callable(
+            getattr(admission, "stored_reservation", None)
+        ):
+            return admission
+        return None
+
+    def durable_reservation(self) -> Any:
+        """The run's reservation: SQLite first when an authority is attached, else the file.
+
+        With an authority attached the JSON file beside the journal is a projection only: a stale
+        worker could have written it, so it is never read back as the reservation.
+        """
+
+        from id_detector.run_ledger import read_reservation, reservation_path
+
+        authority = self._reservation_authority()
+        if authority is not None:
+            return authority.stored_reservation(self.run_id)
+        return read_reservation(reservation_path(self.path, self.run_id), run_id=self.run_id)
+
+    def dispatch_without_reservation(self) -> bool:
+        """True when the authority proves a dispatch but holds no reservation (fail closed)."""
+
+        authority = self._reservation_authority()
+        if authority is None or authority.stored_reservation(self.run_id) is not None:
+            return False
+        return any(attempt.dispatched for attempt in self.run_ledger().attempts)
+
+    def record_reservation(self, reservation: Any) -> Any:
+        """Persist the reservation before any dispatch; an existing record for the run wins.
+
+        A queue-driven run writes it to SQLite under the claim check, in one transaction (a stale
+        worker writes nothing), and only then projects it beside the journal.
+        """
+
+        from id_detector.run_ledger import (
+            ReservationRecord,
+            project_reservation,
+            reservation_path,
+            write_reservation,
+        )
+
+        record = ReservationRecord.from_reservation(self.run_id, reservation)
+        path = reservation_path(self.path, self.run_id)
+        authority = self._reservation_authority()
+        if authority is None:
+            return write_reservation(path, record)
+        stored = authority.reserve(record)  # fenced; raises before anything is written
+        return project_reservation(path, stored)
 
     def dispatched(self, attempt_id: str) -> None:
         self._write("dispatched", attempt_id, None)
@@ -89,7 +212,17 @@ class AttemptJournal:
             unit_usd_e6=self.unit_usd_e6,
             outcome=outcome,
         )
-        append_line(self.path, record)
+        self._persist(record)
+
+    def _persist(self, record: ProviderAttemptEvent) -> None:
+        """Write ONE event object durably (a projection writes the same object)."""
+
+        if record.event == "dispatched" and self.admission is not None:
+            # The authoritative dispatch row, committed in the SAME transaction as the claim check
+            # (claim, lease, active, run token, not cancelled). Refused -> DispatchRefused, and
+            # nothing is written: no row, no line, no request.
+            self.admission.admit(record, self.path)
+        append_line(self.path, record)  # the JSONL projection, only after that commit
 
 
 @dataclass(frozen=True)

@@ -408,6 +408,7 @@ def test_web_runner_owns_one_breaker_across_jobs_and_reports_waiting(tmp_path, m
 
     monkeypatch.setattr(service_pipeline, "run_analysis", refused)
     context = SimpleNamespace(
+        run_id="breaker-web-job",  # the job's durable run id (the runner fails closed without)
         target=str(AUDIO),
         build_index=False,
         profile="free",

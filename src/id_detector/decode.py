@@ -19,6 +19,7 @@ from id_detector.contracts import (
 from id_detector.ingest import IngestResult
 from id_detector.io import (
     atomic_write_json,
+    durable_replace,
     native_path,
     path_is_file,
     path_size,
@@ -136,7 +137,9 @@ async def decode(ingested: IngestResult) -> DecodeResult:
                 "decoded PCM duration differs from ffprobe by more than 500 ms: "
                 f"{duration_ms} vs {ffprobe_duration_ms}"
             )
-        os.replace(native_path(temporary), native_path(pcm_path))
+        # Write-through, not a plain rename: a checkpoint will name this file, and on Windows only
+        # MOVEFILE_WRITE_THROUGH waits for the move itself to reach the disk (4b-i retro P1).
+        durable_replace(Path(temporary), pcm_path)
     finally:
         with suppress(FileNotFoundError):
             os.unlink(native_path(temporary))

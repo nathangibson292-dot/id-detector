@@ -8,15 +8,15 @@ import os
 import threading
 import time
 import uuid
-from collections import deque
 from collections.abc import Callable, Iterator, Mapping
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
 from dataclasses import dataclass, replace
+from functools import lru_cache
 from hashlib import sha256
 from pathlib import Path
 from typing import Any, Literal, Protocol
 
-from id_detector.attempts import AttemptJournal
+from id_detector.attempts import AttemptJournal, DispatchRefused
 from id_detector.compat import (
     LOCAL_OWNER_SCOPE,
     AnalysisInputs,
@@ -33,10 +33,24 @@ from id_detector.hints.pipeline import run_hints
 from id_detector.ingest import _load_cached, ingest
 from id_detector.io import fsync_directory, native_path, path_is_file, read_text, sha256_file
 from id_detector.jobs import JobStoreLocked, ProcessLock
-from id_detector.journal import timestamp
+from id_detector.journal import append_line
+from id_detector.paid_clip import PAID_CLIP_ENGINES
 from id_detector.present.bundles import read_bundle_manifest
 from id_detector.providers.base import AppConfig
 from id_detector.recipes import RECIPES, Recipe, get_recipe
+from id_detector.run_ledger import (
+    AttemptEvent,
+    LedgerConflict,
+    RecoveredMoney,
+    ReservationRecord,
+    event_from_record,
+    event_from_row,
+    fold_run_ledger,
+    new_run_id,
+    parse_journal_lines,
+    recovered_money,
+)
+from id_detector.scan import PAID_FILE_SCANNERS
 from id_detector.service import (
     CHECKPOINT_PHASES,
     CheckpointPhase,
@@ -47,11 +61,46 @@ from id_detector.service import (
     RunResult,
     TargetRefused,
     UploadId,
+    checkpoint_entry_valid,
+    durable_artefact_records,
     validate_platform_url,
     validate_upload_id,
 )
 from id_detector.shazam_breaker import BreakerConfig, ShazamBreaker
-from idea_web.database import Database
+from idea_web.database import Database, migrations
+
+#: Hosted paid money is deferred to the hosted cycle (round 6) and must be re-reviewed before
+#: it is enabled: until then a hosted worker refuses every paid engine at intake AND at
+#: dispatch admission.
+HOSTED_PAID_REFUSAL = "paid engines are not enabled in hosted mode yet"
+#: The money-authority code version (migration 0003). New code stamps it on a job at submit
+#: and keeps it on every claim it makes; a claim by older code marks the job 0 (the trigger
+#: in 0003), and only a stamped job with no authority rows may settle at zero money.
+MONEY_AUTHORITY = 3
+_PAID_ENGINE_NAMES = frozenset(PAID_FILE_SCANNERS) | frozenset(PAID_CLIP_ENGINES)
+
+
+class SchemaTooNew(RuntimeError):
+    """The database was upgraded by newer ID'er code: this worker must stop claiming and exit."""
+
+
+@lru_cache(maxsize=1)
+def known_schema_version() -> int:
+    """The newest migration this code ships (and therefore understands)."""
+
+    available = migrations()
+    return available[-1].number if available else 0
+
+
+def recipe_uses_paid_engine(recipe: Recipe) -> bool:
+    """True when ``recipe`` can spend money: a paid primary or secondary engine, or a paid cap."""
+
+    return (
+        recipe.max_usd_e2 > 0
+        or recipe.primary_engine in _PAID_ENGINE_NAMES
+        or (recipe.secondary_engine or "") in _PAID_ENGINE_NAMES
+    )
+
 
 HEARTBEAT_SECONDS = 10.0
 DEFAULT_LEASE_SECONDS = 30.0
@@ -78,7 +127,17 @@ _ACTIVE_SQL = "('intake','waiting','analysis')"
 #: ``json_extract`` is NULL for a job whose progress has no ``attached`` key, and ``NOT (TRUE AND
 #: NULL)`` is NULL, not TRUE -- a predicate written without COALESCE silently excluded every
 #: breaker-waiting job from the queue forever.
-_ATTACHED_SQL = "COALESCE(json_extract(progress, '$.attached'), 0) = 1"
+#: Attachment is a durable column (migration 0002), never inferred from mutable progress JSON: a
+#: malformed or rewritten progress document can no longer turn an attached job into a claimant.
+_ATTACHED_SQL = "attached = 1"
+#: No OTHER job drives this run under a live lease: the claim token on the run belongs to an active,
+#: unexpired, non-attached job other than the one asking. Parameters: the asking job id, now.
+_NO_OTHER_LIVE_DRIVER_SQL = (
+    "NOT EXISTS (SELECT 1 FROM jobs d WHERE d.run_id = analysis_runs.run_id AND d.id <> ? "
+    "AND d.attached = 0 AND d.claim_token IS NOT NULL "
+    "AND d.claim_token = analysis_runs.claim_token "
+    f"AND d.state IN {_ACTIVE_SQL} AND d.lease_until > ?)"
+)
 
 
 class StaleClaim(RuntimeError):
@@ -87,6 +146,532 @@ class StaleClaim(RuntimeError):
     Raised instead of silently succeeding: a worker whose lease was reclaimed must not be able to
     overwrite its replacement's checkpoints, money or attempt ledger, and must find out.
     """
+
+
+#: The run-side fence (plan §4.6): the run's claim token must belong to a job that is still driving
+#: it — active, holding that same token, and with an UNEXPIRED lease. It is checked inside the
+#: caller's write transaction, immediately before the write it guards, so a worker that slept past
+#: its lease cannot checkpoint, admit a dispatch or settle even before anybody else reclaims.
+_RUN_FENCE_SQL = (
+    "SELECT 1 FROM analysis_runs r JOIN jobs j "
+    "ON j.run_id = r.run_id AND j.claim_token = r.claim_token "
+    f"WHERE r.run_id = ? AND r.claim_token = ? AND j.state IN {_ACTIVE_SQL} AND j.lease_until > ?"
+)
+_ATTEMPT_ROW_COLUMNS = (
+    "attempt_id, state, run_id, provider, egress_id, query_id, parent_attempt_id, "
+    "unit_usd_e6, outcome"
+)
+
+
+def require_run_fence(connection: Any, run_id: str, claim_token: str | None, now: float) -> None:
+    if claim_token is None:
+        raise StaleClaim(f"no claim token for run {run_id}; refusing to write")
+    if connection.execute(_RUN_FENCE_SQL, (run_id, claim_token, now)).fetchone() is None:
+        raise StaleClaim(f"claim on run {run_id} is stale, inactive or past its lease")
+
+
+#: The ONE claim check every run-side write of a job shares (plan §4.6): the job holds this claim
+#: token, is active, and its lease has not expired; a job that drives a queue-side run must also
+#: hold that run's token. Parameters: job id, claim token, now.
+_JOB_CLAIM_SQL = (
+    "SELECT 1 FROM jobs j WHERE j.id = ? AND j.claim_token = ? "
+    f"AND j.state IN {_ACTIVE_SQL} AND j.lease_until > ? "
+    "AND (j.run_id IS NULL "
+    "OR NOT EXISTS (SELECT 1 FROM analysis_runs r WHERE r.run_id = j.run_id) "
+    "OR EXISTS (SELECT 1 FROM analysis_runs r "
+    "WHERE r.run_id = j.run_id AND r.claim_token = j.claim_token))"
+)
+
+
+class DispatchAdmission:
+    """The ONE dispatch-admission check for every paid dispatch path, hosted and supervised local.
+
+    Atomically requires the matching claim token, an active state, an unexpired lease AND no
+    cancellation request, evaluated immediately before the ``dispatched`` event is durably written.
+    With ``require_not_cancelled=False`` the same check is the claim fence for terminal settlement
+    (a cancelled job must still be able to settle what it spent).
+    """
+
+    def __init__(
+        self,
+        database: Database,
+        *,
+        job_id: str,
+        claim_token: str,
+        clock: Callable[[], float] = time.time,
+        require_not_cancelled: bool = True,
+        hosted: bool = False,
+    ) -> None:
+        self.database = database
+        self.job_id = job_id
+        self.claim_token = claim_token
+        self.clock = clock
+        self.require_not_cancelled = require_not_cancelled
+        #: A hosted worker's admission refuses every paid dispatch (hosted paid money is deferred).
+        self.hosted = hosted
+        #: Test seam: runs INSIDE the admission transaction, after the row is written.
+        self.before_commit: Callable[[], None] | None = None
+
+    def check(self, connection: Any) -> None:
+        if self.hosted and self.require_not_cancelled:
+            raise DispatchRefused(HOSTED_PAID_REFUSAL)
+        sql = _JOB_CLAIM_SQL + (" AND j.cancel_requested = 0" if self.require_not_cancelled else "")
+        if connection.execute(sql, (self.job_id, self.claim_token, self.clock())).fetchone():
+            return
+        if self.require_not_cancelled:
+            raise DispatchRefused(
+                f"job {self.job_id} is cancelled, reclaimed or past its lease: dispatch refused"
+            )
+        raise StaleClaim(f"job {self.job_id} no longer holds its claim: settlement refused")
+
+    def admit_in(self, connection: Any, record: ProviderAttemptEvent, journal_path: Path) -> None:
+        """The claim check AND the authoritative dispatch row, in the caller's ONE transaction.
+
+        Nothing may send a request unless this row committed. The primary key makes a second
+        dispatch of one attempt impossible: its insert is a no-op, and a no-op is a refusal.
+        """
+
+        from id_detector.io import canonical_json_bytes
+
+        self.check(connection)
+        owner = connection.execute("SELECT run_id FROM jobs WHERE id=?", (self.job_id,)).fetchone()
+        if owner is None or owner["run_id"] != record.run_id:
+            raise DispatchRefused(
+                f"attempt {record.attempt_id} is for run {record.run_id}, "
+                f"not job {self.job_id}'s run"
+            )
+        if record.provider != "shazam" and stored_reservation(connection, record.run_id) is None:
+            raise DispatchRefused(
+                f"run {record.run_id} has no durable reservation: paid dispatch refused"
+            )
+        inserted = connection.execute(
+            "INSERT INTO run_dispatches(run_id, attempt_id, job_id, provider, event, "
+            "journal_path, created_at) VALUES (?, ?, ?, ?, ?, ?, ?) "
+            "ON CONFLICT(run_id, attempt_id) DO NOTHING",
+            (
+                record.run_id,
+                record.attempt_id,
+                self.job_id,
+                record.provider,
+                canonical_json_bytes(record).decode("utf-8"),
+                str(journal_path),
+                self.clock(),
+            ),
+        ).rowcount
+        if inserted != 1:
+            raise DispatchRefused(f"attempt {record.attempt_id} was already dispatched")
+        if self.before_commit is not None:
+            self.before_commit()
+
+    def admit(self, record: ProviderAttemptEvent, journal_path: Path) -> None:
+        with self.database.write() as connection:
+            self.admit_in(connection, record, journal_path)
+
+    def reserve(self, record: ReservationRecord) -> ReservationRecord:
+        """The run's ONE reservation, written under the claim check before its first dispatch.
+
+        One transaction: the claim (token, active state, unexpired lease) is checked and the unique
+        ``run_reservations`` row inserted together, so a stale worker past its lease writes nothing.
+        An existing row always wins: a replacement worker under a different price or cap resumes
+        against the reservation the run made, never a recomputed one.
+        """
+
+        if self.hosted:
+            raise DispatchRefused(HOSTED_PAID_REFUSAL)
+        with self.database.write() as connection:
+            if not connection.execute(
+                _JOB_CLAIM_SQL, (self.job_id, self.claim_token, self.clock())
+            ).fetchone():
+                raise StaleClaim(
+                    f"job {self.job_id} no longer holds its claim: reservation refused"
+                )
+            owner = connection.execute(
+                "SELECT run_id FROM jobs WHERE id=?", (self.job_id,)
+            ).fetchone()
+            if owner is None or (owner["run_id"] is not None and owner["run_id"] != record.run_id):
+                raise DispatchRefused(f"run {record.run_id} is not driven by job {self.job_id}")
+            stored = stored_reservation(connection, record.run_id)
+            if stored is not None:
+                return stored
+            connection.execute(
+                "INSERT INTO run_reservations(run_id, job_id, reservation, usd_e6_reserved, "
+                "created_at) VALUES (?, ?, ?, ?, ?)",
+                (
+                    record.run_id,
+                    self.job_id,
+                    json.dumps(record.document(), sort_keys=True, separators=(",", ":")),
+                    record.usd_e6_reserved,
+                    self.clock(),
+                ),
+            )
+        return record
+
+    def stored_reservation(self, run_id: str) -> ReservationRecord | None:
+        with self.database.read() as connection:
+            return stored_reservation(connection, run_id)
+
+    def dispatched_events(self, run_id: str, provider: str | None = None) -> list[AttemptEvent]:
+        with self.database.read() as connection:
+            return dispatch_events(connection, run_id, provider)
+
+
+def stored_reservation(connection: Any, run_id: str) -> ReservationRecord | None:
+    """``run_id``'s authoritative reservation row; an unreadable row fails closed (raises)."""
+
+    row = connection.execute(
+        "SELECT reservation FROM run_reservations WHERE run_id=?", (run_id,)
+    ).fetchone()
+    if row is None:
+        return None
+    try:
+        value = json.loads(row["reservation"])
+    except (TypeError, ValueError):
+        value = None
+    record = ReservationRecord.from_document(value, run_id=run_id)
+    if record is None:
+        raise LedgerConflict(f"run {run_id} has an unreadable reservation row")
+    return record
+
+
+def dispatch_events(
+    connection: Any, run_id: str, provider: str | None = None, *, paid_only: bool = False
+) -> list[AttemptEvent]:
+    """``run_id``'s authoritative dispatch rows as attempt events (their JSONL may be missing).
+
+    ``provider`` narrows them to one provider; ``paid_only`` leaves out the free Shazam identities
+    (which are fenced here too, but never carry money).
+    """
+
+    sql = "SELECT event FROM run_dispatches WHERE run_id=?"
+    params: list[Any] = [run_id]
+    if provider is not None:
+        sql += " AND provider=?"
+        params.append(provider)
+    if paid_only:
+        sql += " AND provider <> 'shazam'"
+    rows = connection.execute(sql + " ORDER BY created_at, attempt_id", params).fetchall()
+    return [
+        event_from_record(ProviderAttemptEvent.model_validate_json(row["event"])) for row in rows
+    ]
+
+
+class SettlementLedger:
+    """``run_settlements``: the ONE authority for a run's terminal settlement (plan §2.3.2).
+
+    The claim holder's write (``fence``) upserts the row under the claim check in one transaction,
+    with monotonic money; ``only_if_missing`` writers (the derived sweep, the post-commit fast path)
+    insert only when no row exists, so concurrent writers produce exactly one row. After commit the
+    row is projected into ``invocations.jsonl``; :meth:`reproject` restores a lost projection.
+    """
+
+    def __init__(
+        self,
+        database: Database,
+        *,
+        fence: Callable[[Any], None] | None = None,
+        job_id: str | None = None,
+        clock: Callable[[], float] = time.time,
+        only_if_missing: bool = False,
+    ) -> None:
+        self.database = database
+        self.fence = fence
+        self.job_id = job_id
+        self.clock = clock
+        self.only_if_missing = only_if_missing
+
+    def __call__(self, path: Path | None, entry: Any) -> bool:
+        return self.settle(path, entry)
+
+    def settle(self, path: Path | None, entry: Any) -> bool:
+        """Upsert (``only_if_missing``: insert) the run's row; project it when ``path`` is known.
+
+        ``path`` is ``None`` for a run whose media cannot be located right now. Such a row may
+        hold paid spend, conservatively folded from SQLite alone (every unresolved dispatch counts
+        as spent); it has no journal yet, and :meth:`attach` projects it once the media is found.
+        """
+
+        from id_detector.io import canonical_json_bytes
+        from id_detector.journal import merge_monotonic
+
+        run_id = entry.invocation_id
+        with self.database.write() as connection:
+            if self.fence is not None:
+                self.fence(connection)  # stale, reclaimed or expired -> raises; nothing written
+            if self.job_id is not None:
+                self._check_owner(connection, run_id)
+            row = connection.execute(
+                "SELECT entry FROM run_settlements WHERE run_id=?", (run_id,)
+            ).fetchone()
+            if row is not None and self.only_if_missing:
+                return False
+            merged = entry if row is None else merge_monotonic(entry, json.loads(row["entry"]))
+            now = self.clock()
+            connection.execute(
+                "INSERT INTO run_settlements(run_id, job_id, status, journal_path, entry, "
+                "created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?) "
+                "ON CONFLICT(run_id) DO UPDATE SET "
+                "job_id=COALESCE(excluded.job_id, run_settlements.job_id), "
+                "status=excluded.status, journal_path=excluded.journal_path, "
+                "entry=excluded.entry, updated_at=excluded.updated_at",
+                (
+                    run_id,
+                    self.job_id,
+                    merged.status,
+                    str(Path(path)) if path is not None else "",
+                    canonical_json_bytes(merged).decode("utf-8"),
+                    now,
+                    now,
+                ),
+            )
+        if path is not None:
+            _project_settlement(Path(path), merged)  # after commit
+        return True
+
+    def _check_owner(self, connection: Any, run_id: str) -> None:
+        """In the settlement transaction: the job exists and ``jobs.run_id`` IS this run."""
+
+        owner = connection.execute("SELECT run_id FROM jobs WHERE id=?", (self.job_id,)).fetchone()
+        if owner is None:
+            raise LedgerConflict(f"settlement of run {run_id} names a missing job {self.job_id}")
+        if owner["run_id"] != run_id:
+            raise LedgerConflict(
+                f"settlement of run {run_id} does not belong to job {self.job_id} "
+                f"(its run is {owner['run_id']})"
+            )
+
+    def row(self, run_id: str) -> dict[str, Any] | None:
+        with self.database.read() as connection:
+            found = connection.execute(
+                "SELECT journal_path, entry, status FROM run_settlements WHERE run_id=?",
+                (run_id,),
+            ).fetchone()
+        return dict(found) if found is not None else None
+
+    def adopt(
+        self, run_id: str, path: Path, lines: list[Mapping[str, Any]], money: RecoveredMoney
+    ) -> bool:
+        """Reconcile settlement lines written before SQLite held settlements into ONE row.
+
+        Every line for the run is read (the pre-fix cancel/resume journal could leave several) and
+        folded with the run's durable money (attempts, dispatch rows, reservation): each money
+        field is the maximum any of them reports, the newest line names the outcome. That canonical
+        row is inserted once, and the projection is rewritten to exactly one line for the run.
+        """
+
+        from id_detector.contracts import InvocationJournalEntry
+        from id_detector.journal import merge_monotonic
+
+        entries: list[Any] = []
+        for line in lines:
+            with suppress(ValueError):
+                entries.append(InvocationJournalEntry.model_validate(dict(line)))
+        if not entries:
+            raise ValueError(f"run {run_id} has no readable settlement line to adopt")
+        canonical = entries[-1]
+        for line in lines:
+            canonical = merge_monotonic(canonical, dict(line))
+        settlement = money.settlement()
+        canonical = merge_monotonic(
+            canonical,
+            {
+                "usd_e6_reserved": settlement.usd_e6_reserved,
+                "usd_e6_spent": settlement.usd_e6_spent,
+                "usd_e2_reserved": settlement.usd_e2_reserved,
+                "usd_e2_spent": settlement.usd_e2_spent,
+                "costs": {"usd_e2": settlement.usd_e2_spent},
+            },
+        )
+        attempts = money.attempts
+        for line in lines:
+            counts = line.get("counts")
+            value = counts.get("paid_attempts") if isinstance(counts, Mapping) else None
+            if isinstance(value, int) and not isinstance(value, bool):
+                attempts = max(attempts, value)
+        if attempts:
+            canonical = canonical.model_copy(
+                update={"counts": {**canonical.counts, "paid_attempts": attempts}}
+            )
+        inserted = self.settle(path, canonical)
+        self.reproject(run_id)  # whoever inserted the row, the file ends with exactly one line
+        return inserted
+
+    def attach(self, run_id: str, path: Path, money: RecoveredMoney) -> bool:
+        """Give a row settled while its media was missing its journal, once the media is found.
+
+        The row keeps its outcome; its money is raised to the full fold (never lowered: the
+        SQLite-only settlement already counted every unresolved dispatch as spent), and the journal
+        is then made to hold exactly that one line.
+        """
+
+        from id_detector.contracts import InvocationJournalEntry
+        from id_detector.io import canonical_json_bytes
+        from id_detector.journal import merge_monotonic
+
+        with self.database.write() as connection:
+            row = connection.execute(
+                "SELECT entry, journal_path FROM run_settlements WHERE run_id=?", (run_id,)
+            ).fetchone()
+            if row is None:
+                return False
+            if not row["journal_path"]:
+                entry = merge_monotonic(
+                    InvocationJournalEntry.model_validate_json(row["entry"]), _money_prior(money)
+                )
+                attempts = max(int(entry.counts.get("paid_attempts", 0) or 0), money.attempts)
+                if attempts:
+                    entry = entry.model_copy(
+                        update={"counts": {**entry.counts, "paid_attempts": attempts}}
+                    )
+                connection.execute(
+                    "UPDATE run_settlements SET journal_path=?, entry=?, updated_at=? "
+                    "WHERE run_id=? AND journal_path=''",
+                    (
+                        str(Path(path)),
+                        canonical_json_bytes(entry).decode("utf-8"),
+                        self.clock(),
+                        run_id,
+                    ),
+                )
+        return self.reproject(run_id)
+
+    def reproject(self, run_id: str) -> bool:
+        """Make the journal hold EXACTLY the row's settlement: restored when missing or different.
+
+        A line reporting MORE money than the row first raises the row (money is monotonic and the
+        row must never under-report); otherwise the row wins. Duplicate lines collapse to one.
+        """
+
+        from id_detector.contracts import InvocationJournalEntry
+        from id_detector.io import canonical_json_bytes
+        from id_detector.journal import invocation_lines, merge_monotonic
+
+        row = self.row(run_id)
+        if row is None or not row["journal_path"]:
+            return False
+        path = Path(row["journal_path"])
+        lines = invocation_lines(path, run_id)
+        stored = InvocationJournalEntry.model_validate_json(row["entry"])
+        if len(lines) == 1 and _same_settlement(lines[0], stored):
+            return False
+        with self.database.write() as connection:
+            current = connection.execute(
+                "SELECT entry FROM run_settlements WHERE run_id=?", (run_id,)
+            ).fetchone()
+            canonical = InvocationJournalEntry.model_validate_json(current["entry"])
+            raised = canonical
+            for line in lines:
+                raised = merge_monotonic(raised, line)
+            if raised != canonical:
+                connection.execute(
+                    "UPDATE run_settlements SET entry=?, updated_at=? WHERE run_id=?",
+                    (canonical_json_bytes(raised).decode("utf-8"), self.clock(), run_id),
+                )
+        _project_settlement(path, raised)  # replaces every line for the run with this one
+        return True
+
+
+class LegacyRecoveryLedger(SettlementLedger):
+    """The ONE explicit path for a pre-upgrade job that has no ``jobs.run_id``.
+
+    Its association is validated in the settlement transaction instead of run ownership: the job
+    exists, still has no run id and is stopped; no job owns the run; and no settlement of the run
+    already names a different job.
+    """
+
+    def _check_owner(self, connection: Any, run_id: str) -> None:
+        legacy = connection.execute(
+            f"SELECT 1 FROM jobs WHERE id=? AND run_id IS NULL AND state NOT IN {_ACTIVE_SQL}",
+            (self.job_id,),
+        ).fetchone()
+        if legacy is None:
+            raise LedgerConflict(
+                f"job {self.job_id} is not a stopped pre-upgrade job without a run id"
+            )
+        if connection.execute("SELECT 1 FROM jobs WHERE run_id=?", (run_id,)).fetchone():
+            raise LedgerConflict(f"run {run_id} belongs to another job")
+        settled = connection.execute(
+            "SELECT job_id FROM run_settlements WHERE run_id=?", (run_id,)
+        ).fetchone()
+        if settled is not None and settled["job_id"] not in (None, self.job_id):
+            raise LedgerConflict(f"run {run_id} is already settled for job {settled['job_id']}")
+
+
+def _money_prior(money: RecoveredMoney) -> dict[str, Any]:
+    settlement = money.settlement()
+    return {
+        "usd_e6_reserved": settlement.usd_e6_reserved,
+        "usd_e6_spent": settlement.usd_e6_spent,
+        "usd_e2_reserved": settlement.usd_e2_reserved,
+        "usd_e2_spent": settlement.usd_e2_spent,
+        "costs": {"usd_e2": settlement.usd_e2_spent},
+    }
+
+
+def _same_settlement(line: Mapping[str, Any], stored: Any) -> bool:
+    from id_detector.contracts import InvocationJournalEntry
+
+    try:
+        return InvocationJournalEntry.model_validate(dict(line)) == stored
+    except ValueError:
+        return False
+
+
+def _project_settlement(path: Path, entry: Any) -> None:
+    from id_detector import journal as journal_module
+
+    journal_module.append_invocation(path, entry)
+
+
+def _run_attempt_events(connection: Any, run_id: str, provider: str = "audd") -> list[AttemptEvent]:
+    rows = connection.execute(
+        f"SELECT {_ATTEMPT_ROW_COLUMNS} FROM provider_attempt_events "
+        "WHERE run_id = ? AND provider = ? ORDER BY event_id",
+        (run_id, provider),
+    ).fetchall()
+    return [event_from_row(row) for row in rows]
+
+
+def fold_run_money(connection: Any, run_id: str) -> RecoveredMoney:
+    """Fold every durable record of ``run_id`` into its cumulative money and raise the row to it.
+
+    The shared :mod:`id_detector.run_ledger` fold over the SQLite attempt events, the durable
+    reservation, the primary checkpoint and the row itself: a cancellation, dead letter or
+    settlement of a run that died before ``primary`` never reports less than it really spent.
+    """
+
+    run = connection.execute(
+        "SELECT checkpoints, usd_e6_reserved, usd_e6_spent, attempts FROM analysis_runs "
+        "WHERE run_id=?",
+        (run_id,),
+    ).fetchone()
+    if run is None:
+        return RecoveredMoney()
+    try:
+        document = json.loads(run["checkpoints"])
+    except (TypeError, json.JSONDecodeError):
+        document = {}
+    if not isinstance(document, dict):
+        document = {}
+    primary = document.get("primary")
+    primary_state = primary.get("state") if isinstance(primary, dict) else None
+    if not isinstance(primary_state, dict):
+        primary_state = {}
+    money = recovered_money(
+        fold_run_ledger(run_id, _run_attempt_events(connection, run_id)),
+        ReservationRecord.from_document(document.get("_reservation"), run_id=run_id),
+        RecoveredMoney(int(run["usd_e6_reserved"]), int(run["usd_e6_spent"]), int(run["attempts"])),
+        RecoveredMoney(
+            int(primary_state.get("usd_e6_reserved", 0) or 0),
+            int(primary_state.get("usd_e6_spent", 0) or 0),
+            int(primary_state.get("attempts", 0) or 0),
+        ),
+    )
+    connection.execute(
+        "UPDATE analysis_runs SET usd_e6_reserved=MAX(usd_e6_reserved, ?), "
+        "usd_e6_spent=MAX(usd_e6_spent, ?), attempts=MAX(attempts, ?) WHERE run_id=?",
+        (money.usd_e6_reserved, money.usd_e6_spent, money.attempts, run_id),
+    )
+    return money
 
 
 def _json(value: object) -> str:
@@ -114,17 +699,13 @@ def fsync_artefact(path: Path) -> None:
 def require_durable(artefacts: tuple[Path, ...] | list[Path]) -> tuple[Path, ...]:
     """Return the artefacts, refusing any that is missing or cannot be made durable."""
 
-    resolved: list[Path] = []
-    for item in artefacts:
-        path = Path(item)
-        if not path_is_file(path):
-            raise ValueError(f"checkpoint artefacts are not durable: {path}")
-        try:
-            fsync_artefact(path)
-        except OSError as exc:
-            raise ValueError(f"checkpoint artefact could not be flushed: {path} ({exc})") from exc
-        resolved.append(path.resolve())
-    return tuple(resolved)
+    return tuple(Path(record["path"]) for record in durable_records(artefacts))
+
+
+def durable_records(artefacts: tuple[Path, ...] | list[Path]) -> list[dict[str, Any]]:
+    """The service's shared checkpoint boundary (flush, then size + SHA-256 per artefact)."""
+
+    return durable_artefact_records(artefacts, flush=lambda path: fsync_artefact(path))
 
 
 def _target_document(
@@ -233,6 +814,7 @@ class SQLiteCheckpointStore:
         claim_token: str | None = None,
         before_commit: Callable[[str, CheckpointPhase], None] | None = None,
         after_commit: Callable[[str, CheckpointPhase], None] | None = None,
+        clock: Callable[[], float] = time.time,
     ) -> None:
         self.database = database
         self.work_root = Path(work_root).resolve()
@@ -242,6 +824,7 @@ class SQLiteCheckpointStore:
         self.claim_token = claim_token
         self.before_commit = before_commit
         self.after_commit = after_commit
+        self.clock = clock
 
     def _document(self, connection: Any, run_id: str) -> dict[str, Any]:
         row = connection.execute(
@@ -259,9 +842,14 @@ class SQLiteCheckpointStore:
 
     def completed_phases(self, run_id: str) -> frozenset[CheckpointPhase]:
         with self.database.read() as connection:
-            known = set(CHECKPOINT_PHASES)
-            phases = self._document(connection, run_id).keys() & known
-            return frozenset(phases)  # type: ignore[return-value]
+            document = self._document(connection, run_id)
+        # A phase counts only while its artefacts are still there with their recorded content; a
+        # checkpoint whose artefact is absent (a rename a power cut lost) is not complete.
+        return frozenset(
+            phase
+            for phase in CHECKPOINT_PHASES
+            if phase in document and checkpoint_entry_valid(document[phase], phase=phase)
+        )
 
     def write(
         self,
@@ -275,13 +863,15 @@ class SQLiteCheckpointStore:
             raise ValueError(f"unknown checkpoint phase: {phase}")
         if self.claim_token is None:
             raise StaleClaim("checkpoint store has no claim token; refusing to write")
-        durable = require_durable(artefacts)
+        records = durable_records(artefacts)
         if self.before_commit is not None:
             self.before_commit(run_id, phase)
         with self.database.write() as connection:
+            require_run_fence(connection, run_id, self.claim_token, self.clock())
             document = self._document(connection, run_id)
             document[phase] = {
-                "artefacts": [str(path) for path in durable],
+                "artefacts": [record["path"] for record in records],
+                "artefact_records": records,
                 "state": state or {},
             }
             if phase == "primary":
@@ -311,6 +901,17 @@ class SQLiteCheckpointStore:
                 raise StaleClaim(f"checkpoint claim is no longer current: {run_id}/{phase}")
         if self.after_commit is not None:
             self.after_commit(run_id, phase)
+
+    def settlement_writer(self, run_id: str) -> SettlementLedger:
+        """The run's terminal settlement: its SQLite row under the run fence, in one transaction."""
+
+        return SettlementLedger(
+            self.database,
+            fence=lambda connection: require_run_fence(
+                connection, run_id, self.claim_token, self.clock()
+            ),
+            clock=self.clock,
+        )
 
     def state(self, run_id: str, phase: CheckpointPhase) -> dict[str, Any]:
         with self.database.read() as connection:
@@ -344,20 +945,23 @@ _EVENT_SEQ = {"prepared": 1, "dispatched": 2, "resolved": 3}
 class _EventProjection:
     """Insert immutable ``provider_attempt_events`` rows, fenced by the run's claim token."""
 
-    def __init__(self, database: Database, *, run_id: str, claim_token: str | None) -> None:
+    def __init__(
+        self,
+        database: Database,
+        *,
+        run_id: str,
+        claim_token: str | None,
+        clock: Callable[[], float] = time.time,
+    ) -> None:
         self.database = database
         self.run_id = run_id
         self.claim_token = claim_token
+        self.clock = clock
 
     def fence(self, connection: Any) -> None:
         if self.claim_token is None:
             raise StaleClaim("attempt journal has no claim token; refusing to write")
-        row = connection.execute(
-            "SELECT 1 FROM analysis_runs WHERE run_id=? AND claim_token=?",
-            (self.run_id, self.claim_token),
-        ).fetchone()
-        if row is None:
-            raise StaleClaim(f"attempt claim is no longer current: {self.run_id}")
+        require_run_fence(connection, self.run_id, self.claim_token, self.clock())
 
     def insert(
         self,
@@ -372,10 +976,12 @@ class _EventProjection:
         outcome: str | None,
         unit_usd_e6: int,
         at: str,
+        verify_egress: bool = True,
+        ordinal: int | None = None,
     ) -> None:
         # ``ON CONFLICT DO NOTHING``, not ``INSERT OR IGNORE``: replaying an event this run already
         # projected is expected, but a row that violates a CHECK must raise instead of vanishing.
-        connection.execute(
+        inserted = connection.execute(
             "INSERT INTO provider_attempt_events("
             "attempt_id, seq, run_id, provider, egress_id, query_id, parent_attempt_id, "
             "state, outcome, http_status, unit_usd_e6, at) "
@@ -395,15 +1001,40 @@ class _EventProjection:
                 unit_usd_e6,
                 at,
             ),
+        ).rowcount
+        if inserted == 1:
+            return
+        # Replaying an event this run already projected is expected. A DIFFERENT payload under the
+        # same ``(attempt_id, seq)`` is two stories about one request: refused, never ignored.
+        existing = connection.execute(
+            f"SELECT {_ATTEMPT_ROW_COLUMNS} FROM provider_attempt_events "
+            "WHERE attempt_id=? AND seq=?",
+            (attempt_id, _EVENT_SEQ[state]),
+        ).fetchone()
+        incoming = AttemptEvent(
+            attempt_id=attempt_id,
+            event=state,
+            run_id=self.run_id,
+            provider=provider,
+            query_id=query_id,
+            parent_attempt_id=parent_attempt_id,
+            unit_usd_e6=unit_usd_e6,
+            outcome=outcome,
+            ordinal=ordinal,
+            # A backfill replays a JSONL line, which records no egress: the projected row's own
+            # attribution stands. A live duplicate claiming another egress is a conflict.
+            egress_id=egress_id if verify_egress else None,
         )
+        if existing is None or event_from_row(existing).conflicts(incoming):
+            raise LedgerConflict(f"conflicting duplicate {state} event for attempt {attempt_id}")
 
 
 class SQLiteAttemptJournal(AttemptJournal):
     """Attempt journal that also projects each immutable event into SQLite.
 
-    The JSONL file stays authoritative -- it is what ``recover_paid_attempts`` reads, and it is
-    fsynced before the request enters network I/O. The SQLite rows are a projection, so a crash
-    between the two is repaired by :meth:`backfill` rather than losing an event.
+    SQLite is the authority: each event's row (and, for a dispatch, its ``run_dispatches`` row)
+    commits under the claim fence first, and the JSONL line is its projection, written after that
+    commit. :meth:`backfill` projects a JSONL-only event (an older writer's) into SQLite.
     """
 
     def __init__(
@@ -416,14 +1047,31 @@ class SQLiteAttemptJournal(AttemptJournal):
         unit_usd_e6: int,
         egress_id: str,
         claim_token: str | None = None,
+        clock: Callable[[], float] = time.time,
+        job_id: str | None = None,
+        hosted: bool = True,
     ) -> None:
         super().__init__(path, run_id=run_id, provider=provider, unit_usd_e6=unit_usd_e6)
         self.database = database
+        #: Fail closed: a hosted journal refuses every paid event and reservation (only the free
+        #: Shazam provider may journal). The queue's local mode passes ``hosted=False``.
+        self.hosted = hosted
         self.egress_id = egress_id
         self.claim_token = claim_token
-        self.projection = _EventProjection(database, run_id=run_id, claim_token=claim_token)
+        self.job_id = job_id
+        self.projection = _EventProjection(
+            database, run_id=run_id, claim_token=claim_token, clock=clock
+        )
+        #: Paid dispatches are admitted by the ONE queue check, inside the event's transaction.
+        self.dispatch_admission = (
+            DispatchAdmission(
+                database, job_id=job_id, claim_token=claim_token, clock=clock, hosted=hosted
+            )
+            if job_id is not None and claim_token is not None and provider == "audd"
+            else None
+        )
 
-    def backfill(self) -> int:
+    def backfill(self, *, batch_size: int = 64) -> int:
         """Project any durable JSONL event this run is missing in SQLite.
 
         A crash between the journal append and the SQLite insert would otherwise leave the hosted
@@ -433,121 +1081,203 @@ class SQLiteAttemptJournal(AttemptJournal):
 
         if not path_is_file(self.path):
             return 0
+        # Read and parsed OUTSIDE any write transaction, then projected in short fenced batches:
+        # an unbounded read holding SQLite's writer lock could starve the heartbeat past the lease.
+        events = [
+            event
+            for event in parse_journal_lines(read_text(self.path))
+            if event.run_id == self.run_id
+        ]
         projected = 0
-        with self.database.write() as connection:
-            self.projection.fence(connection)
-            for line in read_text(self.path).splitlines():
-                if not line.strip():
-                    continue
-                try:
-                    event = ProviderAttemptEvent.model_validate(json.loads(line))
-                except ValueError:  # a torn trailing line from a crash mid-append
-                    continue
-                if event.run_id != self.run_id:
-                    continue
-                self.projection.insert(
-                    connection,
-                    attempt_id=event.attempt_id,
-                    provider=event.provider,
-                    egress_id=self.egress_id,
-                    query_id=event.query_id,
-                    parent_attempt_id=event.parent_attempt_id,
-                    state=event.event,
-                    outcome=event.outcome,
-                    unit_usd_e6=event.unit_usd_e6,
-                    at=event.at,
-                )
-                projected += 1
+        batch = max(1, batch_size)
+        for start in range(0, len(events), batch):
+            with self.database.write() as connection:
+                self.projection.fence(connection)
+                for event in events[start : start + batch]:
+                    self.projection.insert(
+                        connection,
+                        attempt_id=event.attempt_id,
+                        provider=event.provider,
+                        egress_id=self.egress_id,
+                        query_id=event.query_id,
+                        parent_attempt_id=event.parent_attempt_id,
+                        state=event.event,
+                        outcome=event.outcome,
+                        unit_usd_e6=event.unit_usd_e6,
+                        at=event.at,
+                        verify_egress=False,
+                        ordinal=event.ordinal,
+                    )
+                    projected += 1
         return projected
 
-    def _write(self, event: str, attempt_id: str, outcome: str | None) -> None:
-        query_id, _window_id, _ordinal, parent_attempt_id = self._open[attempt_id]
+    def durable_events(self) -> list[Any]:
+        """The JSONL AND the validated SQLite projection, folded together.
+
+        A new journal whose directory entry a power cut lost leaves its events in SQLite only; the
+        run's paid state still recovers from them rather than restoring zero and re-sending.
+        """
+
+        with self.database.read() as connection:
+            projected = _run_attempt_events(connection, self.run_id, self.provider)
+        return [*super().durable_events(), *projected]
+
+    def _stored_reservation(self, connection: Any) -> ReservationRecord | None:
+        row = connection.execute(
+            "SELECT CASE WHEN json_valid(checkpoints) "
+            "THEN json_extract(checkpoints, '$._reservation') END AS reservation "
+            "FROM analysis_runs WHERE run_id=?",
+            (self.run_id,),
+        ).fetchone()
+        if row is None or row["reservation"] is None:
+            return None
+        try:
+            value = json.loads(row["reservation"])
+        except (TypeError, json.JSONDecodeError):
+            return None
+        return ReservationRecord.from_document(value, run_id=self.run_id)
+
+    def durable_reservation(self) -> Any:
+        record = super().durable_reservation()
+        if record is not None:
+            return record
+        with self.database.read() as connection:
+            return self._stored_reservation(connection)
+
+    def record_reservation(self, reservation: Any) -> Any:
+        """Durable in SQLite (fenced, write-once) and beside the journal, before any dispatch."""
+
+        if self.hosted:
+            raise DispatchRefused(HOSTED_PAID_REFUSAL)
+        record = ReservationRecord.from_reservation(self.run_id, reservation)
         with self.database.write() as connection:
-            # Fenced BEFORE the durable append: a worker that lost its lease must not be able to
-            # journal -- and therefore must not be able to dispatch -- another paid request.
             self.projection.fence(connection)
-            super()._write(event, attempt_id, outcome)  # type: ignore[arg-type]
+            existing = self._stored_reservation(connection)
+            if existing is not None:
+                record = existing
+            else:
+                connection.execute(
+                    "UPDATE analysis_runs SET checkpoints=json_set("
+                    "CASE WHEN json_valid(checkpoints) THEN checkpoints ELSE '{}' END, "
+                    "'$._reservation', json(?)), usd_e6_reserved=MAX(usd_e6_reserved, ?) "
+                    "WHERE run_id=? AND claim_token=?",
+                    (
+                        json.dumps(record.document()),
+                        record.usd_e6_reserved,
+                        self.run_id,
+                        self.claim_token,
+                    ),
+                )
+        if self.dispatch_admission is not None:
+            # The queue's local mode: the same unique, claim-fenced ``run_reservations`` row every
+            # paid dispatch requires inside its admission transaction.
+            record = self.dispatch_admission.reserve(record)
+        super().record_reservation(record.reservation())
+        return record
+
+    def for_provider(self, provider: str) -> SQLiteAttemptJournal:
+        """The same run's journal for another provider, projected into the same SQLite ledger."""
+
+        return SQLiteAttemptJournal(
+            self.path.parent / f"{provider}-{self.path.name}",
+            database=self.database,
+            run_id=self.run_id,
+            provider=provider,
+            unit_usd_e6=0,
+            egress_id=self.egress_id,
+            claim_token=self.claim_token,
+            hosted=self.hosted,
+            clock=self.projection.clock,
+        )
+
+    def events_for(self, provider: str) -> list[Any]:
+        with self.database.read() as connection:
+            return _run_attempt_events(connection, self.run_id, provider)
+
+    def _persist(self, record: ProviderAttemptEvent) -> None:
+        """ONE immutable event object: projected (and verified) and appended in one transaction.
+
+        Fenced first: a worker that lost its lease must not journal — and therefore must not
+        dispatch — another paid request. The projection is inserted before the append, so a
+        conflicting duplicate is refused before anything reaches the JSONL; a crash after the
+        append and before the commit leaves the event in the JSONL, which :meth:`backfill` repairs.
+        """
+
+        if self.hosted and self.provider != "shazam":
+            # Before any transaction, row or line: hosted paid money is deferred (round 6).
+            raise DispatchRefused(HOSTED_PAID_REFUSAL)
+        with self.database.write() as connection:
+            self.projection.fence(connection)
+            if record.event == "dispatched" and self.dispatch_admission is not None:
+                # Claim check + authoritative dispatch row, in THIS transaction.
+                self.dispatch_admission.admit_in(connection, record, self.path)
             self.projection.insert(
                 connection,
-                attempt_id=attempt_id,
-                provider=self.provider,
+                attempt_id=record.attempt_id,
+                provider=record.provider,
                 egress_id=self.egress_id,
-                query_id=query_id,
-                parent_attempt_id=parent_attempt_id,
-                state=event,
-                outcome=outcome,
-                unit_usd_e6=self.unit_usd_e6,
-                at=timestamp(),
+                query_id=record.query_id,
+                parent_attempt_id=record.parent_attempt_id,
+                state=record.event,
+                outcome=record.outcome,
+                unit_usd_e6=record.unit_usd_e6,
+                at=record.at,
+                ordinal=record.ordinal,
             )
+        # The JSONL is a projection, written only after the authoritative rows committed.
+        append_line(self.path, record)
 
 
 class LedgerShazamBreaker(ShazamBreaker):
-    """§2.3.5's per-process Shazam policy, projected into the hosted attempt ledger.
+    """One run's view of the worker's ONE process Shazam breaker (§2.3.5).
 
-    4b-ii's service-wide breaker reads ``provider_attempt_events``: without these rows the table
-    has an AudD-only history and no Shazam denominator, so free primaries and Deep secondaries
-    would be invisible to it. The breaker is the only hosted seam the recognise path exposes; it
-    knows the egress and the outcome but not the clip cache key, so ``query_id`` is NULL rather
-    than invented. ``prepared`` is written when the attempt is admitted (before network I/O) and
-    ``dispatched``/``resolved`` when it settles -- an unresolved Shazam attempt is free, so
-    re-issuing it is correct and it is never counted as spend.
+    Every policy decision -- samples, daily budget, cooldown, latch -- belongs to ``inner``, the
+    worker's single process breaker, so its state outlives each job. The breaker no longer writes
+    attempt rows: a Shazam request has ONE identity, the recognise journal's own event (the clip
+    query id, a deterministic attempt id), which the hosted journal projects into
+    ``provider_attempt_events``. Two writers would give one request two identities.
     """
 
     def __init__(
         self,
         config: BreakerConfig | None = None,
         *,
-        database: Database,
-        run_id: str,
-        egress_id: str,
-        claim_token: str | None,
+        database: Database | None = None,
+        run_id: str | None = None,
+        egress_id: str | None = None,
+        claim_token: str | None = None,
         clock: Callable[[], Any] | None = None,
+        inner: ShazamBreaker | None = None,
+        lease_clock: Callable[[], float] = time.time,
     ) -> None:
-        super().__init__(config, clock=clock)
-        self.projection = _EventProjection(database, run_id=run_id, claim_token=claim_token)
-        self.database = database
-        self.egress_id = egress_id
-        self._pending: deque[str] = deque()
-        self._ledger_lock = threading.Lock()
+        # Deliberately no ShazamBreaker.__init__: this object holds no policy state of its own.
+        del database, run_id, egress_id, claim_token, lease_clock
+        self.inner = inner if inner is not None else ShazamBreaker(config, clock=clock)
 
-    def _record(self, attempt_id: str, state: str, outcome: str | None) -> None:
-        with self.database.write() as connection:
-            self.projection.fence(connection)
-            self.projection.insert(
-                connection,
-                attempt_id=attempt_id,
-                provider="shazam",
-                egress_id=self.egress_id,
-                query_id=None,
-                parent_attempt_id=None,
-                state=state,
-                outcome=outcome,
-                unit_usd_e6=0,
-                at=timestamp(),
-            )
+    @property
+    def config(self) -> BreakerConfig:  # type: ignore[override]
+        return self.inner.config
+
+    def configure(self, config: BreakerConfig) -> None:
+        self.inner.configure(config)
+
+    def reenable(self) -> None:
+        self.inner.reenable()
+
+    def reason(self) -> str | None:
+        return self.inner.reason()
 
     def dispatch(self, *, running_free: bool) -> Any:
-        day = super().dispatch(running_free=running_free)
-        attempt_id = uuid.uuid4().hex
-        self._record(attempt_id, "prepared", None)
-        with self._ledger_lock:
-            self._pending.append(attempt_id)
-        return day
+        return self.inner.dispatch(running_free=running_free)
 
     def release_dispatch(self, dispatch_day: Any) -> None:
-        super().release_dispatch(dispatch_day)
-        with self._ledger_lock:
-            if self._pending:
-                # The admission was rolled back before network I/O; its ``prepared`` row stands
-                # alone, which is exactly what "never sent" means in §2.3.3.
-                self._pending.pop()
+        self.inner.release_dispatch(dispatch_day)
+
+    def sent(self) -> None:
+        self.inner.sent()
 
     def resolved(self, outcome: str) -> None:
-        super().resolved(outcome)
-        with self._ledger_lock:
-            attempt_id = self._pending.popleft() if self._pending else uuid.uuid4().hex
-        self._record(attempt_id, "dispatched", None)
-        self._record(attempt_id, "resolved", outcome)
+        self.inner.resolved(outcome)
 
 
 class JobQueue:
@@ -559,10 +1289,16 @@ class JobQueue:
         *,
         local_mode: bool = False,
         clock: Callable[[], float] = time.time,
+        on_abandon: Callable[[str, str | None, str], None] | None = None,
     ) -> None:
         self.database = database
         self.local_mode = local_mode
         self.clock = clock
+        #: Called AFTER a quarantine or dead letter commits, with ``(job id, run id, target)``: the
+        #: local worker settles the run's shared ledger there (a hosted run's money is folded into
+        #: its ``analysis_runs`` row inside the transaction instead).
+        self.on_abandon = on_abandon
+        self._abandoned: list[tuple[str, str | None, str]] = []
 
     def enqueue(
         self,
@@ -586,7 +1322,8 @@ class JobQueue:
         with self.database.write() as connection:
             connection.execute(
                 "INSERT INTO jobs(id, run_id, target, recipe_id, state, log_path, tenant_scope, "
-                "progress, created_at, updated_at) VALUES (?, ?, ?, ?, 'intake', ?, ?, ?, ?, ?)",
+                "progress, created_at, updated_at, money_authority) "
+                "VALUES (?, ?, ?, ?, 'intake', ?, ?, ?, ?, ?, ?)",
                 (
                     identifier,
                     run_id,
@@ -597,6 +1334,7 @@ class JobQueue:
                     _json(dict(progress or {})),
                     now,
                     now,
+                    MONEY_AUTHORITY,
                 ),
             )
         return identifier
@@ -645,17 +1383,36 @@ class JobQueue:
         )
 
     def _abandon_run(
-        self, connection: Any, run_id: str | None, *, status: str, reason: str | None, now: float
+        self,
+        connection: Any,
+        run_id: str | None,
+        *,
+        status: str,
+        reason: str | None,
+        now: float,
+        job_id: str | None = None,
     ) -> None:
         """Move a run to the same terminal fate as the job that was driving it.
 
         A dead letter that left its run ``analysis`` is an immortal run: nobody will ever execute
         it, yet the intake transaction would keep attaching new submissions to it. Accounting
-        (attempts, reservation, spend) is deliberately untouched.
+        (attempts, reservation, spend) is folded from every durable record first and only ever
+        raised: a run that died before ``primary`` still carries what its events prove it spent.
         """
 
         if run_id is None:
             return
+        live_driver = connection.execute(
+            f"SELECT 1 FROM analysis_runs WHERE run_id=? AND NOT {_NO_OTHER_LIVE_DRIVER_SQL}",
+            (run_id, job_id or "", now),
+        ).fetchone()
+        if live_driver is not None:
+            # Another job drives this run under an unexpired lease: whatever became of THIS row,
+            # the run is not its to fold, abandon or unfence.
+            return
+        # A corrupt ledger must not keep a dead row claimable; the row's own money then stands.
+        with suppress(LedgerConflict):
+            fold_run_money(connection, run_id)
         connection.execute(
             "UPDATE analysis_runs SET status=?, reason=COALESCE(reason, ?), "
             "finished_at=COALESCE(finished_at, ?), claim_token=NULL "
@@ -675,16 +1432,71 @@ class JobQueue:
             "lease_until=NULL, heartbeat_at=NULL, claim_token=NULL, updated_at=? WHERE id=?",
             (reason, now, row["id"]),
         )
-        self._abandon_run(connection, row["run_id"], status="dead_letter", reason=reason, now=now)
+        self._remember_abandoned(row["id"], row["run_id"], row["target"])
+        self._abandon_run(
+            connection,
+            row["run_id"],
+            status="dead_letter",
+            reason=reason,
+            now=now,
+            job_id=row["id"],
+        )
+
+    def _remember_abandoned(self, job_id: str, run_id: str | None, target: object) -> None:
+        if self.on_abandon is None or run_id is None:
+            return
+        text = ""
+        with suppress(TypeError, ValueError, AttributeError):
+            value = json.loads(target) if isinstance(target, str) else None
+            if isinstance(value, dict):
+                text = str(value.get("url") or value.get("path") or value.get("upload_id") or "")
+        if isinstance(target, PlatformUrl):
+            text = target.url
+        elif isinstance(target, LocalPath):
+            text = str(target.path)
+        self._abandoned.append((job_id, run_id, text))
+
+    def _flush_abandoned(self) -> None:
+        pending, self._abandoned = self._abandoned, []
+        for job_id, run_id, target in pending:
+            with suppress(Exception):  # settlement bookkeeping never breaks the queue
+                assert self.on_abandon is not None
+                self.on_abandon(job_id, run_id, target)
 
     def claim(self, worker_id: str, *, lease_seconds: float = DEFAULT_LEASE_SECONDS) -> Job | None:
-        """Fence the oldest claimable job to a fresh claim token and return it."""
+        """Fence the oldest claimable job to a fresh claim token and return it.
+
+        A row quarantined on the way is settled through ``on_abandon`` only once the claim
+        transaction has committed; a rolled-back quarantine settles nothing.
+        """
+
+        self._abandoned = []
+        try:
+            job = self._claim(worker_id, lease_seconds=lease_seconds)
+        except BaseException:
+            self._abandoned = []
+            raise
+        self._flush_abandoned()
+        return job
+
+    def _claim(self, worker_id: str, *, lease_seconds: float) -> Job | None:
 
         now = self.clock()
         with self.database.write() as connection:
+            # Inside the claim transaction: a database upgraded by newer code is never claimed from.
+            version = int(
+                connection.execute(
+                    "SELECT COALESCE(MAX(number), 0) FROM schema_migrations"
+                ).fetchone()[0]
+            )
+            if version > known_schema_version():
+                raise SchemaTooNew(
+                    f"this work folder's database is at schema {version}, newer than this ID'er "
+                    f"understands ({known_schema_version()}): stop it and run the newer ID'er"
+                )
             rows = connection.execute(
                 f"SELECT * FROM jobs WHERE state IN {_ACTIVE_SQL} "
-                f"AND NOT (state='waiting' AND {_ATTACHED_SQL}) "
+                "AND attached = 0 "
                 "AND (lease_until IS NULL OR lease_until <= ?) ORDER BY created_at, id",
                 (now,),
             ).fetchall()
@@ -695,9 +1507,24 @@ class JobQueue:
                 token = uuid.uuid4().hex
                 changed = connection.execute(
                     "UPDATE jobs SET lease_owner=?, lease_until=?, heartbeat_at=?, claim_token=?, "
+                    # Provenance (migration 0003): this claim is made by money-authority code. A
+                    # job first claimed by older code, or marked 0 by the trigger, stays unproven.
+                    "authority_token=?, money_authority=CASE WHEN money_authority=? "
+                    "OR (money_authority IS NULL AND attempt=0) THEN ? ELSE 0 END, "
                     "attempt=attempt+1, "
                     "updated_at=? WHERE id=? AND (lease_until IS NULL OR lease_until <= ?)",
-                    (worker_id, now + lease_seconds, now, token, now, row["id"], now),
+                    (
+                        worker_id,
+                        now + lease_seconds,
+                        now,
+                        token,
+                        token,
+                        MONEY_AUTHORITY,
+                        MONEY_AUTHORITY,
+                        now,
+                        row["id"],
+                        now,
+                    ),
                 ).rowcount
                 if changed != 1:
                     continue
@@ -711,16 +1538,42 @@ class JobQueue:
                         connection, claimed, f"unusable job row: {type(exc).__name__}: {exc}", now
                     )
                     continue
-                if job.run_id is not None:
-                    # Ownership of the run rotates with the claim, so the previous claim's
-                    # checkpoint, money and journal writes are refused from this moment on --
-                    # including on the cancel-before-start path, which never enters analysis.
+                if job.run_id is not None and not self._rotate_run(
+                    connection, job.run_id, row["id"], token, now
+                ):
+                    # Another job holds this run under a live lease, so this row is not its
+                    # driver: give the claim back untouched and leave the run to its owner.
                     connection.execute(
-                        "UPDATE analysis_runs SET claim_token=? WHERE run_id=?",
-                        (token, job.run_id),
+                        "UPDATE jobs SET lease_owner=NULL, lease_until=NULL, heartbeat_at=NULL, "
+                        "claim_token=NULL, attempt=MAX(attempt - 1, 0), updated_at=? WHERE id=?",
+                        (now, row["id"]),
                     )
+                    continue
                 return job
         return None
+
+    @staticmethod
+    def _rotate_run(connection: Any, run_id: str, job_id: str, token: str, now: float) -> bool:
+        """Hand the run's fence to this claim — only if no other job drives it under a live lease.
+
+        Ownership rotates with the claim, so the previous claim's checkpoint, money and journal
+        writes are refused from this moment on (including the cancel-before-start path). A run
+        with no row yet (intake has not committed) has nothing to rotate.
+        """
+
+        if (
+            connection.execute("SELECT 1 FROM analysis_runs WHERE run_id=?", (run_id,)).fetchone()
+            is None
+        ):
+            return True
+        return (
+            connection.execute(
+                "UPDATE analysis_runs SET claim_token=? "
+                f"WHERE run_id=? AND {_NO_OTHER_LIVE_DRIVER_SQL}",
+                (token, run_id, job_id, now),
+            ).rowcount
+            == 1
+        )
 
     def begin_analysis(self, job_id: str, claim_token: str) -> bool:
         """Make a waiting retry visibly analysis before it enters the pipeline."""
@@ -753,7 +1606,7 @@ class JobQueue:
             rows = connection.execute(
                 "SELECT j.id, j.run_id, r.status FROM jobs j "
                 "JOIN analysis_runs r ON r.run_id=j.run_id "
-                "WHERE j.state='waiting' AND json_extract(j.progress, '$.attached')=1 "
+                "WHERE j.state='waiting' AND j.cancel_requested=0 AND j.attached=1 "
                 f"AND r.status NOT IN {_ACTIVE_SQL}"
             ).fetchall()
             for row in rows:
@@ -798,11 +1651,14 @@ class JobQueue:
 
         now = self.clock()
         with self.database.write() as connection:
+            # "No run" is no analysis_runs row: a local job carries its durable service run id
+            # from submission, long before (and without ever) creating a queue-side run.
             return (
                 connection.execute(
                     "UPDATE jobs SET state='cancelled', cancel_requested=1, progress=?, "
                     "lease_owner=NULL, lease_until=NULL, heartbeat_at=NULL, updated_at=? "
-                    "WHERE id=? AND state='intake' AND run_id IS NULL AND claim_token IS NULL",
+                    "WHERE id=? AND state='intake' AND claim_token IS NULL AND (run_id IS NULL "
+                    "OR NOT EXISTS (SELECT 1 FROM analysis_runs r WHERE r.run_id = jobs.run_id))",
                     (_json(dict(progress)), now, job_id),
                 ).rowcount
                 == 1
@@ -822,9 +1678,95 @@ class JobQueue:
                 == 1
             )
 
+    def adopt_run_id(self, job_id: str, claim_token: str) -> str:
+        """The claimed job's ONE service run id, durable in the column AND the snapshot at once.
+
+        The normalised ``jobs.run_id`` is the only authority; a row that somehow has none gets one
+        minted by :func:`new_run_id` and written to both places in a single fenced transaction.
+        """
+
+        now = self.clock()
+        with self.database.write() as connection:
+            row = connection.execute(
+                "SELECT run_id FROM jobs WHERE id=? AND claim_token=? AND lease_until > ? "
+                f"AND state IN {_ACTIVE_SQL}",
+                (job_id, claim_token, now),
+            ).fetchone()
+            if row is None:
+                raise StaleClaim(f"job {job_id} lost its claim before its run id was adopted")
+            run_id = row["run_id"] or new_run_id()
+            connection.execute(
+                "UPDATE jobs SET run_id=?, progress=CASE WHEN json_valid(progress) THEN "
+                "CASE WHEN json_type(progress, '$.local') = 'object' "
+                "THEN json_set(progress, '$.local.run_id', ?) ELSE progress END "
+                "ELSE progress END WHERE id=? AND claim_token=?",
+                (run_id, run_id, job_id, claim_token),
+            )
+            return run_id
+
+    def settlement_candidates(self, states: frozenset[str]) -> list[tuple[str, str, str, str]]:
+        """``(job id, run id, target, state)`` of settled-state jobs that carry a service run."""
+
+        with self.database.read() as connection:
+            rows = connection.execute(
+                "SELECT id, run_id, target, state FROM jobs WHERE run_id IS NOT NULL "
+                f"AND state IN ({', '.join('?' for _ in states)})",
+                tuple(sorted(states)),
+            ).fetchall()
+        found: list[tuple[str, str, str, str]] = []
+        for row in rows:
+            with suppress(TypeError, ValueError, AttributeError):
+                value = json.loads(row["target"])
+                text = str(value.get("url") or value.get("path") or "")
+                if text:
+                    found.append((row["id"], row["run_id"], text, row["state"]))
+        return found
+
+    def unidentified_terminal_rows(self) -> list[dict[str, Any]]:
+        """Stopped local jobs with no ``run_id`` (pre-upgrade rows) and their time window."""
+
+        with self.database.read() as connection:
+            rows = connection.execute(
+                "SELECT id, target, state, progress, created_at, updated_at FROM jobs "
+                f"WHERE run_id IS NULL AND state NOT IN {_ACTIVE_SQL}"
+            ).fetchall()
+        found: list[dict[str, Any]] = []
+        for row in rows:
+            with suppress(TypeError, ValueError, AttributeError):
+                target = json.loads(row["target"])
+                text = str(target.get("url") or target.get("path") or "")
+                progress = json.loads(row["progress"]) if row["progress"] else {}
+                local = progress.get("local") if isinstance(progress, dict) else None
+                if not text or not isinstance(local, dict):
+                    continue
+                start = local.get("started_at") or local.get("created_at") or row["created_at"]
+                end = local.get("finished_at") or row["updated_at"]
+                found.append(
+                    {
+                        "job_id": row["id"],
+                        "target": text,
+                        "state": row["state"],
+                        "start": float(start),
+                        "end": float(end),
+                    }
+                )
+        return found
+
     def request_cancel(self, job_id: str) -> bool:
         now = self.clock()
         with self.database.write() as connection:
+            # An ATTACHED job drives nothing: cancelling it is an explicit detachment, settled at
+            # once, which reconciliation can never overwrite with the driving run's result.
+            detached = connection.execute(
+                "UPDATE jobs SET state='cancelled', cancel_requested=1, "
+                "progress=json_set(CASE WHEN json_valid(progress) THEN progress ELSE '{}' END, "
+                "'$.detached', 1), lease_owner=NULL, lease_until=NULL, heartbeat_at=NULL, "
+                "claim_token=NULL, updated_at=? "
+                f"WHERE id=? AND state='waiting' AND claim_token IS NULL AND {_ATTACHED_SQL}",
+                (now, job_id),
+            ).rowcount
+            if detached == 1:
+                return True
             return (
                 connection.execute(
                     "UPDATE jobs SET cancel_requested=1, updated_at=? WHERE id=? "
@@ -864,23 +1806,50 @@ class JobQueue:
                 == 1
             )
 
-    def fail(self, job: Job, claim_token: str, reason: str) -> None:
+    def fail(self, job: Job, claim_token: str, reason: str, *, permanent: bool = False) -> None:
         now = self.clock()
-        dead = job.attempt >= job.max_attempts
+        dead = permanent or job.attempt >= job.max_attempts
         state = "dead_letter" if dead else job.state
         dead_reason = reason if dead else None
+        self._abandoned = []
+        try:
+            self._fail(
+                job, claim_token, reason, now=now, dead=dead, state=state, dead_reason=dead_reason
+            )
+        except BaseException:
+            self._abandoned = []
+            raise
+        self._flush_abandoned()
+
+    def _fail(
+        self,
+        job: Job,
+        claim_token: str,
+        reason: str,
+        *,
+        now: float,
+        dead: bool,
+        state: str,
+        dead_reason: str | None,
+    ) -> None:
         with self.database.write() as connection:
             changed = connection.execute(
                 "UPDATE jobs SET state=?, dead_letter_reason=?, lease_owner=NULL, "
-                "lease_until=NULL, "
-                "heartbeat_at=NULL, claim_token=NULL, updated_at=? WHERE id=? AND claim_token=?",
-                (state, dead_reason, now, job.id, claim_token),
+                "lease_until=NULL, heartbeat_at=NULL, claim_token=NULL, updated_at=? "
+                f"WHERE id=? AND claim_token=? AND lease_until > ? AND state IN {_ACTIVE_SQL}",
+                (state, dead_reason, now, job.id, claim_token, now),
             ).rowcount
             if changed != 1:
                 return
             if dead:
+                self._remember_abandoned(job.id, job.run_id, job.target)
                 self._abandon_run(
-                    connection, job.run_id, status="dead_letter", reason=reason, now=now
+                    connection,
+                    job.run_id,
+                    status="dead_letter",
+                    reason=reason,
+                    now=now,
+                    job_id=job.id,
                 )
             else:
                 # Retryable: the run stays claimable, but this claim no longer owns it.
@@ -903,11 +1872,15 @@ class JobQueue:
         now = self.clock()
         with self.database.write() as connection:
             row = connection.execute(
-                "SELECT run_id FROM jobs WHERE id=? AND claim_token=?", (job_id, claim_token)
+                "SELECT run_id FROM jobs WHERE id=? AND claim_token=? AND lease_until > ? "
+                f"AND state IN {_ACTIVE_SQL}",
+                (job_id, claim_token, now),
             ).fetchone()
             if row is None:
                 return False
             if row["run_id"] is not None:
+                # Durable provider events first (§2.3.2): exactly one settlement, never below them.
+                fold_run_money(connection, row["run_id"])
                 # MAX, not assignment: money and attempts already recovered onto this run are
                 # facts. A settlement that reported less (a cancel before restart, a refusal)
                 # would erase spend the owner was really charged.
@@ -980,7 +1953,9 @@ class JobQueue:
         now = self.clock()
         with self.database.write() as connection:
             row = connection.execute(
-                "SELECT run_id FROM jobs WHERE id=? AND claim_token=?", (job_id, claim_token)
+                "SELECT run_id FROM jobs WHERE id=? AND claim_token=? AND lease_until > ? "
+                f"AND state IN {_ACTIVE_SQL}",
+                (job_id, claim_token, now),
             ).fetchone()
             if row is None:
                 return False
@@ -1072,6 +2047,12 @@ class Worker:
         self.checkpoint_before_commit = checkpoint_before_commit
         self.checkpoint_after_commit = checkpoint_after_commit
         self.queue = JobQueue(database, local_mode=local_mode, clock=clock)
+        config = self.options.app_config or AppConfig()
+        #: ONE breaker state for this worker process (§2.3.5): its samples, daily count and latch
+        #: outlive every job. Each run decorates it with that run's ledger context.
+        self.process_breaker: ShazamBreaker = self.options.shazam_breaker or ShazamBreaker(
+            getattr(config, "shazam_breaker", None)
+        )
         self._draining = threading.Event()
 
     def drain(self) -> None:
@@ -1116,6 +2097,11 @@ class Worker:
             try:
                 if job.cancel_requested:
                     self._cancel_before_start(job, token)
+                    return self._current(job.id)
+                if not self.local_mode and recipe_uses_paid_engine(job.recipe):
+                    # Hosted paid money is deferred to the hosted cycle: refused here, before
+                    # intake, any run row, reservation or dispatch -- and permanently.
+                    self.queue.fail(job, token, HOSTED_PAID_REFUSAL, permanent=True)
                     return self._current(job.id)
                 if job.state == "intake" or job.run_id is None:
                     # No run yet, whatever the row says: there is nothing to resume, so this claim
@@ -1193,6 +2179,7 @@ class Worker:
             claim_token=job.claim_token,
             before_commit=self.checkpoint_before_commit,
             after_commit=self.checkpoint_after_commit,
+            clock=self.queue.clock,
         )
 
     def _prepare_intake(self, job: Job, store: SQLiteCheckpointStore) -> PreparedIntake:
@@ -1323,8 +2310,9 @@ class Worker:
         checkpoints = self._validated_checkpoints(intake.checkpoints)
         with self.database.write() as connection:
             owned = connection.execute(
-                "SELECT * FROM jobs WHERE id=? AND claim_token=? AND state='intake'",
-                (job.id, token),
+                "SELECT * FROM jobs WHERE id=? AND claim_token=? AND state='intake' "
+                "AND lease_until > ?",
+                (job.id, token, self.queue.clock()),
             ).fetchone()
             if owned is None:
                 raise StaleClaim("job lease was lost during intake")
@@ -1360,7 +2348,7 @@ class Worker:
             ).fetchone()
             if attached is not None:
                 connection.execute(
-                    "UPDATE jobs SET run_id=?, state='waiting', lease_owner=NULL, "
+                    "UPDATE jobs SET run_id=?, state='waiting', attached=1, lease_owner=NULL, "
                     "lease_until=NULL, heartbeat_at=NULL, claim_token=NULL, progress=?, "
                     "updated_at=? WHERE id=? AND claim_token=?",
                     (
@@ -1372,7 +2360,7 @@ class Worker:
                     ),
                 )
                 return "waiting"
-            run_id = job.run_id or uuid.uuid4().hex
+            run_id = job.run_id or new_run_id()
             if self.reservation_seam is not None:
                 self.reservation_seam.reserve_for_new_run(connection, job, intake)
             connection.execute(
@@ -1425,11 +2413,15 @@ class Worker:
                 raise ValueError(f"checkpoint artefacts are not durable: {phase}")
             # Same boundary as the service's checkpoints: contents flushed before the row that
             # names them is committed (§3.4), never merely "the file exists".
-            durable = require_durable([Path(path) for path in artefacts])
+            records = durable_records([Path(path) for path in artefacts])
             state = checkpoint.get("state", {})
             if not isinstance(state, dict):
                 raise ValueError(f"checkpoint state is invalid: {phase}")
-            result[phase] = {"artefacts": [str(path) for path in durable], "state": state}
+            result[phase] = {
+                "artefacts": [record["path"] for record in records],
+                "artefact_records": records,
+                "state": state,
+            }
         return result
 
     def _intake_for_run(self, job: Job) -> PreparedIntake:
@@ -1482,29 +2474,24 @@ class Worker:
 
         options = self._options_for(job)
         app_config = options.app_config or AppConfig()
-        journal = SQLiteAttemptJournal(
-            self.work_root / ".attempts" / f"{job.run_id}.jsonl",
-            database=self.database,
-            run_id=job.run_id,
-            provider="audd",
-            unit_usd_e6=app_config.audd_usd_e6_per_request,
-            egress_id=self.egress_id,
-            claim_token=claim_token,
-        )
+        journal = self._journal(job.run_id, claim_token, app_config, job_id=job.id)
         # Repair the projection before trusting it: an event may be on disk in the durable JSONL
         # and missing from SQLite if the previous pass died between the two.
         journal.backfill()
-        if options.shazam_breaker is None:
-            options = replace(
-                options,
-                shazam_breaker=LedgerShazamBreaker(
-                    getattr(app_config, "shazam_breaker", None),
-                    database=self.database,
-                    run_id=job.run_id,
-                    egress_id=self.egress_id,
-                    claim_token=claim_token,
-                ),
-            )
+        # Always decorated, never bypassed: a caller-supplied breaker is this worker's process
+        # breaker, and this run's attempts still reach the hosted ledger.
+        options = replace(
+            options,
+            shazam_breaker=LedgerShazamBreaker(
+                None,
+                database=self.database,
+                run_id=job.run_id,
+                egress_id=self.egress_id,
+                claim_token=claim_token,
+                inner=self.process_breaker,
+                lease_clock=self.queue.clock,
+            ),
+        )
         store = SQLiteCheckpointStore(
             self.database,
             self.work_root,
@@ -1513,6 +2500,7 @@ class Worker:
             claim_token=claim_token,
             before_commit=self.checkpoint_before_commit,
             after_commit=self.checkpoint_after_commit,
+            clock=self.queue.clock,
         )
         request = RunRequest(
             run_id=job.run_id,
@@ -1529,6 +2517,10 @@ class Worker:
             cancel_token=QueueCancelToken(),
         )
         result = self.service_runner(request)
+        if result.status == "failed":
+            # §4.3: a real failure comes back as a RunResult with its settled money. The queue
+            # still owns retry and dead-letter, and both fold that money from the durable events.
+            raise RuntimeError(result.reason or "analysis failed")
         if result.status == "waiting":
             self.queue.wait(
                 job.id, claim_token, result.reason, cooldown_seconds=self.wait_cooldown_seconds
@@ -1544,6 +2536,28 @@ class Worker:
             if candidates:
                 bundle_path = candidates[0]
         self.queue.terminal(job.id, claim_token, result, bundle_path=bundle_path)
+
+    def _journal(
+        self,
+        run_id: str,
+        claim_token: str,
+        app_config: AppConfig | None = None,
+        *,
+        job_id: str | None = None,
+    ) -> SQLiteAttemptJournal:
+        config = app_config or self.options.app_config or AppConfig()
+        return SQLiteAttemptJournal(
+            self.work_root / ".attempts" / f"{run_id}.jsonl",
+            database=self.database,
+            run_id=run_id,
+            provider="audd",
+            unit_usd_e6=config.audd_usd_e6_per_request,
+            egress_id=self.egress_id,
+            claim_token=claim_token,
+            clock=self.queue.clock,
+            job_id=job_id,
+            hosted=not self.local_mode,
+        )
 
     def _recovered_money(self, run_id: str | None) -> tuple[int, int, int]:
         """This run's already-recorded reservation, spend and attempts."""
@@ -1575,6 +2589,12 @@ class Worker:
         owner their money was never charged.
         """
 
+        if job.run_id is not None:
+            # Project anything durable in the JSONL but missing from SQLite before settling; the
+            # settlement then folds every event (a run that died before ``primary``). If this
+            # claim is stale the fenced settlement below refuses to write at all.
+            with suppress(OSError, ValueError, StaleClaim):
+                self._journal(job.run_id, claim_token).backfill()
         reserved, spent, attempts = self._recovered_money(job.run_id)
         result = RunResult(
             job.run_id or "", "cancelled", None, None, None, reserved, spent, attempts
