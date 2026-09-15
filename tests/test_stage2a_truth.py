@@ -135,7 +135,9 @@ def test_seed_verify_second_pass_freeze_state_machine(tmp_path: Path) -> None:
         for episode in resolved.episodes
     )
 
-    manifest_path = tmp_path / "corpus-version.json"
+    # The one manifest location every consumer finds: the corpus directory being frozen (round-3
+    # R-P1-3).  Entry paths are relative to it.
+    manifest_path = truth_dir.parent / "corpus-version.json"
     manifest = freeze_truth(truth_dir.parent, corpus_version="frozen-v1", out_path=manifest_path)
     assert manifest["corpus_version"] == "frozen-v1"
     assert manifest["sets"][0]["path"] == "set-one/ground_truth.json"
@@ -166,7 +168,7 @@ def test_seed_combines_hints_and_manual_tracklist_and_marks_repeat(tmp_path: Pat
     tracklist = tmp_path / "tracklist.txt"
     tracklist.write_text("00:20 Artist - Repeat\n", encoding="utf-8")
     truth = seed_truth(
-        out_path=tmp_path / "ground_truth.json",
+        out_path=tmp_path / "corpus" / "set" / "ground_truth.json",
         set_id="repeat-set",
         duration_ms=40_000,
         media_key="b" * 64,
@@ -186,7 +188,7 @@ def test_mixed_timed_and_untimed_seed_requires_explicit_cues(tmp_path: Path) -> 
     tracklist.write_text("Untimed - Track\n", encoding="utf-8")
     with pytest.raises(ValueError, match="explicit cue for every entry"):
         seed_truth(
-            out_path=tmp_path / "ground_truth.json",
+            out_path=tmp_path / "corpus" / "set" / "ground_truth.json",
             set_id="mixed",
             duration_ms=60_000,
             media_key="c" * 64,
@@ -198,7 +200,7 @@ def test_mixed_timed_and_untimed_seed_requires_explicit_cues(tmp_path: Path) -> 
 def test_first_pass_can_replace_seed_with_full_timeline_annotation(tmp_path: Path) -> None:
     tracklist = tmp_path / "tracklist.txt"
     tracklist.write_text("Seed Artist - Seed Track\n", encoding="utf-8")
-    truth_path = tmp_path / "ground_truth.json"
+    truth_path = tmp_path / "corpus" / "set" / "ground_truth.json"
     seeded = seed_truth(
         out_path=truth_path,
         set_id="editable",
@@ -292,10 +294,12 @@ def test_work_only_truth_can_freeze_without_exact_version_evidence(tmp_path: Pat
     annotation = tmp_path / "work-only.json"
     atomic_write_json(annotation, payload)
     verify_truth(truth_path, annotator_ref="work-reviewer", annotation_path=annotation)
+    # The one supported layout is <corpus>/<set>/ground_truth.json with the manifest in <corpus>
+    # (round 4); ``tmp_path`` is the corpus and ``set`` the set folder.
     manifest = freeze_truth(
-        truth_path.parent,
+        tmp_path,
         corpus_version="work-only-v1",
-        out_path=tmp_path / "work-only-manifest.json",
+        out_path=tmp_path / "corpus-version.json",
     )
     assert manifest["sets"][0]["set_id"] == "work-only"
 
@@ -392,8 +396,9 @@ def _seed_with_overlays(tmp_path: Path, tracklist_text: str, overlays_text: str,
     tracklist.write_text(tracklist_text, encoding="utf-8")
     overlays = tmp_path / "overlays.txt"
     overlays.write_text(overlays_text, encoding="utf-8")
+    (tmp_path / "corpus").mkdir(parents=True, exist_ok=True)  # seeds need an existing root
     return seed_truth(
-        out_path=tmp_path / "ground_truth.json",
+        out_path=tmp_path / "corpus" / "set" / "ground_truth.json",
         set_id="overlay-set",
         duration_ms=kwargs.pop("duration_ms", 180_000),
         media_key="d" * 64,
@@ -421,7 +426,7 @@ def test_seed_overlays_become_layered_episodes_linked_both_ways(tmp_path: Path) 
         "0:02:30 - Artist E - Five (W/ Overlay)\n",
     )
     reloaded = GroundTruthRecord.model_validate_json(
-        (tmp_path / "ground_truth.json").read_text(encoding="utf-8")
+        (tmp_path / "corpus" / "set" / "ground_truth.json").read_text(encoding="utf-8")
     )
     assert reloaded == truth
     assert [(episode.work.artist, episode.work.title) for episode in truth.episodes] == [
@@ -503,7 +508,7 @@ def test_seed_overlays_reject_what_cannot_be_placed(
 ) -> None:
     with pytest.raises(ValueError, match=message):
         _seed_with_overlays(tmp_path, tracklist_text, overlays_text)
-    assert not (tmp_path / "ground_truth.json").exists()
+    assert not (tmp_path / "corpus" / "set" / "ground_truth.json").exists()
 
 
 def test_seed_strips_a_leading_bullet_from_a_timed_tracklist_row(tmp_path: Path) -> None:
@@ -517,7 +522,7 @@ def test_seed_strips_a_leading_bullet_from_a_timed_tracklist_row(tmp_path: Path)
     )
     with pytest.raises(ValueError, match="explicit cue"):
         seed_truth(
-            out_path=tmp_path / "ground_truth.json",
+            out_path=tmp_path / "corpus" / "set" / "ground_truth.json",
             set_id="bullets",
             duration_ms=3_600_000,
             media_key="e" * 64,
@@ -528,7 +533,7 @@ def test_seed_strips_a_leading_bullet_from_a_timed_tracklist_row(tmp_path: Path)
         "0:00:00 - Artist A - One\n0:17:09 – Royal-T - Tokyo Dub\n", encoding="utf-8"
     )
     truth = seed_truth(
-        out_path=tmp_path / "ground_truth.json",
+        out_path=tmp_path / "corpus" / "set" / "ground_truth.json",
         set_id="bullets",
         duration_ms=3_600_000,
         media_key="e" * 64,
@@ -558,8 +563,12 @@ def test_seed_overlays_of_one_row_are_ordered_by_time_whatever_the_file_says(
     """Two overlays over the same row: the episode list stays in mix order however the overlays
     file was written, so a truth is never handed to the scorer out of chronological order."""
 
+    # Each seed is its own set folder inside one corpus (``tmp_path``): the one supported layout is
+    # <corpus>/<set>/ground_truth.json, so a folder can no longer be both a set and a corpus.
+    shuffled_dir = tmp_path / "shuffled"
+    shuffled_dir.mkdir()
     truth = _seed_with_overlays(
-        tmp_path,
+        shuffled_dir,
         "0:00:00 - Artist A - One\n0:02:00 - Artist B - Two\n",
         "0:01:30 - Artist D - Late (w/ overlay)\n0:00:30 - Artist C - Early (w/ overlay)\n",
     )
@@ -581,3 +590,16 @@ def test_seed_overlays_of_one_row_are_ordered_by_time_whatever_the_file_says(
         "0:00:30 - Artist C - Early (w/ overlay)\n0:01:30 - Artist D - Late (w/ overlay)\n",
     )
     assert in_order.episodes == truth.episodes
+
+
+# Round 9: these tests exercise freezing and certification underneath the owner's moratorium, so the
+# single gate is opened for them by fixture (production keeps it closed).  Tests that assert the
+# moratorium itself close it again explicitly.
+pytestmark = pytest.mark.usefixtures("certification_gate_open")
+
+
+@pytest.fixture(autouse=True)
+def _existing_corpus_root(tmp_path: Path) -> None:
+    """Round 9: seeding creates only the set directory, so these tests' corpus root exists."""
+
+    (tmp_path / "corpus").mkdir(exist_ok=True)

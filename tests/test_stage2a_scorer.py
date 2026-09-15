@@ -23,6 +23,7 @@ from id_detector.benchmark.scorer import (
 )
 from id_detector.contracts import GroundTruthRecord, TruthVersion, TruthWork
 from id_detector.io import atomic_write_json, canonical_json_bytes
+from tests.conftest import write_corpus_fixture
 
 
 def _config(
@@ -61,7 +62,7 @@ def _write_freeze_manifest(root: Path, truths: list[GroundTruthRecord]) -> None:
                 "annotation_passes": {"first": None, "second": None, "resolution": None},
             }
         )
-    atomic_write_json(
+    write_corpus_fixture(
         root / "corpus-version.json",
         {
             "schema_version": "1.0.0",
@@ -503,7 +504,7 @@ def test_score_cli_plumbing_report_validates_schema_and_has_only_integers(tmp_pa
     truth, predictions = _vector()
     truth_dir = tmp_path / "truth" / truth.set_id
     truth_dir.mkdir(parents=True)
-    atomic_write_json(truth_dir / "ground_truth.json", truth)
+    write_corpus_fixture(truth_dir / "ground_truth.json", truth)
     prediction_path = tmp_path / "predictions.json"
     config_snapshot, config_hash = _config(11)
     atomic_write_json(
@@ -596,7 +597,7 @@ def test_certification_uses_profile_dimension_tier_preregistration(tmp_path: Pat
         )
         set_dir = truth_root / set_id
         set_dir.mkdir(parents=True)
-        atomic_write_json(set_dir / "ground_truth.json", truth)
+        write_corpus_fixture(set_dir / "ground_truth.json", truth)
         prediction_sets.append(
             PredictionSet(
                 set_id=set_id,
@@ -675,7 +676,7 @@ def test_certification_population_excludes_unknown_stratum(tmp_path: Path) -> No
         )
         set_dir = truth_root / set_id
         set_dir.mkdir(parents=True)
-        atomic_write_json(set_dir / "ground_truth.json", truth)
+        write_corpus_fixture(set_dir / "ground_truth.json", truth)
         prediction_sets.append(
             PredictionSet(
                 set_id=set_id,
@@ -732,3 +733,9 @@ def test_scorer_uses_resolved_work_identity_instead_of_episode_text() -> None:
     )
     assert scored.metrics.identification_work.precision_e4 == 10_000
     assert scored.metrics.identification_work.recall_e4 == 10_000
+
+
+# Round 9: these tests exercise freezing and certification underneath the owner's moratorium, so the
+# single gate is opened for them by fixture (production keeps it closed).  Tests that assert the
+# moratorium itself close it again explicitly.
+pytestmark = pytest.mark.usefixtures("certification_gate_open")

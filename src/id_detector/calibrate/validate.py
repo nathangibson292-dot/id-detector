@@ -3,7 +3,8 @@
 Splits the controlled sets whole-set into a calibration and a test half, fits the calibrator on the
 calibration half, applies it to the test half, and measures prediction-interval coverage/width/
 Winkler and per-tier precision with Clopper-Pearson and cluster (by-set) lower bounds.  It writes
-``data/corpus/<corpus>/calibration-validation.json`` labelled as controlled machinery validation.
+``data/local/calibration/<corpus>/calibration-validation.json`` (outside every corpus)
+labelled as controlled machinery validation.
 
 This proves the code path end-to-end.  It is **not** a real-mix certification and certifies no tier:
 the plan forbids certifying real-mix tiers from controlled renders, so the report's certification
@@ -14,6 +15,7 @@ from __future__ import annotations
 
 import json
 import random
+import tempfile
 from dataclasses import dataclass
 from hashlib import sha256
 from pathlib import Path
@@ -24,7 +26,6 @@ from id_detector.benchmark.corpus import (
     _local_media,
     _prediction_set,
     _run_controlled,
-    _truth_files,
 )
 from id_detector.benchmark.scorer import (
     BOUNDARY_TOLERANCE_MS,
@@ -60,8 +61,18 @@ from id_detector.contracts import (
 from id_detector.io import (
     atomic_write_json,
     canonical_json_bytes,
+    completion_sidecar_path,
     read_text,
     write_completion_sidecar,
+)
+from id_detector.truth import (
+    FREEZE_MANIFEST_NAME,
+    TRUTH_RECORD_NAME,
+    frozen_manifest,
+    open_corpus,
+    refuse_generated_output,
+    require_corpus_member,
+    write_corpus_file_through_gateway,
 )
 
 DEFAULT_SPLIT_SEED = 20_260_904
@@ -282,18 +293,58 @@ def _interval_rows(outcomes: list[_EpisodeOutcome]) -> list[CalibrationValidatio
 
 
 def _frozen_subset_truth(corpus_dir: Path, set_ids: list[str], destination: Path) -> Path:
-    manifest = json.loads(read_text(corpus_dir / "corpus-version.json"))
-    kept = [item for item in manifest.get("sets", []) if item.get("set_id") in set(set_ids)]
-    for item in kept:
-        source = corpus_dir / str(item["path"])
-        target = destination / str(item["set_id"]) / "ground_truth.json"
-        atomic_write_json(target, json.loads(read_text(source)))
-        item["path"] = f"{item['set_id']}/ground_truth.json"
-    atomic_write_json(
-        destination / "corpus-version.json",
+    """Copy the frozen records of ``set_ids``, with their manifest entries, into ``destination``.
+
+    The source corpus is read only through the gateway (its vetted records and its manifest).
+    ``destination`` is a temporary directory outside both the work tree and every corpus.
+    """
+
+    with open_corpus(corpus_dir, mutate=False) as handle:
+        manifest = frozen_manifest(handle)
+        if manifest is None:
+            raise ValueError(f"calibration validation requires a frozen corpus: {corpus_dir}")
+        kept = [item for item in manifest.get("sets", []) if item.get("set_id") in set(set_ids)]
+        for item in kept:
+            source = require_corpus_member(handle, handle.root / str(item["path"]))
+            target = destination / str(item["set_id"]) / TRUTH_RECORD_NAME
+            write_corpus_file_through_gateway(target, json.loads(read_text(source)))
+            item["path"] = f"{item['set_id']}/{TRUTH_RECORD_NAME}"
+    write_corpus_file_through_gateway(
+        destination / FREEZE_MANIFEST_NAME,
         {**manifest, "sets": sorted(kept, key=lambda item: item["set_id"])},
     )
     return destination
+
+
+def _write_calibration_model(model_path: Path, model: Any) -> None:
+    """Write the fitted model and its completion sidecar, each guarded immediately before its write.
+
+    Neither destination may be a link or reached through one, nor lie inside any corpus, so a
+    programmatic ``model_out`` can never overwrite a truth record or a corpus manifest.
+    """
+
+    refuse_generated_output(model_path)
+    atomic_write_json(model_path, model)
+    sidecar = completion_sidecar_path(model_path)
+    refuse_generated_output(sidecar)
+    write_completion_sidecar(model_path, {})
+
+
+def validation_report_path(project_root: Path, corpus_version: str, out_path: Path | None) -> Path:
+    """Where the validation report is written: never inside a corpus.
+
+    By default it sits in the run's output folder beside the fitted model,
+    ``data/local/calibration/<corpus>/calibration-validation.json``; an explicit ``out_path`` inside
+    any corpus (the frozen one included) is refused.
+    """
+
+    path = (
+        out_path
+        or (project_root / "data" / "local" / "calibration" / corpus_version)
+        / "calibration-validation.json"
+    )
+    refuse_generated_output(path)
+    return path
 
 
 async def run_calibration_validation(
@@ -305,18 +356,19 @@ async def run_calibration_validation(
     out_path: Path | None = None,
     model_out: Path | None = None,
 ) -> ValidationResult:
+    # Both user-selectable outputs are validated before anything is read or run.
+    validation_path = validation_report_path(project_root, corpus_version, out_path)
+    if model_out is not None:
+        refuse_generated_output(model_out)
     corpus_dir = project_root / "data" / "corpus" / corpus_version
-    manifest_path = corpus_dir / "corpus-version.json"
-    if (
-        not manifest_path.is_file()
-        or json.loads(read_text(manifest_path)).get("frozen") is not True
-    ):
-        raise ValueError(f"calibration validation requires a frozen corpus: {corpus_version}")
+    with open_corpus(corpus_dir, mutate=False) as handle:
+        if frozen_manifest(handle) is None:
+            raise ValueError(f"calibration validation requires a frozen corpus: {corpus_version}")
+        truth_files = handle.truth_files
     truths = {
         truth.set_id: truth
         for truth in (
-            GroundTruthRecord.model_validate_json(read_text(path))
-            for path in _truth_files(corpus_dir, None)
+            GroundTruthRecord.model_validate_json(read_text(path)) for path in truth_files
         )
     }
     if any(truth.corpus_version != corpus_version for truth in truths.values()):
@@ -374,8 +426,7 @@ async def run_calibration_validation(
     model_path = model_out or (
         project_root / "data" / "local" / "calibration" / corpus_version / model.version
     )
-    atomic_write_json(model_path, model)
-    write_completion_sidecar(model_path, {})
+    _write_calibration_model(model_path, model)
 
     # -- test split (calibrated) → PI + per-tier metrics ----------------------------------------
     outcomes_by_set: dict[str, list[_EpisodeOutcome]] = {}
@@ -405,7 +456,6 @@ async def run_calibration_validation(
     certification = _score_certification(
         corpus_version=corpus_version,
         project_root=project_root,
-        work_root=work_root,
         test_ids=test_ids,
         prediction_sets=calibrated_prediction_sets,
         corpus_dir=corpus_dir,
@@ -442,7 +492,7 @@ async def run_calibration_validation(
             "not open-world recognition accuracy.",
         ],
     )
-    validation_path = out_path or (corpus_dir / "calibration-validation.json")
+    refuse_generated_output(validation_path)  # re-checked immediately before the write
     atomic_write_json(validation_path, record)
     return ValidationResult(
         validation_path=validation_path,
@@ -457,7 +507,6 @@ def _score_certification(
     *,
     corpus_version: str,
     project_root: Path,
-    work_root: Path,
     test_ids: list[str],
     prediction_sets: list[dict[str, Any]],
     corpus_dir: Path,
@@ -470,8 +519,6 @@ def _score_certification(
 
     from id_detector.calibrate.certify import build_prediction_document, registered_targets
 
-    truth_dir = work_root.resolve() / ".calibration-validation" / corpus_version / "truth"
-    _frozen_subset_truth(corpus_dir, test_ids, truth_dir)
     document = build_prediction_document(
         corpus_version=corpus_version,
         profile="free",
@@ -480,11 +527,13 @@ def _score_certification(
         project_root=project_root,
         unverified=False,
     )
-    predictions_path = (
-        work_root.resolve() / ".calibration-validation" / corpus_version / "predictions.json"
-    )
-    atomic_write_json(predictions_path, document)
-    report = score_corpus(truth_dir, predictions_path)
+    # The scratch corpus lives in a temporary directory outside work/ (which idea gc prunes) and
+    # outside every corpus; it is scored and then removed.
+    with tempfile.TemporaryDirectory(prefix="idea-calibration-validation-") as scratch:
+        truth_dir = _frozen_subset_truth(corpus_dir, test_ids, Path(scratch) / "truth")
+        predictions_path = Path(scratch) / "predictions.json"
+        atomic_write_json(predictions_path, document)
+        report = score_corpus(truth_dir, predictions_path)
     entries: list[CalibrationCertEntry] = []
     by_key = {(item.dimension, item.tier): item for item in report.certification}
     for dimension in CERT_DIMENSIONS:
@@ -494,7 +543,12 @@ def _score_certification(
                 CalibrationCertEntry(
                     dimension=dimension,  # type: ignore[arg-type]
                     tier=tier,  # type: ignore[arg-type]
-                    status=row.status if row is not None else "provisional",
+                    # Only a real certification maps through; the disabled status is provisional.
+                    status=(
+                        "certified"
+                        if row is not None and row.status == "certified"
+                        else "provisional"
+                    ),
                     n_test_predictions=row.n if row is not None else 0,
                     lower_bound_e4=row.lower_bound_e4 if row is not None else 0,
                     test_version="controlled-machinery",

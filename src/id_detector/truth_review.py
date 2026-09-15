@@ -7,7 +7,6 @@ from __future__ import annotations
 
 import html
 import json
-import os
 import re
 import threading
 from collections.abc import Callable
@@ -24,11 +23,37 @@ from id_detector.contracts import (
     TruthRoleSegment,
     TruthWork,
 )
-from id_detector.io import atomic_write_json, path_is_file, read_text, sha256_file
+from id_detector.io import canonical_json_bytes, path_is_file, read_text, sha256_file
 from id_detector.present.exports import _candidate_label
 from id_detector.present.index import media_dir_for_key_read_only
 from id_detector.present.theme import head_html, topbar_html
-from id_detector.truth import _annotation_path, truth_write_lock, verify_truth
+from id_detector.truth import (
+    EXPOSURE_NAME,
+    TRUTH_RECORD_NAME,
+    exact_corpus_root,
+    exposure_path,
+    open_corpus,
+    prediction_exposure,
+    record_exposure_in_ledger,
+    record_path,
+    recover_interrupted_write,
+    refuse_frozen,
+    refuse_reattribution,
+    require_corpus_member,
+    set_record_names,
+    truth_write_lock,
+    verify_truth,
+)
+from id_detector.truth_paths import (
+    PinnedDirectory,
+    is_link,
+    is_within,
+    link_refusal,
+    path_key,
+    pinned_set_directory,
+    real_path,
+    refuse_link_components,
+)
 
 _SET_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 _URL = re.compile(r"(?i)\b(?:https?://|www\.)\S+")
@@ -44,20 +69,13 @@ _MAX_BODY = 1 << 20
 _SAVE_LOCK_TIMEOUT = 20.0
 
 
-def _real(path: Path) -> Path:
-    """The one spelling of a path this module compares on.
-
-    ``os.path.realpath`` follows symlinks *and*, on Windows, resolves 8.3 short names, junctions
-    and substituted drives, so an alias spelling of the work tree and a symlink pointing into it
-    both normalise to the same string a containment check can reject.  ``normcase`` then removes
-    letter case as a way past that check on Windows.
-    """
-
-    return Path(os.path.normcase(os.path.realpath(path)))
-
-
 def reject_work_destination(path: Path, work_root: Path | None) -> None:
     """Refuse to treat anything beneath the work tree as a corpus record.
+
+    Both sides are compared by :func:`truth_paths.is_within`, on ``path_key`` spellings:
+    ``realpath`` follows symlinks, junctions, 8.3 short names and substituted drives; a Win32
+    namespace prefix (``\\\\?\\C:\\...``, ``\\\\?\\UNC\\...``) that ``realpath`` keeps is stripped;
+    and ``normcase`` removes letter case, so no alias spelling gets past the check.
 
     ``work/`` is a regenerable cache that ``idea gc`` prunes: a truth record written there would
     be the one kind of corpus loss nothing can undo.  ``--corpus`` takes an arbitrary directory,
@@ -66,9 +84,7 @@ def reject_work_destination(path: Path, work_root: Path | None) -> None:
 
     if work_root is None:
         return
-    real_work = _real(work_root)
-    target = _real(path)
-    if target == real_work or target.is_relative_to(real_work):
+    if is_within(path, work_root):
         raise ValueError(
             f"refusing to review a truth record beneath the work tree: {path} resolves inside "
             f"{work_root}"
@@ -80,15 +96,19 @@ def find_truth_path(corpus: Path, set_id: str, *, work_root: Path | None = None)
 
     if not _SET_ID.fullmatch(set_id):
         raise ValueError("set id must contain only letters, numbers, dot, underscore or hyphen")
-    root = corpus.resolve()
+    # Checked on the path as given, *before* anything is resolved, enumerated or read: a corpus
+    # reached through a junction or symlink is refused with "pass the real path", never followed,
+    # and only the supported <corpus>/<set>/ground_truth.json layout is accepted.
+    with open_corpus(corpus, mutate=False, work_root=work_root) as handle:
+        candidates = list(handle.truth_files)
+    root = real_path(corpus)
     reject_work_destination(root, work_root)
     matches: list[Path] = []
-    for candidate in sorted(root.rglob("ground_truth.json")):
-        resolved = candidate.resolve()
-        # The work check comes first: a corpus entry that is a symlink *out* of the corpus and
-        # into work/ must be refused out loud, not quietly skipped by the containment test.
+    for candidate in candidates:
+        refuse_link_components(candidate)
+        resolved = real_path(candidate)
         reject_work_destination(resolved, work_root)
-        if not resolved.is_relative_to(root):
+        if not is_within(resolved, root):
             continue
         try:
             truth = GroundTruthRecord.model_validate_json(read_text(resolved))
@@ -150,7 +170,10 @@ def preview_bulk_offset(
             end_values[1] = end_values[0]
         roles = []
         for role in episode.role_segments:
-            role_start, start_clamped = _shift(role.from_ms, offset_ms, duration)
+            # The identical shift and clamp as the row: a role's start obeys the start clamp
+            # (last millisecond), its end the end clamp (media end), so a segment moves with its
+            # row even where the row's own endpoints are pinned to a bound.
+            role_start, start_clamped = _shift(role.from_ms, offset_ms, max(0, duration - 1))
             role_end, end_clamped = _shift(role.to_ms, offset_ms, duration)
             clamped_count += int(start_clamped) + int(end_clamped)
             role_start = max(start_values[0], min(role_start, end_values[1]))
@@ -242,15 +265,46 @@ def reconciled_role_segments(
     return clipped
 
 
+def _offsets(value: object, duration_ms: int) -> list[int]:
+    if value is None:
+        return []
+    if (
+        not isinstance(value, list)
+        or len(value) > 1_000
+        or any(
+            isinstance(item, bool) or not isinstance(item, int) or abs(item) > duration_ms
+            for item in value
+        )
+    ):
+        raise ValueError("offsets_ms must be a list of whole-millisecond offsets within the media")
+    return value
+
+
 def reviewed_record(
-    original: GroundTruthRecord, rows: object, *, annotator_ref: str
+    original: GroundTruthRecord,
+    rows: object,
+    *,
+    annotator_ref: str,
+    offsets_ms: object = None,
 ) -> GroundTruthRecord:
-    """Apply only the fields the review screen owns and complete the first-pass decisions."""
+    """Apply only the fields the review screen owns and complete the first-pass decisions.
+
+    ``offsets_ms`` is the sequence of bulk offsets the owner applied (net of undo).  Replaying it
+    through :func:`preview_bulk_offset` gives every role endpoint the identical shift and clamp the
+    row's own start and end received, so a clamped row's segments move with it instead of being
+    guessed at from four endpoint deltas.  A row whose times the owner then changed further is
+    reconciled against that shifted state.
+    """
 
     if not isinstance(rows, list) or len(rows) != len(original.episodes):
         raise ValueError("save must contain every truth row exactly once")
+    shifted = original
+    for offset in _offsets(offsets_ms, original.source.duration_ms):
+        shifted, _, _ = preview_bulk_offset(shifted, offset)
     updated = []
-    for index, (episode, row) in enumerate(zip(original.episodes, rows, strict=True)):
+    for index, (episode, moved, row) in enumerate(
+        zip(original.episodes, shifted.episodes, rows, strict=True)
+    ):
         if not isinstance(row, dict) or row.get("index") != index:
             raise ValueError("truth rows are missing or out of order")
         artist = _safe_label(row.get("artist"), f"row {index + 1} artist")
@@ -264,6 +318,15 @@ def reviewed_record(
         if episode.draft and row.get("confirmed") is not True:
             raise ValueError(f"row {index + 1} still needs listening and confirmation")
         if episode.draft:
+            if start == moved.start_ms_range and end == moved.end_ms_range:
+                roles = list(moved.role_segments)
+            else:
+                roles = reconciled_role_segments(moved, start, end)
+            if episode.role_segments and not roles:
+                raise ValueError(
+                    f"row {index + 1}: this timing edit would discard the row's hand-made role "
+                    "annotation; adjust its times or undo the edit"
+                )
             updated.append(
                 episode.model_copy(
                     update={
@@ -273,7 +336,7 @@ def reviewed_record(
                         "verified_against": "audio",
                         "version_verified": False,
                         "annotator_ref": annotator_ref,
-                        "role_segments": reconciled_role_segments(episode, start, end),
+                        "role_segments": roles,
                         "draft": False,
                     }
                 )
@@ -340,42 +403,21 @@ def _utc_now() -> datetime:
     return datetime.now(UTC)
 
 
-def exposure_path(truth_path: Path) -> Path:
-    """The durable record that IDea's own answers were shown while this set was reviewed."""
+def _write_exposure(pinned: PinnedDirectory, *, set_id: str, when: str) -> None:
+    """Write the exposure sidecar inside the held, verified set directory -- never through a link."""
 
-    return truth_path.with_name("review-exposure.json")
-
-
-def _read_exposure(path: Path) -> bool:
-    try:
-        payload = json.loads(read_text(path))
-    except (OSError, ValueError):
-        return False
-    return bool(isinstance(payload, dict) and payload.get("predictions_visible_during_review"))
-
-
-def _annotation_exposure(truth_path: Path) -> bool:
-    try:
-        payload = json.loads(read_text(_annotation_path(truth_path, "first")))
-    except (OSError, ValueError):
-        return False
-    provenance = payload.get("review_provenance") if isinstance(payload, dict) else None
-    return bool(
-        isinstance(provenance, dict) and provenance.get("predictions_visible_during_review")
-    )
-
-
-def _write_exposure(path: Path, *, set_id: str, when: str) -> None:
-    atomic_write_json(
-        path,
-        {
-            "schema_version": "1.0.0",
-            "generated_by": "id-detector/0.1.0",
-            "set_id": set_id,
-            "predictions_visible_during_review": True,
-            "first_revealed_at_utc": when,
-            "tool": "idea truth review",
-        },
+    pinned.write_bytes(
+        EXPOSURE_NAME,
+        canonical_json_bytes(
+            {
+                "schema_version": "1.0.0",
+                "generated_by": "id-detector/0.1.0",
+                "set_id": set_id,
+                "predictions_visible_during_review": True,
+                "first_revealed_at_utc": when,
+                "tool": "idea truth review",
+            }
+        ),
     )
 
 
@@ -390,13 +432,36 @@ class TruthReviewSession:
         annotator_ref: str = "owner",
         clock: Callable[[], datetime] = _utc_now,
     ) -> None:
-        self.truth_path = truth_path.resolve()
+        self.work_root = work_root
+        # The gateway first: the record sits exactly at <corpus>/<set>/ground_truth.json, its
+        # corpus passes the link, work-tree and inside-another-corpus refusals and the layout
+        # check, and the record is one of the vetted files -- before anything is resolved or read.
+        with open_corpus(
+            exact_corpus_root(truth_path, name=TRUTH_RECORD_NAME),
+            mutate=False,
+            work_root=work_root,
+        ) as handle:
+            require_corpus_member(handle, truth_path)
+        self.truth_path = real_path(truth_path)
         reject_work_destination(self.truth_path, work_root)
+        record_path(truth_path)
+        # Every record this tool reads or writes beside the truth must be a real file in the set
+        # directory.  A link out of it -- into work/, which idea gc prunes, or anywhere else --
+        # is refused before anything is read through it.
+        for name in set_record_names(self.truth_path):
+            sibling = self.truth_path.with_name(name)
+            if is_link(sibling):
+                raise link_refusal(sibling, sibling)
+        #: Where the set directory resolved when it was vetted; every write re-checks it.
+        self.set_dir_key = path_key(self.truth_path.parent)
+        recover_interrupted_write(self.truth_path, work_root=work_root)
         self.truth = GroundTruthRecord.model_validate_json(read_text(self.truth_path))
+        refuse_frozen(self.truth_path, self.truth)
         if any(episode.second_pass_ref is not None for episode in self.truth.episodes):
             raise ValueError("truth review cannot reopen a set after its second pass")
         if any(episode.disagreement_resolution is not None for episode in self.truth.episodes):
             raise ValueError("truth review cannot reopen a resolved set")
+        refuse_reattribution(self.truth, annotator_ref)
         self.original_sha256 = sha256_file(self.truth_path)
         self.annotator_ref = annotator_ref
         self.clock = clock
@@ -415,7 +480,7 @@ class TruthReviewSession:
         one-way: once either says the owner saw our answers, this set is exposed.
         """
 
-        return _read_exposure(self.exposure_path) or _annotation_exposure(self.truth_path)
+        return bool(prediction_exposure(self.truth_path)["predictions_visible_during_review"])
 
     def reveal_predictions(self) -> list[dict[str, Any]]:
         """Record the exposure durably *before* any prediction can reach the screen.
@@ -427,15 +492,65 @@ class TruthReviewSession:
         optimistic.
         """
 
-        with self.lock:
-            if not self.predictions_visible:
-                _write_exposure(
-                    self.exposure_path,
-                    set_id=self.truth.set_id,
-                    when=self.clock().astimezone(UTC).isoformat().replace("+00:00", "Z"),
-                )
-                self.predictions_visible = True
-            return _predictions(self.media_dir)
+        with (
+            self.lock,
+            truth_write_lock(self.truth_path, timeout=_SAVE_LOCK_TIMEOUT),
+            pinned_set_directory(
+                self.truth_path.parent,
+                expected_key=self.set_dir_key,
+                work_root=self.work_root,
+            ) as pinned,
+        ):
+            # Every reveal re-reads the disk under the record's lock rather than trusting the
+            # cached flag: a sidecar deleted since the last reveal is written again before any
+            # prediction is assembled.  Exposure only ever moves from false to true.
+            refuse_frozen(self.truth_path, self.truth)
+            self._ensure_exposure(pinned)
+            self.predictions_visible = True
+            predictions = _predictions(self.media_dir)
+            # An actor that ignores the advisory lock could have removed the evidence while the
+            # predictions were being assembled.  So it is reasserted now and verified while held
+            # open without delete sharing, and the predictions are returned only from inside that
+            # hold; if the evidence cannot be reasserted and verified, nothing is returned.
+            for _ in range(3):
+                self._ensure_exposure(pinned)
+                try:
+                    with pinned.hold_undeletable(EXPOSURE_NAME) as raw:
+                        self._verify_exposure(raw)
+                        self._evidence_held()
+                        return predictions
+                except FileNotFoundError:
+                    continue
+            raise ValueError(
+                "the exposure record could not be reasserted on disk; predictions withheld"
+            )
+
+    def _ensure_exposure(self, pinned: PinnedDirectory) -> None:
+        when = self.clock().astimezone(UTC).isoformat().replace("+00:00", "Z")
+        if not pinned.exists(EXPOSURE_NAME):
+            _write_exposure(pinned, set_id=self.truth.set_id, when=when)
+        # The second, corpus-level record: it survives the sidecar being tidied away before the
+        # first save, and is consulted by every later pass, freeze, scorer and certification.
+        record_exposure_in_ledger(
+            self.truth_path, set_id=self.truth.set_id, when=when, work_root=self.work_root
+        )
+
+    def _verify_exposure(self, raw: bytes) -> None:
+        try:
+            payload = json.loads(raw.decode("utf-8"))
+        except ValueError:
+            payload = None
+        if not (
+            isinstance(payload, dict)
+            and payload.get("predictions_visible_during_review") is True
+            and payload.get("set_id") == self.truth.set_id
+        ):
+            raise ValueError(
+                "the exposure record on disk does not record this reveal; predictions withheld"
+            )
+
+    def _evidence_held(self) -> None:
+        """Called while the exposure record is held undeletable, just before returning (a seam)."""
 
     def save(self, payload: object) -> GroundTruthRecord:
         if not isinstance(payload, dict):
@@ -445,10 +560,14 @@ class TruthReviewSession:
             # another review process cannot slip a write (or a reveal) between check and commit.
             if sha256_file(self.truth_path) != self.original_sha256:
                 raise ValueError("ground truth changed on disk; reload review before saving")
+            refuse_frozen(self.truth_path, self.truth)
             exposed = self.predictions_visible or self._recorded_prediction_visibility()
             self.predictions_visible = exposed
             updated = reviewed_record(
-                self.truth, payload.get("rows"), annotator_ref=self.annotator_ref
+                self.truth,
+                payload.get("rows"),
+                annotator_ref=self.annotator_ref,
+                offsets_ms=payload.get("offsets_ms"),
             )
             provenance = {
                 "predictions_visible_during_review": exposed,
@@ -461,6 +580,8 @@ class TruthReviewSession:
                 annotator_ref=self.annotator_ref,
                 annotation_record=updated,
                 annotation_provenance=provenance,
+                work_root=self.work_root,
+                expected_dir_key=self.set_dir_key,
             )
             self.truth = saved
             self.original_sha256 = sha256_file(self.truth_path)
@@ -501,7 +622,9 @@ const offsetInput=document.getElementById('offset');
 // rows is mutated in place and never replaced: an offset owns only the two time fields it wrote,
 // so undoing one can never take an artist or title correction with it.
 let rows=TRUTH_ROWS, current=0, dirty=false, editBase=null;
-let offsetBase=null, offsetUndo=[], previewOffset=0, collapsed=[];
+// appliedOffsets is the offset intent the server replays, so every role segment gets exactly the
+// shift and clamp its row got; it grows on apply and shrinks on undo, never on a mere preview.
+let offsetBase=null, offsetUndo=[], appliedOffsets=[], previewOffset=0, collapsed=[];
 function rowEls(){return document.querySelectorAll('.truth-row');}
 function fmt(ms){let s=Math.max(0,Math.floor(ms/1000)),h=Math.floor(s/3600),m=Math.floor(s%3600/60);
  let z=String(s%60).padStart(2,'0');return h?h+':'+String(m).padStart(2,'0')+':'+z:m+':'+z;}
@@ -551,10 +674,10 @@ function preview(){let raw=String(offsetInput.value).trim(), seconds=Number(raw)
 function applyOffset(){if(offsetBase===null)preview();if(offsetBase===null)return;
  if(collapsed.length){message.textContent='Offset not applied: '+rowList(collapsed)+
   ' would have no audible span at '+(previewOffset/1000).toFixed(1)+' s. Undo, choose a smaller shift, or fix those rows first.';return;}
- offsetUndo.push(offsetBase);offsetBase=null;dirty=true;
+ offsetUndo.push(offsetBase);appliedOffsets.push(previewOffset);offsetBase=null;dirty=true;
  message.textContent='Applied '+(previewOffset/1000).toFixed(1)+' s in this review. Save is still required.';}
 function undo(){let base=null;
- if(offsetBase!==null){base=offsetBase;offsetBase=null;}else if(offsetUndo.length)base=offsetUndo.pop();
+ if(offsetBase!==null){base=offsetBase;offsetBase=null;}else if(offsetUndo.length){base=offsetUndo.pop();appliedOffsets.pop();}
  else{message.textContent='Nothing to undo.';return;}
  restoreTimes(base);collapsed=[];dirty=true;render();
  message.textContent='Offset undone. Artist and title edits are untouched; save is still required.';}
@@ -570,7 +693,7 @@ async function save(){if(offsetBase!==null){message.textContent='Apply or undo t
  rowEls().forEach((tr,i)=>{tr.querySelectorAll('input').forEach(el=>{rows[i][el.dataset.field]=el.value;});});
  let bad=rows.map((r,i)=>isCollapsed(r)?i+1:0).filter(Boolean);
  if(bad.length){message.textContent='Not saved: '+rowList(bad)+' has no audible span.';return;}
- let res=await fetch('/save',{method:'POST',headers:{'Content-Type':'application/json','X-CSRF-Token':CSRF_TOKEN},body:JSON.stringify({rows:rows})});
+ let res=await fetch('/save',{method:'POST',headers:{'Content-Type':'application/json','X-CSRF-Token':CSRF_TOKEN},body:JSON.stringify({rows:rows,offsets_ms:appliedOffsets})});
  let data=await res.json();if(!res.ok){message.textContent=data.error||'Save failed.';return;}dirty=false;
  message.textContent='Saved first-pass truth and annotation atomically.';}
 rowEls().forEach((tr,i)=>{tr.addEventListener('click',e=>{if(!e.target.matches('input'))select(i);});

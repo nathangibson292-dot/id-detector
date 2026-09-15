@@ -35,8 +35,10 @@ def controlled_renders(
     second = root / "second"
     first_audio = root / "first-audio"
     second_audio = root / "second-audio"
-    first.mkdir()
-    first_audio.mkdir()
+    # Round 6: rendering refuses to replace a directory that is not a controlled corpus it produced,
+    # so a fresh render creates the target; a re-render (marker present) replaces it and clears any
+    # stale content the owner dropped in beside it.
+    asyncio.run(render_controlled(sources, first, seed=20260904, audio_dir=first_audio))
     (first / "stale.json").write_text("stale", encoding="utf-8")
     (first_audio / "stale.wav").write_bytes(b"stale")
     asyncio.run(render_controlled(sources, first, seed=20260904, audio_dir=first_audio))
@@ -173,6 +175,14 @@ def test_controlled_ffmpeg_writes_an_extended_length_path(tmp_path: Path) -> Non
     assert path_is_file(output)
 
 
+def _tree_bytes(root: Path) -> dict[str, bytes]:
+    return {
+        path.relative_to(root).as_posix(): read_bytes(path)
+        for path in sorted(root.rglob("*"))
+        if path.is_file()
+    }
+
+
 def test_failed_render_keeps_previously_published_corpus(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -180,10 +190,11 @@ def test_failed_render_keeps_previously_published_corpus(
     synthesize_test_sources(sources, seed=17, count=3)
     artifacts = tmp_path / "artifacts"
     audio = tmp_path / "audio"
-    artifacts.mkdir()
-    audio.mkdir()
-    (artifacts / "old-manifest.json").write_text("old", encoding="utf-8")
-    (audio / "old-mix.wav").write_bytes(b"old")
+    # Round 6: the target must be a controlled corpus this tool produced (marker present) before a
+    # re-render may replace it; render it once, then prove a failed re-render leaves it intact.
+    asyncio.run(render_controlled(sources, artifacts, seed=17, audio_dir=audio))
+    published_corpus = _tree_bytes(artifacts)
+    published_audio = _tree_bytes(audio)
 
     async def fail_truth(**_: object) -> GroundTruthRecord:
         raise RuntimeError("injected render failure")
@@ -191,9 +202,11 @@ def test_failed_render_keeps_previously_published_corpus(
     monkeypatch.setattr(controlled_module, "_truth_for_render", fail_truth)
     with pytest.raises(RuntimeError, match="injected render failure"):
         asyncio.run(render_controlled(sources, artifacts, seed=17, audio_dir=audio))
-    assert (artifacts / "old-manifest.json").read_text(encoding="utf-8") == "old"
-    assert (audio / "old-mix.wav").read_bytes() == b"old"
-    assert not list(tmp_path.glob("*.staging"))
+    # Byte-for-byte: the failed re-render leaves the previously published corpus and its audio
+    # exactly as they were -- every file, every byte -- and no staging tree is left behind.
+    assert _tree_bytes(artifacts) == published_corpus
+    assert _tree_bytes(audio) == published_audio
+    assert not list(tmp_path.glob("*.staging")) and not list(tmp_path.glob(".*.staging"))
 
 
 @pytest.mark.parametrize("kind", ["resample", "tempo"])

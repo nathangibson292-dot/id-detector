@@ -46,6 +46,7 @@ from id_detector.contracts import (
 from id_detector.io import (
     atomic_write_json,
     canonical_json_bytes,
+    completion_sidecar_path,
     read_text,
     sha256_file,
     write_completion_sidecar,
@@ -60,6 +61,7 @@ from id_detector.providers.base import (
     DEFAULT_WINDOW_MS,
     AppConfig,
 )
+from id_detector.truth import certifiable_under_gate, refuse_generated_output
 
 PROFILE_NAMES = ("free", "max_accuracy")
 
@@ -257,7 +259,7 @@ def _feature_rows(ablations: dict[str, Any], citer: _Citer) -> tuple[list[Profil
         ProfileFeature(
             name="rescans",
             enabled=rescans_on,
-            certified=rescans_on,
+            certified=certifiable_under_gate(rescans_on),
             setting={"enabled": rescans_on},
             decision=(
                 "Enabled: rescans are the only thing that moves the proved start bound "
@@ -281,7 +283,7 @@ def _feature_rows(ablations: dict[str, Any], citer: _Citer) -> tuple[list[Profil
         ProfileFeature(
             name="novelty",
             enabled=novelty_on,
-            certified=novelty_on,
+            certified=certifiable_under_gate(novelty_on),
             setting={"enabled": novelty_on},
             decision=(
                 "Enabled: novelty change points are the only trigger that reaches a rate- or "
@@ -326,7 +328,7 @@ def _feature_rows(ablations: dict[str, Any], citer: _Citer) -> tuple[list[Profil
         ProfileFeature(
             name="transforms",
             enabled=transforms_policy != "off",
-            certified=transforms_policy != "off",
+            certified=certifiable_under_gate(transforms_policy != "off"),
             setting={"policy": transforms_policy},
             decision=(
                 "Enabled at rescan_only: applying the transform grid on rescans lifts work/segment "
@@ -375,7 +377,7 @@ def _feature_rows(ablations: dict[str, Any], citer: _Citer) -> tuple[list[Profil
         ProfileFeature(
             name="schedule",
             enabled=True,
-            certified=True,
+            certified=certifiable_under_gate(True),
             setting=schedule_setting,
             decision=(
                 "Frozen at the plan default 12 s / 9 s / phase 0 (rev 5.2). The 12/5 challenger "
@@ -638,6 +640,8 @@ def freeze_profiles(
 ) -> FreezeResult:
     """Derive and write ``free`` and ``max_accuracy`` profiles from the two reports."""
 
+    refuse_generated_output(out_dir)  # before anything is read
+
     ablations = json.loads(read_text(ablations_path))
     shortlist = json.loads(read_text(shortlist_path))
     ablations_ref = _report_ref(ablations_path)
@@ -656,7 +660,9 @@ def freeze_profiles(
             shortlist_ref=shortlist_ref,
         )
         destination = out_dir / profile.version
+        refuse_generated_output(destination)  # revalidated immediately before the write
         atomic_write_json(destination, profile)
+        refuse_generated_output(completion_sidecar_path(destination))
         write_completion_sidecar(destination, {})
         profiles[name] = profile
         written[name] = destination

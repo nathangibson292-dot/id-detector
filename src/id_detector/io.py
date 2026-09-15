@@ -77,10 +77,48 @@ def canonical_json_bytes(value: Any) -> bytes:
     ).encode("utf-8")
 
 
-def atomic_write_bytes(path: Path, content: bytes) -> None:
-    """Write beside the destination, close it, then atomically replace the destination."""
+#: The corpus file names the low-level write backstop protects.  ``io`` cannot import ``truth``
+#: (``truth`` imports ``io``), so the names are spelled here as well.
+_CORPUS_FILE_NAMES = frozenset(
+    {"ground_truth.json", "corpus-version.json", "review-exposure-ledger.jsonl"}
+)
+
+
+def refuse_corpus_destination(path: Path) -> None:
+    """The backstop under every atomic write: never replace a corpus file or write into a corpus.
+
+    Refuses a destination named ``ground_truth.json``, ``corpus-version.json`` or
+    ``review-exposure-ledger.jsonl``, or whose parent or grandparent directly holds one of those
+    files (a corpus root or a set directory).  It is bounded to six ``lstat`` probes and never
+    lists a directory, so it stays cheap for the pipeline and money code.  Corpus files the
+    gateway has validated are written with ``through_corpus_gateway=True``, which only
+    ``truth.write_corpus_file_through_gateway`` passes.
+    """
+
+    if path.name.casefold() in _CORPUS_FILE_NAMES:
+        raise ValueError(
+            f"refusing to write {path}: {path.name} is a corpus file; corpus files are written "
+            "only through the corpus gateway"
+        )
+    for directory in (path.parent, path.parent.parent):
+        for name in _CORPUS_FILE_NAMES:
+            if os.path.lexists(native_path(directory / name)):
+                raise ValueError(
+                    f"refusing to write {path}: {directory} holds {name}, so it is a corpus or a "
+                    "set; corpus directories are written only through the corpus gateway"
+                )
+
+
+def atomic_write_bytes(path: Path, content: bytes, *, through_corpus_gateway: bool = False) -> None:
+    """Write beside the destination, close it, then atomically replace the destination.
+
+    Every write first passes :func:`refuse_corpus_destination` (the corpus backstop), unless the
+    corpus gateway validated it and says so with ``through_corpus_gateway=True``.
+    """
 
     path = path.resolve()
+    if not through_corpus_gateway:
+        refuse_corpus_destination(path)
     os.makedirs(native_path(path.parent), exist_ok=True)
     temporary: Path | None = None
     try:

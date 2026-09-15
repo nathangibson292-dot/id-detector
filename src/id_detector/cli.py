@@ -23,7 +23,13 @@ from id_detector.benchmark.hints import run_hint_gate
 from id_detector.benchmark.scorer import score_corpus
 from id_detector.benchmark.shortlist import run_shortlist
 from id_detector.benchmark.transforms_schedule import run_transform_schedule_benchmark
-from id_detector.calibrate.certify import CorpusNotFrozen, DuplicateTestVersion, run_certify
+from id_detector.calibrate.certify import (
+    CertificationDisabled,
+    CorpusNotFrozen,
+    CorpusNotIndependent,
+    DuplicateTestVersion,
+    run_certify,
+)
 from id_detector.calibrate.model import load_calibration
 from id_detector.calibrate.validate import run_calibration_validation
 from id_detector.calibration import calibrate_shazam
@@ -69,7 +75,11 @@ from id_detector.recipes import get_recipe
 from id_detector.retention import collect
 from id_detector.shazam import HTTPClientInterface
 from id_detector.truth import (
+    CERTIFICATION_DISABLED,
+    FREEZE_MANIFEST_NAME,
+    certification_enabled,
     freeze_truth,
+    refuse_generated_output,
     resolve_truth,
     second_pass_truth,
     seed_truth,
@@ -363,13 +373,25 @@ def config_init(
 ) -> None:
     """Write the documented idea.toml template (never contains secrets)."""
 
+    _refuse_output_or_exit(path)  # before anything, --force included
     if path.exists() and not force:
         typer.echo(f"{path} already exists; pass --force to overwrite", err=True)
         raise typer.Exit(1)
     _validate_config_or_exit()
     path.parent.mkdir(parents=True, exist_ok=True)
+    _refuse_output_or_exit(path)  # revalidated immediately before the write
     path.write_text(CONFIG_TEMPLATE, encoding="utf-8", newline="\n")
     typer.echo(f"wrote {path}; edit it and keep it un-committed (it is git-ignored).")
+
+
+def _refuse_output_or_exit(path: Path) -> None:
+    """``truth.refuse_generated_output`` for a CLI destination, reported as a usage error."""
+
+    try:
+        refuse_generated_output(path)
+    except ValueError as exc:
+        typer.echo(str(exc), err=True)
+        raise typer.Exit(1) from None
 
 
 def _validate_config_or_exit() -> None:
@@ -1245,6 +1267,8 @@ def benchmark_score(
         f"scored {len(report.sets)} sets; work precision="
         f"{report.overall.identification_work.precision_e4}/10000; report={out}"
     )
+    if not certification_enabled():
+        typer.echo(f"certification: {CERTIFICATION_DISABLED}")
 
 
 @benchmark_app.command("render")
@@ -1275,6 +1299,7 @@ def benchmark_render(
                 audio_dir=audio_out,
                 case_set=cases,
                 corpus_version=corpus_version,
+                work_root=DEFAULT_WORK_ROOT,
             )
         )
     except KeyboardInterrupt:
@@ -1457,7 +1482,12 @@ def benchmark_certify(
         )
     except KeyboardInterrupt:
         raise typer.Exit(130) from None
-    except (CorpusNotFrozen, DuplicateTestVersion) as exc:
+    except (
+        CertificationDisabled,
+        CorpusNotFrozen,
+        CorpusNotIndependent,
+        DuplicateTestVersion,
+    ) as exc:
         typer.echo(redact_text(str(exc)), err=True)
         raise typer.Exit(2) from None
     except (ValueError, RuntimeError, OSError, json.JSONDecodeError) as exc:
@@ -1475,7 +1505,10 @@ def benchmark_calibration_validate(
     corpus: Annotated[str, typer.Option("--corpus", help="Frozen controlled corpus version.")],
     out: Annotated[
         Path | None,
-        typer.Option("--out", help="Validation report JSON (default under data/corpus)."),
+        typer.Option(
+            "--out",
+            help="Validation report JSON (default data/local/calibration/<corpus>).",
+        ),
     ] = None,
     work_root: Annotated[Path, typer.Option("--work-root")] = Path(
         "data/local/work-calibration-validate"
@@ -1606,6 +1639,8 @@ def benchmark_links(
 ) -> None:
     """Draw a stratified (version-ambiguity) sample of direct links for a human to mark."""
 
+    _refuse_output_or_exit(out)  # before anything is read
+
     from id_detector.contracts import AcquireFile
 
     paths = _collect_acquire_files(episodes)
@@ -1614,6 +1649,7 @@ def benchmark_links(
         raise typer.Exit(2)
     records = [AcquireFile.model_validate_json(read_text(path)) for path in paths]
     sheet = build_link_sample(records, sample_size=sample)
+    _refuse_output_or_exit(out)  # revalidated immediately before the write
     atomic_write_json(out, sheet)
     typer.echo(
         f"link sample: {len(sheet['links'])} of {sheet['total_direct_links']} direct links "
@@ -1629,15 +1665,25 @@ def benchmark_links_score(
 ) -> None:
     """Score a marked link sample: precision and a one-sided 95% Clopper-Pearson lower bound."""
 
+    if out is not None:
+        _refuse_output_or_exit(out)  # before anything is read
+
     sheet = json.loads(read_text(marked))
     score = score_link_sample(sheet)
     if out is not None:
+        _refuse_output_or_exit(out)  # revalidated immediately before the write
         atomic_write_json(out, score)
+    gate = score["gate"]
+    # While certification is disabled the gate is not judged: print its status, never a pass.
+    verdict = (
+        f"gate_pass={str(gate['pass']).lower()}"
+        if gate["pass"] is not None
+        else f"gate_status={gate['status']}"
+    )
     typer.echo(
         f"marked={score['marked_links']} correct={score['correct']} "
         f"incorrect={score['incorrect']} precision_e4={score['precision_e4']} "
-        f"one_sided_95_lower_e4={score['one_sided_95_lower_e4']} "
-        f"gate_pass={str(score['gate']['pass']).lower()}"
+        f"one_sided_95_lower_e4={score['one_sided_95_lower_e4']} {verdict}"
     )
 
 
@@ -1690,6 +1736,7 @@ def truth_seed(
             uploader=uploader,
             event=event,
             project_root=PROJECT_ROOT,
+            work_root=DEFAULT_WORK_ROOT,
         )
     except (ValueError, OSError, json.JSONDecodeError) as exc:
         typer.echo(str(exc), err=True)
@@ -1710,7 +1757,11 @@ def truth_verify(
     """Run the first-pass terminal annotation loop (commands only; no GUI launch)."""
     try:
         updated = verify_truth(
-            truth, annotator_ref=annotator_ref, audio=audio, annotation_path=annotation
+            truth,
+            annotator_ref=annotator_ref,
+            audio=audio,
+            annotation_path=annotation,
+            work_root=DEFAULT_WORK_ROOT,
         )
     except (ValueError, OSError) as exc:
         typer.echo(str(exc), err=True)
@@ -1784,7 +1835,11 @@ def truth_second_pass(
     """Store a distinct second annotation without revealing the first-pass decisions."""
     try:
         updated = second_pass_truth(
-            truth, annotator_ref=annotator_ref, audio=audio, annotation_path=annotation
+            truth,
+            annotator_ref=annotator_ref,
+            audio=audio,
+            annotation_path=annotation,
+            work_root=DEFAULT_WORK_ROOT,
         )
     except (ValueError, OSError) as exc:
         typer.echo(str(exc), err=True)
@@ -1803,7 +1858,12 @@ def truth_resolve(
 ) -> None:
     """Resolve differing first/second passes with a distinct third annotation."""
     try:
-        updated = resolve_truth(truth, resolver_ref=resolver_ref, annotation_path=annotation)
+        updated = resolve_truth(
+            truth,
+            resolver_ref=resolver_ref,
+            annotation_path=annotation,
+            work_root=DEFAULT_WORK_ROOT,
+        )
     except (ValueError, OSError) as exc:
         typer.echo(str(exc), err=True)
         raise typer.Exit(1) from None
@@ -1812,34 +1872,68 @@ def truth_resolve(
 
 @truth_app.command("freeze")
 def truth_freeze(
-    truth: Annotated[Path, typer.Option("--truth", help="Truth corpus directory.")],
+    truth: Annotated[
+        Path,
+        typer.Option(
+            "--truth", help="The <corpus> directory; sets must be <corpus>/<set>/ground_truth.json."
+        ),
+    ],
     corpus_version: Annotated[str, typer.Option("--corpus-version")],
-    out: Annotated[Path, typer.Option("--out", help="Corpus-version manifest JSON.")],
+    out: Annotated[
+        Path,
+        typer.Option(
+            "--out",
+            help=(
+                "Must be <corpus>/corpus-version.json, directly in the corpus directory being "
+                "frozen: the only place scoring, certification and review look for it."
+            ),
+        ),
+    ],
 ) -> None:
     """Validate complete verification and hash a frozen corpus manifest."""
     try:
-        manifest = freeze_truth(truth, corpus_version=corpus_version, out_path=out)
+        manifest = freeze_truth(
+            truth, corpus_version=corpus_version, out_path=out, work_root=DEFAULT_WORK_ROOT
+        )
     except (ValueError, OSError) as exc:
         typer.echo(str(exc), err=True)
         raise typer.Exit(1) from None
+    exposed = manifest["exposed_sets"]
     typer.echo(f"froze {len(manifest['sets'])} sets as {corpus_version}; manifest={out}")
+    if exposed:
+        typer.echo(
+            f"NOT CERTIFIABLE: {', '.join(exposed)} was reviewed with IDea's predictions visible; "
+            "the manifest records and hashes that evidence, so those sets can be scored but never "
+            "back an L3 or certification claim"
+        )
 
 
 @truth_app.command("manifest-draft")
 def truth_manifest_draft(
-    truth: Annotated[Path, typer.Option("--truth", help="Draft truth corpus directory.")],
+    truth: Annotated[
+        Path,
+        typer.Option(
+            "--truth", help="The <corpus> directory; the inventory is written to its own root."
+        ),
+    ],
     corpus_version: Annotated[str, typer.Option("--corpus-version")],
-    out: Annotated[Path, typer.Option("--out", help="Draft inventory JSON.")],
 ) -> None:
-    """Inventory unverified seeds without claiming that they are frozen truth."""
+    """Inventory unverified seeds without claiming that they are frozen truth.
+
+    The inventory is always written to ``<corpus>/corpus-version.json``; there is no ``--out``, so a
+    draft can never target another corpus's manifest.
+    """
 
     try:
-        manifest = write_draft_manifest(truth, corpus_version=corpus_version, out_path=out)
+        manifest = write_draft_manifest(
+            truth, corpus_version=corpus_version, work_root=DEFAULT_WORK_ROOT
+        )
     except (ValueError, OSError) as exc:
         typer.echo(str(exc), err=True)
         raise typer.Exit(1) from None
     typer.echo(
-        f"recorded {len(manifest['sets'])} unverified draft sets; frozen=false; manifest={out}"
+        f"recorded {len(manifest['sets'])} unverified draft sets; frozen=false; "
+        f"manifest={truth / FREEZE_MANIFEST_NAME}"
     )
 
 

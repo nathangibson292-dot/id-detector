@@ -103,6 +103,7 @@ from id_detector.benchmark.scorer import (
     ScoringConfigSnapshot,
     SetScore,
     _ratio_e4,
+    corpus_independent,
     load_truth_directory,
     pooled_metrics,
     score_corpus_detailed,
@@ -130,6 +131,12 @@ from id_detector.io import (
     read_text,
 )
 from id_detector.present.exports import flatten_tracklist, hidden_reason
+from id_detector.truth import (
+    CERTIFICATION_DISABLED,
+    certifiable_under_gate,
+    certification_enabled,
+    refuse_generated_output,
+)
 
 GENERATED_BY = "id-detector/0.1.0 scripts/score_corpus.py"
 CONFIG_VERSION = "score-corpus-v1"
@@ -275,6 +282,8 @@ class MixScore:
     entry: RunEntry
     truth: GroundTruthRecord
     truth_status: TruthStatus
+    #: ``False`` when predictions were visible during the truth's review (see `truth_independent`).
+    independent: bool
     timing: Timing
     match_mode: MatchMode
     episodes_total: int
@@ -428,6 +437,14 @@ def truth_status(truth_path: Path, truth: GroundTruthRecord) -> TruthStatus:
     if any(episode.draft for episode in truth.episodes):
         return "draft"
     return "unverified"
+
+
+def truth_independent(truth_path: Path, truth: GroundTruthRecord) -> bool:
+    """``False`` when the set's own records, or its freeze manifest, say IDea's predictions were
+    visible while the truth was reviewed.  Such a set is still scored; it can back no L3 claim."""
+
+    # Through the corpus gateway: the corpus's vetted records and its manifest, never a raw walk.
+    return corpus_independent(truth_path, [truth])
 
 
 def placeholder_rows(truth: GroundTruthRecord) -> frozenset[int]:
@@ -804,6 +821,7 @@ def score_mix(
     assert_identities_cover(episodes, identities, graph_path, entry.mix_id)
     listed, hidden_by_reason = listed_episodes(episodes, identities, entry.min_track_ms)
     status = truth_status(entry.truth, truth)
+    independent = truth_independent(entry.truth, truth)
     timing = truth_timing(truth)
     # Only a fully timed truth can be matched by time; a partly timed one would score its
     # still-placeholder rows against an equal-slice point, i.e. as misses.
@@ -862,8 +880,10 @@ def score_mix(
     )
     mix_dir = artefact_dir / entry.mix_id
     predictions_path = mix_dir / "predictions.json"
+    refuse_generated_output(predictions_path)
     atomic_write_json(predictions_path, document)
     work_match_path = mix_dir / "work-match.json"
+    refuse_generated_output(work_match_path)
     atomic_write_json(
         work_match_path,
         _work_match_document(
@@ -885,6 +905,7 @@ def score_mix(
         entry=entry,
         truth=truth,
         truth_status=status,
+        independent=independent,
         timing=timing,
         match_mode=mode,
         episodes_total=len(episodes.episodes),
@@ -983,6 +1004,8 @@ def score_run_list(
 ) -> dict[str, Any]:
     """Score every mix, pool the counts, and build the output document."""
 
+    refuse_generated_output(artefact_dir)
+
     mixes: list[MixScore] = []
     scored_by_set: dict[str, str] = {}
     for entry in run_list.runs:
@@ -1018,7 +1041,12 @@ def score_run_list(
         counts_by_mode = _work_counts(work_only)
         # The listed-precision bar needs timed truth; a work-only score cannot judge L3.
         thresholds_met = None
+    if thresholds_met is True and not certification_enabled():
+        # No positive L3 claim while certification is disabled: the thresholds are left
+        # unjudged (null), never reported as met.
+        thresholds_met = None
     status = min((mix.truth_status for mix in mixes), key=_TRUTH_RANK.__getitem__)
+    independent = all(mix.independent for mix in mixes)
     hidden_total: Counter[str] = Counter()
     for mix in mixes:
         hidden_total.update(mix.hidden_by_reason)
@@ -1036,7 +1064,15 @@ def score_run_list(
             # The three thresholds only. L3 also asks for a corpus shape (mixes, DJs, platforms,
             # hours, two-pass truth) that these numbers cannot judge — see L3_CORPUS_NOTE.
             "thresholds_met": thresholds_met,
-            "certifiable": status == "verified" and mode == "time",
+            # Frozen, verified and timed is not enough: truth reviewed while IDea's predictions
+            # were on screen is not independent of them, and can back no L3 claim however it scores.
+            "independent": independent,
+            # Refused outright until the certification follow-up lands: the owner has not allowed
+            # freezing or certification, and a run list may still name a subset of a frozen corpus.
+            "certifiable": certifiable_under_gate(
+                status == "verified" and mode == "time" and independent
+            ),
+            "certification": None if certification_enabled() else CERTIFICATION_DISABLED,
         },
         "counts": {
             "mixes": len(mixes),
@@ -1057,6 +1093,7 @@ def score_run_list(
                 "mix_id": mix.entry.mix_id,
                 "set_id": mix.truth.set_id,
                 "truth_status": mix.truth_status,
+                "independent": mix.independent,
                 "timing": mix.timing,
                 "match_mode": mix.match_mode,
                 "truth": _relative(mix.entry.truth, run_list_dir),
@@ -1167,6 +1204,13 @@ def summary(document: dict[str, Any], out: Path | None) -> str:
         else "the presentation floor hid nothing"
     )
     where = f" Full numbers: {out.as_posix()}." if out is not None else ""
+    exposed = [mix["mix_id"] for mix in document["mixes"] if mix.get("independent") is False]
+    independence = (
+        f" The truth for {', '.join(exposed)} is not independent of IDea's predictions (they were "
+        "visible while it was reviewed), so this score cannot back an L3 or certification claim."
+        if exposed
+        else ""
+    )
     if document["match_mode"] == "work":
         work = counts["work"]
         seen = [
@@ -1203,18 +1247,27 @@ def summary(document: dict[str, Any], out: Path | None) -> str:
             f"{counts['work']['correct']} of the {counts['work']['truth']} distinct tracks "
             f"actually played (work recall {_pct(document['work_recall_e4'])})"
         )
-        verdict = f"L3 asks for {bar}: " + (
-            f"all three thresholds are met on these numbers ({L3_CORPUS_NOTE})"
-            if not shortfalls
-            else "the L3 bar is not met (" + "; ".join(shortfalls) + ")"
-        )
+        if not shortfalls and not certification_enabled():
+            # No positive L3 claim is printed while certification is disabled.
+            verdict = (
+                f"L3 asks for {bar}: no L3 threshold claim is made because "
+                f"{CERTIFICATION_DISABLED} ({L3_CORPUS_NOTE})"
+            )
+        else:
+            verdict = f"L3 asks for {bar}: " + (
+                f"all three thresholds are met on these numbers ({L3_CORPUS_NOTE})"
+                if not shortfalls
+                else "the L3 bar is not met (" + "; ".join(shortfalls) + ")"
+            )
         if status != "verified":
             verdict += ", and a non-verified score cannot clear L3 either way"
+    gate = document["l3"].get("certification")
+    gated = f" {gate}." if gate and gate not in verdict else ""
     return (
         f"The {document['recipe']} recipe was scored over {counts['mixes']} mix(es) ({mix_ids}) "
         f"against {truth_note}. {_matching_note(document)}. Of the "
         f"{counts['episodes']['total']} tracks the tool found, {hidden_note}, leaving "
-        f"{counts['episodes']['listed']} listed; {numbers}. {verdict}.{where}"
+        f"{counts['episodes']['listed']} listed; {numbers}. {verdict}.{independence}{gated}{where}"
     )
 
 
@@ -1320,8 +1373,10 @@ def main(argv: list[str] | None = None) -> int:
         return 2
     try:
         if args.out is not None:
+            refuse_generated_output(args.out)  # on the path as given, before it is resolved
             out: Path = args.out.resolve()
             artefact_dir = out.parent / f"{out.stem}-mixes"
+            refuse_generated_output(artefact_dir)
             document = score_run_list(
                 run_list,
                 run_list_dir=args.run_list.resolve().parent,
@@ -1329,6 +1384,7 @@ def main(argv: list[str] | None = None) -> int:
                 out_dir=out.parent,
                 match=args.match,
             )
+            refuse_generated_output(out)  # revalidated immediately before the write
             atomic_write_json(out, document)
         else:
             with tempfile.TemporaryDirectory(prefix="idea-score-corpus-") as scratch:
@@ -1364,6 +1420,14 @@ def main(argv: list[str] | None = None) -> int:
             f"listed {'n/a' if listed is None else f'{listed}/10000'}, "
             f"recall {document['work_recall_e4']}/10000; report={out}"
         )
+        if document["l3"].get("certification"):
+            print(f"NOT CERTIFIABLE: {document['l3']['certification']}")
+        if document["l3"]["independent"] is False:
+            exposed = [mix["mix_id"] for mix in document["mixes"] if mix["independent"] is False]
+            print(
+                f"NOT CERTIFIABLE: the truth for {', '.join(exposed)} is not independent of "
+                "IDea's predictions (they were visible while it was reviewed); it cannot back L3"
+            )
     return 0
 
 

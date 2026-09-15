@@ -57,6 +57,7 @@ from id_detector.providers.base import (
 )
 from id_detector.rescan import DEFAULT_MAX_GENERATIONS, plan_within_budget
 from id_detector.semantics import RECORDING_NAMESPACES
+from id_detector.truth import open_corpus, refuse_generated_output
 from id_detector.windows import (
     DEFAULT_TRANSFORM_GRID,
     TransformGrid,
@@ -130,7 +131,10 @@ class ArmRun:
 
 
 def _truth_files(corpus_dir: Path) -> list[Path]:
-    paths = sorted(corpus_dir.rglob("ground_truth.json"))
+    """The controlled corpus's truth files, only from the gateway's vetted list."""
+
+    with open_corpus(corpus_dir, mutate=False, require_records=False) as handle:
+        paths = list(handle.truth_files)
     if not paths:
         raise ValueError(f"controlled corpus contains no truth: {corpus_dir}")
     return paths
@@ -683,6 +687,13 @@ class AblationResult:
     payload: dict[str, Any]
 
 
+def _publish_report(out_path: Path, payload: object) -> None:
+    """The run's final publication: the destination is revalidated immediately before the write."""
+
+    refuse_generated_output(out_path)
+    atomic_write_json(out_path, payload)
+
+
 def run_ablations(
     *,
     corpus_version: str,
@@ -691,6 +702,7 @@ def run_ablations(
     work_root: Path,
     engine_statuses: list[dict[str, Any]] | None = None,
 ) -> AblationResult:
+    refuse_generated_output(out_path)  # before anything runs
     corpus_dir, truths = _validated_truths(project_root, corpus_version)
     novelty_by_set: dict[str, tuple[int, ...]] = {}
     for truth in truths:
@@ -831,5 +843,5 @@ def run_ablations(
         ],
         "gates": gates,
     }
-    atomic_write_json(out_path, payload)
+    _publish_report(out_path, payload)
     return AblationResult(path=out_path, payload=payload)

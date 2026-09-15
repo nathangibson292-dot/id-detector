@@ -35,12 +35,20 @@ from id_detector.semantics import (
 
 ROOT = Path(__file__).resolve().parents[1]
 GOLDEN = ROOT / "tests" / "golden"
+#: Golden files whose name differs from their contract.  The ground-truth sample is not named
+#: like a corpus record: a set-shaped file directly under tests/golden would make tests/ look
+#: like a corpus, and the corpus gateway refuses every fixture corpus inside another corpus.
+_GOLDEN_FILES = {"ground_truth": "ground_truth_record"}
 SCHEMAS = ROOT / "docs" / "schemas"
 MEDIA_KEY = "a" * 64
 
 
+def _golden_path(name: str) -> Path:
+    return GOLDEN / f"{_GOLDEN_FILES.get(name, name)}.json"
+
+
 def _golden(name: str) -> dict:
-    return json.loads((GOLDEN / f"{name}.json").read_text(encoding="utf-8"))
+    return json.loads(_golden_path(name).read_text(encoding="utf-8"))
 
 
 def _contains_float(value: object) -> bool:
@@ -55,7 +63,7 @@ def _contains_float(value: object) -> bool:
 
 @pytest.mark.parametrize("name", sorted(SCHEMA_MODELS))
 def test_golden_validates_against_schema_and_model(name: str) -> None:
-    instance = json.loads((GOLDEN / f"{name}.json").read_text(encoding="utf-8"))
+    instance = json.loads(_golden_path(name).read_text(encoding="utf-8"))
     schema = json.loads((SCHEMAS / f"{name}.schema.json").read_text(encoding="utf-8"))
     Draft202012Validator.check_schema(schema)
     Draft202012Validator(schema).validate(instance)

@@ -394,18 +394,21 @@ def test_injected_atomic_replace_failure_leaves_original(
     truth_path, truth = _truth(corpus)
     original = truth_path.read_bytes()
     session = TruthReviewSession(truth_path, work_root=tmp_path / "work")
-    real_write = truth_module.atomic_write_json
+    # Every set-file replacement goes through this one seam (link-safe, inside the held set
+    # directory); fail the truth replacement after the annotation has already been replaced.
+    real_write = truth_module._write_set_file
 
-    def fail_truth(path: Path, value: object) -> None:
-        if path.resolve() == truth_path.resolve():
+    def fail_truth(pinned: object, name: str, content: bytes) -> None:
+        if name == truth_path.name:
             raise OSError("injected replace failure")
-        real_write(path, value)
+        real_write(pinned, name, content)
 
-    monkeypatch.setattr(truth_module, "atomic_write_json", fail_truth)
+    monkeypatch.setattr(truth_module, "_write_set_file", fail_truth)
     with pytest.raises(OSError, match="injected"):
         session.save({"rows": _rows(truth)})
     assert truth_path.read_bytes() == original
     assert not _annotation_path(truth_path, "first").exists()
+    assert not truth_module.transaction_path(truth_path).exists()
 
 
 def test_fixture_audit_passes_after_review_save(
@@ -557,14 +560,14 @@ def test_reveal_survives_a_failed_save(
     session = TruthReviewSession(truth_path, work_root=tmp_path / "work")
     session.reveal_predictions()
 
-    real_write = truth_module.atomic_write_json
+    real_write = truth_module._write_set_file
 
-    def fail_truth(path: Path, value: object) -> None:
-        if path.resolve() == truth_path.resolve():
+    def fail_truth(pinned: object, name: str, content: bytes) -> None:
+        if name == truth_path.name:
             raise OSError("injected replace failure")
-        real_write(path, value)
+        real_write(pinned, name, content)
 
-    monkeypatch.setattr(truth_module, "atomic_write_json", fail_truth)
+    monkeypatch.setattr(truth_module, "_write_set_file", fail_truth)
     with pytest.raises(OSError, match="injected"):
         session.save({"rows": _rows(truth)})
     monkeypatch.undo()
@@ -582,10 +585,10 @@ def test_predictions_are_withheld_when_the_exposure_cannot_be_recorded(
     _reveal_stub(monkeypatch)
     session = TruthReviewSession(truth_path, work_root=tmp_path / "work")
 
-    def fail_exposure(path: Path, value: object) -> None:
+    def fail_exposure(pinned: object, **_: object) -> None:
         raise OSError("injected exposure write failure")
 
-    monkeypatch.setattr(review_module, "atomic_write_json", fail_exposure)
+    monkeypatch.setattr(review_module, "_write_exposure", fail_exposure)
     with pytest.raises(OSError, match="injected exposure"):
         session.reveal_predictions()
     assert session.predictions_visible is False
@@ -758,9 +761,11 @@ def test_symlinked_record_into_the_work_root_is_refused(tmp_path: Path) -> None:
         link.symlink_to(work / "hidden" / "fixture-set" / "ground_truth.json")
     except (OSError, NotImplementedError):  # pragma: no cover - Windows without developer mode
         pytest.skip("this platform/account cannot create symlinks")
-    with pytest.raises(ValueError, match="beneath the work tree"):
+    # Round 4: a link is refused before the path is resolved, so the link refusal (with its
+    # "pass the real path" guidance) now fires ahead of the work-tree check; either refuses.
+    with pytest.raises(ValueError, match="beneath the work tree|Pass the resolved real path"):
         find_truth_path(corpus, "fixture-truth-review", work_root=work)
-    with pytest.raises(ValueError, match="beneath the work tree"):
+    with pytest.raises(ValueError, match="beneath the work tree|Pass the resolved real path"):
         TruthReviewSession(link, work_root=work)
 
 
@@ -776,11 +781,11 @@ def test_symlinked_directory_into_the_work_root_is_never_traversed(tmp_path: Pat
         )
     except (OSError, NotImplementedError):  # pragma: no cover - Windows without developer mode
         pytest.skip("this platform/account cannot create directory symlinks")
-    # rglob does not recurse into symlinked directories, so the record is simply never a
-    # candidate -- unreachable is as good as refused, and the direct path is refused anyway.
-    with pytest.raises(ValueError, match="set not found in corpus"):
+    # The gateway's link-refusing walk refuses the symlinked set directory outright with the exact
+    # "pass the real path" guidance; a silent "set not found" skip would fail this assertion.
+    with pytest.raises(ValueError, match="Pass the resolved real path instead"):
         find_truth_path(corpus, "fixture-truth-review", work_root=work)
-    with pytest.raises(ValueError, match="beneath the work tree"):
+    with pytest.raises(ValueError, match="beneath the work tree|Pass the resolved real path"):
         TruthReviewSession(corpus / "fixture-set" / "ground_truth.json", work_root=work)
 
 

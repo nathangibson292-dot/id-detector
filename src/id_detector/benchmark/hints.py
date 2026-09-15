@@ -17,6 +17,7 @@ from id_detector.benchmark.scorer import (
 )
 from id_detector.contracts import GroundTruthRecord
 from id_detector.io import atomic_write_json, read_text
+from id_detector.truth import refuse_generated_output
 
 
 @dataclass(frozen=True)
@@ -100,6 +101,7 @@ async def run_hint_gate(
     work_root: Path,
     max_requests: int = 2_000,
 ) -> HintGateResult:
+    refuse_generated_output(out_path)  # before anything runs
     corpus_dir = project_root / "data" / "corpus" / corpus_version
     if not corpus_dir.is_dir():
         raise ValueError(
@@ -146,6 +148,7 @@ async def run_hint_gate(
     coverage_lower = int(coverage["lower_bound_e4"])
     precision_lower = int(precision["lower_bound_e4"])
     passed = coverage_delta >= 500 and coverage_lower > 0 and bool(precision["pass"])
+    refuse_generated_output(out_path)  # revalidated immediately before the write
     atomic_write_json(
         out_path,
         {

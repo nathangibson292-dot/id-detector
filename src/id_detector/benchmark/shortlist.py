@@ -84,6 +84,7 @@ from id_detector.recognise import (
     recognise_generation_zero,
 )
 from id_detector.shazam import ShazamAdapter
+from id_detector.truth import refuse_generated_output
 from id_detector.windows import generate_windows_async
 
 
@@ -696,6 +697,13 @@ def _not_evaluated(
     )
 
 
+def _publish_report(out_path: Path, payload: object) -> None:
+    """The run's final publication: the destination is revalidated immediately before the write."""
+
+    refuse_generated_output(out_path)
+    atomic_write_json(out_path, payload)
+
+
 async def run_shortlist(
     *,
     corpus_version: str,
@@ -709,6 +717,8 @@ async def run_shortlist(
     engine_runners: Mapping[str, EngineRunner] | None = None,
 ) -> ShortlistResult:
     """Run each available engine independently over every controlled corpus set."""
+
+    refuse_generated_output(out_path)  # before anything runs
 
     corpus_dir = project_root / "data" / "corpus" / corpus_version
     truths = [
@@ -856,7 +866,7 @@ async def run_shortlist(
             "Paid estimates use 150 cents/hour for AudD and 140 cents/hour for ACRCloud.",
         ],
     )
-    atomic_write_json(out_path, report)
+    _publish_report(out_path, report)
     prediction_paths = tuple(
         project_root
         / "data"

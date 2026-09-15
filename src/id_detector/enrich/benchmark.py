@@ -15,6 +15,7 @@ from typing import Any
 
 from id_detector.benchmark.scorer import clopper_pearson_lower_e4
 from id_detector.contracts import AcquireFile
+from id_detector.truth import CERTIFICATION_DISABLED, certification_enabled
 
 STRATA = ("has_qualifier", "no_qualifier", "contested")
 
@@ -135,7 +136,13 @@ def score_link_sample(marked: dict[str, Any]) -> dict[str, Any]:
         "gate": {
             "target_e4": target_e4,
             "min_links": min_links,
-            "pass": passed,
-            "status": "certified" if passed else "pending_owner_marking",
+            # Not judged while certification is disabled: null, never a pass or a fail.
+            "pass": passed if certification_enabled() else None,
+            # A passing sample is never reported certified while certification is disabled.
+            "status": (
+                ("certified" if certification_enabled() else CERTIFICATION_DISABLED)
+                if passed
+                else "pending_owner_marking"
+            ),
         },
     }

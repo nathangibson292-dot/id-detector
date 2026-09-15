@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import io
+import json
 import os
 import random
 import re
@@ -29,6 +30,25 @@ from id_detector.io import (
     sha256_file,
 )
 from id_detector.process import run_process
+from id_detector.truth import (
+    TRUTH_RECORD_NAME,
+    CorpusHandle,
+    corpus_containing,
+    corpus_content_below,
+    is_corpus_directory,
+    open_corpus,
+    write_corpus_file_through_gateway,
+)
+from id_detector.truth_paths import is_link, is_within, refuse_link_components
+
+#: Written into every controlled corpus this renderer produces.  A directory may be replaced only
+#: when it holds this marker as a regular, non-link file whose schema is a render manifest and whose
+#: ``sets`` name exactly that target's set directories with their hashed truth bytes, so a marker
+#: copied or linked into a hand-made or real corpus (data/corpus/release-1) never authorises it.
+CONTROLLED_RENDER_MARKER = "render_manifest.json"
+#: Written into the root of every rendered audio directory.  An existing, non-empty audio
+#: directory may be replaced only when it holds this marker as a regular, non-link file.
+CONTROLLED_AUDIO_MARKER = "controlled-audio.json"
 
 SAMPLE_RATE = 16_000
 AUDIBLE_RULE = (
@@ -660,6 +680,7 @@ async def render_controlled(
     audio_dir: Path | None = None,
     case_set: str = "base",
     corpus_version: str | None = None,
+    work_root: Path | None = None,
 ) -> RenderResult:
     sources_dir = sources_dir.resolve()
     sources = sorted(
@@ -669,15 +690,169 @@ async def render_controlled(
     )
     if len(sources) < 3:
         raise ValueError("controlled rendering requires at least three local audio sources")
-    out_dir = out_dir.resolve()
+    # As spelled: the gateway refuses a link on the target before anything is resolved.
+    out_dir = Path(os.path.abspath(out_dir))
     corpus_version = corpus_version or f"controlled-r5-seed-{seed}"
-    audio_dir = (
-        audio_dir.resolve()
-        if audio_dir is not None
-        else (Path.cwd() / "data" / "local" / "controlled" / corpus_version).resolve()
+    # As spelled, like out_dir: the audio destination is validated before anything resolves it,
+    # before staging, and again immediately before it is published (_render_controlled_locked).
+    audio_dir = Path(
+        os.path.abspath(
+            audio_dir
+            if audio_dir is not None
+            else Path.cwd() / "data" / "local" / "controlled" / corpus_version
+        )
     )
-    if out_dir == audio_dir or out_dir in audio_dir.parents or audio_dir in out_dir.parents:
-        raise ValueError("controlled JSON and rendered audio directories must be separate")
+    _refuse_audio_destination(audio_dir, work_root)
+    audio_dir = audio_dir.resolve()
+    # The target is a corpus, so it goes through the gateway before anything is resolved or read:
+    # a link, a target beneath work_root, a target inside another corpus (such as
+    # data/corpus/release-1/new-controlled) and a frozen target are all refused, and the target's
+    # corpus lock is held for the entire render and publish.  Only a controlled corpus this renderer
+    # produced, proven by a marker bound to that exact target, may then be replaced.
+    with open_corpus(out_dir, mutate=True, work_root=work_root, require_records=False) as handle:
+        resolved_out = out_dir.resolve()
+        if (
+            resolved_out == audio_dir
+            or resolved_out in audio_dir.parents
+            or audio_dir in resolved_out.parents
+        ):
+            raise ValueError("controlled JSON and rendered audio directories must be separate")
+        _refuse_controlled_overwrite(handle)
+        return await _render_controlled_locked(
+            sources=sources,
+            out_dir=resolved_out,
+            audio_dir=audio_dir,
+            seed=seed,
+            case_set=case_set,
+            corpus_version=corpus_version,
+            work_root=work_root,
+        )
+
+
+def _controlled_marker_problem(handle: CorpusHandle) -> str | None:
+    """Why the marker does not prove this renderer produced exactly this target, or None."""
+
+    marker = handle.root / CONTROLLED_RENDER_MARKER
+    if is_link(marker):
+        return f"its {CONTROLLED_RENDER_MARKER} is a symlink or junction, not a regular file"
+    if not os.path.isfile(native_path(marker)):
+        return f"no {CONTROLLED_RENDER_MARKER}"
+    try:
+        payload = json.loads(read_bytes(marker))
+    except (OSError, ValueError):
+        return f"its {CONTROLLED_RENDER_MARKER} is not valid JSON"
+    sets = payload.get("sets") if isinstance(payload, dict) else None
+    if (
+        not isinstance(payload, dict)
+        or payload.get("schema_version") != "1.0.0"
+        or not str(payload.get("generated_by", "")).startswith("id-detector/")
+        or not isinstance(sets, list)
+        or payload.get("set_count") != len(sets)
+        or not all(isinstance(item, dict) for item in sets)
+    ):
+        return f"its {CONTROLLED_RENDER_MARKER} is not a render manifest"
+    set_ids = [str(item.get("set_id")) for item in sets]
+    if len(set(set_ids)) != len(set_ids):
+        return f"its {CONTROLLED_RENDER_MARKER} lists a set_id more than once"
+    recorded = {str(item.get("set_id")): item.get("ground_truth_sha256") for item in sets}
+    on_disk = {path.parent.name: path for path in handle.truth_files}
+    if set(recorded) != set(on_disk):
+        return f"its {CONTROLLED_RENDER_MARKER} does not name exactly this target's set directories"
+    for set_id, path in sorted(on_disk.items()):
+        if sha256_file(path) != recorded[set_id]:
+            return f"its {CONTROLLED_RENDER_MARKER} does not match the truth of {set_id}"
+    return None
+
+
+def _audio_marker_problem(audio_dir: Path) -> str | None:
+    """Why ``audio_dir`` is not an audio directory this renderer produced, or ``None``."""
+
+    marker = audio_dir / CONTROLLED_AUDIO_MARKER
+    if is_link(marker):
+        return f"its {CONTROLLED_AUDIO_MARKER} is a symlink or junction, not a regular file"
+    if not os.path.isfile(native_path(marker)):
+        return f"no {CONTROLLED_AUDIO_MARKER}"
+    try:
+        payload = json.loads(read_bytes(marker))
+    except (OSError, ValueError):
+        return f"its {CONTROLLED_AUDIO_MARKER} is not valid JSON"
+    set_ids = payload.get("set_ids") if isinstance(payload, dict) else None
+    if (
+        not isinstance(payload, dict)
+        or payload.get("kind") != "controlled-audio"
+        or not isinstance(set_ids, list)
+        or not all(isinstance(item, str) for item in set_ids)
+        or len(set(set_ids)) != len(set_ids)
+    ):
+        return f"its {CONTROLLED_AUDIO_MARKER} is not a controlled audio marker"
+    return None
+
+
+def _refuse_audio_destination(audio_dir: Path, work_root: Path | None) -> None:
+    """Refuse an ``--audio-out`` that could replace anything but audio this renderer produced.
+
+    Checked on the path as spelled, before staging and again immediately before publication: a
+    link anywhere on it; a destination beneath ``work_root``; one inside a corpus, that is a
+    corpus, or that holds corpus files anywhere below it; a non-directory; and an existing,
+    non-empty directory without a valid renderer-owned :data:`CONTROLLED_AUDIO_MARKER`.
+    """
+
+    refuse_link_components(audio_dir)
+    if work_root is not None and is_within(audio_dir, work_root):
+        raise ValueError(
+            f"refusing --audio-out {audio_dir}: it lies beneath the work tree {work_root}, "
+            "which idea gc prunes"
+        )
+    ancestor = corpus_containing(audio_dir)
+    if ancestor is not None:
+        raise ValueError(f"refusing --audio-out {audio_dir}: it is inside the corpus {ancestor}")
+    if not os.path.lexists(native_path(audio_dir)):
+        return  # a fresh directory: nothing to replace
+    if not os.path.isdir(native_path(audio_dir)):
+        raise ValueError(f"refusing --audio-out {audio_dir}: it exists and is not a directory")
+    if is_corpus_directory(audio_dir):
+        raise ValueError(f"refusing --audio-out {audio_dir}: it is a corpus, not rendered audio")
+    with os.scandir(native_path(audio_dir)) as entries:
+        empty = next(entries, None) is None
+    if empty:
+        return  # an empty directory: nothing to lose
+    problem = _audio_marker_problem(audio_dir)
+    if problem is not None:
+        raise ValueError(
+            f"refusing to replace --audio-out {audio_dir}: it is not an audio directory this "
+            f"tool rendered ({problem}); render audio into a new or previously rendered directory"
+        )
+    below = corpus_content_below(audio_dir)
+    if below is not None:
+        raise ValueError(
+            f"refusing to replace --audio-out {audio_dir}: it holds corpus content ({below})"
+        )
+
+
+def _refuse_controlled_overwrite(handle: CorpusHandle) -> None:
+    """Refuse to publish over a directory that is not a controlled corpus this renderer produced."""
+
+    if not os.path.isdir(native_path(handle.root)):
+        return  # a fresh directory: nothing to overwrite
+    problem = _controlled_marker_problem(handle)
+    if problem is not None:
+        raise ValueError(
+            f"refusing to replace {handle.root}: it is not a controlled corpus this tool rendered "
+            f"({problem}); rendering never overwrites a hand-made or real corpus such as "
+            "data/corpus/release-1. Render into a new or previously rendered controlled directory"
+        )
+
+
+async def _render_controlled_locked(
+    *,
+    sources: list[Path],
+    out_dir: Path,
+    audio_dir: Path,
+    seed: int,
+    case_set: str,
+    corpus_version: str,
+    work_root: Path | None = None,
+) -> RenderResult:
     out_staging: Path | None = _make_staging_directory(out_dir)
     audio_staging: Path | None = _make_staging_directory(audio_dir)
     try:
@@ -718,8 +893,8 @@ async def render_controlled(
             )
             truth_dir = out_staging / set_id
             os.makedirs(native_path(truth_dir), exist_ok=True)
-            truth_path = truth_dir / "ground_truth.json"
-            atomic_write_json(truth_path, truth)
+            truth_path = truth_dir / TRUTH_RECORD_NAME
+            write_corpus_file_through_gateway(truth_path, truth)
             boundary_count += 2 * len(truth.episodes)
             manifest_sets.append(
                 {
@@ -750,7 +925,20 @@ async def render_controlled(
             "boundary_count": boundary_count,
             "sets": manifest_sets,
         }
+        atomic_write_json(
+            audio_staging / CONTROLLED_AUDIO_MARKER,
+            {
+                "schema_version": "1.0.0",
+                "generated_by": "id-detector/0.1.0",
+                "kind": "controlled-audio",
+                "corpus_version": corpus_version,
+                "set_ids": sorted(str(item["set_id"]) for item in manifest_sets),
+            },
+        )
         atomic_write_json(out_staging / "render_manifest.json", manifest)
+        # Re-validated immediately before publication: a corpus, a link or an unmarked directory
+        # that appeared at the audio destination while rendering is refused, never replaced.
+        _refuse_audio_destination(audio_dir, work_root)
         _publish_directory(audio_staging, audio_dir)
         audio_staging = None
         _publish_directory(out_staging, out_dir)

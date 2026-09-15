@@ -3,12 +3,17 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 import sys
+import unicodedata
 from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit
+
+from id_detector.truth import TRUTH_RECORD_NAME, is_corpus_directory, open_corpus
+from id_detector.truth_paths import is_link
 
 ROOT = Path(__file__).resolve().parents[1]
 SCAN_ROOTS = (
@@ -276,18 +281,61 @@ def _audit_derived(relative: Path, text: str) -> list[str]:
     return failures
 
 
-#: Tracklist furniture that must never survive seeding into a committed truth record.  A row like
-#: "0:17:09 - Royal-T - Tokyo Dub" carries a bullet after the timestamp; the seed parser strips it
-#: (`truth._TRACKLIST`), but a record seeded by an older parser keeps it, and the owner then reviews
-#: 25 rows whose artist reads "- Mall Grab".  The parser is tested; this catches stale
-#: committed data.
-_SEED_FURNITURE = re.compile(r"^\s*[-–—•*]")
+#: Tracklist furniture must never survive seeding into a committed truth record.  A row like
+#: "0:17:09 - Royal-T - Tokyo Dub" carries a list marker after the timestamp; the seed parser strips
+#: it (`truth._TRACKLIST`: an optional time, then a marker *followed by whitespace*), but a record
+#: seeded by an older parser keeps it, and the owner then reviews 25 rows whose artist reads
+#: "- Mall Grab".
+#:
+#: The check follows that grammar rather than a first-glyph test.  A marker is furniture only
+#: where the parser would have consumed it — standing alone, separated from the name by
+#: whitespace — so real names that *start* with the same glyph (``*NSYNC``, ``-M-``, ``-``) pass.
+#: Before matching, the label is read the way a person sees it: leading whitespace and invisible
+#: format characters (a BOM, zero-width spaces and joiners) are skipped, compatibility forms are
+#: folded (NFKC: fullwidth and small hyphens, no-break spaces), and every dash, minus and bullet
+#: variant becomes one marker.  An invisible leading character is reported on its own, because
+#: it is never what the owner transcribed.
+_DASH_AND_BULLET_VARIANTS = {
+    ord(character): "-"
+    for character in (
+        "‐‑‒–—―⁃−﹘﹣－"  # dashes, minus
+        "•‣∙▪●◦·・･*"  # bullets and asterisk
+    )
+}
+_SEED_FURNITURE = re.compile(r"^(?:\d+(?::\d{1,2}){1,2}\s+)?-\s+\S")
+
+
+def _label_defect(value: str) -> str | None:
+    """Why a human-read truth label is not what the owner transcribed, or ``None``.
+
+    Invisible format characters (Unicode ``Cf``) are removed from the *whole* label before the
+    grammar is matched, so one hidden between a timestamp, a marker and its whitespace
+    (``"-\\u200b Mall Grab"``) cannot disguise furniture.  One that appears before the first
+    letter is also reported in its own right; a joiner inside a name (after its first letter) is
+    left alone.
+    """
+
+    categories = [unicodedata.category(character) for character in value]
+    first_letter = next(
+        (index for index, category in enumerate(categories) if category[0] == "L"), len(value)
+    )
+    invisible = "Cf" in categories[:first_letter]
+    visible = "".join(ch for ch in value if unicodedata.category(ch) != "Cf").lstrip()
+    readable = unicodedata.normalize("NFKC", visible).translate(_DASH_AND_BULLET_VARIANTS)
+    furniture = _SEED_FURNITURE.match(readable) is not None
+    if furniture and invisible:
+        return "keeps tracklist furniture behind an invisible leading character"
+    if furniture:
+        return "keeps tracklist furniture"
+    if invisible:
+        return "starts with an invisible character"
+    return None
 
 
 def _audit_truth_record(relative: Path, text: str) -> list[str]:
     """Ground-truth records must not carry seed furniture in the fields a human reads."""
 
-    if relative.name != "ground_truth.json":
+    if relative.name != TRUTH_RECORD_NAME:
         return []
     try:
         record = json.loads(text)
@@ -298,11 +346,42 @@ def _audit_truth_record(relative: Path, text: str) -> list[str]:
         work = episode.get("work") or {}
         for field in ("artist", "title"):
             value = work.get(field)
-            if isinstance(value, str) and _SEED_FURNITURE.match(value):
-                failures.append(
-                    f"{relative}: episode {index} {field} keeps tracklist furniture: {value[:40]!r}"
-                )
+            defect = _label_defect(value) if isinstance(value, str) else None
+            if defect is not None:
+                failures.append(f"{relative}: episode {index} {field} {defect}: {value[:40]!r}")
     return failures
+
+
+def _audited_files(scan_root: Path) -> tuple[list[Path], list[Path]]:
+    """Every regular file under ``scan_root`` to audit, and every link that was refused.
+
+    A corpus directory -- one holding corpus-version.json or a set directory with ground_truth.json
+    -- is read only through the corpus gateway, ``open_corpus(..., mutate=False)``: its vetted truth
+    files plus the other files of the tree the gateway validated.  Any other, non-corpus fixture
+    folder is walked directly with ``os.scandir``, refusing every symlink or junction.
+    """
+
+    files: list[Path] = []
+    links: list[Path] = []
+
+    def walk(directory: Path) -> None:
+        if is_corpus_directory(directory):
+            with open_corpus(directory, mutate=False, require_records=False) as handle:
+                vetted = set(handle.truth_files)
+                files.extend(handle.truth_files)
+                files.extend(path for path in handle.files if path not in vetted)
+            return
+        for entry in sorted(os.scandir(directory), key=lambda item: item.name):
+            child = directory / entry.name
+            if is_link(child):
+                links.append(child)
+            elif entry.is_dir(follow_symlinks=False):
+                walk(child)
+            elif entry.is_file(follow_symlinks=False):
+                files.append(child)
+
+    walk(scan_root)
+    return sorted(files), links
 
 
 def audit() -> list[str]:
@@ -312,7 +391,13 @@ def audit() -> list[str]:
     for scan_root in SCAN_ROOTS:
         if not scan_root.exists():
             continue
-        for path in sorted(item for item in scan_root.rglob("*") if item.is_file()):
+        files, links = _audited_files(scan_root)
+        failures.extend(
+            f"{link.relative_to(ROOT)}: is a symlink or junction; the audit refuses links "
+            "(pass the resolved real path instead)"
+            for link in links
+        )
+        for path in files:
             scanned += 1
             relative = path.relative_to(ROOT)
             if not _pattern_exempt(relative) and re.search(r"\d{6,}", relative.as_posix()):

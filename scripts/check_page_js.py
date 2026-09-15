@@ -24,6 +24,7 @@ from id_detector.contracts import GroundTruthRecord
 from id_detector.io import read_text
 from id_detector.present import page, server
 from id_detector.present.exports import build_projection
+from id_detector.truth import open_corpus
 from id_detector.truth_review import _page as truth_review_page
 from id_detector.webapp.jobs import Job
 
@@ -120,12 +121,12 @@ def _pages() -> list[tuple[str, str | bytes]]:
         failed_phase="ingest",
         error="boom",
     )
-    truth = GroundTruthRecord.model_validate_json(
-        read_text(
-            Path(__file__).resolve().parents[1]
-            / "tests/fixtures/truth-review/fixture-set/ground_truth.json"
-        )
-    )
+    # Read through the corpus gateway like every other corpus reader: the committed review fixture
+    # corpus holds exactly one set.
+    with open_corpus(
+        Path(__file__).resolve().parents[1] / "tests" / "fixtures" / "truth-review", mutate=False
+    ) as fixture_corpus:
+        truth = GroundTruthRecord.model_validate_json(read_text(fixture_corpus.truth_files[0]))
     review = SimpleNamespace(
         truth=truth,
         suggested_offset_ms=None,

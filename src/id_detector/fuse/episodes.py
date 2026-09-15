@@ -60,6 +60,7 @@ from id_detector.semantics import (
     partition_durations,
     proved_bounds,
 )
+from id_detector.truth import certification_enabled
 
 
 @dataclass(frozen=True)
@@ -586,7 +587,12 @@ def _certification(profile: str, calibrator: Any | None = None) -> Certification
                 CertificationEntry(
                     dimension=entry.dimension,
                     tier=entry.tier,
-                    status=entry.status,
+                    # A calibration model's certification never propagates while disabled.
+                    status=(
+                        entry.status
+                        if certification_enabled() or entry.status != "certified"
+                        else "provisional"
+                    ),
                     n_test_predictions=entry.n_test_predictions,
                     lower_bound_e4=entry.lower_bound_e4,
                     test_version=entry.test_version,

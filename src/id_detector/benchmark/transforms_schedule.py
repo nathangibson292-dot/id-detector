@@ -35,6 +35,7 @@ from id_detector.local_fixture import (
 from id_detector.providers.base import DEFAULT_HOP_MS, DEFAULT_PHASE_MS, DEFAULT_WINDOW_MS
 from id_detector.recognise import load_provider_configs
 from id_detector.semantics import RECORDING_NAMESPACES
+from id_detector.truth import open_corpus, refuse_generated_output
 from id_detector.windows import (
     DEFAULT_TRANSFORM_GRID,
     TransformGrid,
@@ -90,7 +91,10 @@ class TransformScheduleResult:
 
 
 def _truth_files(corpus_dir: Path) -> list[Path]:
-    paths = sorted(corpus_dir.rglob("ground_truth.json"))
+    """The controlled corpus's truth files, only from the gateway's vetted list."""
+
+    with open_corpus(corpus_dir, mutate=False, require_records=False) as handle:
+        paths = list(handle.truth_files)
     if not paths:
         raise ValueError(f"controlled corpus contains no truth: {corpus_dir}")
     return paths
@@ -362,6 +366,13 @@ def _best_schedule(rows: list[dict[str, Any]], *, window_ms: int | None) -> Wind
     )
 
 
+def _publish_report(out_path: Path, payload: object) -> None:
+    """The run's final publication: the destination is revalidated immediately before the write."""
+
+    refuse_generated_output(out_path)
+    atomic_write_json(out_path, payload)
+
+
 def run_transform_schedule_benchmark(
     *,
     corpus_version: str,
@@ -369,6 +380,7 @@ def run_transform_schedule_benchmark(
     project_root: Path,
     work_root: Path,
 ) -> TransformScheduleResult:
+    refuse_generated_output(out_path)  # before anything runs
     corpus_dir = project_root / "data" / "corpus" / corpus_version
     truths = [
         GroundTruthRecord.model_validate_json(read_text(path)) for path in _truth_files(corpus_dir)
@@ -539,5 +551,5 @@ def run_transform_schedule_benchmark(
             ),
         },
     }
-    atomic_write_json(out_path, payload)
+    _publish_report(out_path, payload)
     return TransformScheduleResult(path=out_path, selected_schedule=rescan)

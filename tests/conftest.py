@@ -8,6 +8,8 @@ deselects ``slow`` and ``live``.  Run everything except live with ``pytest -m "n
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
 
 #: Modules whose tests render audio or drive the full multi-generation / multi-process pipeline.
@@ -26,3 +28,29 @@ def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item
     for item in items:
         if item.module.__name__.rsplit(".", 1)[-1] in SLOW_MODULES:
             item.add_marker(slow)
+
+
+def write_corpus_fixture(path: Path, value: object) -> None:
+    """Write a test corpus file directly.
+
+    Production corpus files go through the corpus gateway, and ``io``'s atomic writers refuse
+    corpus file names by design, so tests that build a corpus by hand write its files here.
+    """
+
+    from id_detector.io import canonical_json_bytes
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(canonical_json_bytes(value))
+
+
+@pytest.fixture
+def certification_gate_open(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Open the owner's freeze/certification moratorium for one test.
+
+    Production keeps ``truth.CERTIFICATION_ENABLED`` false.  Tests that exercise the freeze and
+    certification logic underneath the gate open it here, by monkeypatch only.
+    """
+
+    import id_detector.truth as truth
+
+    monkeypatch.setattr(truth, "CERTIFICATION_ENABLED", True)

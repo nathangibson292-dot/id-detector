@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import math
+import os
 import random
 import re
 import unicodedata
@@ -36,7 +37,35 @@ from id_detector.contracts import (
     TruthVersion,
     TruthWork,
 )
-from id_detector.io import atomic_write_json, canonical_json_bytes, read_text, sha256_file
+from id_detector.io import (
+    atomic_write_json,
+    canonical_json_bytes,
+    read_bytes,
+    read_text,
+    sha256_file,
+)
+from id_detector.truth import (
+    CERTIFICATION_DISABLED,
+    TRUTH_RECORD_NAME,
+    CorpusHandle,
+    certification_enabled,
+    exposure_ledger_path,
+    frozen_manifest,
+    ledger_entry_digests,
+    open_corpus,
+    prediction_exposure,
+    refuse_generated_output,
+    require_corpus_member,
+    require_frozen_inventory,
+    require_frozen_ledger,
+)
+from id_detector.truth_paths import (
+    is_link,
+    is_within,
+    link_refusal,
+    path_key,
+    refuse_link_components,
+)
 
 ASSOCIATION_MARGIN_MS = 30_000
 BOUNDARY_TOLERANCE_MS = 10_000
@@ -1193,46 +1222,145 @@ def paired_non_inferiority(
     }
 
 
-def load_truth_directory(path: Path) -> list[GroundTruthRecord]:
-    path = path.resolve()
-    if path.is_file():
-        candidates = [path]
-    else:
-        candidates = sorted(path.rglob("ground_truth.json"))
-        if not candidates:
-            candidates = sorted(path.glob("*.json"))
-    truths: list[GroundTruthRecord] = []
+@dataclass(frozen=True)
+class LoadedTruth:
+    """One truth record as loaded: the file it came from and the exact bytes that were parsed."""
+
+    path: Path
+    raw: bytes
+    record: GroundTruthRecord
+
+
+def _population_root(path: Path) -> Path | None:
+    """The corpus root a truth path belongs to, or ``None`` for a standalone truth document.
+
+    A directory (or a path that does not exist yet) is itself the corpus root.  A file named
+    ``ground_truth.json`` is a corpus record, which must sit exactly at
+    ``<root>/<set>/ground_truth.json``, so its root is exactly its grandparent.  Any other file is a
+    standalone truth document: never a corpus record, so never frozen-verified or certified.
+    """
+
+    absolute = Path(os.path.abspath(path))
+    if os.path.isdir(absolute):
+        return absolute
+    if absolute.name == TRUTH_RECORD_NAME:
+        return absolute.parent.parent
+    if not os.path.lexists(absolute):
+        return absolute
+    return None
+
+
+def _truth_candidates(path: Path, handle: CorpusHandle) -> list[Path]:
+    """The records a path names, taken only from the gateway's vetted list."""
+
+    absolute = Path(os.path.abspath(path))
+    if absolute.name == TRUTH_RECORD_NAME and not os.path.isdir(absolute):
+        return [require_corpus_member(handle, absolute)]
+    return list(handle.truth_files)
+
+
+def _load_candidates(candidates: list[Path]) -> list[LoadedTruth]:
+    loaded: list[LoadedTruth] = []
     for candidate in candidates:
-        try:
-            truths.append(GroundTruthRecord.model_validate_json(read_text(candidate)))
-        except Exception:
-            if candidate.name == "ground_truth.json" or path.is_file():
-                raise
-    if not truths:
-        raise ValueError(f"no ground_truth.json files found under {path}")
-    if len({truth.set_id for truth in truths}) != len(truths):
+        raw = read_bytes(candidate)
+        loaded.append(LoadedTruth(candidate, raw, GroundTruthRecord.model_validate_json(raw)))
+    if len({item.record.set_id for item in loaded}) != len(loaded):
         raise ValueError("truth directory contains duplicate set_id values")
-    return truths
+    return loaded
+
+
+def load_truth_files(path: Path) -> list[LoadedTruth]:
+    """Load truth records, keeping each one's file and raw bytes for manifest binding.
+
+    Links on the path as given are refused first.  A corpus directory is read only from
+    ``open_corpus(..., mutate=False).truth_files``; a corpus record's root passes the same
+    gateway and the record must be one of its vetted files; a standalone truth document is
+    read as given.
+    """
+
+    refuse_link_components(path)
+    root = _population_root(path)
+    if root is None:
+        return _load_candidates([Path(os.path.abspath(path))])
+    with open_corpus(root, mutate=False) as handle:
+        return _load_candidates(_truth_candidates(path, handle))
+
+
+def load_truth_directory(path: Path) -> list[GroundTruthRecord]:
+    return [item.record for item in load_truth_files(path)]
+
+
+def find_freeze_manifest(path: Path) -> Path | None:
+    """The ``corpus-version.json`` covering a truth file or directory, if any.
+
+    In the one supported layout the manifest is ``<corpus>/corpus-version.json``: the corpus given,
+    or exactly the record's grandparent, and nowhere else.  It is located through the corpus gateway
+    (links, work tree, inside another corpus and layout refused first), a manifest that is itself a
+    link is refused, and a standalone truth document has none.
+    """
+
+    refuse_link_components(path)
+    root = _population_root(path)
+    if root is None:
+        return None
+    with open_corpus(root, mutate=False, require_records=False) as handle:
+        manifest = handle.manifest_path
+        if is_link(manifest):
+            raise link_refusal(manifest, manifest)
+        return manifest if manifest.is_file() else None
+
+
+def _manifest_records_exposure(manifest: dict[str, Any] | None, set_id: str) -> bool:
+    """Whether a frozen manifest records that ``set_id`` was reviewed with predictions visible."""
+
+    if manifest is None or manifest.get("frozen") is not True:
+        return False
+    for item in manifest.get("sets", []):
+        if isinstance(item, dict) and str(item.get("set_id")) == set_id:
+            exposure = item.get("prediction_exposure")
+            return isinstance(exposure, dict) and (
+                exposure.get("predictions_visible_during_review") is True
+            )
+    return False
+
+
+def frozen_prediction_exposure(path: Path, set_id: str) -> bool:
+    """Whether a frozen manifest records that ``set_id`` was reviewed with predictions visible.
+
+    The freeze hashes that evidence (see ``truth.freeze_truth``), so the record outlives the
+    sidecar it was taken from: deleting ``review-exposure.json`` after a freeze cannot make an
+    exposed set independent again.
+    """
+
+    manifest_path = find_freeze_manifest(path)
+    if manifest_path is None:
+        return False
+    return _manifest_records_exposure(json.loads(read_text(manifest_path)), set_id)
 
 
 def truth_is_frozen_verified(path: Path, truths: list[GroundTruthRecord]) -> bool:
-    """Return verified state only for non-draft truth covered by a hash-checked freeze manifest."""
+    """Return verified state only for non-draft truth covered by a hash-checked freeze manifest.
 
-    resolved = path.resolve()
-    directories = [resolved] if resolved.is_dir() else [resolved.parent, *resolved.parents[1:3]]
-    manifest_path = next(
-        (
-            directory / "corpus-version.json"
-            for directory in directories
-            if (directory / "corpus-version.json").is_file()
-        ),
-        None,
-    )
-    if manifest_path is None:
-        return False
-    manifest = json.loads(read_text(manifest_path))
-    if manifest.get("frozen") is not True:
-        return False
+    Any prediction-exposure evidence the freeze hashed must still be present and unchanged;
+    verified is about the integrity of the frozen record, and independence is judged separately
+    (:func:`frozen_prediction_exposure`).
+    """
+
+    refuse_link_components(path)
+    root = _population_root(path)
+    if root is None:
+        return False  # a standalone truth document is never frozen-verified
+    with open_corpus(root, mutate=False, require_records=False) as handle:
+        manifest = frozen_manifest(handle)
+        if manifest is None:
+            return False
+        # Exact population: the loaded inventory must equal the frozen manifest's, or verified
+        # (and so independent and certified) status is refused, naming every difference.
+        require_frozen_inventory(handle, manifest)
+        manifest_path = handle.manifest_path
+        loaded = {
+            item.record.set_id: item for item in _load_candidates(_truth_candidates(path, handle))
+        }
     corpus_versions = {truth.corpus_version for truth in truths}
     if corpus_versions != {manifest.get("corpus_version")}:
         raise ValueError("freeze manifest corpus_version differs from loaded truth")
@@ -1246,10 +1374,144 @@ def truth_is_frozen_verified(path: Path, truths: list[GroundTruthRecord]) -> boo
         entry = entries.get(truth.set_id)
         if entry is None:
             raise ValueError(f"freeze manifest does not cover truth set {truth.set_id}")
-        truth_file = manifest_path.parent / str(entry.get("path", ""))
-        if not truth_file.is_file() or sha256_file(truth_file) != entry.get("sha256"):
-            raise ValueError(f"freeze manifest hash mismatch for truth set {truth.set_id}")
+        relative = Path(str(entry.get("path", "")))
+        if relative.is_absolute() or ".." in relative.parts or not relative.parts:
+            raise ValueError(
+                f"freeze manifest path for truth set {truth.set_id} escapes the corpus: {relative}"
+            )
+        truth_file = manifest_path.parent / relative
+        # Bind the record being scored to *its own* entry: the same file (not a same-set_id copy
+        # elsewhere under the corpus), reached without links, with exactly the frozen bytes.
+        scored = loaded.get(truth.set_id)
+        if scored is None or scored.record != truth:
+            raise ValueError(
+                f"truth set {truth.set_id} being scored is not the record on disk at {path}"
+            )
+        _refuse_links_below(manifest_path.parent, truth_file, truth.set_id)
+        if path_key(scored.path) != path_key(truth_file):
+            raise ValueError(
+                f"truth set {truth.set_id} is scored from {scored.path}, but the freeze manifest "
+                f"froze it at {truth_file}; a copy is never verified by the original's entry"
+            )
+        if sha256(scored.raw).hexdigest() != entry.get("sha256"):
+            raise ValueError(
+                f"freeze manifest truth record for truth set {truth.set_id} is missing or altered"
+            )
+        _require_frozen_file(
+            truth_file, entry.get("sha256"), manifest_path.parent, truth.set_id, "truth record"
+        )
+        exposure = entry.get("prediction_exposure")
+        evidence = exposure.get("evidence") if isinstance(exposure, dict) else None
+        recorded_ledger = exposure.get("ledger_entries") if isinstance(exposure, dict) else None
+        if recorded_ledger:
+            # The corpus ledger may grow (other sets are revealed later), so each recorded line is
+            # checked for presence rather than the whole file being hashed.
+            ledger = exposure_ledger_path(truth_file)
+            refuse_link_components(ledger)
+            present = (
+                set(
+                    ledger_entry_digests(
+                        read_bytes(ledger),
+                        set_id=truth.set_id,
+                        set_directory=truth_file.parent.name,
+                    )
+                )
+                if ledger.is_file()
+                else set()
+            )
+            if not set(recorded_ledger) <= present:
+                raise ValueError(
+                    f"freeze manifest exposure ledger entry for truth set {truth.set_id} is "
+                    f"missing or altered in {ledger}"
+                )
+        for name, digest in sorted((evidence or {}).items()):
+            if Path(str(name)).name != str(name):
+                raise ValueError(
+                    f"freeze manifest exposure evidence for truth set {truth.set_id} is missing "
+                    f"or altered: {name}"
+                )
+            _require_frozen_file(
+                truth_file.parent / str(name),
+                digest,
+                manifest_path.parent,
+                truth.set_id,
+                f"exposure evidence {name}",
+            )
+        passes = entry.get("annotation_passes")
+        if isinstance(passes, dict):
+            # Every pass the freeze saw must still be there, unchanged; a pass the freeze did not
+            # see must not have appeared since.  Otherwise "frozen two-pass truth" is a claim the
+            # files on disk no longer support.
+            for name in ("first", "second", "resolution"):
+                record = truth_file.parent / f"annotation-{name}.json"
+                digest = passes.get(name)
+                if digest is None:
+                    if os.path.lexists(record):
+                        raise ValueError(
+                            f"freeze manifest annotation pass for truth set {truth.set_id} "
+                            f"appeared after the freeze: {record.name}"
+                        )
+                    continue
+                _require_frozen_file(
+                    record,
+                    digest,
+                    manifest_path.parent,
+                    truth.set_id,
+                    f"annotation pass {record.name}",
+                )
+    # The whole ledger, not only each set's recorded lines: a line added after the freeze is
+    # refused while it is present.
+    require_frozen_ledger(handle, manifest)
     return True
+
+
+def _refuse_links_below(root: Path, record: Path, set_id: str) -> None:
+    """No component from the manifest's directory down to ``record`` may be a link."""
+
+    refuse_link_components(root)  # the manifest root and its ancestors
+    current = root
+    for part in record.relative_to(root).parts:
+        current = current / part
+        if is_link(current):
+            raise link_refusal(f"freeze manifest entry for truth set {set_id}", current)
+
+
+def _require_frozen_file(record: Path, digest: object, root: Path, set_id: str, what: str) -> None:
+    """A file a freeze manifest hashed: a real file inside the corpus, with the recorded bytes."""
+
+    _refuse_links_below(root, record, set_id)
+    if is_link(record):
+        raise link_refusal(record, record)
+    if not is_within(record, root):
+        raise ValueError(
+            f"freeze manifest {what} for truth set {set_id} escapes the corpus: {record}"
+        )
+    if not record.is_file() or sha256_file(record) != digest:
+        raise ValueError(f"freeze manifest {what} for truth set {set_id} is missing or altered")
+
+
+def corpus_independent(path: Path, truths: list[GroundTruthRecord]) -> bool:
+    """``False`` when any loaded set was annotated with IDea's predictions visible.
+
+    Live evidence beside each record and the frozen manifest's hashed record both count, so the
+    verdict survives a sidecar deleted after the freeze.
+    """
+
+    refuse_link_components(path)  # before resolving, enumerating or reading anything
+    root = _population_root(path)
+    manifest: dict[str, Any] | None = None
+    if root is None:
+        candidates = [Path(os.path.abspath(path))]
+    else:
+        with open_corpus(root, mutate=False) as handle:
+            candidates = _truth_candidates(path, handle)
+            manifest = frozen_manifest(handle)
+            if manifest is not None:
+                # Independence of a frozen corpus is judged only over exactly its population.
+                require_frozen_inventory(handle, manifest)
+    if any(prediction_exposure(item)["predictions_visible_during_review"] for item in candidates):
+        return False
+    return not any(_manifest_records_exposure(manifest, truth.set_id) for truth in truths)
 
 
 def score_corpus(
@@ -1258,6 +1520,8 @@ def score_corpus(
     *,
     out_path: Path | None = None,
 ) -> BenchmarkReportRecord:
+    if out_path is not None:
+        refuse_generated_output(out_path)
     report, _ = score_corpus_detailed(truth_path, predictions_path, out_path=out_path)
     return report
 
@@ -1270,10 +1534,15 @@ def score_corpus_detailed(
 ) -> tuple[BenchmarkReportRecord, list[SetScore]]:
     """Score a corpus and also return the per-set states, which carry the raw numerators."""
 
+    if out_path is not None:
+        refuse_generated_output(out_path)  # before anything is read
+
     truths = load_truth_directory(truth_path)
     raw_predictions = json.loads(read_text(predictions_path))
     document = PredictionDocument.model_validate(raw_predictions)
     verified = truth_is_frozen_verified(truth_path, truths)
+    # Certification needs truth made without seeing IDea's answers; verified alone is not enough.
+    independent = corpus_independent(truth_path, truths)
     derived_unverified = not verified
     if document.unverified_seed_comparison != derived_unverified:
         raise ValueError(
@@ -1344,8 +1613,11 @@ def score_corpus_detailed(
                         document.config_snapshot.config_version if target is not None else None
                     ),
                     "status": (
-                        "certified"
+                        CERTIFICATION_DISABLED
+                        if not certification_enabled()
+                        else "certified"
                         if verified
+                        and independent
                         and target is not None
                         and cp_lower >= target
                         and cluster_lower >= target
@@ -1378,5 +1650,6 @@ def score_corpus_detailed(
         unverified_seed_comparison=derived_unverified,
     )
     if out_path is not None:
+        refuse_generated_output(out_path)  # revalidated immediately before the write
         atomic_write_json(out_path, report)
     return report, scores

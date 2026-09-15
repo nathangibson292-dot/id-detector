@@ -12,6 +12,7 @@ from id_detector.benchmark.scorer import (
     work_key,
 )
 from id_detector.io import atomic_write_json, canonical_json_bytes
+from id_detector.truth import refuse_generated_output
 
 
 def main() -> None:
@@ -21,6 +22,7 @@ def main() -> None:
     parser.add_argument("--profile", default="controlled-plumbing")
     parser.add_argument("--seed", type=int, default=0)
     args = parser.parse_args()
+    refuse_generated_output(args.out)  # before anything is read
     truths = load_truth_directory(args.truth)
     versions = {truth.corpus_version for truth in truths}
     if len(versions) != 1:
@@ -151,6 +153,7 @@ def main() -> None:
         "certification_targets": [],
     }
     snapshot = ScoringConfigSnapshot.model_validate(config_snapshot)
+    refuse_generated_output(args.out)  # revalidated immediately before the write
     atomic_write_json(
         args.out,
         {

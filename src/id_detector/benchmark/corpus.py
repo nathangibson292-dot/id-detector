@@ -44,6 +44,7 @@ from id_detector.present import export_tracklist
 from id_detector.process import run_process
 from id_detector.recognise import load_provider_config
 from id_detector.semantics import RECORDING_NAMESPACES
+from id_detector.truth import open_corpus, refuse_generated_output
 from id_detector.windows import HOP_MS, WINDOW_MS, generate_windows_async
 
 SOURCE_DURATION_TOLERANCE_MS = 500
@@ -63,7 +64,10 @@ class CorpusRunResult:
 
 
 def _truth_files(corpus_dir: Path, set_id: str | None) -> list[Path]:
-    paths = sorted(corpus_dir.rglob("ground_truth.json"))
+    """The corpus's truth files, taken only from the gateway's vetted list (``open_corpus``)."""
+
+    with open_corpus(corpus_dir, mutate=False, require_records=False) as handle:
+        paths = list(handle.truth_files)
     if set_id is not None:
         paths = [
             path
@@ -480,6 +484,13 @@ def _scoring_config(
     )
 
 
+def _publish_report(out_path: Path, payload: object) -> None:
+    """The run's final publication: the destination is revalidated immediately before the write."""
+
+    refuse_generated_output(out_path)
+    atomic_write_json(out_path, payload)
+
+
 async def run_corpus(
     *,
     corpus_version: str,
@@ -492,6 +503,7 @@ async def run_corpus(
     max_requests: int = 2_000,
     include_hints: bool = False,
 ) -> CorpusRunResult:
+    refuse_generated_output(out_path)  # before anything runs
     if profile != "free":
         raise ValueError("Stage 2b corpus runs support only the free profile")
     corpus_dir = project_root / "data" / "corpus" / corpus_version
@@ -581,5 +593,5 @@ async def run_corpus(
                 "regression": _regression(report, baseline_path, seed=config.bootstrap_seed),
             }
         )
-    atomic_write_json(out_path, report)
+    _publish_report(out_path, report)
     return CorpusRunResult(report=report, predictions_path=predictions_path)

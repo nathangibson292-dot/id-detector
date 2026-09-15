@@ -527,6 +527,11 @@ class DurationsRecord(Record):
     unscanned_ms: NonNegativeInt
 
 
+#: The exact message every freeze and certification refusal carries while the owner's moratorium
+#: holds (see ``truth.CERTIFICATION_ENABLED``), and the non-certified benchmark status it produces.
+CERTIFICATION_DISABLED = "certification is disabled until the certification follow-up lands"
+
+
 class CertificationEntry(ContractModel):
     dimension: Literal["work", "version", "start", "end", "boundary"]
     tier: Literal["possible", "likely", "verified"]
@@ -858,7 +863,11 @@ class BenchmarkCertification(ContractModel):
     n_sets: NonNegativeInt
     target_e4: ConfidenceE4 | None
     registration_version: str | None
-    status: Literal["certified", "provisional"]
+    status: Literal[
+        "certified",
+        "provisional",
+        "certification is disabled until the certification follow-up lands",
+    ]
 
 
 class RegressionGate(ContractModel):

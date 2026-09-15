@@ -191,3 +191,8 @@ def test_analyse_accepts_a_frozen_profile_and_derives_its_config(monkeypatch) ->
     # The profile certifies rescans on (=3), but the config's default rescan ceiling (0) caps it, so
     # live analyses ship rescans OFF; a config [rescan] setting or --max-generations opts back in.
     assert captured["max_generations"] == 0
+
+
+# Round 10: re-deriving the committed profiles needs their feature `certified` flags, which
+# the moratorium gate forces false, so the gate is opened for these tests by fixture.
+pytestmark = pytest.mark.usefixtures("certification_gate_open")

@@ -266,7 +266,9 @@ def test_time_mode_numbers_on_corpus_mini_are_unchanged(tmp_path: Path) -> None:
     assert document["l3"] == {
         "thresholds": L3_THRESHOLDS["deep"],
         "thresholds_met": False,
+        "independent": True,
         "certifiable": False,
+        "certification": "certification is disabled until the certification follow-up lands",
     }
     by_mix = {mix["mix_id"]: mix for mix in document["mixes"]}
     assert [by_mix["mini-a"][key] for key in L3_KEYS] == [10_000, 6_000, 10_000]
@@ -460,7 +462,13 @@ def test_truth_status_unverified_then_verified_under_a_frozen_manifest(tmp_path:
     assert code == 0
     assert document["truth_status"] == "verified"
     assert [mix["truth_status"] for mix in document["mixes"]] == ["verified", "verified"]
-    assert document["l3"]["certifiable"] is True
+    # Round 8: frozen, verified, timed and independent would have been certifiable, but
+    # certification is disabled until the certification follow-up lands.
+    assert document["l3"]["certifiable"] is False
+    assert (
+        document["l3"]["certification"]
+        == "certification is disabled until the certification follow-up lands"
+    )
     report = json.loads((tmp_path / "frozen" / document["mixes"][0]["report"]).read_text("utf-8"))
     assert report["unverified_seed_comparison"] is False
 
@@ -473,7 +481,9 @@ def test_truth_status_unverified_then_verified_under_a_frozen_manifest(tmp_path:
     assert document["l3"] == {
         "thresholds": L3_THRESHOLDS["deep"],
         "thresholds_met": None,
+        "independent": True,
         "certifiable": False,
+        "certification": "certification is disabled until the certification follow-up lands",
     }
 
     # One draft mix drags the whole run back to draft.
@@ -601,7 +611,10 @@ def test_free_recipe_uses_its_own_recall_threshold_and_can_meet_the_bar() -> Non
     assert "frozen, verified truth" in text
     assert "Matching is by TIME: every truth file has start times" in text
     assert "the presentation floor hid nothing" in text
-    assert "recall >= 70.0% for free: all three thresholds are met on these numbers" in text
+    # Round 10: while certification is disabled no positive L3 claim is printed, however the
+    # numbers look (the gate-open wording is tested in test_truth_corpus_followup_r10).
+    assert "thresholds are met" not in text
+    assert "recall >= 70.0% for free: no L3 threshold claim is made because" in text
     # Meeting the three numbers is not clearing L3: the corpus shape it also asks for is named.
     assert ">= 5 owner-verified mixes, >= 3 DJs, >= 2 platforms and >= 4 h of audio" in text
     assert "cannot clear" not in text
@@ -1633,6 +1646,9 @@ def test_an_overlay_seeded_truth_scores_the_blended_track_by_time(tmp_path: Path
         encoding="utf-8",
     )
     truth_path = root / "mini-b" / "ground_truth.json"
+    # Seeding never overwrites an existing truth set (round-3 R-P0-2); replacing this fixture copy's
+    # record is deliberate here, so it is removed first, exactly as the refusal message advises.
+    truth_path.unlink()
     seeded = seed_truth(
         out_path=truth_path,
         set_id="mini-b",

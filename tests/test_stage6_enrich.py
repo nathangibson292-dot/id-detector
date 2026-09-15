@@ -609,7 +609,10 @@ def test_link_benchmark_sample_is_stratified_and_scored() -> None:
         row["mark"] = "correct"
     score = link_bench.score_link_sample(sheet)
     assert score["correct"] == 2 and score["precision_e4"] == 10_000
-    assert score["gate"]["pass"] is False  # fewer than 60 marked links
+    # Round 11: certification is disabled, so the gate is not judged (null); the sample is
+    # still reported as not passing through its status.
+    assert score["gate"]["pass"] is None
+    assert score["gate"]["status"] == "pending_owner_marking"  # fewer than 60 marked links
 
     # One wrong mark lowers precision and the one-sided lower bound.
     sheet["links"][0]["mark"] = "incorrect"

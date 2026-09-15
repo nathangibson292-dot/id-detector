@@ -32,6 +32,8 @@
   "generated_by": "id-detector/0.1.0 scripts/score_corpus.py",
   "l3": {
     "certifiable": false,
+    "certification": "certification is disabled until the certification follow-up lands",
+    "independent": true,
     "thresholds": {
       "likely_precision_e4": 9000,
       "listed_precision_e4": 8000,
@@ -68,6 +70,7 @@
         "buried": 1,
         "short": 1
       },
+      "independent": true,
       "likely_precision_e4": 10000,
       "listed_precision_e4": 6000,
       "match_mode": "time",
@@ -146,6 +149,7 @@
       "hidden_by_reason": {
         "short": 1
       },
+      "independent": true,
       "likely_precision_e4": 5000,
       "listed_precision_e4": 5000,
       "match_mode": "time",

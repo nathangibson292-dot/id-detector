@@ -9,8 +9,10 @@ import pytest
 
 from id_detector.benchmark.corpus import _real_analyse_command
 from id_detector.calibrate.certify import (
-    CorpusNotFrozen,
+    CERTIFICATION_DISABLED,
+    CertificationDisabled,
     DuplicateTestVersion,
+    _guard_test_version,
     _population_prediction_count,
     registered_targets,
     run_certify,
@@ -39,6 +41,7 @@ from id_detector.contracts import (
 from id_detector.fuse.episodes import build_episodes, competing_candidate_count
 from id_detector.fuse.identity import build_identity_graph
 from id_detector.io import atomic_write_json
+from tests.conftest import write_corpus_fixture
 
 MEDIA_KEY = "7" * 64
 
@@ -314,7 +317,7 @@ def test_build_episodes_uses_calibrator_when_present() -> None:
 # Certification command refusal paths
 # --------------------------------------------------------------------------------------------------
 def _write_manifest(project_root: Path, corpus: str, *, frozen: bool) -> None:
-    atomic_write_json(
+    write_corpus_fixture(
         project_root / "data" / "corpus" / corpus / "corpus-version.json",
         {
             "schema_version": SCHEMA_VERSION,
@@ -328,7 +331,9 @@ def _write_manifest(project_root: Path, corpus: str, *, frozen: bool) -> None:
 
 def test_certify_refuses_unfrozen_corpus(tmp_path: Path) -> None:
     _write_manifest(tmp_path, "draftcorpus", frozen=False)
-    with pytest.raises(CorpusNotFrozen):
+    # Round 8: certification is disabled until the certification follow-up lands, so it is
+    # refused before the corpus is opened (the frozen guard itself is tested directly).
+    with pytest.raises(CertificationDisabled, match=CERTIFICATION_DISABLED):
         __import__("asyncio").run(
             run_certify(
                 corpus_version="draftcorpus",
@@ -340,13 +345,14 @@ def test_certify_refuses_unfrozen_corpus(tmp_path: Path) -> None:
         )
 
 
-def test_certify_refuses_repeated_test_version(tmp_path: Path) -> None:
+def test_certify_with_a_repeated_test_version_is_refused_as_disabled(tmp_path: Path) -> None:
     _write_manifest(tmp_path, "frozencorpus", frozen=True)
     registry = (
         tmp_path / "data" / "local" / "certification" / "frozencorpus" / "free" / "registry.json"
     )
     atomic_write_json(registry, {"test_versions": ["v1"]})
-    with pytest.raises(DuplicateTestVersion):
+    # Round 8: refused as disabled before the test-version registry is consulted.
+    with pytest.raises(CertificationDisabled, match=CERTIFICATION_DISABLED):
         __import__("asyncio").run(
             run_certify(
                 corpus_version="frozencorpus",
@@ -356,6 +362,19 @@ def test_certify_refuses_repeated_test_version(tmp_path: Path) -> None:
                 work_root=tmp_path / "work",
             )
         )
+
+
+def test_guard_test_version_refuses_a_reused_version(tmp_path: Path) -> None:
+    """The retained repeated-version guard, tested directly; production certification stays off."""
+
+    registry = (
+        tmp_path / "data" / "local" / "certification" / "frozencorpus" / "free" / "registry.json"
+    )
+    atomic_write_json(registry, {"test_versions": ["v1"]})
+    with pytest.raises(DuplicateTestVersion, match="already certified"):
+        _guard_test_version(registry, "free", "v1")
+    assert _guard_test_version(registry, "free", "v2") == ["v1"]
+    assert _guard_test_version(tmp_path / "absent.json", "free", "v1") == []
 
 
 def test_registered_targets_cover_every_dimension_and_tier() -> None:

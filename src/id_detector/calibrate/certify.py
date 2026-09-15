@@ -37,6 +37,15 @@ from id_detector.calibrate.model import (
 from id_detector.contracts import BenchmarkCost, BenchmarkReportRecord, GroundTruthRecord
 from id_detector.io import atomic_write_json, canonical_json_bytes, read_text
 from id_detector.profiles import UnknownProfile, load_profile
+from id_detector.truth import (
+    CERTIFICATION_DISABLED,
+    certification_enabled,
+    frozen_manifest,
+    open_corpus,
+    prediction_exposure,
+    require_frozen_inventory,
+)
+from id_detector.truth_paths import is_link, link_refusal
 
 BOOTSTRAP_SEED = 20_260_904
 
@@ -45,8 +54,16 @@ class CorpusNotFrozen(ValueError):
     """Raised when certification is attempted on a corpus that is not frozen."""
 
 
+class CorpusNotIndependent(ValueError):
+    """Raised when a corpus's truth was annotated with IDea's own predictions visible."""
+
+
 class DuplicateTestVersion(ValueError):
     """Raised when a ``(profile, test_version)`` pair has already been certified."""
+
+
+class CertificationDisabled(ValueError):
+    """Raised by every certification entry point until the certification follow-up lands."""
 
 
 @dataclass(frozen=True)
@@ -128,14 +145,59 @@ def _population_prediction_count(
 
 
 def _require_frozen(corpus_dir: Path, corpus_version: str) -> None:
-    manifest_path = corpus_dir / "corpus-version.json"
-    if not manifest_path.is_file():
-        raise CorpusNotFrozen(
-            f"corpus {corpus_version} has no freeze manifest; certification refused"
-        )
-    if json.loads(read_text(manifest_path)).get("frozen") is not True:
-        raise CorpusNotFrozen(
-            f"corpus {corpus_version} is not frozen; freeze it before certification"
+    """Refuse certification unless the corpus is frozen over exactly its loaded population.
+
+    Read through the corpus gateway (links, work tree, inside another corpus and layout refused
+    first); the manifest must exist, record ``frozen: true``, and list exactly the loaded
+    ``(set_id, path)`` inventory -- a set deleted from or added to a frozen corpus makes
+    certification impossible, and the refusal names it.
+    """
+
+    with open_corpus(corpus_dir, mutate=False, require_records=False) as handle:
+        if is_link(handle.manifest_path):
+            raise link_refusal(handle.manifest_path, handle.manifest_path)
+        if not handle.manifest_path.is_file():
+            raise CorpusNotFrozen(
+                f"corpus {corpus_version} has no freeze manifest; certification refused"
+            )
+        manifest = frozen_manifest(handle)
+        if manifest is None:
+            raise CorpusNotFrozen(
+                f"corpus {corpus_version} is not frozen; freeze it before certification"
+            )
+        require_frozen_inventory(handle, manifest)
+
+
+def _require_independent(corpus_dir: Path, corpus_version: str) -> None:
+    """Refuse a corpus any of whose sets was reviewed with IDea's predictions on screen.
+
+    Both the freeze manifest's hashed record and the set directories themselves are consulted:
+    either one saying the predictions were visible is enough, so the refusal survives a sidecar
+    deleted after the freeze and a manifest written by older tooling.  Everything is read through
+    one gateway handle: its manifest path and its vetted truth files.
+    """
+
+    with open_corpus(corpus_dir, mutate=False, require_records=False) as handle:
+        if is_link(handle.manifest_path):
+            raise link_refusal(handle.manifest_path, handle.manifest_path)
+        manifest = json.loads(read_text(handle.manifest_path))
+        truth_files = handle.truth_files
+    exposed: set[str] = set()
+    for item in manifest.get("sets", []):
+        exposure = item.get("prediction_exposure") if isinstance(item, dict) else None
+        if isinstance(exposure, dict) and exposure.get("predictions_visible_during_review") is True:
+            exposed.add(str(item.get("set_id")))
+    for truth_path in truth_files:
+        if prediction_exposure(truth_path)["predictions_visible_during_review"]:
+            try:
+                exposed.add(GroundTruthRecord.model_validate_json(read_text(truth_path)).set_id)
+            except ValueError:
+                exposed.add(truth_path.parent.name)
+    if exposed:
+        raise CorpusNotIndependent(
+            f"corpus {corpus_version} is not independent of IDea's predictions: "
+            f"{', '.join(sorted(exposed))} was reviewed with predictions visible; certification "
+            "refused"
         )
 
 
@@ -172,8 +234,12 @@ async def run_certify(
     out_path: Path | None = None,
     max_requests: int = 2_000,
 ) -> CertifyResult:
+    if not certification_enabled():
+        # Refused before any corpus is opened or read, and before any report is written.
+        raise CertificationDisabled(CERTIFICATION_DISABLED)
     corpus_dir = project_root / "data" / "corpus" / corpus_version
     _require_frozen(corpus_dir, corpus_version)
+    _require_independent(corpus_dir, corpus_version)
     try:
         profile_record = load_profile(project_root, profile)
     except UnknownProfile as exc:
