@@ -85,13 +85,15 @@ _CORPUS_FILE_NAMES = frozenset(
 
 
 def refuse_corpus_destination(path: Path) -> None:
-    """The backstop under every atomic write: never replace a corpus file or write into a corpus.
+    """The backstop under every shared file write: never touch a corpus file or write into a corpus.
 
     Refuses a destination named ``ground_truth.json``, ``corpus-version.json`` or
     ``review-exposure-ledger.jsonl``, or whose parent or grandparent directly holds one of those
     files (a corpus root or a set directory).  It is bounded to six ``lstat`` probes and never
-    lists a directory, so it stays cheap for the pipeline and money code.  Corpus files the
-    gateway has validated are written with ``through_corpus_gateway=True``, which only
+    lists a directory, so it stays cheap for the pipeline and money code.  Every helper here that
+    creates, replaces or renames a file at a caller-chosen destination (:func:`atomic_write_bytes`,
+    :func:`durable_replace`, :func:`create_file_durably`) calls it first.  Corpus files the gateway
+    has validated are written with ``through_corpus_gateway=True``, which only
     ``truth.write_corpus_file_through_gateway`` passes.
     """
 
@@ -210,14 +212,20 @@ def _move_write_through(source: Path, destination: Path, *, replace: bool) -> bo
     raise ctypes.WinError(error)
 
 
-def durable_replace(source: Path, destination: Path) -> None:
+def durable_replace(
+    source: Path, destination: Path, *, through_corpus_gateway: bool = False
+) -> None:
     """Atomically move an already-written file into place and make the move itself durable.
 
-    The source's bytes are flushed first. On Windows the rename uses ``MOVEFILE_WRITE_THROUGH`` —
+    The destination first passes :func:`refuse_corpus_destination` (the corpus backstop), unless
+    the corpus gateway validated it and says so with ``through_corpus_gateway=True``.  The
+    source's bytes are flushed next. On Windows the rename uses ``MOVEFILE_WRITE_THROUGH`` —
     the operation Microsoft documents as returning only once the move is on disk — because there
     is no directory fsync; on POSIX the containing directory is fsynced after ``os.replace``.
     """
 
+    if not through_corpus_gateway:
+        refuse_corpus_destination(Path(destination).resolve())
     fsync_file(source)
     if os.name == "nt":
         _move_write_through(Path(source), Path(destination), replace=True)
@@ -226,13 +234,18 @@ def durable_replace(source: Path, destination: Path) -> None:
         fsync_directory(Path(destination).parent)
 
 
-def create_file_durably(path: Path) -> bool:
+def create_file_durably(path: Path, *, through_corpus_gateway: bool = False) -> bool:
     """Create an empty file whose directory entry is durable; ``False`` if it already existed.
 
     Create-if-absent, never replace: a concurrent creator that already appended a line keeps it.
+    The destination first passes :func:`refuse_corpus_destination` (the corpus backstop), before
+    any directory is created, unless the corpus gateway validated it and says so with
+    ``through_corpus_gateway=True``.
     """
 
     path = Path(path).resolve()
+    if not through_corpus_gateway:
+        refuse_corpus_destination(path)
     ensure_directory_durable(path.parent)
     if path_is_file(path):
         return False
