@@ -25,7 +25,7 @@ import pytest
 
 from id_detector.recipes import DEEP_RECIPE
 from id_detector.webapp.jobs import Job, JobContext, JobWaiting
-from idea_web.application import create_app
+from idea_web.application import ASSET_VERSION, STATIC_JS, create_app
 from idea_web.jobs.local import (
     ABANDONED,
     LocalJobs,
@@ -200,7 +200,8 @@ def test_the_web_app_enqueues_reads_cancels_and_dismisses_without_running_anythi
     assert not any(thread.name == "webapp-jobs" for thread in threading.enumerate())
 
     page = _request(app, "GET", f"/jobs/{job_id}")
-    assert page.status_code == 200 and "setTimeout(tick, 2500)" in page.text
+    assert page.status_code == 200 and f'src="/static/app.{ASSET_VERSION}.js"' in page.text
+    assert "setTimeout(tick, 2500)" in STATIC_JS.decode()  # the page script is static (4a-iii)
     assert _request(app, "GET", f"/jobs/{job_id}/status").json()["status"] == "queued"
     assert f'data-job="{job_id}"' in _request(app, "GET", "/").text
 

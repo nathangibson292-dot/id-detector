@@ -82,6 +82,8 @@ class LoopbackServer:
                 log_level="warning",
                 access_log=False,
                 lifespan="off",
+                # No ``Server:`` header: the old server advertised its Python version (U-F29).
+                server_header=False,
             )
         )
         self._closed = False

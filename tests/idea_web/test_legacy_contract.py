@@ -44,7 +44,9 @@ READS = [
     ("csrf", "/csrf", 200, JSON, True, None, {}),
     ("home", "/", 200, HTML, True, None, {}),
     ("index_html", "/index.html", 200, HTML, True, None, {}),
-    ("new", "/new", 303, None, False, b"", {"location": "/", "content-length": "0"}),
+    # 4a-iii puts ``nosniff`` (and the other defensive headers) on every answer, redirects and
+    # audio included; the retired handler sent it only with a body it had typed itself.
+    ("new", "/new", 303, None, True, b"", {"location": "/", "content-length": "0"}),
     ("playlists", "/playlists", 200, HTML, True, None, {}),
     ("playlists_state", "/playlists/state", 200, "application/json", True, None, {}),
     ("job_page", "/jobs/{job}", 200, HTML, True, None, {}),
@@ -67,7 +69,7 @@ READS = [
         "/media/{media}/audio",
         200,
         "audio/webm",
-        False,
+        True,
         None,
         {"content-length": "1024"},
     ),
@@ -226,7 +228,7 @@ def test_recorded_audio_ranges(servers, value, status, content_range, length) ->
     assert response.status_code == status
     assert response.headers.get("content-range") == content_range
     assert response.headers["content-length"] == length
-    assert "x-content-type-options" not in response.headers
+    assert response.headers["x-content-type-options"] == "nosniff"  # on every answer (4a-iii)
     if status == 416:
         assert "content-type" not in response.headers and response.content == b""
     else:

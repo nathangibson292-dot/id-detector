@@ -34,24 +34,36 @@ from id_detector.present import server as legacy
 from id_detector.present.bundles import read_bundle_manifest, result_dir
 from id_detector.providers.base import AppConfig
 from id_detector.webapp.jobs import TargetValidationError
+from idea_web import pages
 from idea_web.http import (
+    CSS,
     HTML,
+    IMMUTABLE,
+    IMMUTABLE_PRIVATE,
+    JAVASCRIPT,
     JSON,
+    REVALIDATE,
     TEXT,
     UNSUPPORTED_METHODS,
-    HeadResponseGuard,
-    LoopbackPostGuard,
     bytes_response,
     contained_directory,
     contained_file,
+    content_security_policy,
     csrf_matches,
+    deliver,
     drain_request,
+    etag_matches,
+    html_response,
+    install_middleware,
     json_response,
     not_found,
+    not_modified,
     range_response,
     read_bounded,
     redirect,
+    weak_etag,
 )
+from idea_web.pages import ASSET_VERSION, STATIC_CSS, STATIC_JS
 
 _SHA = re.compile(r"^[0-9a-f]{64}$")
 _JOB_ID = re.compile(r"^[0-9a-f]{32}$")
@@ -63,20 +75,19 @@ _CONTENT_TYPES = {
     ".json": JSON,
     ".cue": TEXT,
     ".md": TEXT,
-    ".css": "text/css; charset=utf-8",
-    ".js": "text/javascript; charset=utf-8",
+    ".css": CSS,
+    ".js": JAVASCRIPT,
 }
 _PLATFORM_LINK = re.compile(
     r"(^|\.)(soundcloud\.com|mixcloud\.com|youtube\.com|youtu\.be)(/|$)", re.IGNORECASE
 )
 _CSRF_REFUSAL = {"error": f"missing or invalid CSRF token (GET /csrf, then send {_CSRF_HEADER})"}
-#: The binding progress-page poll interval (ADR 0001 / plan §4.3) is owned by the web layer: the
-#: shared page script is reused unchanged and only its poll delay is set here.
-_POLL_FROM = "setTimeout(tick, 1500)"
-_POLL_TO = "setTimeout(tick, 2500)"
-if legacy._JOB_JS.count(_POLL_FROM) != 1:  # pragma: no cover - fails loudly if the script drifts
-    raise RuntimeError("the progress page script no longer has exactly one status poll to pace")
-_JOB_JS = legacy._JOB_JS.replace(_POLL_FROM, _POLL_TO)
+#: The versioned static assets (``idea_web.pages``), under the URLs the live pages link.
+_STATIC = {
+    pages.STYLESHEET_HREF: (STATIC_CSS, CSS),
+    pages.SCRIPT_SRC: (STATIC_JS, JAVASCRIPT),
+}
+__all__ = ["ASSET_VERSION", "STATIC_CSS", "STATIC_JS", "WebSettings", "create_app"]
 
 
 class JobQueueAdapter(Protocol):
@@ -139,27 +150,39 @@ def _template(state: _State, name: str, **context: object) -> bytes:
     return state.templates.get_template(name).render(**context).encode("utf-8")
 
 
+def _active_jobs(state: _State) -> list[Any]:
+    """The home's activity list: running first, then queued, then what stopped (U-F18)."""
+
+    assert state.jobs is not None
+    active = [job for job in state.jobs.recent() if job.status != "succeeded"]
+    rank = {"running": 0, "queued": 1, "waiting": 2, "failed": 3, "cancelled": 4}
+    active.sort(key=lambda job: (rank.get(job.status, 5), -job.created_at))
+    return active
+
+
+def _activity_html(state: _State) -> str:
+    active = _active_jobs(state)
+    return pages.activity_list_html(active, state.csrf_token) if active else ""
+
+
 def _home_document(state: _State, form_state: legacy._FormState) -> bytes:
     assert state.jobs is not None
     work_root = state.settings.work_root
     sets = legacy._discover_sets(work_root)
-    active = [job for job in state.jobs.recent() if job.status != "succeeded"]
-    rank = {"running": 0, "queued": 1, "waiting": 2, "failed": 3, "cancelled": 4}
-    active.sort(key=lambda job: (rank.get(job.status, 5), -job.created_at))
     csrf = state.csrf_token
     return _template(
         state,
         "home.html",
-        head=legacy.head_html("ID'er — your mixes", legacy._APP_CSS),
+        head=pages.head_html("ID'er — your mixes"),
         topbar=legacy.topbar_html(back=False, new=True),
         form=legacy._form_html(csrf_token=csrf, state=form_state),
-        activity=[legacy._activity_item_html(job, csrf) for job in active],
+        activity=_activity_html(state),
         stats=legacy._library_stats_html(sets),
-        mixes=legacy._mixes_block(
+        mixes=pages.mixes_block(
             sets, csrf_token=csrf, failed_runs=legacy._discover_failed_runs(work_root)
         ),
         footer=legacy._footer_html(),
-        script=legacy._PROGRESS_JS + legacy._FORM_JS + legacy._HOME_JS,
+        script_src=pages.SCRIPT_SRC,
     )
 
 
@@ -168,10 +191,10 @@ def _index_document(state: _State) -> bytes:
     return _template(
         state,
         "index.html",
-        head=legacy.head_html("ID'er — analysed sets", legacy._APP_CSS),
+        head=pages.head_html("ID'er — analysed sets"),
         topbar=legacy.topbar_html(back=False, new=False),
         stats=legacy._library_stats_html(sets),
-        mixes=legacy._mixes_block(sets, allow_new=False),
+        mixes=pages.mixes_block(sets, allow_new=False),
         footer=legacy._footer_html(),
     )
 
@@ -180,26 +203,26 @@ def _job_document(state: _State, job: Any) -> bytes:
     plan = legacy.plan_embed_from_url(job.target)
     platform = plan.kind if plan.kind in ("soundcloud", "youtube", "mixcloud") else "file"
     steps = legacy._job_steps(job)
-    script = (
+    # The per-job constants are the page's only inline script; the shared script is static.
+    # ``</`` cannot appear: the id and token are URL-safe and the tables are the server's own.
+    config = (
         f"var JOB_ID={json.dumps(job.id)};"
         f"var RETRY_HREF={json.dumps(f'/?job={job.id}')};"
         f"var OUTCOME_COPY={json.dumps(legacy._outcome_copy_js())};"
         f"var STEPS={json.dumps(steps)};var CSRF_TOKEN={json.dumps(state.csrf_token)};"
-        + legacy._PROGRESS_JS
-        + _JOB_JS
-        + legacy._PLAYER_JS
     )
     return _template(
         state,
         "job.html",
-        head=legacy.head_html("Analysing — ID'er", legacy._APP_CSS),
+        head=pages.head_html("Analysing — ID'er"),
         topbar=legacy.topbar_html(back=True, new=True),
         title=legacy._job_title(job),
         platform_chip=legacy.platform_chip(platform),
         player=legacy._job_player_html(plan, job),
         steps=steps,
         footer=legacy._footer_html(),
-        script=script,
+        config=config,
+        script_src=pages.SCRIPT_SRC,
     )
 
 
@@ -263,7 +286,7 @@ def _job_get(state: _State, request: Request, route: str) -> Response:
         job = state.jobs.get(segments[1])
         if job is None:
             return not_found(b"unknown job")
-        return bytes_response(HTTPStatus.OK, _job_document(state, job), HTML)
+        return html_response(HTTPStatus.OK, _job_document(state, job))
     if len(segments) == 3 and _JOB_ID.fullmatch(segments[1]) and segments[2] == "status":
         job = state.jobs.get(segments[1])
         if job is None:
@@ -311,6 +334,12 @@ def _get(state: _State, request: Request) -> Response:
     if route == "/csrf":
         # Readable only by this origin's own scripts (no CORS header is ever sent).
         return json_response(HTTPStatus.OK, {"token": state.csrf_token})
+    if route.startswith("/static/"):
+        asset = _STATIC.get(route)
+        if asset is None:
+            return not_found()
+        body, content_type = asset
+        return bytes_response(HTTPStatus.OK, body, content_type, cache=IMMUTABLE)
     if route == "/playlists" or route.startswith("/playlists/"):
         # The playlists feature owns its storage and views; the web layer only routes to it.
         from id_detector import playlists
@@ -318,7 +347,7 @@ def _get(state: _State, request: Request) -> Response:
         status, body, content_type = playlists.handle_get(
             route, parse_qs(request.url.query), work_root=settings.work_root
         )
-        return bytes_response(status, body, content_type)
+        return deliver(status, body, content_type)
     if route in ("/", "/index.html"):
         if state.active:
             assert state.jobs is not None
@@ -334,10 +363,14 @@ def _get(state: _State, request: Request) -> Response:
             body = _home_document(state, legacy._FormState(url=prefill))
         else:
             body = _index_document(state)
-        return bytes_response(HTTPStatus.OK, body, HTML)
+        return html_response(HTTPStatus.OK, body)
     if state.active and route == "/new":
         prefill = (parse_qs(request.url.query).get("url") or [""])[0][:2048]
         return redirect("/" + (f"?url={quote(prefill, safe='')}" if prefill else ""))
+    if state.active and route == "/activity":
+        # The home's activity list, freshly rendered: what the card polling swaps in when a job
+        # ends or starts, so the list never needs a reload to be right (U-F18).
+        return html_response(HTTPStatus.OK, _activity_html(state).encode("utf-8"))
     if state.active and route.startswith("/jobs/"):
         return _job_get(state, request, route)
     if route.startswith("/media/"):
@@ -355,11 +388,21 @@ def _get(state: _State, request: Request) -> Response:
         return not_found()
     with open(native_path(served), "rb") as handle:
         body = handle.read()
-    return bytes_response(HTTPStatus.OK, body, _CONTENT_TYPES[served.suffix.lower()])
+    # A bundle file never changes under its URL; the canonical route follows the newest run, so a
+    # browser revalidates it and the ETag answers with nothing when nothing moved.
+    content_type = _CONTENT_TYPES[served.suffix.lower()]
+    cache = IMMUTABLE_PRIVATE if "/bundles/" in route else REVALIDATE
+    etag = weak_etag(body)
+    if etag_matches(request.headers.get("if-none-match"), etag):
+        # A 304 updates the cached document's headers, so it must carry the document's own
+        # policy: the resource default would leave the reloaded page unable to run or style.
+        policy = content_security_policy(body) if content_type == HTML else None
+        return not_modified(etag, cache, policy=policy)
+    return deliver(HTTPStatus.OK, body, content_type, cache=cache, etag=etag)
 
 
 def _form_error(state: _State, form_state: legacy._FormState, status: int) -> Response:
-    return bytes_response(status, _home_document(state, form_state), HTML)
+    return html_response(status, _home_document(state, form_state))
 
 
 def _analyse(state: _State, request: Request, raw: bytes | None, wants_json: bool) -> Response:
@@ -414,9 +457,16 @@ def _analyse(state: _State, request: Request, raw: bytes | None, wants_json: boo
     if profile is not None and profile not in _PROFILES:
         if wants_json:
             return json_response(HTTPStatus.BAD_REQUEST, {"error": "unknown profile"})
+        # Every inline error re-renders the form with what was typed (U-F1); a bad mode value
+        # must not eat the link, the pasted tracklist or the links choice either.
         return _form_error(
             state,
-            legacy._FormState(url=url, error="Choose Free scan or Deep scan."),
+            legacy._FormState(
+                url=url,
+                acquire=acquire,
+                known_tracklist=str(known_tracklist or ""),
+                error="Choose Free scan or Deep scan.",
+            ),
             HTTPStatus.BAD_REQUEST,
         )
     # A pasted tracklist is an optional hint seed; blank means "audio only", and it is capped.
@@ -558,10 +608,7 @@ def create_app(
         raise ValueError("analyse_enabled requires a queue adapter")
     settings = WebSettings(Path(work_root).resolve(), local, enabled, config)
     app = FastAPI(docs_url=None, redoc_url=None, openapi_url=None)
-    # Added last runs first: the loopback gate answers a foreign POST before anything else, and
-    # every HEAD answer is its GET answer with the body removed.
-    app.add_middleware(HeadResponseGuard)
-    app.add_middleware(LoopbackPostGuard)
+    install_middleware(app)
     state = _State(
         settings=settings,
         jobs=adapter,

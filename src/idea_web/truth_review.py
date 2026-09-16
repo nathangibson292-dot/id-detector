@@ -22,15 +22,14 @@ from starlette.concurrency import run_in_threadpool
 from id_detector import truth_review as review
 from id_detector.present.server import _audio_content_type
 from idea_web.http import (
-    HTML,
     TEXT,
     UNSUPPORTED_METHODS,
-    HeadResponseGuard,
-    LoopbackPostGuard,
     bytes_response,
     cross_site,
     csrf_matches,
     drain_request,
+    html_response,
+    install_middleware,
     json_response,
     not_found,
     range_response,
@@ -38,11 +37,42 @@ from idea_web.http import (
 )
 from idea_web.server import LoopbackServer, RunningServer, run_in_background
 
+#: The review page wires four buttons from inline ``onclick`` attributes, which the hashed
+#: Content-Security-Policy refuses.  The page module is closed to Phase-4 work (plan §4.2), so
+#: the served page is rewired here: each attribute becomes an id, and one more script — named in
+#: the policy by its hash like the page's own — attaches the same behaviour.  Every lookup is
+#: guarded: the audio and the scorer-suggestion controls are not always on the page.
+_INLINE_HANDLERS = (
+    (b' onclick="audio&&audio.paused?audio.play():audio&&audio.pause()"', b' id="play-pause"'),
+    (b" onclick=\"help.classList.add('open')\"", b' id="help-open"'),
+    (b" onclick=\"help.classList.remove('open')\"", b' id="help-close"'),
+    (
+        b" onclick=\"document.getElementById('offset').value=this.dataset.offset;preview()\"",
+        b' id="use-suggestion"',
+    ),
+)
+_WIRING = (
+    b"<script>function wire(id,fn){let el=document.getElementById(id);if(el)el.onclick=fn;}\n"
+    b"wire('play-pause',()=>{if(audio){audio.paused?audio.play():audio.pause();}});\n"
+    b"wire('help-open',()=>help.classList.add('open'));"
+    b"wire('help-close',()=>help.classList.remove('open'));\n"
+    b"wire('use-suggestion',function(){offsetInput.value=this.dataset.offset;preview();});"
+    b"</script></body>"
+)
+
+
+def review_page(session: review.TruthReviewSession, token: str) -> bytes:
+    """``truth_review._page`` with no inline handler in it."""
+
+    page = review._page(session, token)
+    for inline, replacement in _INLINE_HANDLERS:
+        page = page.replace(inline, replacement)
+    return page.replace(b"</body>", _WIRING, 1)
+
 
 def create_truth_review_app(session: review.TruthReviewSession) -> FastAPI:
     app = FastAPI(docs_url=None, redoc_url=None, openapi_url=None)
-    app.add_middleware(HeadResponseGuard)
-    app.add_middleware(LoopbackPostGuard)
+    install_middleware(app)
     token = secrets.token_urlsafe(32)
     app.state.csrf_token = token
     app.state.session = session
@@ -50,7 +80,7 @@ def create_truth_review_app(session: review.TruthReviewSession) -> FastAPI:
     def get(request: Request) -> Response:
         route = request.url.path
         if route in {"/", "/index.html"}:
-            return bytes_response(HTTPStatus.OK, review._page(session, token), HTML)
+            return html_response(HTTPStatus.OK, review_page(session, token))
         if route == "/csrf":
             # Defence in depth against DNS rebinding: a POST already requires a loopback Host,
             # but there is no reason to hand the token to a request that could not use it.

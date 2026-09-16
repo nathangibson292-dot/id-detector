@@ -175,6 +175,11 @@ def main() -> int:
             print(f"no inline script found in {name} — the extractor is broken")
             return 2
         payloads += [(f"{name} #{index}", body) for index, body in enumerate(scripts, start=1)]
+    # The live pages link one static script (4a-iii) assembled from the same fragments the
+    # compatibility renderers inline above; the assembled file is checked as the browser gets it.
+    from idea_web.application import STATIC_JS
+
+    payloads.append(("static app.js (live pages)", STATIC_JS.decode("utf-8")))
 
     failures = 0
     with tempfile.TemporaryDirectory(prefix="idea-js-") as temporary:
@@ -193,8 +198,8 @@ def main() -> int:
         print(f"page JavaScript check failed: {failures} of {len(payloads)} inline scripts")
         return 1
     print(
-        f"page JavaScript check passed: {len(payloads)} inline scripts "
-        f"across {len(pages)} page renders"
+        f"page JavaScript check passed: {len(payloads) - 1} inline scripts "
+        f"across {len(pages)} page renders, plus the static app.js"
     )
     return 0
 

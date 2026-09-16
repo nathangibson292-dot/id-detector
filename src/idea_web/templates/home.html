@@ -7,7 +7,7 @@ confidence for every track.</p>
 {{ form | safe }}
 <p class="lede reassurance">You can close this tab while the scan runs.</p>
 </header>
-{% if activity %}<h2 class="sec">Recent analyses</h2><ul class="acts">{% for item in activity %}{{ item | safe }}{% endfor %}</ul>{% endif %}
+{% if activity %}<h2 class="sec">Recent analyses</h2>{{ activity | safe }}{% endif %}
 <h2 class="sec">Your mixes</h2>
 {{ stats | safe }}{{ mixes | safe }}{{ footer | safe }}</main>
-<script>{{ script | safe }}</script></body></html>
+<script src="{{ script_src }}"></script></body></html>

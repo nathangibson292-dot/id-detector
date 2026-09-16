@@ -21,4 +21,5 @@
 <div class="steps">{% for key, name, sub in steps %}<div class="step" data-step="{{ key }}">
 <div class="k"><i>{{ loop.index }}</i>{{ name }}</div><small>{{ sub }}</small></div>{% endfor %}</div>
 <details class="log"><summary>Show the log</summary><pre id="log"></pre></details>
-{{ footer | safe }}</main><script>{{ script | safe }}</script></body></html>
+{{ footer | safe }}</main><script>{{ config | safe }}</script>
+<script src="{{ script_src }}"></script></body></html>

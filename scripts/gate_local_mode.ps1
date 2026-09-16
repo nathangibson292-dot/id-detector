@@ -46,7 +46,9 @@ frame.onload = () => {
   audio.addEventListener('seeked', () => {
     if (audio.currentTime >= 1) {
       console.log('audio-ok'); document.getElementById('log').textContent = 'audio-ok';
-      new Image().src = 'http://127.0.0.1:''' + str(int(port) + 1) + '''/audio-ok';
+      // Navigate to signal: a cross-origin image is refused by the page's own policy
+      // (img-src 'self' data:), which is correct for the product; navigation is not.
+      window.location.href = 'http://127.0.0.1:''' + str(int(port) + 1) + '''/audio-ok';
     }
   });
   const seek = () => { audio.currentTime = 2; };

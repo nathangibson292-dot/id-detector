@@ -22,7 +22,7 @@ import pytest
 from id_detector.present.page import PAGE_VERSION
 from id_detector.present.refresh import page_version
 from id_detector.webapp.jobs import JobContext, JobManager, _strip_extended_prefix
-from idea_web.application import create_app
+from idea_web.application import ASSET_VERSION, create_app
 from idea_web.http import DRAIN_LIMIT, FILE_CHUNK
 from idea_web.jobs.local import LocalJobs, LocalWorker, local_database
 from idea_web.server import serve_in_background
@@ -201,8 +201,12 @@ def test_job_page_status_cancel_dismiss_and_2500ms_polling(tmp_path: Path) -> No
     csrf = token(app)
     job_id = jobs.submit(MIX, "free")
     page = request(app, "GET", f"/jobs/{job_id}")
-    assert page.status_code == 200 and "setTimeout(tick, 2500)" in page.text
-    assert "setTimeout(tick, 1500)" not in page.text
+    assert page.status_code == 200
+    # The page script is a static asset since 4a-iii; the 2.5 s poll is paced in that file.
+    script = request(app, "GET", f"/static/app.{ASSET_VERSION}.js")
+    assert f'src="/static/app.{ASSET_VERSION}.js"' in page.text
+    assert script.status_code == 200 and "setTimeout(tick, 2500)" in script.text
+    assert "setTimeout(tick, 1500)" not in script.text and "setTimeout(tick" not in page.text
     status = request(app, "GET", f"/jobs/{job_id}/status")
     assert status.status_code == 200 and status.json()["id"] == job_id
     refused = request(app, "POST", f"/jobs/{job_id}/cancel", content=b"payload")
