@@ -181,7 +181,7 @@ def _job_row(database: Database, job_id: str) -> sqlite3.Row:
 
 def test_migrations_go_up_and_down_and_enable_wal_and_foreign_keys(tmp_path: Path) -> None:
     database = _database(tmp_path)
-    assert database.version() == 4
+    assert database.version() == 5
     with database.read() as connection:
         assert connection.execute("PRAGMA journal_mode").fetchone()[0] == "wal"
         assert connection.execute("PRAGMA foreign_keys").fetchone()[0] == 1
@@ -228,10 +228,10 @@ def test_simultaneous_migrators_are_serialised(tmp_path: Path) -> None:
     for thread in threads:
         thread.join(60)
     assert not errors
-    assert versions == [4, 4, 4, 4]
+    assert versions == [5, 5, 5, 5]
     with Database(path).read() as connection:
         applied = connection.execute("SELECT COUNT(*) FROM schema_migrations").fetchone()[0]
-    assert applied == 4
+    assert applied == 5
 
 
 def test_intake_transitions_to_analysis_before_the_service_runs(tmp_path: Path) -> None:

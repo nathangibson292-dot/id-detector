@@ -166,6 +166,281 @@ _ATTEMPT_ROW_COLUMNS = (
 )
 
 
+class QuotaExceeded(RuntimeError):
+    """A reservation seam refused a request: it is ended ``quota_exceeded`` and never attached."""
+
+
+class UsdCapSeam(Protocol):
+    """4d-iv's account-month USD ceiling, read inside the payer-transfer transaction.
+
+    ``None`` means the account has no cap (the only answer before 4d-iv exists).
+    """
+
+    def account_month_remaining_e6(self, connection: Any, user_id: str | None) -> int | None: ...
+
+
+#: The subscribers still holding a reservation on a run, earliest-attached first (plan §3.5): not
+#: detached, reservation held, and their own job still active. Parameter: the run id.
+_LIVE_SUBSCRIBERS_SQL = (
+    "SELECT s.* FROM run_subscribers s JOIN jobs j ON j.id = s.job_id "
+    "WHERE s.run_id = ? AND s.detached_at IS NULL AND s.reservation_state = 'held' "
+    f"AND j.state IN {_ACTIVE_SQL} ORDER BY s.seq"
+)
+#: The audit action written when a re-attributed USD reservation exceeds the new payer's cap.
+USD_REATTRIBUTION_OVERAGE = "usd_reattribution_overage"
+
+
+def _new_reservation_id() -> str:
+    return f"res-{uuid.uuid4().hex}"
+
+
+def reservation_minutes(duration_ms: int) -> int:
+    """A subscriber's credit reservation: the mix length in whole minutes, rounded up (§3.5)."""
+
+    return -(-max(0, int(duration_ms)) // 60_000)
+
+
+def _payer_event(
+    connection: Any,
+    *,
+    run_id: str,
+    kind: str,
+    subscriber: Mapping[str, Any],
+    now: float,
+    to: Mapping[str, Any] | None = None,
+    usd_e6_reattributed: int = 0,
+    usd_e6_overage: int = 0,
+    status: str | None = None,
+) -> None:
+    """One append-only ``run_payer_events`` row; its unique key makes each change exactly-once."""
+
+    connection.execute(
+        "INSERT INTO run_payer_events(run_id, kind, reservation_id, user_id, to_reservation_id, "
+        "to_user_id, usd_e6_reattributed, usd_e6_overage, status, at) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (
+            run_id,
+            kind,
+            subscriber["reservation_id"],
+            subscriber["user_id"],
+            to["reservation_id"] if to is not None else None,
+            to["user_id"] if to is not None else None,
+            usd_e6_reattributed,
+            usd_e6_overage,
+            status,
+            now,
+        ),
+    )
+
+
+def _run_usd_reserved(connection: Any, run_id: str) -> int:
+    """The run's USD reservation as the money authority's ONE row records it (never recomputed).
+
+    Only ``run_reservations`` counts: its insert is where :func:`attribute_reservation` attributes
+    the money, so a transfer reads either the whole reservation (made before it) or nothing (the
+    reservation, made later, is attributed to the payer of that moment). Nothing is counted twice.
+    """
+
+    row = connection.execute(
+        "SELECT usd_e6_reserved FROM run_reservations WHERE run_id = ?", (run_id,)
+    ).fetchone()
+    return int(row["usd_e6_reserved"]) if row is not None else 0
+
+
+def close_subscriptions(connection: Any, run_id: str, status: str, now: float) -> None:
+    """At the run's terminal status: the payer's reservation settles, every other one is released.
+
+    Only the reservations still held change, so a second call (or a dead letter that later
+    expires to ``failed``) changes nothing. The run's money itself is settled by the one existing
+    authority (``run_settlements`` and the folded ``analysis_runs`` row); this records only whose
+    reservation that settlement is attributed to.
+    """
+
+    run = connection.execute(
+        "SELECT payer_reservation_id FROM analysis_runs WHERE run_id=?", (run_id,)
+    ).fetchone()
+    payer = run["payer_reservation_id"] if run is not None else None
+    held = connection.execute(
+        "SELECT * FROM run_subscribers WHERE run_id=? AND reservation_state='held' ORDER BY seq",
+        (run_id,),
+    ).fetchall()
+    for subscriber in held:
+        settles = subscriber["reservation_id"] == payer
+        connection.execute(
+            "UPDATE run_subscribers SET reservation_state=?, released_at=? "
+            "WHERE seq=? AND reservation_state='held'",
+            ("settled" if settles else "released", now, subscriber["seq"]),
+        )
+        _payer_event(
+            connection,
+            run_id=run_id,
+            kind="close" if settles else "release",
+            subscriber=subscriber,
+            now=now,
+            status=status if settles else None,
+        )
+
+
+def mirror_attached(connection: Any, run_id: str, status: str, now: float) -> int:
+    """Give every still-attached subscriber job the run's terminal result, in this transaction.
+
+    The ONE mirroring rule, shared by the terminal transaction, the abandon path (dead letter,
+    quarantine) and the reconciliation backstop. Returns how many jobs changed.
+    """
+
+    bundle = connection.execute(
+        "SELECT bundle_id FROM result_bundles WHERE run_id=? ORDER BY created_at DESC LIMIT 1",
+        (run_id,),
+    ).fetchone()
+    return connection.execute(
+        "UPDATE jobs SET state=?, result_bundle_id=?, updated_at=? "
+        "WHERE run_id=? AND attached=1 AND state='waiting' AND cancel_requested=0",
+        (status, bundle["bundle_id"] if bundle is not None else None, now, run_id),
+    ).rowcount
+
+
+#: The reason recorded on a run whose last subscriber detached before its result was recorded.
+ALL_SUBSCRIBERS_DETACHED = "every subscriber detached"
+
+
+def _settle_as_cancelled(connection: Any, run_id: str, now: float) -> bool:
+    """Make an existing settlement row of a run that ended ``cancelled`` say so (§3.5).
+
+    The pipeline may have settled ``complete`` just before the last subscriber detached. The row
+    stays the ONE settlement, rewritten to the truth of a cancelled run: status, exit code and
+    reason; no achieved recipe, no bundle, no fuse run and no compatibility metadata, so nothing
+    reading it can take it for a servable result. Its money is not touched, so what was
+    dispatched stays spent. Returns True when the row changed and its projection must be rewritten
+    after commit (:meth:`Worker.reproject_cancelled_settlements` repairs a projection that a crash
+    or an I/O failure left stale). A missing row is left to the settlement writers.
+    """
+
+    from id_detector.contracts import InvocationJournalEntry
+    from id_detector.io import canonical_json_bytes
+    from id_detector.service import STATUS_EXIT_CODES
+
+    row = connection.execute(
+        "SELECT status, entry FROM run_settlements WHERE run_id=?", (run_id,)
+    ).fetchone()
+    if row is None or row["status"] == "cancelled":
+        return False
+    entry = InvocationJournalEntry.model_validate_json(row["entry"]).model_copy(
+        update={
+            "status": "cancelled",
+            "exit_code": STATUS_EXIT_CODES.get("cancelled", 1),
+            "reason": ALL_SUBSCRIBERS_DETACHED,
+            "achieved": None,
+            "bundle_id": None,
+            "fuse_run": None,
+            "compatibility": None,
+        }
+    )
+    connection.execute(
+        "UPDATE run_settlements SET status='cancelled', entry=?, updated_at=? WHERE run_id=?",
+        (canonical_json_bytes(entry).decode("utf-8"), now, run_id),
+    )
+    return True
+
+
+def _cap_overage(
+    connection: Any, usd_caps: UsdCapSeam | None, user_id: str | None, usd_e6: int
+) -> int:
+    """The part of ``usd_e6`` the account's month cap cannot cover (0 when uncapped or free)."""
+
+    if usd_e6 <= 0 or usd_caps is None:
+        return 0
+    remaining = usd_caps.account_month_remaining_e6(connection, user_id)
+    if remaining is None:
+        return 0
+    return max(0, usd_e6 - max(0, int(remaining)))
+
+
+def _audit_overage(
+    connection: Any,
+    *,
+    run_id: str,
+    source: Mapping[str, Any],
+    payer: Mapping[str, Any],
+    usd_e6: int,
+    overage: int,
+    trigger: str,
+    now: float,
+) -> None:
+    """§3.5: the run continues; the uncovered part is charged to the global pool and audited."""
+
+    connection.execute(
+        "INSERT INTO admin_audit(actor, action, target, detail, at) VALUES (?, ?, ?, ?, ?)",
+        (
+            "system",
+            USD_REATTRIBUTION_OVERAGE,
+            f"run:{run_id}",
+            _json(
+                {
+                    "run_id": run_id,
+                    "trigger": trigger,
+                    "from_user": source["user_id"],
+                    "from_reservation": source["reservation_id"],
+                    "to_user": payer["user_id"],
+                    "to_reservation": payer["reservation_id"],
+                    "usd_e6_reattributed": usd_e6,
+                    "usd_e6_overage": overage,
+                    "charged_to": "global_pool",
+                }
+            ),
+            now,
+        ),
+    )
+
+
+def attribute_reservation(
+    connection: Any, run_id: str, usd_e6: int, now: float, usd_caps: UsdCapSeam | None
+) -> None:
+    """Attribute a run's NEW USD reservation to whoever pays at this moment (§3.5).
+
+    Called inside the transaction that inserts the run's one ``run_reservations`` row, under the
+    claim check. A payer transfer that happened before the reservation existed re-attributed
+    nothing; the money is attributed here instead, to the CURRENT payer, and that payer's month
+    cap is checked now. A run that never changed payer is the initiator's own reservation, which
+    4d-iv checks at reservation time; only a transferred payer takes §3.5's overage path.
+    """
+
+    run = connection.execute(
+        "SELECT payer_reservation_id FROM analysis_runs WHERE run_id=?", (run_id,)
+    ).fetchone()
+    if run is None or run["payer_reservation_id"] is None:
+        return  # no subscriber model on this run (local mode, or a run from before 0005)
+    payer = connection.execute(
+        "SELECT * FROM run_subscribers WHERE reservation_id=?", (run["payer_reservation_id"],)
+    ).fetchone()
+    initiator = connection.execute(
+        "SELECT * FROM run_subscribers WHERE run_id=? ORDER BY seq LIMIT 1", (run_id,)
+    ).fetchone()
+    if payer is None or initiator is None:
+        raise LedgerConflict(f"run {run_id} names a payer with no subscriber row")
+    transferred = payer["reservation_id"] != initiator["reservation_id"]
+    overage = _cap_overage(connection, usd_caps, payer["user_id"], usd_e6) if transferred else 0
+    _payer_event(
+        connection,
+        run_id=run_id,
+        kind="reserve",
+        subscriber=payer,
+        now=now,
+        usd_e6_reattributed=usd_e6,
+        usd_e6_overage=overage,
+    )
+    if overage:
+        _audit_overage(
+            connection,
+            run_id=run_id,
+            source=initiator,
+            payer=payer,
+            usd_e6=usd_e6,
+            overage=overage,
+            trigger="reservation_after_transfer",
+            now=now,
+        )
+
+
 def require_run_fence(connection: Any, run_id: str, claim_token: str | None, now: float) -> None:
     if claim_token is None:
         raise StaleClaim(f"no claim token for run {run_id}; refusing to write")
@@ -204,12 +479,15 @@ class DispatchAdmission:
         clock: Callable[[], float] = time.time,
         require_not_cancelled: bool = True,
         hosted: bool = False,
+        usd_caps: UsdCapSeam | None = None,
     ) -> None:
         self.database = database
         self.job_id = job_id
         self.claim_token = claim_token
         self.clock = clock
         self.require_not_cancelled = require_not_cancelled
+        #: The account-month cap a reservation made after a payer transfer is checked against.
+        self.usd_caps = usd_caps
         #: A hosted worker's admission refuses every paid dispatch (hosted paid money is deferred).
         self.hosted = hosted
         #: Test seam: runs INSIDE the admission transaction, after the row is written.
@@ -306,6 +584,10 @@ class DispatchAdmission:
                     record.usd_e6_reserved,
                     self.clock(),
                 ),
+            )
+            # Same transaction: the new money belongs to whoever pays NOW (§3.5).
+            attribute_reservation(
+                connection, record.run_id, record.usd_e6_reserved, self.clock(), self.usd_caps
             )
         return record
 
@@ -769,6 +1051,8 @@ class Job:
     tenant_scope: str
     created_at: float
     updated_at: float
+    #: The opaque id of the user who asked (plan §4.5 ``run_subscribers.user``); accounts are 4c-i.
+    user_id: str | None = None
 
     @property
     def token(self) -> str:
@@ -792,7 +1076,13 @@ class PreparedIntake:
 
 
 class ReservationSeam(Protocol):
-    """4d-i implements this inside the intake transaction; 4b-i does not mint credits."""
+    """4d-i implements this inside the intake transaction; 4b-i does not mint credits.
+
+    Either call may raise :class:`QuotaExceeded`: the request then ends ``quota_exceeded`` with no
+    run, no subscriber row and nothing the seam wrote (its writes are rolled back to a savepoint).
+    ``reserve_for_subscriber`` (optional, 4b-iv) is the attaching subscriber's provisional
+    reservation of the same size, made in the same transaction as the attachment.
+    """
 
     def reserve_for_new_run(self, connection: Any, job: Job, intake: PreparedIntake) -> None: ...
 
@@ -1053,6 +1343,7 @@ class SQLiteAttemptJournal(AttemptJournal):
         clock: Callable[[], float] = time.time,
         job_id: str | None = None,
         hosted: bool = True,
+        usd_caps: UsdCapSeam | None = None,
     ) -> None:
         super().__init__(path, run_id=run_id, provider=provider, unit_usd_e6=unit_usd_e6)
         self.database = database
@@ -1068,7 +1359,12 @@ class SQLiteAttemptJournal(AttemptJournal):
         #: Paid dispatches are admitted by the ONE queue check, inside the event's transaction.
         self.dispatch_admission = (
             DispatchAdmission(
-                database, job_id=job_id, claim_token=claim_token, clock=clock, hosted=hosted
+                database,
+                job_id=job_id,
+                claim_token=claim_token,
+                clock=clock,
+                hosted=hosted,
+                usd_caps=usd_caps,
             )
             if job_id is not None and claim_token is not None and provider == "audd"
             else None
@@ -1293,10 +1589,13 @@ class JobQueue:
         local_mode: bool = False,
         clock: Callable[[], float] = time.time,
         on_abandon: Callable[[str, str | None, str], None] | None = None,
+        usd_caps: UsdCapSeam | None = None,
     ) -> None:
         self.database = database
         self.local_mode = local_mode
         self.clock = clock
+        #: 4d-iv's account-month ceiling for payer transfers; ``None``: no account is capped yet.
+        self.usd_caps = usd_caps
         #: Called AFTER a quarantine or dead letter commits, with ``(job id, run id, target)``: the
         #: local worker settles the run's shared ledger there (a hosted run's money is folded into
         #: its ``analysis_runs`` row inside the transaction instead).
@@ -1313,6 +1612,7 @@ class JobQueue:
         tenant_scope: str | None = None,
         log_path: Path | None = None,
         progress: Mapping[str, object] | None = None,
+        user_id: str | None = None,
     ) -> str:
         document = _target_document(target, local_mode=self.local_mode)
         scope = tenant_scope or (
@@ -1325,8 +1625,8 @@ class JobQueue:
         with self.database.write() as connection:
             connection.execute(
                 "INSERT INTO jobs(id, run_id, target, recipe_id, state, log_path, tenant_scope, "
-                "progress, created_at, updated_at, money_authority) "
-                "VALUES (?, ?, ?, ?, 'intake', ?, ?, ?, ?, ?, ?)",
+                "progress, created_at, updated_at, money_authority, user_id) "
+                "VALUES (?, ?, ?, ?, 'intake', ?, ?, ?, ?, ?, ?, ?)",
                 (
                     identifier,
                     run_id,
@@ -1338,6 +1638,7 @@ class JobQueue:
                     now,
                     now,
                     MONEY_AUTHORITY,
+                    user_id,
                 ),
             )
         return identifier
@@ -1383,6 +1684,8 @@ class JobQueue:
             tenant_scope=row["tenant_scope"],
             created_at=row["created_at"],
             updated_at=row["updated_at"],
+            # ``sqlite3.Row`` membership tests values, so the column names are asked for.
+            user_id=row["user_id"] if "user_id" in row.keys() else None,  # noqa: SIM118
         )
 
     def _abandon_run(
@@ -1416,12 +1719,17 @@ class JobQueue:
         # A corrupt ledger must not keep a dead row claimable; the row's own money then stands.
         with suppress(LedgerConflict):
             fold_run_money(connection, run_id)
-        connection.execute(
+        ended = connection.execute(
             "UPDATE analysis_runs SET status=?, reason=COALESCE(reason, ?), "
             "finished_at=COALESCE(finished_at, ?), claim_token=NULL "
             f"WHERE run_id=? AND status IN {_ACTIVE_SQL}",
             (status, reason, now, run_id),
-        )
+        ).rowcount
+        if ended == 1:
+            close_subscriptions(connection, run_id, status, now)
+            # A dead letter during drain must not leave its subscribers waiting for a
+            # reconciliation pass that a draining worker never runs.
+            mirror_attached(connection, run_id, status, now)
 
     def _quarantine(self, connection: Any, row: Any, reason: str, now: float) -> None:
         """Retire a row this worker cannot even parse, inside the claim transaction.
@@ -1601,33 +1909,23 @@ class JobQueue:
             return True
 
     def reconcile_attached(self) -> int:
-        """Mirror a coalesced run's terminal result without ever running its pipeline twice."""
+        """Mirror a coalesced run's terminal result without ever running its pipeline twice.
+
+        A backstop only: the terminal and abandon transactions already mirror through the same
+        :func:`mirror_attached`.
+        """
 
         now = self.clock()
         changed = 0
         with self.database.write() as connection:
             rows = connection.execute(
-                "SELECT j.id, j.run_id, r.status FROM jobs j "
+                "SELECT DISTINCT r.run_id, r.status FROM jobs j "
                 "JOIN analysis_runs r ON r.run_id=j.run_id "
                 "WHERE j.state='waiting' AND j.cancel_requested=0 AND j.attached=1 "
                 f"AND r.status NOT IN {_ACTIVE_SQL}"
             ).fetchall()
             for row in rows:
-                bundle = connection.execute(
-                    "SELECT bundle_id FROM result_bundles WHERE run_id=? "
-                    "ORDER BY created_at DESC LIMIT 1",
-                    (row["run_id"],),
-                ).fetchone()
-                connection.execute(
-                    "UPDATE jobs SET state=?, result_bundle_id=?, updated_at=? WHERE id=?",
-                    (
-                        row["status"],
-                        bundle["bundle_id"] if bundle is not None else None,
-                        now,
-                        row["id"],
-                    ),
-                )
-                changed += 1
+                changed += mirror_attached(connection, row["run_id"], row["status"], now)
         return changed
 
     def heartbeat(self, job_id: str, claim_token: str, *, lease_seconds: float) -> bool:
@@ -1758,6 +2056,13 @@ class JobQueue:
     def request_cancel(self, job_id: str) -> bool:
         now = self.clock()
         with self.database.write() as connection:
+            subscription = connection.execute(
+                "SELECT * FROM run_subscribers WHERE job_id=?", (job_id,)
+            ).fetchone()
+            if subscription is not None:
+                # A subscribed job's cancel is a DETACH (plan §3.5), decided in this one
+                # transaction together with the payer, the reservations and the cancel token.
+                return self._detach(connection, subscription, now)
             # An ATTACHED job drives nothing: cancelling it is an explicit detachment, settled at
             # once, which reconciliation can never overwrite with the driving run's result.
             detached = connection.execute(
@@ -1777,6 +2082,121 @@ class JobQueue:
                     (now, job_id),
                 ).rowcount
                 == 1
+            )
+
+    def _detach(self, connection: Any, subscriber: Any, now: float) -> bool:
+        """Detach one subscriber inside the caller's ``BEGIN IMMEDIATE`` transaction.
+
+        * the payer detaching while others remain: the payer moves to the earliest-attached
+          remaining subscriber and the run's USD reservation is re-attributed to that account
+          (an overage its month cap cannot cover is audited; the run is never stopped for it);
+        * anyone else detaching: their provisional reservation is released in full;
+        * the last subscriber detaching: the run's cancel token fires (its driving job is marked
+          ``cancel_requested``) and the payer's reservation stays the settling one until the run's
+          terminal status, so a run with attempts in flight always has a payer.
+
+        The driving job itself keeps its claim while anyone is still subscribed: its user's detach
+        only ends their subscription, and the run's result is recorded as ``cancelled`` for them.
+        """
+
+        job = connection.execute(
+            "SELECT state, attached FROM jobs WHERE id=?", (subscriber["job_id"],)
+        ).fetchone()
+        if job is None or job["state"] not in ACTIVE_RUN_STATES:
+            return False
+        if subscriber["detached_at"] is not None:
+            return True  # already detached: the request stands and nothing changes twice
+        run_id = subscriber["run_id"]
+        if (
+            connection.execute(
+                "UPDATE run_subscribers SET detached_at=? WHERE seq=? AND detached_at IS NULL",
+                (now, subscriber["seq"]),
+            ).rowcount
+            != 1
+        ):
+            raise LedgerConflict(f"subscriber {subscriber['reservation_id']} detached twice")
+        _payer_event(connection, run_id=run_id, kind="detach", subscriber=subscriber, now=now)
+        run = connection.execute(
+            "SELECT status, payer_reservation_id FROM analysis_runs WHERE run_id=?", (run_id,)
+        ).fetchone()
+        remaining = connection.execute(_LIVE_SUBSCRIBERS_SQL, (run_id,)).fetchall()
+        if subscriber["reservation_state"] == "held":
+            if run is None or run["payer_reservation_id"] != subscriber["reservation_id"]:
+                released = connection.execute(
+                    "UPDATE run_subscribers SET reservation_state='released', released_at=? "
+                    "WHERE seq=? AND reservation_state='held'",
+                    (now, subscriber["seq"]),
+                ).rowcount
+                if released != 1:
+                    raise LedgerConflict(f"reservation {subscriber['reservation_id']} changed")
+                _payer_event(
+                    connection, run_id=run_id, kind="release", subscriber=subscriber, now=now
+                )
+            elif remaining and run["status"] in ACTIVE_RUN_STATES:
+                self._transfer_payer(connection, run_id, subscriber, remaining[0], now)
+        if not remaining:
+            # §3.5: the last subscriber detached, so the run's cancel token fires.
+            connection.execute(
+                "UPDATE jobs SET cancel_requested=1, updated_at=? "
+                f"WHERE run_id=? AND attached=0 AND state IN {_ACTIVE_SQL}",
+                (now, run_id),
+            )
+        if job["attached"] == 1:
+            # An attached job drives nothing: its detach ends it at once, and neither
+            # reconciliation nor the run's terminal status can overwrite that.
+            connection.execute(
+                "UPDATE jobs SET state='cancelled', cancel_requested=1, "
+                "progress=json_set(CASE WHEN json_valid(progress) THEN progress ELSE '{}' END, "
+                "'$.detached', 1), lease_owner=NULL, lease_until=NULL, heartbeat_at=NULL, "
+                "claim_token=NULL, updated_at=? "
+                f"WHERE id=? AND state IN {_ACTIVE_SQL}",
+                (now, subscriber["job_id"]),
+            )
+        return True
+
+    def _transfer_payer(
+        self, connection: Any, run_id: str, payer: Any, successor: Any, now: float
+    ) -> None:
+        """§3.5's payer transfer: exactly once, to a live subscriber, never leaving no payer."""
+
+        changed = connection.execute(
+            "UPDATE analysis_runs SET payer_user=?, payer_reservation_id=? "
+            f"WHERE run_id=? AND payer_reservation_id=? AND status IN {_ACTIVE_SQL}",
+            (successor["user_id"], successor["reservation_id"], run_id, payer["reservation_id"]),
+        ).rowcount
+        if changed != 1:
+            raise LedgerConflict(f"run {run_id}'s payer changed during a transfer")
+        released = connection.execute(
+            "UPDATE run_subscribers SET reservation_state='released', released_at=? "
+            "WHERE seq=? AND reservation_state='held'",
+            (now, payer["seq"]),
+        ).rowcount
+        if released != 1:
+            raise LedgerConflict(f"reservation {payer['reservation_id']} changed")
+        # Only a reservation that already exists moves here; one made later is attributed to the
+        # payer of that moment when it is inserted (attribute_reservation), never frozen at $0.
+        usd = _run_usd_reserved(connection, run_id)
+        overage = _cap_overage(connection, self.usd_caps, successor["user_id"], usd)
+        _payer_event(
+            connection,
+            run_id=run_id,
+            kind="transfer",
+            subscriber=payer,
+            to=successor,
+            now=now,
+            usd_e6_reattributed=usd,
+            usd_e6_overage=overage,
+        )
+        if overage:
+            _audit_overage(
+                connection,
+                run_id=run_id,
+                source=payer,
+                payer=successor,
+                usd_e6=usd,
+                overage=overage,
+                trigger="payer_transfer",
+                now=now,
             )
 
     def cancel_requested(self, job_id: str, claim_token: str) -> bool:
@@ -1875,19 +2295,29 @@ class JobQueue:
         now = self.clock()
         with self.database.write() as connection:
             row = connection.execute(
-                "SELECT run_id FROM jobs WHERE id=? AND claim_token=? AND lease_until > ? "
-                f"AND state IN {_ACTIVE_SQL}",
+                "SELECT run_id, cancel_requested FROM jobs WHERE id=? AND claim_token=? "
+                f"AND lease_until > ? AND state IN {_ACTIVE_SQL}",
                 (job_id, claim_token, now),
             ).fetchone()
             if row is None:
                 return False
+            if result.status != "cancelled" and self._abandoned_by_subscribers(connection, row):
+                # §3.5: the last subscriber detached before this result was recorded, so the
+                # run ends ``cancelled`` (0 % credits) whatever the pipeline reported. Spend
+                # already dispatched stays spent: the money below is folded, never lowered.
+                result = replace(
+                    result, status="cancelled", reason=ALL_SUBSCRIBERS_DETACHED, achieved=None
+                )
+                bundle_path, progress = None, None
+            ended = 0
+            reproject = False
             if row["run_id"] is not None:
                 # Durable provider events first (§2.3.2): exactly one settlement, never below them.
                 fold_run_money(connection, row["run_id"])
                 # MAX, not assignment: money and attempts already recovered onto this run are
                 # facts. A settlement that reported less (a cancel before restart, a refusal)
                 # would erase spend the owner was really charged.
-                connection.execute(
+                ended = connection.execute(
                     "UPDATE analysis_runs SET achieved=?, status=?, reason=?, "
                     "attempts=MAX(attempts, ?), "
                     "usd_e6_reserved=MAX(usd_e6_reserved, ?), usd_e6_spent=MAX(usd_e6_spent, ?), "
@@ -1903,7 +2333,7 @@ class JobQueue:
                         row["run_id"],
                         claim_token,
                     ),
-                )
+                ).rowcount
             bundle_id = None
             if result.bundle_id is not None and bundle_path is not None:
                 manifest = read_bundle_manifest(bundle_path)
@@ -1922,12 +2352,28 @@ class JobQueue:
                     ),
                 )
                 bundle_id = result.bundle_id
+            state = result.status
+            if ended == 1:
+                # One transaction: the run's terminal status, whose reservation it settles under,
+                # the release of every other one, and the result for every attached subscriber.
+                close_subscriptions(connection, row["run_id"], result.status, now)
+                mirror_attached(connection, row["run_id"], result.status, now)
+                if result.status == "cancelled":
+                    reproject = _settle_as_cancelled(connection, row["run_id"], now)
+            detached = connection.execute(
+                "SELECT 1 FROM run_subscribers WHERE job_id=? AND detached_at IS NOT NULL",
+                (job_id,),
+            ).fetchone()
+            if detached is not None:
+                # This job drove the run for others after its own user detached: for that user
+                # the request was cancelled, whatever the run went on to achieve.
+                state, bundle_id = "cancelled", None
             changed = connection.execute(
                 "UPDATE jobs SET state=?, result_bundle_id=?, lease_owner=NULL, lease_until=NULL, "
                 "heartbeat_at=NULL, claim_token=NULL, progress=COALESCE(?, progress), updated_at=? "
                 "WHERE id=? AND claim_token=?",
                 (
-                    result.status,
+                    state,
                     bundle_id,
                     _json(dict(progress)) if progress is not None else None,
                     now,
@@ -1935,7 +2381,24 @@ class JobQueue:
                     claim_token,
                 ),
             ).rowcount
-            return changed == 1
+        if reproject:
+            # After commit, like every settlement projection: the journal line follows the row.
+            with suppress(Exception):
+                SettlementLedger(self.database, clock=self.clock).reproject(row["run_id"])
+        return changed == 1
+
+    @staticmethod
+    def _abandoned_by_subscribers(connection: Any, job: Any) -> bool:
+        """The job's run had subscribers and the last of them has detached (its token fired)."""
+
+        if job["run_id"] is None or not job["cancel_requested"]:
+            return False
+        subscribed = connection.execute(
+            "SELECT 1 FROM run_subscribers WHERE run_id=? LIMIT 1", (job["run_id"],)
+        ).fetchone()
+        if subscribed is None:
+            return False  # no subscriber model: the job's own cancellation governs as before
+        return connection.execute(_LIVE_SUBSCRIBERS_SQL, (job["run_id"],)).fetchone() is None
 
     def wait(
         self,
@@ -2081,6 +2544,7 @@ class Worker:
         clock: Callable[[], float] = time.time,
         checkpoint_before_commit: Callable[[str, CheckpointPhase], None] | None = None,
         checkpoint_after_commit: Callable[[str, CheckpointPhase], None] | None = None,
+        usd_caps: UsdCapSeam | None = None,
     ) -> None:
         self.database = database
         self.work_root = Path(work_root).resolve()
@@ -2100,7 +2564,7 @@ class Worker:
         self.egress_id = egress_id
         self.checkpoint_before_commit = checkpoint_before_commit
         self.checkpoint_after_commit = checkpoint_after_commit
-        self.queue = JobQueue(database, local_mode=local_mode, clock=clock)
+        self.queue = JobQueue(database, local_mode=local_mode, clock=clock, usd_caps=usd_caps)
         config = self.options.app_config or AppConfig()
         #: ONE breaker for this egress (§2.3.5), shared by every worker process rather than owned
         #: by this one: its denominator is the resolved Shazam attempts in `provider_attempt_events`
@@ -2114,6 +2578,8 @@ class Worker:
             config=getattr(config, "shazam_breaker", None),
         )
         self._draining = threading.Event()
+        #: Runs whose cancelled settlement journal this process has already verified.
+        self._reprojected: set[str] = set()
 
     def drain(self) -> None:
         """Stop claiming new work; an already-running job retains its heartbeat."""
@@ -2146,6 +2612,7 @@ class Worker:
         if self._draining.is_set():
             return None
         self.queue.reconcile_attached()
+        self.reproject_cancelled_settlements()
         job = self.queue.claim(self.worker_id, lease_seconds=self.lease_seconds)
         if job is None:
             return None
@@ -2222,6 +2689,40 @@ class Worker:
                     raise
                 self.queue.fail(job, token, f"{type(exc).__name__}: {exc}")
         return self._current(job.id)
+
+    def reproject_cancelled_settlements(self) -> int:
+        """Repair the journal of every run whose last subscriber detached over a success.
+
+        ``terminal()`` rewrites such a settlement row in its transaction and reprojects the
+        journal only after commit; a crash or an I/O failure in between leaves the journal saying
+        ``complete``. The row is the authority, so the existing reproject-from-row repairs it.
+        Each run is checked once per worker process (the first pass is the worker's start); a
+        failed repair is retried on the next pass. Returns how many journals were rewritten.
+        """
+
+        try:
+            with self.database.read() as connection:
+                run_ids = [
+                    row["run_id"]
+                    for row in connection.execute(
+                        "SELECT run_id FROM run_settlements WHERE status='cancelled' "
+                        "AND json_valid(entry) AND json_extract(entry, '$.reason')=?",
+                        (ALL_SUBSCRIBERS_DETACHED,),
+                    )
+                ]
+        except Exception:  # noqa: BLE001 - a busy database must not stop the consumer
+            return 0
+        ledger = SettlementLedger(self.database, clock=self.queue.clock)
+        repaired = 0
+        for run_id in run_ids:
+            if run_id in self._reprojected:
+                continue
+            try:
+                repaired += int(ledger.reproject(run_id))
+            except Exception:  # noqa: BLE001 - retried on the next pass
+                continue
+            self._reprojected.add(run_id)
+        return repaired
 
     def _current(self, job_id: str) -> Job | None:
         try:
@@ -2395,6 +2896,10 @@ class Worker:
         rows = connection.execute(
             "SELECT b.bundle_id, b.path, r.run_id FROM result_bundles b "
             "JOIN analysis_runs r ON r.run_id=b.run_id WHERE r.media_key=? "
+            # Only a run whose own outcome is a result may be served: a bundle is never the
+            # answer of a run that ended cancelled (its last subscriber left), failed or waiting,
+            # whatever the bundle's manifest says.
+            "AND r.status IN ('complete', 'degraded') "
             "ORDER BY b.created_at DESC",
             (intake.inputs.media_key,),
         ).fetchall()
@@ -2465,16 +2970,37 @@ class Worker:
                     ),
                 )
                 return "complete"
-            # Attach only to a run somebody is still driving. A run whose job dead-lettered is
-            # abandoned: attaching to it would leave the new submission waiting forever.
-            attached = connection.execute(
-                "SELECT r.run_id FROM analysis_runs r JOIN jobs j ON j.run_id=r.run_id "
-                f"WHERE r.analysis_key=? AND r.status IN {_ACTIVE_SQL} "
-                f"AND j.state IN {_ACTIVE_SQL} AND j.id<>? "
-                "ORDER BY r.started_at LIMIT 1",
-                (intake.analysis_key, job.id),
-            ).fetchone()
+            if not self.local_mode and recipe_uses_paid_engine(job.recipe):
+                # Coalescing is never a way around the hosted paid refusal: no hosted paid request
+                # becomes a subscriber (or a run) even if a run for its key somehow exists.
+                raise DispatchRefused(HOSTED_PAID_REFUSAL)
+            minutes = reservation_minutes(intake.duration_ms)
+            attached = None
+            if job.tenant_scope == "public" and intake.inputs.tenant_scope == "public":
+                # §3.4: the coalescing key is the analysis key, and private scope never coalesces.
+                # Attach only to a live public run of the SAME recipe that somebody is still
+                # driving and somebody is still subscribed to: a run whose job dead-lettered is
+                # abandoned, and a run whose last subscriber left is being cancelled.
+                attached = connection.execute(
+                    "SELECT r.run_id FROM analysis_runs r "
+                    "WHERE r.analysis_key=? AND r.tenant_scope='public' "
+                    f"AND r.requested_recipe_id=? AND r.status IN {_ACTIVE_SQL} "
+                    "AND r.payer_reservation_id IS NOT NULL "
+                    "AND EXISTS (SELECT 1 FROM jobs j WHERE j.run_id=r.run_id AND j.id<>? "
+                    f"AND j.attached=0 AND j.cancel_requested=0 AND j.state IN {_ACTIVE_SQL}) "
+                    "AND EXISTS (SELECT 1 FROM run_subscribers s JOIN jobs sj ON sj.id=s.job_id "
+                    "WHERE s.run_id=r.run_id AND s.detached_at IS NULL "
+                    f"AND s.reservation_state='held' AND sj.state IN {_ACTIVE_SQL}) "
+                    "ORDER BY r.started_at LIMIT 1",
+                    (intake.analysis_key, job.recipe.recipe_id, job.id),
+                ).fetchone()
             if attached is not None:
+                seam = getattr(self.reservation_seam, "reserve_for_subscriber", None)
+                if seam is not None and not self._reserved(
+                    connection, lambda: seam(connection, job, intake, attached["run_id"])
+                ):
+                    return self._refuse_quota(connection, job, tracker, now)
+                self._subscribe(connection, job, attached["run_id"], minutes, now)
                 connection.execute(
                     "UPDATE jobs SET run_id=?, state='waiting', attached=1, lease_owner=NULL, "
                     "lease_until=NULL, heartbeat_at=NULL, claim_token=NULL, progress=?, "
@@ -2495,13 +3021,18 @@ class Worker:
                 )
                 return "waiting"
             run_id = job.run_id or new_run_id()
-            if self.reservation_seam is not None:
-                self.reservation_seam.reserve_for_new_run(connection, job, intake)
+            seam = self.reservation_seam
+            if seam is not None and not self._reserved(
+                connection, lambda: seam.reserve_for_new_run(connection, job, intake)
+            ):
+                return self._refuse_quota(connection, job, tracker, now)
+            reservation_id = _new_reservation_id()
             connection.execute(
                 "INSERT INTO analysis_runs(run_id, analysis_key, media_key, requested_recipe_id, "
                 "algorithm_version, adapter_versions, status, tenant_scope, checkpoints, "
-                "started_at, analysis_inputs, non_recipe_key, claim_token) "
-                "VALUES (?, ?, ?, ?, ?, ?, 'analysis', ?, ?, ?, ?, ?, ?)",
+                "started_at, analysis_inputs, non_recipe_key, claim_token, payer_user, "
+                "payer_reservation_id) "
+                "VALUES (?, ?, ?, ?, ?, ?, 'analysis', ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     run_id,
                     intake.analysis_key,
@@ -2515,8 +3046,12 @@ class Worker:
                     _json(vars(intake.inputs)),
                     intake.inputs.non_recipe_key,
                     token,
+                    job.user_id,
+                    reservation_id,
                 ),
             )
+            # The initiator is the run's first subscriber and its payer (§3.5).
+            self._subscribe(connection, job, run_id, minutes, now, reservation_id=reservation_id)
             changed = connection.execute(
                 "UPDATE jobs SET run_id=?, state='analysis', progress=?, updated_at=? "
                 "WHERE id=? AND claim_token=?",
@@ -2538,6 +3073,57 @@ class Worker:
             if changed != 1:
                 raise StaleClaim("job lease was lost while committing intake")
         return "analysis"
+
+    @staticmethod
+    def _reserved(connection: Any, reserve: Callable[[], object]) -> bool:
+        """Run one reservation-seam call; ``False`` (with its writes undone) on a quota refusal."""
+
+        connection.execute("SAVEPOINT idea_reservation")
+        try:
+            reserve()
+        except QuotaExceeded:
+            connection.execute("ROLLBACK TO idea_reservation")
+            connection.execute("RELEASE idea_reservation")
+            return False
+        connection.execute("RELEASE idea_reservation")
+        return True
+
+    def _refuse_quota(self, connection: Any, job: Job, tracker: PageProgress, now: float) -> str:
+        """End a request the reservation seam refused: ``quota_exceeded``, never attached."""
+
+        refused = tracker.settle("quota_exceeded", usd_e2_spent=0, spend_known=True)
+        changed = connection.execute(
+            "UPDATE jobs SET run_id=NULL, state='quota_exceeded', lease_owner=NULL, "
+            "lease_until=NULL, heartbeat_at=NULL, claim_token=NULL, progress=?, updated_at=? "
+            "WHERE id=? AND claim_token=?",
+            (_json({**refused, "phase": "intake"}), now, job.id, job.token),
+        ).rowcount
+        if changed != 1:
+            raise StaleClaim("job lease was lost while refusing its reservation")
+        return "quota_exceeded"
+
+    @staticmethod
+    def _subscribe(
+        connection: Any,
+        job: Job,
+        run_id: str,
+        minutes: int,
+        now: float,
+        *,
+        reservation_id: str | None = None,
+    ) -> None:
+        """The job's ``run_subscribers`` row (its held reservation) and its ``attach`` event."""
+
+        identifier = reservation_id or _new_reservation_id()
+        connection.execute(
+            "INSERT INTO run_subscribers(reservation_id, run_id, job_id, user_id, recipe_id, "
+            "minutes_reserved, attached_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (identifier, run_id, job.id, job.user_id, job.recipe.recipe_id, minutes, now),
+        )
+        subscriber = connection.execute(
+            "SELECT * FROM run_subscribers WHERE reservation_id=?", (identifier,)
+        ).fetchone()
+        _payer_event(connection, run_id=run_id, kind="attach", subscriber=subscriber, now=now)
 
     @staticmethod
     def _validated_checkpoints(
@@ -2719,6 +3305,7 @@ class Worker:
             clock=self.queue.clock,
             job_id=job_id,
             hosted=not self.local_mode,
+            usd_caps=self.queue.usd_caps,
         )
 
     def _recovered_money(self, run_id: str | None) -> tuple[int, int, int]:
@@ -2764,6 +3351,52 @@ class Worker:
             return reported
         return max(reported, int(row["usd_e6_spent"]) if row is not None else 0)
 
+    def _settle_if_absent(self, job: Job, claim_token: str, status: str) -> bool:
+        """Insert the run's settlement row from its durable money, only if none exists.
+
+        The existing :class:`SettlementLedger` insert-if-absent writer, fenced by this claim: the
+        money is the fold of every durable attempt event, the authoritative dispatch rows (an
+        unresolved dispatch is spent) and the reservation row. Never a second settlement.
+        """
+
+        from id_detector.service import interrupted_entry
+
+        run_id = job.run_id
+        if run_id is None:
+            return False
+        with self.database.write() as connection:
+            run = connection.execute(
+                "SELECT media_key FROM analysis_runs WHERE run_id=?", (run_id,)
+            ).fetchone()
+            if run is None:
+                return False  # no queue-side run: nothing of this run's is settled here
+            floor = fold_run_money(connection, run_id)
+            try:
+                money = recovered_money(
+                    fold_run_ledger(
+                        run_id,
+                        _run_attempt_events(connection, run_id),
+                        dispatch_events(connection, run_id, paid_only=True),
+                    ),
+                    stored_reservation(connection, run_id),
+                    floor,
+                )
+            except LedgerConflict:
+                money = floor
+        media_dirs = sorted(self.work_root.glob(f"*/{run['media_key']}"))
+        path = media_dirs[0] / "invocations.jsonl" if media_dirs else None
+        ledger = SettlementLedger(
+            self.database,
+            fence=lambda connection: require_run_fence(
+                connection, run_id, claim_token, self.queue.clock()
+            ),
+            clock=self.queue.clock,
+            only_if_missing=True,
+        )
+        return ledger.settle(
+            path, interrupted_entry(run_id, _display_target(job.target), status, money, [])
+        )
+
     def _cancel_before_start(self, job: Job, claim_token: str) -> None:
         """Cancel without erasing what an earlier pass of this run already spent.
 
@@ -2778,6 +3411,9 @@ class Worker:
             # claim is stale the fenced settlement below refuses to write at all.
             with suppress(OSError, ValueError, StaleClaim):
                 self._journal(job.run_id, claim_token).backfill()
+            # The run's ONE settlement, if nothing settled it yet (a worker killed after the last
+            # detach and before the pipeline settled): insert-if-absent, under the run fence.
+            self._settle_if_absent(job, claim_token, "cancelled")
         reserved, spent, attempts = self._recovered_money(job.run_id)
         result = RunResult(
             job.run_id or "", "cancelled", None, None, None, reserved, spent, attempts

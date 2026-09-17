@@ -28,7 +28,6 @@ from idea_web.jobs import local
 from idea_web.jobs.worker import JobQueue, Worker, _page_profile, _result_path
 from idea_web.progress import PAGE_DOCUMENT_KEY
 from tests.idea_web.test_worker import (
-    _claim_run,
     _complete,
     _database,
     _insert_run,
@@ -497,7 +496,12 @@ def test_an_attached_job_carries_the_page_document(tmp_path: Path) -> None:
     database = _database(tmp_path)
     queue = JobQueue(database)
     intake = _intake(tmp_path)
-    _claim_run(database, intake, "run-driven")
+    # The driver goes through intake, as every run does from 4b-iv: a run is attachable only while
+    # it has a payer and a live subscriber (a bare run row has neither).
+    queue.enqueue(PlatformUrl(MIX), FREE_RECIPE, run_id="run-driven")
+    driver = queue.claim("driver", lease_seconds=600)
+    assert driver is not None
+    assert Worker(database, tmp_path / "work")._commit_intake(driver, intake) == "analysis"
 
     def never(request):
         raise AssertionError("an attached job must not run the pipeline")
