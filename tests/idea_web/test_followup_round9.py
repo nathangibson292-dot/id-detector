@@ -74,7 +74,7 @@ def test_a_claim_racing_the_migration_check_cannot_commit_before_or_around_it(
             other.close()
 
     database.before_claim_check = racing_claim
-    assert database.migrate() == 3
+    assert database.migrate() == 4
     assert outcome == {"claim": "database is locked"}
     with database.read() as connection:
         assert connection.execute("SELECT COUNT(*) FROM jobs").fetchone()[0] == 0
@@ -97,7 +97,7 @@ def test_every_pending_script_commits_once_or_not_at_all(
         columns = {row[1] for row in connection.execute("PRAGMA table_info(jobs)")}
     assert "attached" not in columns and "money_authority" not in columns
     monkeypatch.undo()
-    assert database.migrate() == 3
+    assert database.migrate() == 4
 
 
 # ------------------------------------------------ item 2: one normalised local identity
@@ -129,7 +129,7 @@ def test_case_relative_and_extended_aliases_of_a_local_database_share_one_superv
             assert alias.version() == 2, name
     finally:
         holder.release()
-    assert aliases["extended"].migrate() == 3
+    assert aliases["extended"].migrate() == 4
 
 
 # ------------------------------------------------ round 10: tests only (round-9 review)
@@ -158,7 +158,7 @@ def test_canonical_and_relative_local_aliases_share_one_supervisor_lock(
             assert alias.version() == 2, name
     finally:
         holder.release()
-    assert aliases["relative"].migrate() == 3
+    assert aliases["relative"].migrate() == 4
 
 
 def test_the_in_transaction_reread_sees_a_migration_applied_after_the_preflight(
@@ -193,7 +193,7 @@ def test_the_in_transaction_reread_sees_a_migration_applied_after_the_preflight(
         return result
 
     monkeypatch.setattr(Database, "_applied", staticmethod(racing_applied))
-    assert database.migrate() == 3
+    assert database.migrate() == 4
     monkeypatch.undo()
     assert seen[0] == {1} and seen[-1] == {1, 2}
     with database.read() as connection:
@@ -201,7 +201,8 @@ def test_the_in_transaction_reread_sees_a_migration_applied_after_the_preflight(
             "SELECT number, COUNT(*) FROM schema_migrations GROUP BY number ORDER BY number"
         ).fetchall()
         columns = {row[1] for row in connection.execute("PRAGMA table_info(jobs)")}
-    assert [tuple(row) for row in rows] == [(1, 1), (2, 1), (3, 1)]  # none twice, none skipped
+    # none twice, none skipped
+    assert [tuple(row) for row in rows] == [(1, 1), (2, 1), (3, 1), (4, 1)]
     assert {"attached", "money_authority", "authority_token"} <= columns
 
 

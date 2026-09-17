@@ -34,6 +34,7 @@ from id_detector.ingest import _load_cached, ingest
 from id_detector.io import fsync_directory, native_path, path_is_file, read_text, sha256_file
 from id_detector.jobs import JobStoreLocked, ProcessLock
 from id_detector.journal import append_line
+from id_detector.money import ceil_e2
 from id_detector.paid_clip import PAID_CLIP_ENGINES
 from id_detector.present.bundles import read_bundle_manifest
 from id_detector.providers.base import AppConfig
@@ -67,7 +68,9 @@ from id_detector.service import (
     validate_upload_id,
 )
 from id_detector.shazam_breaker import BreakerConfig, ShazamBreaker
+from idea_web.breaker import SharedShazamBreaker
 from idea_web.database import Database, migrations
+from idea_web.progress import PageProgress, page_document
 
 #: Hosted paid money is deferred to the hosted cycle (round 6) and must be re-reviewed before
 #: it is enabled: until then a hosted worker refuses every paid engine at intake AND at
@@ -2006,6 +2009,57 @@ IntakeResolver = Callable[["Job", SQLiteCheckpointStore], PreparedIntake]
 ServiceRunner = Callable[[RunRequest], RunResult]
 
 
+def _display_target(target: object) -> str:
+    """A job's target as one string, for the page document's fallback label.
+
+    The page reads its real target from the job's own column (never from the snapshot), so this is
+    only the label a job wears before its title resolves.
+    """
+
+    for attribute in ("url", "path", "upload_id"):
+        value = getattr(target, attribute, None)
+        if value is not None:
+            return str(value)
+    return str(target)
+
+
+def _page_profile(recipe: Recipe) -> str:
+    """The profile name the RENDERER understands, not the recipe's own name.
+
+    `present/server.py` (frozen by §4.2) decides "this run could have cost money" by looking for
+    the profile ``max_accuracy``; a Deep run labelled ``deep`` renders as a Free scan and tells the
+    owner nothing was spent. The mapping therefore happens here, on the web side.
+    """
+
+    return "max_accuracy" if recipe_uses_paid_engine(recipe) else "free"
+
+
+def _plain_path(path: Path) -> Path:
+    r"""``resolve()`` without Windows' ``\\?\`` prefix, so ``relative_to`` keeps working."""
+
+    text = str(Path(path).resolve())
+    if text.startswith("\\\\?\\UNC\\"):
+        text = "\\\\" + text[8:]
+    elif text.startswith("\\\\?\\"):
+        text = text[4:]
+    return Path(text)
+
+
+def _result_path(work_root: Path, bundle_dir: Path | None) -> str | None:
+    """A served, work-root-relative result path — the route the web layer actually answers.
+
+    The page links ``/<result_path>``; a bare bundle id would point at the site root and 404.
+    """
+
+    if bundle_dir is None:
+        return None
+    try:
+        relative = _plain_path(bundle_dir).relative_to(_plain_path(work_root))
+    except ValueError:
+        return None
+    return (relative / "index.html").as_posix()
+
+
 class Worker:
     """One queue consumer. It has no HTTP imports and serves no requests."""
 
@@ -2048,10 +2102,16 @@ class Worker:
         self.checkpoint_after_commit = checkpoint_after_commit
         self.queue = JobQueue(database, local_mode=local_mode, clock=clock)
         config = self.options.app_config or AppConfig()
-        #: ONE breaker state for this worker process (§2.3.5): its samples, daily count and latch
-        #: outlive every job. Each run decorates it with that run's ledger context.
-        self.process_breaker: ShazamBreaker = self.options.shazam_breaker or ShazamBreaker(
-            getattr(config, "shazam_breaker", None)
+        #: ONE breaker for this egress (§2.3.5), shared by every worker process rather than owned
+        #: by this one: its denominator is the resolved Shazam attempts in `provider_attempt_events`
+        #: and its daily budget the **dispatched** ones -- an attempt that was only ever prepared
+        #: was never sent and spends nothing (§2.3.3) -- so two workers cannot each see a third of
+        #: the failures and each conclude the rate is fine. Only the open deadline, the day's open
+        #: count, the latch and the re-enable cutoff are stored (4b-ii).
+        self.process_breaker: ShazamBreaker = self.options.shazam_breaker or SharedShazamBreaker(
+            database,
+            egress_id=egress_id,
+            config=getattr(config, "shazam_breaker", None),
         )
         self._draining = threading.Event()
 
@@ -2103,11 +2163,37 @@ class Worker:
                     # intake, any run row, reservation or dispatch -- and permanently.
                     self.queue.fail(job, token, HOSTED_PAID_REFUSAL, permanent=True)
                     return self._current(job.id)
+                if (job.state == "intake" or job.run_id is None) and not recipe_uses_paid_engine(
+                    job.recipe
+                ):
+                    # §2.3.5: while the breaker is open, a NEW free job waits instead of starting.
+                    # A free primary that is already running is never interrupted (this branch is
+                    # only reached before a run exists), and waiting costs the job no attempt.
+                    try:
+                        open_reason = self.process_breaker.reason()
+                    except Exception:
+                        open_reason = None  # an unreadable breaker must never stall the queue
+                    if open_reason is not None:
+                        self.queue.wait(
+                            job.id,
+                            token,
+                            open_reason,
+                            cooldown_seconds=self.wait_cooldown_seconds,
+                            state="intake" if job.run_id is None else "waiting",
+                        )
+                        return self._current(job.id)
+                # ONE page document spans the whole claim -- intake, a cache hit, an attachment,
+                # the analysis and its terminal state -- and it resumes what the previous attempt
+                # left, so a job that fails in intake is still visible with its cause (U-F33) and
+                # a retry continues the bar instead of resetting it (U-F9).
+                tracker = self._tracker(job)
+                tracker.start()
+                self._publish(job.id, token, tracker.tick("intake", 0, 1, ""))
                 if job.state == "intake" or job.run_id is None:
                     # No run yet, whatever the row says: there is nothing to resume, so this claim
                     # must go through intake rather than down the analysis path.
                     intake = self.intake_resolver(job, self._store(job))
-                    decision = self._commit_intake(job, intake)
+                    decision = self._commit_intake(job, intake, tracker)
                     if decision != "analysis":
                         return self._current(job.id)
                     job = self.queue.get(job.id)
@@ -2116,7 +2202,7 @@ class Worker:
                     if not self.queue.begin_analysis(job.id, token):
                         raise StaleClaim("job lease was lost before analysis")
                     job = self.queue.get(job.id)
-                self._run_analysis(job, intake, token)
+                self._run_analysis(job, intake, token, tracker)
             except JobStoreLocked as exc:
                 # Another process holds the source or media lock: not a failure, so the attempt is
                 # returned and the job is retried after a cooldown.
@@ -2142,6 +2228,31 @@ class Worker:
             return self.queue.get(job_id)
         except (KeyError, ValueError, TargetRefused):
             return None
+
+    def _tracker(self, job: Job) -> PageProgress:
+        """This claim's page document, RESUMING whatever the previous attempt left.
+
+        A retry that started a fresh tracker would throw away the measured phase durations and the
+        monotonic high-water mark, so the bar would snap backwards on every reclaim (U-F9).
+        """
+
+        return PageProgress(
+            self.work_root,
+            job.id,
+            _display_target(job.target),
+            profile=_page_profile(job.recipe),
+            run_id=job.run_id,
+            created_at=getattr(job, "created_at", None),
+            resume=page_document(job.progress),
+        )
+
+    def _publish(self, job_id: str, claim_token: str, document: Mapping[str, object]) -> None:
+        """Publish the page document under the claim fence; a refused write is a lost claim."""
+
+        if not self.queue.update_progress(
+            job_id, claim_token, document, lease_seconds=self.lease_seconds
+        ):
+            raise StaleClaim("job lease was lost while publishing progress")
 
     @contextmanager
     def _heartbeat(self, job_id: str, claim_token: str) -> Iterator[None]:
@@ -2277,7 +2388,7 @@ class Worker:
 
     def _compatible_bundle(
         self, connection: Any, intake: PreparedIntake, recipe: Recipe
-    ) -> tuple[str, str] | None:
+    ) -> tuple[str, str, Path] | None:
         request = CompatibilityRequest(
             intake.inputs, recipe, accept_degraded=False, local=self.local_mode
         )
@@ -2301,10 +2412,19 @@ class Worker:
                 "achieved": manifest.get("achieved"),
             }
             if serves(stored, request, serve_free_from_deep=config.serve_free_from_deep):
-                return row["run_id"], row["bundle_id"]
+                # The path is part of the answer: compatibility selects by ``media_key``, and two
+                # source keys can share one media. Rebuilding the URL under the NEW intake's media
+                # directory would then hand the owner a link that 404s.
+                return row["run_id"], row["bundle_id"], path
         return None
 
-    def _commit_intake(self, job: Job, intake: PreparedIntake) -> str:
+    def _commit_intake(
+        self, job: Job, intake: PreparedIntake, tracker: PageProgress | None = None
+    ) -> str:
+        # Normally the claim's own tracker, carrying what intake already measured; a caller that
+        # commits an intake on its own gets one built from the job's stored document instead, so
+        # the cache-hit and attachment branches always have a page document to publish.
+        tracker = self._tracker(job) if tracker is None else tracker
         now = self.queue.clock()
         token = job.token
         checkpoints = self._validated_checkpoints(intake.checkpoints)
@@ -2322,7 +2442,15 @@ class Worker:
             )
             compatible = self._compatible_bundle(connection, intake, job.recipe)
             if compatible is not None:
-                run_id, bundle_id = compatible
+                run_id, bundle_id, bundle_path = compatible
+                # A cache hit is a finished job: it gets the same page document an analysed one
+                # gets, pointing at the bundle the lookup actually SELECTED and validated.
+                served = tracker.settle(
+                    "complete",
+                    result_path=_result_path(self.work_root, bundle_path),
+                    usd_e2_spent=0,
+                    spend_known=True,
+                )
                 connection.execute(
                     "UPDATE jobs SET run_id=?, state='complete', result_bundle_id=?, "
                     "lease_owner=NULL, lease_until=NULL, heartbeat_at=NULL, claim_token=NULL, "
@@ -2330,7 +2458,7 @@ class Worker:
                     (
                         run_id,
                         bundle_id,
-                        _json({"phase": "intake", "served": True}),
+                        _json({**served, "phase": "intake", "served": True}),
                         now,
                         job.id,
                         token,
@@ -2353,7 +2481,13 @@ class Worker:
                     "updated_at=? WHERE id=? AND claim_token=?",
                     (
                         attached["run_id"],
-                        _json({"phase": "intake", "attached": True}),
+                        _json(
+                            {
+                                **tracker.tick("intake", 1, 1, ""),
+                                "phase": "intake",
+                                "attached": True,
+                            }
+                        ),
                         now,
                         job.id,
                         token,
@@ -2388,7 +2522,14 @@ class Worker:
                 "WHERE id=? AND claim_token=?",
                 (
                     run_id,
-                    _json({"phase": "intake", "done": 1, "total": 1}),
+                    _json(
+                        {
+                            **tracker.tick("intake", 1, 1, ""),
+                            "phase": "intake",
+                            "done": 1,
+                            "total": 1,
+                        }
+                    ),
                     now,
                     job.id,
                     token,
@@ -2453,7 +2594,9 @@ class Worker:
             raise ValueError("analysis media row is missing")
         return int(row["duration_ms"])
 
-    def _run_analysis(self, job: Job, intake: PreparedIntake, claim_token: str) -> None:
+    def _run_analysis(
+        self, job: Job, intake: PreparedIntake, claim_token: str, tracker: PageProgress
+    ) -> None:
         if job.run_id is None:
             raise ValueError("analysis job has no run id")
 
@@ -2462,11 +2605,17 @@ class Worker:
                 del inner_self
                 return self.queue.cancel_requested(job.id, claim_token)
 
+        # The claim's page document continues here -- it already carries intake, and on a retry the
+        # measured time and monotonic bar of the attempt before it. Published again as analysis
+        # begins so a run that fails in its very first phase is still visible with its cause.
+        self._publish(job.id, claim_token, tracker.document())
+
         def progress(phase: str, done: int, total: int, message: str) -> None:
+            document = tracker.tick(phase, done, total, message)
             updated = self.queue.update_progress(
                 job.id,
                 claim_token,
-                {"phase": phase, "done": done, "total": total, "message": message},
+                {**document, "phase": phase, "done": done, "total": total, "message": message},
                 lease_seconds=self.lease_seconds,
             )
             if not updated or self.queue.cancel_requested(job.id, claim_token):
@@ -2535,7 +2684,20 @@ class Worker:
             )
             if candidates:
                 bundle_path = candidates[0]
-        self.queue.terminal(job.id, claim_token, result, bundle_path=bundle_path)
+        self.queue.terminal(
+            job.id,
+            claim_token,
+            result,
+            bundle_path=bundle_path,
+            progress=tracker.settle(
+                result.status,
+                reason=result.reason,
+                result_path=_result_path(self.work_root, bundle_path),
+                # The exact settled figure from the authority, not this pass's own belief.
+                usd_e2_spent=ceil_e2(self._settled_spend(job.run_id, result.usd_e6_spent)),
+                spend_known=True,
+            ),
+        )
 
     def _journal(
         self,
@@ -2580,6 +2742,27 @@ class Worker:
             max(spent, int(state.get("usd_e6_spent", 0))),
             max(attempts, int(state.get("attempts", 0))),
         )
+
+    def _settled_spend(self, run_id: str | None, reported: int) -> int:
+        """This run's spend according to SQLite, which is the authority (§2.3.2).
+
+        ``RunResult`` carries what *this pass* believes it spent. Recovery can fold durable provider
+        events that a resumed or interrupted pass never saw, and `terminal()` raises the row to
+        them. Reading the folded figure means the page states the cost the owner was really
+        charged instead of understating it.
+        """
+
+        if run_id is None:
+            return reported
+        try:
+            with self.database.write() as connection:
+                fold_run_money(connection, run_id)
+                row = connection.execute(
+                    "SELECT usd_e6_spent FROM analysis_runs WHERE run_id=?", (run_id,)
+                ).fetchone()
+        except Exception:  # noqa: BLE001 - a money read must never fail a settled run
+            return reported
+        return max(reported, int(row["usd_e6_spent"]) if row is not None else 0)
 
     def _cancel_before_start(self, job: Job, claim_token: str) -> None:
         """Cancel without erasing what an earlier pass of this run already spent.

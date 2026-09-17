@@ -95,7 +95,7 @@ def test_a_direct_migrate_is_refused_while_another_process_holds_the_supervisor_
             database.migrate(1)  # a downgrade is a migration too
         assert database.version() == 2
         # A hosted database is unaffected by any local supervisor lock.
-        assert Database(tmp_path / "hosted" / "app.db").migrate() == 3
+        assert Database(tmp_path / "hosted" / "app.db").migrate() == 4
     finally:
         assert holder.stdin is not None
         holder.stdin.close()
@@ -104,7 +104,7 @@ def test_a_direct_migrate_is_refused_while_another_process_holds_the_supervisor_
         except subprocess.TimeoutExpired:
             holder.kill()  # only the lock holder this test started, by its handle (PID)
             holder.wait(20)
-    assert database.migrate() == 3
+    assert database.migrate() == 4
 
 
 def test_a_migration_is_refused_while_an_unstamped_unexpired_claim_exists(tmp_path: Path) -> None:
@@ -122,12 +122,12 @@ def test_a_migration_is_refused_while_an_unstamped_unexpired_claim_exists(tmp_pa
     hosted = Database(tmp_path / "hosted.db")
     assert hosted.migrate(2) == 2
     _insert_job(hosted, run_id=None, claim_token="old-code-claim", lease_until=time.time() + 600)
-    assert hosted.migrate() == 3
+    assert hosted.migrate() == 4
 
     # Once the old claim's lease has expired nothing can still be running it.
     with database.write() as connection:
         connection.execute("UPDATE jobs SET lease_until=0 WHERE id=?", (job_id,))
-    assert database.migrate() == 3
+    assert database.migrate() == 4
 
 
 # ------------------------------------------------ item 2: settlement ownership is exact

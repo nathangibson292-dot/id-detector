@@ -32,7 +32,7 @@ import threading
 import time
 import uuid
 from collections import deque
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from pathlib import Path
 from typing import Any
 
@@ -167,9 +167,51 @@ def local_database(work_root: Path) -> Database:
     so no caller can bypass that exclusion.
     """
 
-    database = Database(Path(work_root).resolve() / LOCAL_DATABASE)
-    database.migrate()
+    # A restore interrupted by a crash is undone FIRST: migrating, or serving, a half-published
+    # tree would build new state on top of it that a later recovery would then overwrite. The
+    # restore lock is then held until migration has returned, so no restore can start while the
+    # database is being created, opened or switched to WAL.
+    root = Path(work_root).resolve()
+    with _restore_excluded(root):
+        database = Database(root / LOCAL_DATABASE)
+        database.migrate()
     return database
+
+
+@contextlib.contextmanager
+def _restore_excluded(work_root: Path) -> Iterator[None]:
+    """Refuse during a live restore, undo an interrupted one, and exclude restores meanwhile.
+
+    Refusals surface as ``MigrationRefused``, the error ``idea serve`` already reports.
+    """
+
+    from idea_web.backup import BackupRefused, RestoreInProgress, restore_excluded
+
+    with contextlib.ExitStack() as stack:
+        try:
+            stack.enter_context(restore_excluded(work_root))
+        except RestoreInProgress as exc:
+            raise MigrationRefused(str(exc)) from None
+        except BackupRefused as exc:
+            raise MigrationRefused(
+                f"ID'er found an interrupted restore in this work folder that it could not safely "
+                f"undo: {exc}"
+            ) from None
+        yield  # the restore lock is released by the stack, on success or failure alike
+
+
+def _recover_interrupted_restore(work_root: Path) -> None:
+    """Consume an interrupted restore's journal; the caller already holds the supervisor lock."""
+
+    from idea_web.backup import BackupRefused, recover_interrupted
+
+    try:
+        recover_interrupted(work_root)
+    except BackupRefused as exc:
+        raise MigrationRefused(
+            f"ID'er found an interrupted restore in this work folder that it could not safely "
+            f"undo: {exc}"
+        ) from None
 
 
 def snapshot(job: Job) -> dict[str, Any]:
@@ -930,6 +972,12 @@ class LocalWorkerSupervisor:
         try:
             lock.acquire()
         except JobStoreLocked:
+            from idea_web.backup import RESTORE_IN_PROGRESS, restore_running
+
+            if restore_running(self.work_root):
+                # The holder is a restore, not another window: this server must not run at all.
+                # (`idea serve` ignores a False here, so refusing is the only fail-closed answer.)
+                raise MigrationRefused(RESTORE_IN_PROGRESS) from None
             self._log(
                 "another ID'er window already runs analyses for this work folder; "
                 "analyses started here will run there"
@@ -938,6 +986,9 @@ class LocalWorkerSupervisor:
         self._lock = lock
         self._stopping.clear()
         try:
+            # An interrupted restore is undone before this server touches the tree. Opening the
+            # database already tried; this pass holds the supervisor lock, so nothing can race it.
+            _recover_interrupted_restore(self.work_root)
             # Anything left in flight by a server that stopped without warning is stopped, not
             # silently resumed: closing ID'er has always stopped its analyses.
             self.jobs.cancel_all(ABANDONED)

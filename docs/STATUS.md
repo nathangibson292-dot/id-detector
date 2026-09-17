@@ -90,8 +90,10 @@ Phase 4 has begun:
   wheel (no app yet — that is 4a-ii).
 
 **Done since:** 4a-ii (FastAPI parity, `3cb5dc2`), 4b-i (durable queue and worker, `8e937ab`) and 4a-iii
-(security headers, versioned static assets, server-side page fixes). **Next in plan order:** 4b-ii + 4b-iii
-(progress, operations, shared breaker; backups and restore), then 4b-iv (coalescing, subscribers,
+(security headers, versioned static assets, server-side page fixes), plus 4b-ii + 4b-iii
+(progress, operations, shared breaker; backups and restore; [build notes](reviews/build-4b-ii-iii.md)).
+Progress re-weighting and the breaker-parked job card remain deferred as recorded in the build notes.
+**Next in plan order:** 4b-iv (coalescing, subscribers,
 cancel/drain). **Not started:** 4c–4d (accounts, sessions, tenancy, credits), 6a–6b (ingest policy,
 container, launch checklist), then M2 (billing, Stripe sandbox) — see PLAN-v2 §5.
 

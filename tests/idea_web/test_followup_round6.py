@@ -424,7 +424,7 @@ def test_a_populated_0003_downgrade_is_refused_and_the_rows_survive(
     _insert_authority_row(database, table)
     with pytest.raises(sqlite3.DatabaseError, match="money authority"):
         database.migrate(2)
-    assert database.version() == 3
+    assert database.version() == 4
     assert _count(database, table) == 1
 
 
@@ -437,7 +437,7 @@ def test_an_empty_0003_downgrade_still_works(tmp_path: Path) -> None:
             for row in connection.execute("SELECT name FROM sqlite_master WHERE type='table'")
         }
     assert not names & {"run_dispatches", "run_settlements", "run_reservations"}
-    assert database.migrate() == 3
+    assert database.migrate() == 4
 
 
 # ------------------------------------------------ E: every local job-owned terminal run has a row

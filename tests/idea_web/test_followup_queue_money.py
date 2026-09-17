@@ -429,6 +429,9 @@ def test_one_breaker_state_spans_sequential_jobs_in_a_worker(tmp_path: Path) -> 
         breaker = request.checkpoint_store.options.shazam_breaker
         seen.append(breaker.reason())
         breaker.dispatch(running_free=True)
+        # The budget moves when the request really leaves, not when it is admitted (§2.3.3): a
+        # prepared attempt that was never sent must not consume this egress's daily allowance.
+        breaker.sent()
         breaker.resolved("no_match")
         return _complete(request)
 
@@ -443,9 +446,15 @@ def test_one_breaker_state_spans_sequential_jobs_in_a_worker(tmp_path: Path) -> 
         intake_resolver=_resolver(_intake(tmp_path)),
         service_runner=service,
     )
-    worker.run_once()
-    worker.run_once()
-    assert seen == [None, "shazam_breaker:b_daily_budget"]
+    first = worker.run_once()
+    second = worker.run_once()
+    # One breaker state still spans both jobs: the second sees what the first admitted. Since
+    # 4b-ii it acts on that sooner — §2.3.5 parks a NEW free job while the breaker is open rather
+    # than starting it, so the refusal lands on the queue instead of inside the run.
+    assert seen == [None]
+    assert first is not None and first.state == "complete"
+    assert second is not None and second.state == "intake"
+    assert second.progress["reason"] == "shazam_breaker:b_daily_budget"
 
 
 def test_a_supplied_shared_breaker_is_the_workers_one_policy_state(tmp_path: Path) -> None:
