@@ -348,6 +348,45 @@ class LoopbackPostGuard:
         await self.app(scope, receive, send)
 
 
+def hosted_cross_site(scope: Scope, host: str, origin: str) -> str | None:
+    """Hosted mode's equivalent of :func:`cross_site`, for the one public origin.
+
+    Every request must name the public host (DNS rebinding), except the health probe, which a
+    container check sends to the loopback. A POST must carry exactly the public ``Origin``: a
+    missing one is refused too, since every browser sends it on a form or ``fetch`` POST.
+    """
+
+    if scope.get("path") != "/healthz" and (
+        _header(scope, b"host").strip().casefold() != host.casefold()
+    ):
+        return "host"
+    if scope.get("method") == "POST" and _header(scope, b"origin").strip().casefold() != origin:
+        return "origin"
+    return None
+
+
+class HostedRequestGuard:
+    """Refuse a foreign ``Host`` on any request and a foreign or missing ``Origin`` on a POST."""
+
+    def __init__(self, app: ASGIApp, *, host: str, origin: str) -> None:
+        self.app = app
+        self.host = host
+        self.origin = origin.casefold()
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope.get("type") == "http":
+            refusal = hosted_cross_site(scope, self.host, self.origin)
+            if refusal is not None:
+                if scope.get("method") == "POST":
+                    await drain_receive(receive)
+                response = json_response(
+                    HTTPStatus.FORBIDDEN, {"error": f"cross-site request refused ({refusal})"}
+                )
+                await response(scope, receive, send)
+                return
+        await self.app(scope, receive, send)
+
+
 class HeadResponseGuard:
     """A ``HEAD`` answer is the ``GET`` answer's status and headers, with no body bytes."""
 
@@ -394,7 +433,7 @@ class SecurityHeaders:
         await self.app(scope, receive, send_with_defaults)
 
 
-def install_middleware(app: Any) -> None:
+def install_middleware(app: Any, *, hosted: tuple[str, str] | None = None) -> None:
     """The one middleware stack both loopback apps run, in the one order that is correct.
 
     Starlette runs the middleware added last first: the defensive headers go on every answer,
@@ -402,13 +441,19 @@ def install_middleware(app: Any) -> None:
     routing; a ``HEAD`` answer is the finished ``GET`` answer (compressed, with its headers) minus
     the body; and gzip, innermost, sees the handler's own headers and skips audio, ranges and
     small bodies.
+
+    ``hosted`` (``(host, origin)``) swaps the loopback gate for the hosted one in the same place;
+    local mode passes nothing and runs exactly the stack it always has.
     """
 
     app.add_middleware(
         GZipMiddleware, minimum_size=GZIP_MINIMUM, exclude_content_types=_GZIP_EXCLUDED
     )
     app.add_middleware(HeadResponseGuard)
-    app.add_middleware(LoopbackPostGuard)
+    if hosted is None:
+        app.add_middleware(LoopbackPostGuard)
+    else:
+        app.add_middleware(HostedRequestGuard, host=hosted[0], origin=hosted[1])
     app.add_middleware(SecurityHeaders)
     # An uncaught exception is answered outside that stack (``ServerErrorMiddleware`` is the
     # outermost layer Starlette builds), so its answer applies the same headers itself.

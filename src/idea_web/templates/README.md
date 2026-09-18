@@ -11,4 +11,9 @@ versioned `/static/app.<hash>.css` and `/static/app.<hash>.js` the application s
 immutable, so a browser fetches them once. The only inline script left is the job page's
 per-job constants (`config`), which the page's Content-Security-Policy names by hash.
 
+`login.html`, `set_password.html` and `admin.html` are hosted-mode pages only (4c-i, 4c-ii); local
+mode never renders them. They have no inline script at all, and every value they show — an email
+address, an admin's comment, an error that echoes what was typed — is autoescaped. The only
+`| safe` values are the web layer's own head, bar and account-strip fragments.
+
 Result pages are not templates: they are immutable, pre-rendered bundles served byte-for-byte.

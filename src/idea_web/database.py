@@ -140,9 +140,21 @@ class Database:
     processes; this lock prevents avoidable contention between the heartbeat and worker threads.
     """
 
-    def __init__(self, path: Path, *, busy_timeout_ms: int = 5_000) -> None:
+    def __init__(
+        self,
+        path: Path,
+        *,
+        busy_timeout_ms: int = 5_000,
+        supervisor_lock: Path | None = None,
+    ) -> None:
         self.path = Path(path).resolve()
         self.busy_timeout_ms = busy_timeout_ms
+        #: The worker supervisor lock this database's migrations take, when the database is not a
+        #: work root's own ``.idea/app.db`` (whose lock is implied). A hosted service's database
+        #: and its worker share this lock (:func:`hosted_database`).
+        self._supervisor_lock = (
+            Path(supervisor_lock).resolve() if supervisor_lock is not None else None
+        )
         self._writer = threading.RLock()
         self._migrations = threading.RLock()
         #: Test seam: runs inside the migration's write transaction, just before the claim check.
@@ -292,15 +304,19 @@ class Database:
 
     @property
     def supervisor_lock_path(self) -> Path | None:
-        """``<work root>/.idea/worker-supervisor.lock``, from the same normalised identity."""
+        """The explicit lock, else ``<work root>/.idea/worker-supervisor.lock`` from the same
+        normalised identity; ``None`` for an unsupervised database elsewhere."""
 
+        if self._supervisor_lock is not None:
+            return self._supervisor_lock
         identity = _local_identity(self.path)
         if identity is None:
             return None
         return Path(os.path.dirname(identity)) / SUPERVISOR_LOCK_NAME
 
     def _acquire_supervisor(self) -> Any:
-        """For a local work root, the supervisor lock every ``idea serve`` holds; else ``None``."""
+        """The supervisor lock every ``idea serve`` (or hosted worker) holds; ``None`` if there is
+        no such lock for this database."""
 
         lock_path = self.supervisor_lock_path
         if lock_path is None:
@@ -349,3 +365,24 @@ class Database:
                 "SELECT COALESCE(MAX(number), 0) AS version FROM schema_migrations"
             ).fetchone()
             return int(row["version"])
+
+
+def hosted_database(path: Path) -> Database:
+    """A hosted service's database at ``path``, migrated under its worker supervisor lock.
+
+    This is the hosted counterpart of ``idea_web.jobs.local.local_database``: the lock is the
+    work root's ``.idea/worker-supervisor.lock`` when the database is that root's own
+    ``.idea/app.db``, and otherwise ``worker-supervisor.lock`` next to the database file. The
+    hosted worker holds the same lock for its whole run
+    (``idea_web.jobs.worker.Worker.run_forever(supervisor_lock=...)``), and ``Database.migrate``
+    takes it before any DDL, so no schema change can run under a live worker: it refuses with
+    :class:`MigrationRefused` instead. Hosted startup (``create_app(hosted=...)``) accepts only a
+    database that names such a lock.
+    """
+
+    resolved = Path(path).resolve()
+    database = Database(resolved)
+    if database.supervisor_lock_path is None:
+        database = Database(resolved, supervisor_lock=resolved.parent / SUPERVISOR_LOCK_NAME)
+    database.migrate()
+    return database

@@ -341,7 +341,7 @@ def test_migration_0002_on_a_populated_0001_database_backfills_detaches_and_reve
     assert database.version() == 1
     assert _rows(database) == before
 
-    assert database.migrate() == 5
+    assert database.migrate() == 6
     after = _rows(database)
     assert {key: row["attached"] for key, row in after.items()} == {
         "in-flight": 0,

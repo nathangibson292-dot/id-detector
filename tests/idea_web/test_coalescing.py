@@ -1059,19 +1059,19 @@ def test_a_draining_worker_finishes_its_run_and_its_subscribers_get_the_result(
 
 def test_migration_0005_goes_down_only_while_its_tables_are_empty(tmp_path: Path) -> None:
     database = _database(tmp_path)
-    assert database.version() == 5
+    assert database.version() == 6
     assert database.migrate(4) == 4
     with database.read() as connection:
         names = {row[0] for row in connection.execute("SELECT name FROM sqlite_master")}
         columns = {row[1] for row in connection.execute("PRAGMA table_info(jobs)")}
     assert not names & {"run_subscribers", "run_payer_events", "admin_audit"}
     assert "user_id" not in columns
-    assert database.migrate() == 5
+    assert database.migrate() == 6
 
     _subscribe(database, tmp_path, ["alice"])
     with pytest.raises(sqlite3.DatabaseError, match="subscriber and payer tables hold rows"):
         database.migrate(4)
-    assert database.version() == 5
+    assert database.version() == 6
     assert _count(database, "SELECT COUNT(*) FROM run_subscribers") == 1
     assert _count(database, "SELECT COUNT(*) FROM run_payer_events") == 1
 

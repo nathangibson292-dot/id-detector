@@ -179,7 +179,7 @@ def test_serve_refuses_to_migrate_while_another_supervised_worker_holds_the_lock
         assert database.version() == 2
     finally:
         lock.release()
-    assert local_database(tmp_path).version() == 5
+    assert local_database(tmp_path).version() == 6
 
 
 def test_a_worker_exits_cleanly_when_the_schema_is_newer_than_its_code(tmp_path: Path) -> None:

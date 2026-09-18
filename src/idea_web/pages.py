@@ -224,6 +224,31 @@ JOB_JS = _paced(
     "log label table",
 )
 
+#: Hosted-only pages (sign-in, set a password, admin) and the signed-in account strip (4c). This
+#: is a SEPARATE hosted-only asset (:data:`HOSTED_STYLESHEET_HREF`), never part of the local
+#: stylesheet: local mode's asset set, its ``ASSET_VERSION`` and the bytes it serves are exactly
+#: what they were before accounts existed.
+ACCOUNT_CSS = """
+.auth{max-width:440px;margin:48px auto;padding:0 16px}
+.auth h1{margin:0 0 8px}
+.auth-form,.admin-form{display:flex;flex-direction:column;gap:14px;margin:18px 0}
+.auth-form label,.admin-form label{display:flex;flex-direction:column;gap:6px;font-weight:600}
+.auth-form input,.admin-form input,.admin-form select,.admin-row input,.admin-row select{
+padding:10px 12px;border-radius:9px;border:1px solid #ffffff33;background:transparent;
+color:inherit;font:inherit;min-height:44px}
+.acct{display:flex;gap:10px;align-items:center;justify-content:flex-end;flex-wrap:wrap;
+max-width:1180px;margin:8px auto 0;padding:0 16px;font-size:13px}
+.acct form{display:inline}
+.admin{max-width:1180px;margin:24px auto;padding:0 16px}
+.admin-table{overflow-x:auto}
+.admin table{width:100%;border-collapse:collapse}
+.admin th,.admin td{text-align:left;padding:8px;border-bottom:1px solid #ffffff1a;
+vertical-align:top}
+.admin-row{display:flex;gap:6px;flex-wrap:wrap;align-items:center;margin:4px 0}
+.link-once{word-break:break-all;user-select:all;padding:12px;border-radius:9px;
+border:1px solid #ffffff33}
+.notice{padding:10px 12px;border-radius:9px;border:1px solid #ffffff33;margin:12px 0}
+"""
 #: The live pages' stylesheet and script, served once as versioned immutable assets instead of
 #: being re-sent inline with every page (U-F29, narrowed to the live pages: a result page is an
 #: immutable bundle that must also open as a file, so it keeps its own inline copy).  The
@@ -243,15 +268,45 @@ STATIC_JS = (
 ASSET_VERSION = hashlib.sha256(STATIC_CSS + STATIC_JS).hexdigest()[:12]
 STYLESHEET_HREF = f"/static/app.{ASSET_VERSION}.css"
 SCRIPT_SRC = f"/static/app.{ASSET_VERSION}.js"
+#: The hosted-only stylesheet: served only by a hosted server, linked only from hosted pages.
+HOSTED_CSS = ACCOUNT_CSS.encode("utf-8")
+HOSTED_ASSET_VERSION = hashlib.sha256(HOSTED_CSS).hexdigest()[:12]
+HOSTED_STYLESHEET_HREF = f"/static/hosted.{HOSTED_ASSET_VERSION}.css"
 
 
-def head_html(title: str) -> str:
-    """``theme.head_html`` with the stylesheet linked rather than inlined."""
+def brand_bar_html() -> str:
+    """The top bar with no navigation, for pages shown before sign-in."""
 
+    return (
+        '<nav class="topbar"><div class="topbar-in"><a class="brand" href="/">'
+        '<span class="logo"><span class="eq"><i></i><i></i><i></i><i></i></span></span>'
+        '<span class="wm"><b>ID</b><span>&#39;er</span></span></a></div></nav>'
+    )
+
+
+def account_strip_html(email: str, csrf_token: str, *, admin: bool) -> str:
+    """Who is signed in, a Sign out button and (for an admin) the admin link — hosted pages only."""
+
+    admin_link = '<a class="btn" href="/admin">Admin</a>' if admin else ""
+    return (
+        f'<div class="acct"><span>Signed in as <b>{html.escape(email)}</b></span>{admin_link}'
+        '<form method="post" action="/logout">'
+        f'<input type="hidden" name="{_CSRF_FIELD}" value="{html.escape(csrf_token)}">'
+        '<button class="btn" type="submit">Sign out</button></form></div>'
+    )
+
+
+def head_html(title: str, *, hosted: bool = False) -> str:
+    """``theme.head_html`` with the stylesheet linked rather than inlined.
+
+    A hosted page links the hosted-only stylesheet as well; a local page's head is unchanged.
+    """
+
+    hosted_link = f'<link rel="stylesheet" href="{HOSTED_STYLESHEET_HREF}">' if hosted else ""
     return (
         '<!doctype html>\n<html lang="en"><head><meta charset="utf-8">'
         '<meta name="viewport" content="width=device-width, initial-scale=1">'
         f"<title>{html.escape(title)}</title>"
         f'<link rel="icon" href="{theme.FAVICON}">'
-        f'<link rel="stylesheet" href="{STYLESHEET_HREF}"></head>'
+        f'<link rel="stylesheet" href="{STYLESHEET_HREF}">{hosted_link}</head>'
     )

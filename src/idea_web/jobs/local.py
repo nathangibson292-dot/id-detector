@@ -267,7 +267,12 @@ def _mark_stopped(job: Job, message: str, now: float) -> Job:
 
 
 class LocalJobs:
-    """The web process's view of the local queue: enqueue, read, cancel, dismiss — nothing else."""
+    """The web process's view of the durable queue: enqueue, read, cancel, dismiss — nothing else.
+
+    ``idea serve`` uses it in local mode. A hosted server uses the same adapter over its own
+    (supervised) database with ``local_mode=False``: the queue then refuses a local file target,
+    and every submission carries the signed-in account (``user_id``) into ``jobs.user_id``.
+    """
 
     def __init__(
         self,
@@ -275,10 +280,11 @@ class LocalJobs:
         *,
         database: Database | None = None,
         clock: Callable[[], float] = time.time,
+        local_mode: bool = True,
     ) -> None:
         self.work_root = Path(work_root)
         self.database = database or local_database(self.work_root)
-        self.queue = JobQueue(self.database, local_mode=True, clock=clock)
+        self.queue = JobQueue(self.database, local_mode=local_mode, clock=clock)
         self.clock = clock
         #: The home page lists jobs from this server session (and anything still in flight), as
         #: it did when jobs lived in memory; earlier finished jobs stay reachable by their URL.
@@ -292,6 +298,7 @@ class LocalJobs:
         acquire: bool = False,
         build_index: bool = False,
         known_tracklist: str | None = None,
+        user_id: str | None = None,
     ) -> str:
         validated = validate_target(target)
         try:
@@ -321,6 +328,7 @@ class LocalJobs:
                 # this run's shared ledger when it quarantines or dead-letters the row.
                 run_id=job.run_id,
                 progress={_LOCAL: snapshot(job)},
+                user_id=user_id,
             )
         except TargetRefused as exc:
             raise TargetValidationError(str(exc)) from None

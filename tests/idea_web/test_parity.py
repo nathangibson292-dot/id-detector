@@ -26,6 +26,7 @@ from idea_web.application import ASSET_VERSION, create_app
 from idea_web.http import DRAIN_LIMIT, FILE_CHUNK
 from idea_web.jobs.local import LocalJobs, LocalWorker, local_database
 from idea_web.server import serve_in_background
+from tests.idea_web.hosted_helpers import Browser, hosted_settings, make_account
 from tests.test_phase1a_bundles import publish, seed
 from tests.test_stage7_page import _source
 from tests.test_stage7_server import _seed_work_root
@@ -516,13 +517,17 @@ def test_hosted_mode_suppresses_audio_urls_and_audio_routes(tmp_path: Path) -> N
         job_id = manager.submit(MIX, "free")
         manager.get(job_id).audio_path = str(original)
         local = create_app(tmp_path, jobs=manager)
-        hosted = create_app(tmp_path, local=False, jobs=manager)
+        # Hosted mode needs accounts (4c-i): the same checks, made by a signed-in browser.
+        settings = hosted_settings(tmp_path / "accounts")
+        make_account(settings, "listener@example.com")
+        hosted = Browser(create_app(tmp_path, local=False, jobs=manager, hosted=settings))
+        assert hosted.sign_in("listener@example.com").status_code == 303
         assert request(local, "GET", f"/jobs/{job_id}/status").json()["audio_url"] == (
             f"/jobs/{job_id}/audio"
         )
-        assert request(hosted, "GET", f"/jobs/{job_id}/status").json()["audio_url"] is None
-        assert request(hosted, "GET", f"/jobs/{job_id}/audio").status_code == 404
-        assert request(hosted, "GET", f"/media/{source.media_key}/audio").status_code == 404
+        assert hosted.get(f"/jobs/{job_id}/status").json()["audio_url"] is None
+        assert hosted.get(f"/jobs/{job_id}/audio").status_code == 404
+        assert hosted.get(f"/media/{source.media_key}/audio").status_code == 404
         assert request(local, "GET", f"/media/{source.media_key}/audio").status_code == 200
     finally:
         release.set()

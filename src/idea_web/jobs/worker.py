@@ -76,6 +76,12 @@ from idea_web.progress import PageProgress, page_document
 #: it is enabled: until then a hosted worker refuses every paid engine at intake AND at
 #: dispatch admission.
 HOSTED_PAID_REFUSAL = "paid engines are not enabled in hosted mode yet"
+
+
+class UnsupervisedWorker(RuntimeError):
+    """``Worker.run_forever`` was asked to run over a database that names no supervisor lock."""
+
+
 #: The money-authority code version (migration 0003). New code stamps it on a job at submit
 #: and keeps it on every claim it makes; a claim by older code marks the job 0 (the trigger
 #: in 0003), and only a stamped job with no authority rows may settle at zero money.
@@ -2591,22 +2597,48 @@ class Worker:
         *,
         poll_seconds: float = 0.5,
         stop: threading.Event | None = None,
+        supervisor_lock: Path | None = None,
     ) -> None:
-        """Consume jobs until drained or stopped, without interrupting the current job."""
+        """Consume jobs until drained or stopped, without interrupting the current job.
 
-        external_stop = stop or threading.Event()
-        while not self._draining.is_set() and not external_stop.is_set():
-            try:
-                self.queue.expire_dead_letters()
-                claimed = self.run_once()
-            except (KeyboardInterrupt, SystemExit):
-                raise
-            except Exception:
-                # One job -- or one unreadable row -- must never end the consumer.
-                external_stop.wait(poll_seconds)
-                continue
-            if claimed is None:
-                external_stop.wait(poll_seconds)
+        The run is always supervised: the worker holds the supervisor lock its database names
+        (``database.supervisor_lock_path``, see ``idea_web.database.hosted_database``) for the
+        whole run, so ``Database.migrate`` refuses to change the schema under it, and a second
+        worker on the same lock is refused with ``JobStoreLocked`` before it claims anything.
+        A database that names no lock is refused with :class:`UnsupervisedWorker` before
+        anything is claimed. ``supervisor_lock``, if given, must be that same path: a different
+        one would let this worker and a migrator lock different files, so it is refused too.
+        """
+
+        lock_path = self.database.supervisor_lock_path
+        if lock_path is None:
+            raise UnsupervisedWorker(
+                "a hosted worker only runs under its database's supervisor lock: open the "
+                "database with idea_web.database.hosted_database(path)"
+            )
+        if supervisor_lock is not None and Path(supervisor_lock).resolve() != lock_path:
+            raise UnsupervisedWorker(
+                f"supervisor_lock={supervisor_lock} is a different lock from the one this "
+                f"worker's database names ({lock_path}); a migrator would not see this worker"
+            )
+        lock = ProcessLock(lock_path)
+        lock.acquire()
+        try:
+            external_stop = stop or threading.Event()
+            while not self._draining.is_set() and not external_stop.is_set():
+                try:
+                    self.queue.expire_dead_letters()
+                    claimed = self.run_once()
+                except (KeyboardInterrupt, SystemExit):
+                    raise
+                except Exception:
+                    # One job -- or one unreadable row -- must never end the consumer.
+                    external_stop.wait(poll_seconds)
+                    continue
+                if claimed is None:
+                    external_stop.wait(poll_seconds)
+        finally:
+            lock.release()
 
     def run_once(self) -> Job | None:
         if self._draining.is_set():

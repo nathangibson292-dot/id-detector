@@ -1,0 +1,39 @@
+{{ head | safe }}<body>{{ topbar | safe }}{{ strip | safe }}<main class="admin">
+<h1>Accounts</h1>
+{% if error %}<p class="form-error" role="alert">{{ error }}</p>{% endif %}
+{% if link %}<section class="notice" role="status">
+<p>{{ link_label }} for <b>{{ link_email }}</b>. It works once and expires {{ link_expires }}.
+Copy it now and send it to them yourself: it is not shown again and is not stored.</p>
+<p class="link-once">{{ link }}</p></section>{% endif %}
+{% if notice %}<p class="notice" role="status">{{ notice }}</p>{% endif %}
+<h2 class="sec">Create an account</h2>
+<form method="post" action="/admin/users" class="admin-form">
+<input type="hidden" name="csrf_token" value="{{ csrf }}">
+<label for="new-email">Email<input id="new-email" name="email" type="email" required maxlength="254" value="{{ email }}"></label>
+<label for="new-role">Role<select id="new-role" name="role"><option value="user">User</option><option value="admin">Admin</option></select></label>
+<label for="new-comment">Comment (kept in the audit log)<input id="new-comment" name="comment" type="text" maxlength="500"></label>
+<button class="btn primary" type="submit">Create account and show its set-password link</button>
+</form>
+<h2 class="sec">Accounts</h2>
+<div class="admin-table"><table>
+<thead><tr><th scope="col">Email</th><th scope="col">Role</th><th scope="col">Plan</th><th scope="col">Verified</th><th scope="col">Password</th><th scope="col">Actions</th></tr></thead>
+<tbody>{% for account in accounts %}<tr>
+<td>{{ account.email }}</td><td>{{ account.role }}</td><td>{{ account.plan }}</td>
+<td>{{ "yes" if account.verified_at is not none else "no" }}</td>
+<td>{{ "set" if account.has_password else "not set yet" }}</td>
+<td><form method="post" action="/admin/users/{{ account.id }}/reset" class="admin-row">
+<input type="hidden" name="csrf_token" value="{{ csrf }}">
+<input name="comment" type="text" maxlength="500" placeholder="Comment" aria-label="Comment for {{ account.email }}">
+<button class="btn" type="submit">Issue a password link</button></form>
+<form method="post" action="/admin/users/{{ account.id }}/plan" class="admin-row">
+<input type="hidden" name="csrf_token" value="{{ csrf }}">
+<select name="plan" aria-label="Plan for {{ account.email }}">{% for plan in plans %}<option value="{{ plan }}"{% if plan == account.plan %} selected{% endif %}>{{ plan }}</option>{% endfor %}</select>
+<input name="comment" type="text" maxlength="500" placeholder="Comment" aria-label="Plan comment for {{ account.email }}">
+<button class="btn" type="submit">Set plan</button></form></td>
+</tr>{% endfor %}</tbody></table></div>
+<h2 class="sec">Recent admin actions</h2>
+<div class="admin-table"><table>
+<thead><tr><th scope="col">When (UTC)</th><th scope="col">Who</th><th scope="col">What</th><th scope="col">Account</th><th scope="col">Comment</th></tr></thead>
+<tbody>{% for entry in audit %}<tr><td>{{ entry.when }}</td><td>{{ entry.actor }}</td><td>{{ entry.action }}</td><td>{{ entry.target }}</td><td>{{ entry.comment }}</td></tr>{% endfor %}</tbody>
+</table></div>
+</main></body></html>
