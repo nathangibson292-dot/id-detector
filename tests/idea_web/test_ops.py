@@ -542,8 +542,9 @@ def test_a_retry_continues_the_bar_instead_of_resetting_it(tmp_path: Path) -> No
     worker.run_once()
     first = queue.get(job_id).progress[PAGE_DOCUMENT_KEY]
     # A fake run finishes in microseconds, so the *percentage* is honestly still 0; what must
-    # survive the retry is the measured phase time and the high-water mark behind it.
+    # survive the retry is the time already worked and the high-water mark behind it.
     assert first["phase_seconds"] and "ingest" in first["phase_seconds"]
+    worked = first["carried_seconds"] + sum(first["phase_seconds"].values())
 
     with database.write() as connection:
         connection.execute("UPDATE jobs SET lease_until=NULL WHERE id=?", (job_id,))
@@ -552,9 +553,201 @@ def test_a_retry_continues_the_bar_instead_of_resetting_it(tmp_path: Path) -> No
     assert attempts["n"] == 2
     assert second["progress_max"] >= first["progress_max"]  # never backwards
     assert second["created_at"] == first["created_at"]  # the same job, not a new one
-    assert set(first["phase_seconds"]) <= set(second["phase_seconds"])  # measurements carried
-    for phase, spent in first["phase_seconds"].items():
-        assert second["phase_seconds"][phase] >= spent  # and they accumulate, never reset
+    # The time carries as one number, never as phases the retry has "already finished" (the
+    # mid-recognition retry test below is why).
+    assert second["carried_seconds"] == pytest.approx(worked)
+
+
+def test_the_published_document_reproduces_the_recent_rate_bar_in_another_process(
+    tmp_path: Path,
+) -> None:
+    """The worker publishes the document; the web process rebuilds a job from it and evaluates the
+    bar at request time. The two must agree, so everything the recent-rate estimate needs — the
+    window samples, the unrounded high-water mark and when it was taken — rides in the document
+    and survives JSON. A retry carries the mark but never the previous attempt's samples."""
+
+    now = [5_000.0]
+    page = progress.PageProgress(tmp_path, "j" * 32, MIX, clock=lambda: now[0])
+    page.start()
+    for phase in ("ingest", "decode", "windows"):
+        page.tick(phase, 0, 1)
+        now[0] += 10.0
+    document = page.tick("recognise", 240, 400)  # a cache resume: 60 % done in the first instant
+    for done in range(241, 286):  # then 45 windows/min for a minute
+        now[0] += 60.0 / 45
+        document = page.tick("recognise", done, 400)
+    carried = json.loads(json.dumps(document))[PAGE_DOCUMENT_KEY]
+    assert carried["rate_samples"][0][1] >= 240.0  # the burst is the baseline, not measured speed
+    assert {"progress_value", "progress_at", "rate_samples"} <= set(progress.SNAPSHOT_FIELDS)
+
+    def rebuilt() -> PageJob:
+        return PageJob(target=MIX, **{name: carried[name] for name in progress.SNAPSHOT_FIELDS})
+
+    assert rebuilt().progress_percent(now[0]) == page.job.progress_percent(now[0])
+    assert rebuilt().rate_per_minute(now[0]) == pytest.approx(45.0, rel=0.05)
+    assert rebuilt().eta_seconds(now[0]) == page.job.eta_seconds(now[0])
+    # 90 s of real time against ~150 s still to come: about a third — not the 71 % of windows done.
+    assert 25 <= rebuilt().progress_percent(now[0]) <= 45
+    later = rebuilt().progress_percent(now[0] + 2.5)  # the next poll, before the next publish
+    assert later >= rebuilt().progress_percent(now[0])
+
+
+class _Attempt:
+    """One attempt of a hosted job, driven through the real ``PageProgress`` on a shared clock and
+    polled the way the web process polls it: a job rebuilt from the published document, evaluated
+    at request time, every 2.5 s."""
+
+    def __init__(self, tmp_path: Path, now: list[float], resume: dict | None = None) -> None:
+        self.now = now
+        self.page = progress.PageProgress(
+            tmp_path, "r" * 32, MIX, resume=resume, clock=lambda: now[0]
+        )
+        self.document = self.page.document()
+        self.polls: list[tuple[str, int, int]] = []  # (phase, percent, time left)
+        self.next_poll = now[0]
+        self.page.start()
+
+    def _poll(self) -> None:
+        carried = json.loads(json.dumps(self.document))[PAGE_DOCUMENT_KEY]
+        view = PageJob(target=MIX, **{name: carried[name] for name in progress.SNAPSHOT_FIELDS})
+        self.polls.append(
+            (view.phase, view.progress_percent(self.now[0]), view.eta_seconds(self.now[0]))
+        )
+
+    def tick(self, phase: str, done: int, total: int, seconds: float = 0.0) -> None:
+        self.document = self.page.tick(phase, done, total)
+        target = self.now[0] + seconds
+        while self.next_poll <= target:
+            self.now[0] = self.next_poll
+            self._poll()
+            self.next_poll += 2.5
+        self.now[0] = target
+
+    def percents(self, phase: str | None = None) -> list[int]:
+        return [pct for name, pct, _ in self.polls if phase is None or name == phase]
+
+
+def test_a_retry_from_the_middle_of_listening_neither_leaps_nor_sticks(tmp_path: Path) -> None:
+    """The first attempt dies 30 % of the way through listening, with real time on the clock.
+
+    The retry runs intake, flies through the cached early steps, and re-enters listening with the
+    finished windows back from cache.  Carried as a *finished phase*, the dead attempt's listening
+    time made the estimate think only the closing steps were left: 30 % to 97 % on intake, where
+    the bar then sat while the time left climbed from seconds to minutes.
+    """
+
+    now = [50_000.0]
+    first = _Attempt(tmp_path, now)
+    first.tick("intake", 0, 1, 2.0)
+    for phase, seconds in (("ingest", 20.0), ("decode", 5.0), ("windows", 2.0)):
+        first.tick(phase, 0, 1, seconds)
+    first.tick("recognise", 0, 450)
+    for done in range(1, 136):  # 135 of 450 windows at 45/min: three minutes, 30 %
+        first.tick("recognise", done, 450, 60.0 / 45)
+    worked = now[0] - 50_000.0
+    failed = first.page.settle("failed", reason="provider_error")[PAGE_DOCUMENT_KEY]
+    at_failure = failed["progress_max"]
+    assert 28 <= at_failure <= 36  # ~209 s worked of ~640: the bar was honest when it died
+    assert failed["carried_seconds"] + sum(failed["phase_seconds"].values()) == pytest.approx(
+        worked
+    )
+
+    now[0] += 900.0  # the queue's backoff: waiting, not working, so it is not elapsed time
+    retry = _Attempt(tmp_path, now, resume=failed)
+    assert retry.page.job.carried_seconds == pytest.approx(worked)
+    assert retry.page.job.phase_seconds == {} and retry.page.job.rate_samples == []
+    retry.tick("intake", 0, 1, 6.0)
+    for phase in ("ingest", "decode", "windows"):
+        retry.tick(phase, 0, 1, 0.4)  # cached
+    retry.tick("recognise", 135, 450)  # the finished windows come back at once
+    for done in range(136, 271):  # and three more minutes of listening at 45/min
+        retry.tick("recognise", done, 450, 60.0 / 45)
+
+    everything = retry.percents()
+    assert everything == sorted(everything) and everything[0] >= at_failure  # never backwards
+    # No leap: not on intake, not on re-entering listening, not anywhere.
+    assert max(retry.percents("intake")) <= at_failure + 1, retry.percents("intake")
+    steps = [b - a for a, b in zip(everything, everything[1:], strict=False)]
+    assert max(steps) <= 2, everything
+    # And it keeps moving: 60 % of the windows are done after ~6.5 min of ~11 min of work.
+    total = worked + 7.2 + 315 / 45 * 60 + 3  # intake and cached steps, listening, closing
+    expected = 100.0 * (worked + 7.2 + 180.0) / total
+    assert everything[-1] == pytest.approx(expected, abs=3.0)
+    assert everything[-1] >= at_failure + 20
+    # The time left never did the 9 s -> 759 s swing either: it starts near the truth and falls.
+    etas = [eta for _, _, eta in retry.polls]
+    # During intake it is the 315 windows still to hear (the other 135 are cached) at the cautious
+    # prior, plus the short steps: not all 450 again, and not nine seconds.
+    assert etas[0] == pytest.approx(315 / 18 * 60 + 140, abs=15)
+    assert etas[-1] == pytest.approx(180 / 45 * 60, abs=20)
+
+    finished = retry.page.settle("complete", result_path="runs/x/present/index.html")
+    assert finished[PAGE_DOCUMENT_KEY]["progress_max"] == 100
+
+
+def test_a_retry_whose_bar_was_behind_is_rate_limited_from_its_first_poll(tmp_path: Path) -> None:
+    """A retry keeps the high-water mark but not the last evaluation time, and an estimate with
+    no last evaluation used to be taken as it stood.  Here the first attempt was fully cached and
+    died in the closing steps with the (rate-limited) bar still far behind its estimate — so the
+    retry's computed value is far above its floor, and only the limiter stops the leap."""
+
+    now = [70_000.0]
+    first = _Attempt(tmp_path, now)
+    first.tick("intake", 0, 1, 0.5)
+    for phase in ("ingest", "decode", "windows"):
+        first.tick(phase, 0, 1, 0.3)
+    first.tick("recognise", 450, 450, 0.2)
+    first.tick("hints", 0, 1, 0.5)
+    first.tick("fuse", 0, 1, 1.0)
+    failed = first.page.settle("failed", reason="boom")[PAGE_DOCUMENT_KEY]
+    assert failed["progress_max"] <= 8
+
+    # An attempt that died WITHOUT settling leaves its last phase open; that time still counts.
+    unsettled = json.loads(json.dumps(first.document))[PAGE_DOCUMENT_KEY]
+    assert unsettled["phase"] == "fuse" and unsettled["phase_started_at"] is not None
+    crashed = progress.PageProgress(tmp_path, "r" * 32, MIX, resume=unsettled, clock=lambda: 0.0)
+    assert crashed.job.carried_seconds == pytest.approx(
+        unsettled["progress_at"] - 70_000.0, abs=1e-6
+    )
+
+    now[0] += 900.0
+    retry = _Attempt(tmp_path, now, resume=failed)
+    retry.tick("intake", 0, 1, 5.0)
+    for phase in ("ingest", "decode", "windows"):
+        retry.tick(phase, 0, 1, 0.3)
+    retry.tick("recognise", 450, 450, 0.2)  # everything is cached: the estimate collapses again
+    retry.tick("hints", 0, 1, 6.0)
+    percents = retry.percents()
+    assert len(percents) >= 4 and percents[0] <= failed["progress_max"] + 1, percents
+    assert max(b - a for a, b in zip(percents, percents[1:], strict=False)) <= 7, percents
+    assert percents[-1] > percents[0]  # limited, not frozen
+
+
+def test_a_retry_of_a_job_published_by_the_previous_build_does_not_leap(tmp_path: Path) -> None:
+    """A job in flight across the upgrade left a document with per-phase times and a whole-number
+    mark, and none of the new fields.  Its retry computes a value far above that mark (ten
+    minutes already worked, fifty windows left); with no last evaluation to be smooth against,
+    the first poll would simply take it.  The retry's smoothing starts when the retry does."""
+
+    now = [90_000.0]
+    seed = _Attempt(tmp_path, now)
+    old = json.loads(json.dumps(seed.page.settle("failed", reason="boom")))[PAGE_DOCUMENT_KEY]
+    for name in ("carried_seconds", "progress_value", "progress_at", "rate_samples"):
+        del old[name]
+    old.update(
+        progress_max=12,
+        windows_done=400,
+        windows_total=450,
+        started_at=now[0] - 2_000.0,
+        phase_seconds={"ingest": 60.0, "decode": 30.0, "windows": 15.0, "recognise": 500.0},
+    )
+    retry = _Attempt(tmp_path, now, resume=old)
+    assert retry.page.job.carried_seconds == 605.0
+    retry.tick("intake", 0, 1, 10.0)
+    percents = retry.percents()
+    assert len(percents) >= 4 and percents[0] == 12, percents  # computed alone it would be ~60
+    assert max(b - a for a, b in zip(percents, percents[1:], strict=False)) <= 2, percents
+    assert percents[-1] > 12  # and it walks up from there
 
 
 def test_a_deep_run_is_labelled_as_the_renderer_understands_paid(tmp_path: Path) -> None:

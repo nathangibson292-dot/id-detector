@@ -8,16 +8,23 @@ local worker already publishes exactly that object through ``jobs.progress``.
 
 This module lets the *hosted* worker publish the same document from its own ``(phase, done, total,
 message)`` ticks, by driving the unchanged state machine: a real ``Job`` updated through a real
-``JobContext.progress``. So the measured per-phase durations, the observed-rate recognise estimate
-and the monotonic clamp behind the bar are the shipped ones, not a second implementation.
+``JobContext.progress``. So the measured per-phase durations, the recent-rate recognise estimate,
+the rate-limited climb and the monotonic clamp behind the bar are the shipped ones, not a second
+implementation.
 
-A retry **resumes** the document the previous attempt left (:meth:`PageProgress.resume`): measured
-phase time and the monotonic high-water mark carry over, so a job that is reclaimed after two
-phases does not show the bar snapping back to zero.
+A retry **resumes** the document the previous attempt left: the working time already spent and the
+monotonic high-water mark carry over, so a reclaimed job does not show the bar snapping back to
+zero. The time carries as ONE number (``Job.carried_seconds``), not as per-phase measurements:
+``phase_seconds`` also tells the estimate which phases *this attempt* has finished, and an attempt
+that died half-way through listening has not finished listening — carried as a finished phase it
+put the retry's bar at 97 % during intake, where it then stuck. The previous attempt's window-rate
+samples do not carry either (a rate measured across the gap between two attempts is no rate), and
+the retry's smoothing starts at the moment it is built, so its first poll is rate-limited like
+every other.
 
-**The weighting is deliberately untouched here.** The owner has asked for a different bar and his
-re-weighting request is parked; nothing in this module changes how progress is weighted or
-estimated. It reuses ``Job.progress_percent`` and ``PHASE_EXPECTED_SECONDS`` as they stand.
+**No weighting lives here.** The bar is wall-clock proportional with a recent-window rate (the
+owner's "if it takes ten minutes, every 10 % is about a minute"); all of that is
+``Job.progress_percent`` and ``PHASE_EXPECTED_SECONDS``, which this module reuses as they stand.
 """
 
 from __future__ import annotations
@@ -52,8 +59,10 @@ SNAPSHOT_FIELDS = tuple(
     for item in dataclasses.fields(Job)
     if item.name not in {"target", "log", "cancel_event", "dispatch_admission", "settlement_writer"}
 )
-#: Fields a retry must NOT inherit: the previous attempt's identity, its outcome and its clock.
-#: Measured time (``phase_seconds``) and the high-water mark (``progress_max``) deliberately carry.
+#: Fields a retry must NOT inherit: the previous attempt's identity, its outcome, its clock and
+#: its per-phase state. The high-water mark (``progress_max`` and its unrounded twin
+#: ``progress_value``) and the window counts deliberately carry; the time already worked carries
+#: as ``carried_seconds`` (see :func:`_worked_seconds`), never as finished phases.
 _NOT_RESUMED = frozenset(
     {
         "id",
@@ -69,6 +78,13 @@ _NOT_RESUMED = frozenset(
         "failed_phase",
         "phase_started_at",
         "known_tracklist",
+        "rate_samples",
+        "progress_at",
+        "phase",
+        "phase_done",
+        "phase_total",
+        "phase_seconds",
+        "carried_seconds",
     }
 )
 #: Terminal run statuses (§2.3.5) mapped to the status the page shows for them.
@@ -84,6 +100,28 @@ _PAGE_STATUS = {
     "failed": FAILED,
     "dead_letter": FAILED,
 }
+
+
+def _number(value: Any) -> float | None:
+    return float(value) if isinstance(value, (int, float)) and not isinstance(value, bool) else None
+
+
+def _worked_seconds(document: Mapping[str, Any]) -> float:
+    """The working time every earlier attempt spent, from the document the last one left.
+
+    What that attempt itself inherited, plus each phase it measured. A settled attempt has folded
+    its final phase in already; one that died without settling left that phase open, and the best
+    record of it is the span from the phase's start to the document's last evaluation.
+    """
+
+    worked = _number(document.get("carried_seconds")) or 0.0
+    phases = document.get("phase_seconds")
+    if isinstance(phases, Mapping):
+        worked += sum(_number(seconds) or 0.0 for seconds in phases.values())
+    opened, seen = _number(document.get("phase_started_at")), _number(document.get("progress_at"))
+    if opened is not None and seen is not None:
+        worked += max(0.0, seen - opened)
+    return max(0.0, worked)
 
 
 def snapshot(job: Job) -> dict[str, Any]:
@@ -153,9 +191,15 @@ class PageProgress:
         )
         if isinstance(resume, Mapping):
             self.job.log = deque((str(line) for line in resume.get("log") or ()), maxlen=LOG_RING)
+            self.job.carried_seconds = _worked_seconds(resume)
+            # Smoothing starts now: without a last-evaluation time the first poll of the retry
+            # would be exempt from the climb limit.
+            self.job.progress_at = clock()
         with self._manager.lock:
             self._manager._jobs[job_id] = self.job
-        self._context = JobContext(self._manager, self.job)
+        # The page's clock is the context's clock, so phase durations and window-rate samples are
+        # measured on the same (injectable) timeline as ``started_at`` and ``finished_at``.
+        self._context = JobContext(self._manager, self.job, clock=clock)
         self._clock = clock
 
     def start(self) -> None:
@@ -218,12 +262,12 @@ class PageProgress:
             if spend_known:
                 job.usd_e2_spent = usd_e2_spent
                 job.spend_known = True
-            job.progress_percent()
+            job.progress_percent(self._clock())
         return self.document()
 
     def document(self) -> dict[str, Any]:
         """The publishable ``jobs.progress`` document for this job."""
 
         with self._manager.lock:
-            self.job.progress_percent()
+            self.job.progress_percent(self._clock())
             return {PAGE_DOCUMENT_KEY: snapshot(self.job)}

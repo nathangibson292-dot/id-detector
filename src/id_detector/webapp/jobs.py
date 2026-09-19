@@ -30,16 +30,39 @@ from id_detector.run_ledger import new_run_id
 
 #: Ring-buffer size for a job's human-readable log tail.
 LOG_RING = 200
-#: Cold-start fallback for the progress page's ETA (the historical Shazam ceiling).  Once a few
-#: windows have completed the ETA uses the *observed* rate instead, so concurrency, cache hits or an
-#: adaptive limiter in the recognise stage are reflected rather than assumed.
+#: Cold-start prior for the progress page's estimate, used only until a *recent* rate has been
+#: observed.  It is deliberately the slow end of what the adaptive limiter does (it starts near
+#: 45 windows/min and drops toward 20/min when Shazam throttles), so the early bar under-promises
+#: instead of racing ahead on a guess.
 SHAZAM_RATE_PER_MINUTE = 18
-#: Observed-rate ETA needs at least this many completed windows and this much listening time.
-#: The second floor only guards against a wild rate from a one-tick sample; keeping it low is what
-#: lets a warm cache (a whole recognise pass in seconds) be *observed* instead of assumed, so the
-#: bar collapses the remaining time rather than crawling through a cold-start estimate.
+#: The bar's rate is **recent**: windows completed over roughly the last this-many seconds, never
+#: the run average.  Two reasons.  A cache resume completes many windows in one instant, which would
+#: inflate an average for the rest of the run; and the limiter is adaptive, so the rate that
+#: predicts the *remaining* time is the one being achieved now, not the one achieved earlier.
+RECENT_RATE_SECONDS = 45.0
+#: A recent rate is trusted once it spans this much listening time with at least this many windows
+#: — or once so many windows have completed that the speed is beyond doubt however short the span
+#: (a warm run that finishes its recognise pass in seconds).  Before that the page says it is still
+#: estimating rather than showing a number built on two or three ticks.
 _RATE_MIN_WINDOWS = 3
-_RATE_MIN_SECONDS = 1.0
+_RATE_MIN_SECONDS = 15.0
+_RATE_SURE_WINDOWS = 30
+#: Window ticks closer together than this are folded into one sample, which bounds the sample list
+#: (and the snapshot that carries it) to about one entry per second of the sliding window.
+_SAMPLE_SPACING_SECONDS = 1.0
+#: The displayed bar may climb at most this many times faster than its natural slope (100 % over
+#: the expected total time).  When an estimate improves — the early prior gives way to a measured
+#: rate, or Shazam stops throttling — the bar catches up over a few seconds instead of leaping.
+_MAX_CATCH_UP = 3.0
+#: ...and that natural slope is never taken to be steeper than a job of this many seconds.  When an
+#: estimate *collapses* — every window came back from cache, or listening ended while the estimate
+#: still rested on the prior — the expected total can shrink to a few seconds, and "three times the
+#: natural slope" of a three-second job is any jump at all.  With the floor, no poll of a running
+#: job moves the bar by more than ``3 × 100 / 120 = 2.5`` points per second (about six points per
+#: 2.5 s poll), however short the job turns out to be.  A job that finishes while the bar is still
+#: behind hands over to the finished state directly: done is done, and the page swaps the
+#: percentage for the result at that moment rather than animating a number that is already known.
+_SMOOTHING_FLOOR_SECONDS = 120.0
 #: Expected wall-clock **seconds** for each phase of a cold 60-minute run — the denominator behind
 #: the progress bar (U-F9: "10 % of the bar ≈ a tenth of the expected wall time").  Recognise
 #: dominates by an order of magnitude and is replaced by the *observed*-rate estimate the moment
@@ -172,11 +195,27 @@ class Job:
     #: what makes the bar wall-clock rather than step-index arithmetic: finished phases contribute
     #: what they really cost, not what they were budgeted.
     phase_seconds: dict[str, float] = field(default_factory=dict)
+    #: Working seconds spent by EARLIER attempts of this job (a durable retry).  Kept apart from
+    #: :attr:`phase_seconds` on purpose: that mapping also says which phases THIS attempt has
+    #: finished, and an attempt that died mid-recognition has not finished recognising — counting
+    #: its time as a completed phase is what would put a retry's bar at 97 % during intake.
+    carried_seconds: float = 0.0
     #: When the phase named by :attr:`phase` began, so time *inside* it is measured too.
     phase_started_at: float | None = None
     #: Highest percentage this job has ever reported: the bar must never move backwards, even if a
     #: growing ETA would otherwise pull the computed value down.
     progress_max: int = 0
+    #: The same high-water mark unrounded, and when it was last evaluated.  The bar is rate-limited
+    #: (:data:`_MAX_CATCH_UP`), and on a long run one poll moves it by a fraction of a point, so the
+    #: fraction has to survive between evaluations — and between the worker process that publishes
+    #: this snapshot and the web process that re-evaluates it at request time.
+    progress_value: float = 0.0
+    progress_at: float | None = None
+    #: ``[time, windows_done]`` samples of the current recognise pass, pruned to the sliding window
+    #: (plus one older anchor).  The first sample of a pass already contains every window the cache
+    #: completed instantly, so rate differences never count that burst as observed speed.  Rebound,
+    #: never mutated in place, for the same cross-thread reason as :attr:`phase_seconds`.
+    rate_samples: list[list[float]] = field(default_factory=list)
     #: The frozen §2.3.5 outcome of the run behind a terminal job, read back from its journal:
     #: the status (``failed``/``provider_unavailable``/``budget_exhausted``/``source_changed``/
     #: ``cancelled``), the machine reason, the last pipeline stage that completed, and the money
@@ -201,22 +240,73 @@ class Job:
     dispatch_admission: Any = field(default=None, repr=False, compare=False)
     settlement_writer: Any = field(default=None, repr=False, compare=False)
 
+    def recent_rate_per_minute(self, now: float | None = None) -> float | None:
+        """Windows per minute over the sliding window, or ``None`` before there is enough data.
+
+        Measured from the oldest kept sample towards *now*, not just to the last tick: while
+        Shazam stalls and no window completes, the span keeps growing and the rate decays, so the
+        estimate lengthens honestly instead of freezing at the last good speed.
+        """
+
+        samples = self.rate_samples
+        if len(samples) < 2:
+            return None
+        first, last = samples[0], samples[-1]
+        if self.finished_at is not None:
+            end = self.finished_at
+        else:
+            end = time.time() if now is None else now
+        ticked = last[0] - first[0]
+        windows = last[1] - first[1]
+        if ticked <= 0 or windows < _RATE_MIN_WINDOWS:
+            return None
+        # Between two ticks the next window is simply on its way, so one average gap of silence
+        # is not evidence of slowing; only silence beyond that stretches the span.
+        span = max(ticked, end - first[0] - ticked / windows)
+        if span < _RATE_MIN_SECONDS and windows < _RATE_SURE_WINDOWS:
+            return None
+        return windows * 60.0 / span
+
     def rate_per_minute(self, now: float | None = None) -> float:
-        """Windows completed per minute — observed while recognising, else the fallback constant."""
+        """The rate the estimate uses: the recent observed one, else the cautious prior."""
 
-        started = self.recognise_started_at
-        if started is not None and self.windows_done >= _RATE_MIN_WINDOWS:
-            end = self.finished_at if self.finished_at is not None else (now or time.time())
-            elapsed = end - started
-            if elapsed >= _RATE_MIN_SECONDS:
-                return self.windows_done * 60.0 / elapsed
-        return float(SHAZAM_RATE_PER_MINUTE)
+        recent = self.recent_rate_per_minute(now)
+        return float(SHAZAM_RATE_PER_MINUTE) if recent is None else recent
 
-    def eta_seconds(self, now: float | None = None) -> int:
+    def _recognise_rest_seconds(self, now: float | None = None) -> float:
+        """Seconds of listening still to come: the windows left at the recent rate."""
+
         remaining = max(0, self.windows_total - self.windows_done)
         if not remaining or self.status in TERMINAL_STATES:
+            return 0.0
+        return remaining / self.rate_per_minute(now) * 60.0
+
+    def estimating(self, now: float | None = None) -> bool:
+        """True while the time estimate still rests on the prior instead of a measured rate.
+
+        The page says "Estimating…" rather than putting words to a guess.  Once listening has
+        been measured — or is over, leaving only the short closing steps — the estimate is real.
+        """
+
+        if self.status in TERMINAL_STATES:
+            return False
+        if self.status != RUNNING:
+            return True
+        if "recognise" in self.phase_seconds and self.phase != "recognise":
+            return False
+        if self.phase == "recognise" and 0 < self.windows_total <= self.windows_done:
+            return False
+        return self.recent_rate_per_minute(now) is None
+
+    def eta_seconds(self, now: float | None = None) -> int:
+        """Expected seconds until the whole job finishes — the same estimate the bar divides by."""
+
+        if self.status != RUNNING:
             return 0
-        return int(round(remaining / self.rate_per_minute(now) * 60))
+        now = time.time() if now is None else now
+        started = self.phase_started_at
+        current = max(0.0, now - started) if started is not None else 0.0
+        return int(round(self._remaining_seconds(current, now)))
 
     # -- wall-clock progress (U-F9) -------------------------------------------------------------
     def _phase_runs(self, phase: str) -> bool:
@@ -248,7 +338,7 @@ class Job:
             return 1.0
         return min(4.0, max(0.05, measured / spent))
 
-    def _expected_seconds(self, phase: str) -> float:
+    def _expected_seconds(self, phase: str, now: float | None = None) -> float:
         """Expected wall-clock seconds for one phase of *this* job.
 
         A phase already measured contributes what it really took (a cached ingest costs what the
@@ -262,7 +352,11 @@ class Job:
             return measured
         if phase == "recognise":
             if self.windows_total > 0:
-                return self.windows_total / self.rate_per_minute() * 60.0
+                # Not entered yet in this attempt.  A fresh job has every window ahead of it; a
+                # retry knows how many the earlier attempt finished, and those come back from
+                # cache in an instant, so only the rest is waiting.
+                left = max(0, self.windows_total - self.windows_done)
+                return left / self.rate_per_minute(now) * 60.0
             return PHASE_EXPECTED_SECONDS["recognise"]
         return PHASE_EXPECTED_SECONDS.get(phase, 0.0) * self._speed_factor()
 
@@ -273,23 +367,27 @@ class Job:
         if self.phase in phases:
             index = phases.index(self.phase)
             if self.phase == "recognise":
-                rest = float(self.eta_seconds(now))
+                rest = self._recognise_rest_seconds(now)
             else:
-                rest = max(0.0, self._expected_seconds(self.phase) - current_elapsed)
+                rest = max(0.0, self._expected_seconds(self.phase, now) - current_elapsed)
         else:
             # "starting", or an auxiliary phase the tracker does not list (the local-index scan):
             # place it after the last phase that has already been measured.
             measured = [phases.index(name) for name in phases if name in self.phase_seconds]
             index, rest = (max(measured) if measured else -1), 0.0
-        return rest + sum(self._expected_seconds(phase) for phase in phases[index + 1 :])
+        return rest + sum(self._expected_seconds(phase, now) for phase in phases[index + 1 :])
 
     def progress_percent(self, now: float | None = None) -> int:
         """Percent of the job's expected **wall-clock** time that has elapsed (U-F9).
 
-        ``elapsed / (elapsed + remaining)`` over measured phase durations and an observed-rate
-        recognise estimate, so a tenth of the bar really is about a tenth of the expected time and
-        recognise — 90 %-plus of a cold run — dominates it.  Clamped monotonically and held below
-        100 until the job actually succeeds, so the bar never moves backwards and never lies.
+        ``elapsed / (elapsed + remaining)``: if the job will take ten minutes, every 10 % is about
+        a minute.  ``elapsed`` is real time only, so windows a cache resume completed in an instant
+        add nothing to it; ``remaining`` is the windows left at the **recent** rate plus the short
+        closing steps.  Three rules keep the number steady as well as honest: it never moves
+        backwards (when the rate drops and the estimate lengthens, the bar holds and time catches
+        up), it never climbs faster than :data:`_MAX_CATCH_UP` times its natural slope (so a better
+        estimate is approached over seconds, not leapt to), and it stays below 100 until the job
+        has actually succeeded.
         """
 
         if self.status == SUCCEEDED:
@@ -298,13 +396,25 @@ class Job:
         if self.status == QUEUED:
             return self.progress_max
         now = time.time() if now is None else now
-        current = max(0.0, now - self.phase_started_at) if self.phase_started_at else 0.0
-        elapsed = sum(self.phase_seconds.values()) + current
+        started = self.phase_started_at
+        current = max(0.0, now - started) if started is not None else 0.0
+        elapsed = self.carried_seconds + sum(self.phase_seconds.values()) + current
         if self.status in TERMINAL_STATES:
             return self.progress_max  # failed/cancelled/waiting: freeze where it stopped
         total = elapsed + self._remaining_seconds(current, now)
-        value = int(elapsed * 100.0 / total) if total > 0 else 0
-        self.progress_max = max(self.progress_max, min(99, max(0, value)))
+        value = elapsed * 100.0 / total if total > 0 else 0.0
+        floor = max(self.progress_value, float(self.progress_max))
+        # Rate-limit the climb from the last evaluation — or, the first time, from the moment the
+        # job started, so a first poll cannot leap either.  Only a job with neither (one rebuilt
+        # from a document older than these fields) takes the computed value as it is.
+        since = self.progress_at if self.progress_at is not None else self.started_at
+        if since is not None:
+            waited = max(0.0, now - since)
+            pace = max(total, _SMOOTHING_FLOOR_SECONDS)
+            value = min(value, floor + _MAX_CATCH_UP * 100.0 * waited / pace)
+        self.progress_value = max(floor, min(99.0, max(0.0, value)))
+        self.progress_at = now
+        self.progress_max = max(self.progress_max, int(self.progress_value))
         return self.progress_max
 
     def status_dict(self) -> dict[str, Any]:
@@ -322,7 +432,10 @@ class Job:
             "phase_total": self.phase_total,
             "windows_done": self.windows_done,
             "windows_total": self.windows_total,
+            # The whole job's remaining time (the bar's own denominator), and whether it is still
+            # a guess: the page words a guess as "Estimating…", never as a number.
             "eta_seconds": self.eta_seconds(),
+            "eta_estimating": self.estimating(),
             "rate_per_minute": round(self.rate_per_minute(), 1),
             "message": self.message,
             "error": self.error,
@@ -371,9 +484,12 @@ def _strip_extended_prefix(path: Path) -> Path:
 class JobContext:
     """The handle a runner uses to report progress, log, check cancellation, and set the result."""
 
-    def __init__(self, manager: JobManager, job: Job) -> None:
+    def __init__(
+        self, manager: JobManager, job: Job, *, clock: Callable[[], float] = time.time
+    ) -> None:
         self._manager = manager
         self._job = job
+        self._clock = clock
         self._last_phase: str | None = None
         self._last_logged: tuple[str, str] | None = None
 
@@ -441,10 +557,11 @@ class JobContext:
         self.check_cancel()
         safe = redact_text(message) if message else ""
         with self._manager.lock:
-            if phase != self._job.phase:
+            now = self._clock()
+            entered = phase != self._job.phase
+            if entered:
                 # Leaving a phase freezes its *measured* duration, which is what the wall-clock bar
                 # divides by from then on (U-F9).
-                now = time.time()
                 if self._job.phase_started_at is not None and self._job.phase:
                     spent = max(0.0, now - self._job.phase_started_at)
                     previous = self._job.phase
@@ -462,10 +579,17 @@ class JobContext:
             self._job.phase_total = total
             self._job.message = safe
             if phase == "recognise":
+                # A new pass — the phase was just entered, the total changed, or the count went
+                # back — starts its samples afresh, so its first sample is its own baseline: the
+                # windows a cache resume completed instantly are in it, not measured as speed.
+                fresh = entered or total != self._job.windows_total or done < self._job.windows_done
+                self._job.rate_samples = _with_sample(
+                    [] if fresh else self._job.rate_samples, now, done
+                )
                 self._job.windows_done = done
                 self._job.windows_total = total
                 if self._job.recognise_started_at is None:
-                    self._job.recognise_started_at = time.time()
+                    self._job.recognise_started_at = now
             if phase == "ingest" and total > 0 and done >= total and safe:
                 self._job.resolved_title = safe
             # Log a phase when it starts and again when it completes with a new message, so the
@@ -526,6 +650,35 @@ class JobContext:
             self._job.last_stage = last_stage
             self._job.usd_e2_spent = usd_e2_spent
             self._job.spend_known = spend_known
+
+
+def _with_sample(samples: list[list[float]], now: float, done: int) -> list[list[float]]:
+    """A NEW sample list with ``[now, done]`` added, folded and pruned to the sliding window.
+
+    Ticks less than :data:`_SAMPLE_SPACING_SECONDS` apart replace the newest sample instead of
+    growing the list (the first sample, the pass's baseline, is never replaced).  Samples older
+    than the window are dropped and replaced by one interpolated sample at the window's far edge,
+    so the measured span is the full window — and never more than the window.
+    """
+
+    kept = [list(sample) for sample in samples]
+    if len(kept) >= 2 and kept[-1][0] - kept[-2][0] < _SAMPLE_SPACING_SECONDS:
+        kept.pop()
+    kept.append([float(now), float(done)])
+    horizon = now - RECENT_RATE_SECONDS
+    older = [sample for sample in kept if sample[0] < horizon]
+    inside = [sample for sample in kept if sample[0] >= horizon]
+    if not older:
+        return inside
+    # The far edge is a sample *at* the horizon, interpolated between the last sample before it
+    # and the first one after.  Keeping the old sample itself would let the window stretch to
+    # however long ago that was: after a two-minute stall, work resuming at full speed would be
+    # averaged with the stall for another whole window and the rate would read a fraction of the
+    # truth.  Interpolated, the window is never wider than RECENT_RATE_SECONDS at a tick, so the
+    # rate is back to the live one exactly one window after the work resumes.
+    before, after = older[-1], inside[0]
+    share = (horizon - before[0]) / (after[0] - before[0])
+    return [[horizon, before[1] + (after[1] - before[1]) * share], *inside]
 
 
 #: A runner takes a :class:`JobContext` and runs the work, raising to fail (or ``JobCancelled``).

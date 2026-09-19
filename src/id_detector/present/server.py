@@ -713,16 +713,28 @@ _FORM_JS = """
 
 
 #: Wall-clock progress (U-F9).  The arithmetic lives server-side in ``Job.progress_percent`` — over
-#: *measured* phase durations and the observed-window-rate ETA — so a tenth of the bar really is a
-#: tenth of the expected wall time, recognise dominates it, a cached or skipped phase cannot claim
-#: time it never used, and the progress page and the home cards cannot drift into two bars.  All the
-#: browser does is smooth between polls and hold the monotonic floor a dropped/reordered response
-#: could otherwise breach.
+#: *measured* phase durations and the **recent**-window-rate estimate — so a tenth of the bar really
+#: is a tenth of the expected wall time, recognise dominates it, a cached or skipped phase cannot
+#: claim time it never used, and the progress page and the home cards cannot drift into two bars.
+#: All the browser does is hold the monotonic floor a dropped/reordered response could otherwise
+#: breach, and put the server's time-left estimate into plain words: a guess is worded as
+#: "Estimating…", never as a number, and a real estimate is rounded to the minute so it does not
+#: flicker with every poll.
 _PROGRESS_JS = """
 function wallProgress(j, previous){
   if(j.status === 'succeeded') return 100;
   var value = (typeof j.progress_pct === 'number') ? j.progress_pct : 0;
   return Math.max(previous || 0, Math.max(0, Math.min(100, Math.round(value))));
+}
+function etaWords(j){
+  if(j.terminal) return '—';
+  if(j.status === 'queued') return '…';
+  if(j.eta_estimating || typeof j.eta_seconds !== 'number') return 'Estimating…';
+  if(j.eta_seconds < 50) return 'under a minute';
+  var m = Math.round(j.eta_seconds / 60);
+  if(m < 60) return 'about ' + m + ' min';
+  var h = Math.floor(m / 60), r = m % 60;
+  return 'about ' + h + ' hr' + (r ? ' ' + r + ' min' : '');
 }
 """
 
@@ -931,8 +943,7 @@ function render(j){
   if(total && total !== cellCount && (cellCount === 0 || Math.min(total,
   240) !== cellCount)) buildCells(total);
   if(total) lightCells(done, total); else document.getElementById('cells').classList.add('idle');
-  document.getElementById('t-eta').textContent = (j.eta_seconds && !j.terminal) ? '~' + fmt(
-  j.eta_seconds) : (j.terminal ? '—' : '…');
+  document.getElementById('t-eta').textContent = etaWords(j);
   document.getElementById('t-step').textContent = stepIx !== undefined ?
     (stepIx + 1) + ' of ' + STEPS.length : '—';
   var started = j.started_at, finished = j.finished_at;

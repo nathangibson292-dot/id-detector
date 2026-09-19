@@ -96,7 +96,10 @@ and 4b-iv (coalescing, one payer at a time, last cancel wins; [build notes](revi
 and 4c-i + 4c-ii (hosted accounts, sessions, admin-created logins; [build notes](reviews/build-4c.md)) — local mode
 stays sign-in free.
 Progress re-weighting and the breaker-parked job card remain deferred as recorded in the build notes.
-**Next in plan order:** 4d-i (tenancy schema, lots,
+**The hosted build is PARKED here (2026-09-19, owner: "the goal is just getting me a product i can use first").**
+Work has moved to the owner's own local tool: a wall-clock progress bar
+([build notes](reviews/build-local-progress-bar.md)) has landed, and hint-corroboration accuracy is in review.
+**When the hosted build resumes, next in plan order:** 4d-i (tenancy schema, lots,
 worker-side reservations), then 4d-ii and 4d-iii + 4d-iv. **Not started:** 6a–6b (ingest policy,
 container, launch checklist), then M2 (billing, Stripe sandbox) — see PLAN-v2 §5.
 

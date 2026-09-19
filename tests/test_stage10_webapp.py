@@ -501,9 +501,10 @@ def test_progress_logs_phase_completions_for_the_progress_page(tmp_path: Path) -
     assert log.count("recognise: recognising windows") == 1
 
 
-def test_eta_uses_the_observed_listening_rate_once_it_is_known() -> None:
-    """The ETA falls back to the historical 18/min only until a few windows have completed; after
-    that it follows the rate actually observed (concurrency, cache hits, an adaptive limiter)."""
+def test_eta_uses_the_recent_listening_rate_once_it_is_known() -> None:
+    """The time left rests on the cautious 18/min prior only until a *recent* rate has been
+    measured; after that it follows the rate being achieved now (concurrency, an adaptive limiter),
+    and it is the whole job's remaining time — listening plus the short closing steps."""
 
     job = Job(
         id="b" * 32,
@@ -516,15 +517,24 @@ def test_eta_uses_the_observed_listening_rate_once_it_is_known() -> None:
         phase="recognise",
     )
     job.windows_total = 72
-    # Cold start: too few windows to trust a measurement → the fallback constant.
+    closing = 10 + 20 + 5  # hints, fuse, present: this job neither indexes nor acquires
+    # Cold start: too few windows to trust a measurement → the prior, and the page says so.
     job.windows_done = 1
     job.recognise_started_at = 1_000.0
+    job.rate_samples = [[1_000.0, 0.0], [1_010.0, 1.0]]
     assert job.rate_per_minute(now=1_010.0) == 18.0
-    assert job.eta_seconds(now=1_010.0) == round(71 / 18 * 60)
-    # 36 windows in 60 s → 36/min observed, 36 left → 60 s.
+    assert job.eta_seconds(now=1_010.0) == round(71 / 18 * 60) + closing
+    assert job.estimating(now=1_010.0) is True
+    # 27 windows over the last 45 s → 36/min recently, 36 left → 60 s of listening.
     job.windows_done = 36
+    job.rate_samples = [[1_015.0, 9.0], [1_060.0, 36.0]]
     assert job.rate_per_minute(now=1_060.0) == 36.0
-    assert job.eta_seconds(now=1_060.0) == 60
+    assert job.eta_seconds(now=1_060.0) == 60 + closing
+    assert job.estimating(now=1_060.0) is False
+    # The run average would say 36 windows / 60 s as well here — so make them differ: the same
+    # count reached through a cache burst must not change the recent rate.
+    job.recognise_started_at = 1_059.0
+    assert job.rate_per_minute(now=1_060.0) == 36.0
     # The status snapshot measures against the real clock; only its presence/shape is pinned here.
     assert isinstance(job.status_dict()["rate_per_minute"], float)
     # Terminal jobs report no ETA.

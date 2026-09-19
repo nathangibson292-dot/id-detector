@@ -255,12 +255,15 @@ def test_progress_handles_cached_and_skipped_phases_and_never_moves_backwards() 
     )
     assert cached.progress_percent(now=10.0) == 0
     # ...and a warm recognise pass (97 of 100 windows in 4 s) is *observed*, while the still-to-come
-    # phases are scaled by how fast this run has really been going — so the bar reflects the few
-    # seconds left rather than the minute a cold run would have needed.
+    # phases are scaled by how fast this run has really been going — so the time left is the few
+    # seconds it really is rather than the minute a cold run would have needed.  The bar itself
+    # walks there: a collapsed estimate may not move it more than 2.5 points a second.
     assert cached._speed_factor() < 0.1
     cached.windows_done = 97
+    cached.rate_samples = [[10.0, 0.0], [14.0, 97.0]]
+    assert cached.eta_seconds(now=14.0) <= 5
     warm = cached.progress_percent(now=14.0)
-    assert warm >= 50, warm
+    assert warm == 10, warm
 
     # Monotonic: a growing ETA can never pull the bar back down.
     job = _job(
@@ -270,10 +273,14 @@ def test_progress_handles_cached_and_skipped_phases_and_never_moves_backwards() 
         windows_total=400,
         windows_done=200,
         recognise_started_at=0.0,
+        rate_samples=[[555.0, 155.0], [600.0, 200.0]],  # 60 windows/min just now
     )
     high = job.progress_percent(now=600.0)
-    job.windows_done = 201  # the rate collapses: 201 windows in an hour
-    assert job.progress_percent(now=3_600.0) >= high
+    assert high >= 65
+    job.windows_done = 206  # the rate collapses: six windows in the last ten minutes
+    job.rate_samples = [[3_000.0, 200.0], [3_600.0, 206.0]]
+    assert job.eta_seconds(now=3_600.0) > 10_000  # computed alone, the bar would be under 30 %
+    assert job.progress_percent(now=3_600.0) == high
     assert job.progress_percent(now=3_600.0) <= 99  # never claims done before it is
 
     # Succeeded is 100, and a terminal failure freezes where it stopped.
