@@ -78,6 +78,77 @@ def _intersects(left: tuple[int, int], right: tuple[int, int]) -> bool:
     return min(left[1], right[1]) > max(left[0], right[0])
 
 
+def hint_reaches_supports(position: tuple[int, int], supports: list[tuple[int, int]]) -> bool:
+    """Whether a hint at ``position`` is about the play these (sorted) supports prove.
+
+    It is when it falls anywhere from ``HINT_LEAD_IN_MS`` before the first support to
+    ``HINT_TRAIL_MS`` after the last — the gaps between supports included, where the old
+    window-by-window test dropped a comment that landed between two matched windows.
+    """
+
+    if not supports:
+        return False
+    reach = (supports[0][0] - HINT_LEAD_IN_MS, supports[-1][1] + HINT_TRAIL_MS)
+    return _intersects(position, reach)
+
+
+def hint_backed_play(
+    position: tuple[int, int], plays: dict[Any, list[tuple[int, int]]], duration_ms: int
+) -> tuple[Any, bool] | None:
+    """The ONE play of its own work a hint at ``position`` backs, and whether it is DIRECT.
+
+    ``plays`` maps a key to that play's sorted proved supports.  One hint is one listener talking
+    about one moment, so it never backs two episodes:
+
+    * DIRECT — the hint sits on a matched window.  Among several, the play it overlaps most wins,
+      then the one with more proved on-air time, then the earlier, then the smaller key.
+    * INDIRECT — it sits on no window but within reach (:func:`hint_reaches_supports`).  A play
+      whose hull it falls inside (between two of its windows) comes first; then the play with the
+      most proved on-air time — a track's main body earns the vote, not a stray 12 s fragment of
+      the same track beside it; then the nearer, the earlier, the smaller key.  Plays of one work
+      270 s apart or less are all but always pieces of one performance, which is why on-air time
+      ranks above distance.
+
+    Every tie-break is a total order over the play's own numbers, so the choice is deterministic.
+    """
+
+    direct = [
+        (-overlap, -interval_length(supports, duration_ms), supports[0][0], repr(key), key)
+        for key, supports in plays.items()
+        if (
+            overlap := sum(
+                max(0, min(position[1], support[1]) - max(position[0], support[0]))
+                for support in supports
+            )
+        )
+        > 0
+    ]
+    if direct:
+        return min(direct)[-1], True
+    in_reach = [
+        (
+            not _intersects(position, (supports[0][0], supports[-1][1])),
+            -interval_length(supports, duration_ms),
+            min(abs(supports[0][0] - position[1]), abs(position[0] - supports[-1][1])),
+            supports[0][0],
+            repr(key),
+            key,
+        )
+        for key, supports in plays.items()
+        if hint_reaches_supports(position, supports)
+    ]
+    return (min(in_reach)[-1], False) if in_reach else None
+
+
+def hint_backed_plays(
+    position: tuple[int, int], plays: dict[Any, list[tuple[int, int]]], duration_ms: int
+) -> set[Any]:
+    """:func:`hint_backed_play` as a set: empty, or the one play backed."""
+
+    backed = hint_backed_play(position, plays, duration_ms)
+    return set() if backed is None else {backed[0]}
+
+
 def _interval_overlap_ms(
     left: list[tuple[int, int]], right: list[tuple[int, int]], duration_ms: int
 ) -> int:
@@ -113,6 +184,17 @@ TRUST_FAMILIES: dict[str, str] = {
 #: (the Free recipe defines neither, yet Shazam + a local index can still agree under it).
 CORROBORATION_OVERLAP_MIN_MS = 6_000
 CORROBORATION_SEPARATION_MIN_MS = 60_000
+#: How far outside an episode's proved support a hint for the SAME work may sit and still be about
+#: that play.  A tracklist cue and a listener's "ID?" mark where the track is first HEARD — the
+#: blend in — while the recogniser only locks on once the track dominates, so the hint is early:
+#: on the cached mixes 30 of 36 same-work hints that missed sat before the first matched window
+#: (median 45 s, all within 178 s), and the corpus scorer measures the same lag from the other
+#: side (the tool's start is a median 17-51 s after the hand-checked start).  After the last
+#: matched window the track is only fading out, so the allowance there is shorter.  This never
+#: decides WHAT a hint names — that stays the identity graph's both-parts test — only whether a
+#: hint naming this very work is close enough to be about this play of it.
+HINT_LEAD_IN_MS = 180_000
+HINT_TRAIL_MS = 90_000
 
 
 def trust_family(provider: str) -> str:
@@ -666,6 +748,38 @@ def build_episodes(
         work_id: engine_agreements(votes, overlap_min_ms=overlap_min_ms)
         for work_id, votes in work_votes.items()
     }
+    # Which plays each eligible hint backs, decided per WORK before any play is judged, so a hint
+    # that sits just ahead of its track backs that track's main body and nothing else.
+    plays_by_work: dict[str, dict[tuple[str, int], list[tuple[int, int]]]] = defaultdict(dict)
+    for candidate_id, groups in sorted(assigned.items()):
+        for occurrence_index, (_, votes, _) in enumerate(groups):
+            play_supports = normalise_intervals([item.support_ms for item in votes], duration_ms)
+            if play_supports:
+                plays_by_work[candidate_by_id[candidate_id].work_id][
+                    (candidate_id, occurrence_index)
+                ] = play_supports
+    hints_by_play: dict[tuple[str, int], list[HintRecord]] = defaultdict(list)
+    directly_backed: set[tuple[str, int]] = set()
+    for hint in hints:
+        hint_work_id = identity.hint_work_ids.get(hint.id)
+        if (
+            hint_work_id is None
+            or hint.position_range_ms is None
+            or not _eligible_tracklist_hint(hint)
+        ):
+            continue
+        backed = hint_backed_play(
+            hint.position_range_ms, plays_by_work.get(hint_work_id, {}), duration_ms
+        )
+        if backed is not None:
+            hints_by_play[backed[0]].append(hint)
+            if backed[1]:
+                directly_backed.add(backed[0])
+
+    #: Episodes whose every supporting hint is INDIRECT (near the play, on none of its windows).
+    indirectly_backed_episodes: set[str] = set()
+    #: … and, of those, the ones the audio alone would not have badged ``likely``.
+    badge_owed_to_indirect_hint: set[str] = set()
     provisional: list[dict[str, Any]] = []
     for candidate_id, groups in sorted(assigned.items()):
         for occurrence_index, (evidence, votes, alignment) in enumerate(groups):
@@ -676,14 +790,7 @@ def build_episodes(
             start_bound, end_bound, start_censored, end_censored = proved_bounds(raw_supports)
             independent_trials_e4 = _independent_trials_e4(votes)
             candidate_work_id = candidate_by_id[candidate_id].work_id
-            supporting_hints = [
-                hint
-                for hint in hints
-                if _eligible_tracklist_hint(hint)
-                and identity.hint_work_ids.get(hint.id) == candidate_work_id
-                and hint.position_range_ms is not None
-                and any(_intersects(hint.position_range_ms, support) for support in supports)
-            ]
+            supporting_hints = hints_by_play.get((candidate_id, occurrence_index), [])
             hint_vote_e4 = FULL_TRIAL_E4 * int(
                 bool({hint.provenance_group for hint in supporting_hints})
             )
@@ -754,6 +861,11 @@ def build_episodes(
                 flags.append("alignment_outlier")
             if supporting_hints:
                 flags.append("hint_supported")
+                if (candidate_id, occurrence_index) not in directly_backed:
+                    indirectly_backed_episodes.add(episode_id)
+                    if audio_work_tier != "likely":
+                        # Any ``likely`` badge it ends up with is owed to the indirect vote.
+                        badge_owed_to_indirect_hint.add(episode_id)
             # One cross-family agreement here is "confirmed twice"; two of them
             # ``separation_min_ms`` apart are what may bypass suppression and the on-air floor
             # (with the ``likely`` rule above left exactly as it is — E-S6).
@@ -925,13 +1037,6 @@ def build_episodes(
     # toggle — never deleted).  A likely/verified badge, a corroborating hint or two cross-family
     # agreements ``separation_min_ms`` apart make it immune; one agreement alone does not (plan
     # §2.3.4 step 5).
-    confident_spans = [
-        (episode.evidence_support_ms[0][0], episode.evidence_support_ms[-1][1])
-        for episode in episode_records
-        if episode.badge in {"likely", "verified"}
-        or "hint_supported" in episode.flags
-        or "engine_corroborated_separated" in episode.flags
-    ]
     answer_positions = [
         (hint.position_range_ms, identity.hint_work_ids.get(hint.id))
         for hint in hints
@@ -949,13 +1054,9 @@ def build_episodes(
         )
         return sum(b - a for a, b in clipped) / (hi - lo)
 
-    def _suppressed_reason(episode: EpisodeRecord) -> str | None:
-        if (
-            episode.badge in {"likely", "verified"}
-            or "hint_supported" in episode.flags
-            or "engine_corroborated_separated" in episode.flags
-        ):
-            return None
+    def _own_fault(episode: EpisodeRecord) -> str | None:
+        """``scatter`` / ``contradicted``: what is wrong with this episode's OWN evidence."""
+
         span = (episode.evidence_support_ms[0][0], episode.evidence_support_ms[-1][1])
         hull = span[1] - span[0]
         merged = normalise_intervals(
@@ -971,9 +1072,45 @@ def build_episodes(
         for position, work in answer_positions:
             if work is not None and work != episode_work and _intersects(position, span):
                 return "contradicted"
+        return None
+
+    def _immune(episode: EpisodeRecord) -> bool:
+        """A strong badge, separated engine agreement, or a hint ON one of the matched windows.
+
+        A hint that is only NEAR the play (the lead-in / trail reach) still votes and still keeps a
+        short row listed, but it never overrides ``scatter`` or ``contradicted``: those say the
+        episode's own evidence is smeared or that a listener named another track right here, and a
+        comment a minute away is not proof against either.  That holds whichever way the hint
+        would have got there — its flag, or the ``likely`` badge its one extra trial bought.
+        """
+
+        if (
+            episode.badge in {"likely", "verified"}
+            and episode.id not in badge_owed_to_indirect_hint
+        ):
+            return True
+        if "engine_corroborated_separated" in episode.flags:
+            return True
+        if "hint_supported" not in episode.flags:
+            return False
+        return episode.id not in indirectly_backed_episodes or _own_fault(episode) is None
+
+    confident_spans = [
+        (episode.evidence_support_ms[0][0], episode.evidence_support_ms[-1][1])
+        for episode in episode_records
+        if _immune(episode)
+    ]
+
+    def _suppressed_reason(episode: EpisodeRecord) -> str | None:
+        if _immune(episode):
+            return None
+        fault = _own_fault(episode)
+        if fault is not None:
+            return fault
+        span = (episode.evidence_support_ms[0][0], episode.evidence_support_ms[-1][1])
         # buried: most of this span already sits under OTHER, more-confident/hint-backed tracks.
         others = [item for item in confident_spans if item != span]
-        if hull > 0 and _covered_fraction(span, others) >= 0.6:
+        if span[1] > span[0] and _covered_fraction(span, others) >= 0.6:
             return "buried"
         return None
 

@@ -1,0 +1,83 @@
+{
+  "note": "Hint corroboration on a two-hour mix the recogniser heard ten tracks of, one every ten minutes, each as 12 s matched windows ('supports_ms' are the window starts). The comments are the shapes casual ID answers really take, all authored: either field order, a reply under an 'ID?' question, a collaborator left out, 'ft.' against '(feat. …)', hedging words, dotted initials and a release note, two words typed as one, a near-spelling against a label that carries '(Extended Mix)', a bare hyphen, and an answer that sits ahead of, between and just after the matched windows. 'attaches' names the track each comment must back; 'never' lists the near-misses that must back nothing: another title by the same artist, the same title by someone else, one part only, a title that merely starts the same, the right name far from where it played and ten seconds outside the reach, and an 'Artist - ID' placeholder. A different remix is NOT a near-miss: hints vote for the WORK and never for the version, which is the existing design, so 'other-remix' backs the work and leaves the version unverified.",
+  "duration_ms": 7200000,
+  "window_ms": 12000,
+  "tracks": {
+    "senses": {"artist": "Bakey", "title": "Senses", "supports_ms": [600000, 612000, 636000, 648000]},
+    "good4u": {"artist": "Gentlemens Club & MPH", "title": "GOOD 4 U", "supports_ms": [1200000, 1212000, 1224000]},
+    "drive": {"artist": "Fixture Duo", "title": "Night Drive (feat. Guest Singer) [Extended Mix]", "supports_ms": [1800000, 1812000, 1824000]},
+    "harbour": {"artist": "Low Tide Unit & Second Act", "title": "Harbour Lights (Extended Mix)", "supports_ms": [2400000, 2412000, 2424000]},
+    "cold": {"artist": "HLT", "title": "Cold Start", "supports_ms": [3000000, 3012000, 3024000]},
+    "tooth": {"artist": "Fixture Host & paper tiger", "title": "Makes Me (Wanna Move)", "supports_ms": [3600000, 3612000, 3624000]},
+    "gardens": {"artist": "Mirrorball", "title": "Glass Gardens (Extended Mix)", "supports_ms": [4200000, 4212000, 4224000]},
+    "runit": {"artist": "Low Tide Unit", "title": "Run It", "supports_ms": [4800000, 4812000, 4824000]},
+    "tremors": {"artist": "Fixture Artist", "title": "Tremors", "supports_ms": [5400000, 5412000, 5424000]},
+    "late": {"artist": "Fixture Artist", "title": "Marathon", "supports_ms": [6000000, 6012000, 6024000, 6036000, 6048000], "fragment_ms": [5940000]}
+  },
+  "comments": [
+    {"comment": "q-senses", "text": "what is this track? ID?", "at_ms": 640000, "author": "fan-1"},
+    {"comment": "reply-swapped", "text": "[mention] senses - bakey", "at_ms": 640000, "author": "fan-2", "reply_to": "q-senses"},
+    {"comment": "between-windows", "text": "Bakey - Senses", "at_ms": 629000, "author": "fan-3"},
+    {"comment": "other-remix", "text": "Bakey - Senses (Someone Else Remix)", "at_ms": 606000, "author": "fan-4"},
+    {"comment": "collaborator-left-out", "text": "GOOD 4 U - MPH", "at_ms": 1206000, "author": "fan-5"},
+    {"comment": "ft-spelling", "text": "Fixture Duo ft. Guest Singer - Night Drive", "at_ms": 1806000, "author": "fan-6"},
+    {"comment": "hedged", "text": "pretty sure its Harbour Lights - Low Tide Unit i think", "at_ms": 2406000, "author": "fan-7"},
+    {"comment": "initials-unreleased", "text": "h.l.t. - cold start (unreleased)", "at_ms": 3006000, "author": "fan-8"},
+    {"comment": "joined-words", "text": "papertiger - makes me (wanna move)", "at_ms": 3606000, "author": "fan-9"},
+    {"comment": "near-spelling", "text": "glass garden - mirrorball", "at_ms": 4206000, "author": "fan-10"},
+    {"comment": "bare-hyphen", "text": "glass gardens-mirrorball", "at_ms": 4212000, "author": "fan-11"},
+    {"comment": "ahead-of-the-lock", "text": "Tremors - Fixture Artist", "at_ms": 5290000, "author": "fan-12"},
+    {"comment": "just-after", "text": "Fixture Artist - Tremors", "at_ms": 5500000, "author": "fan-13"},
+    {"comment": "ahead-of-two-plays", "text": "Fixture Artist - Marathon", "at_ms": 5900000, "author": "fan-14"},
+
+    {"comment": "same-artist-other-title", "text": "Bakey - Take It Further", "at_ms": 1210000, "author": "fan-20"},
+    {"comment": "same-title-other-artist", "text": "Somebody Else - Cold Start", "at_ms": 1816000, "author": "fan-21"},
+    {"comment": "title-that-starts-the-same", "text": "run - low tide unit", "at_ms": 4806000, "author": "fan-22"},
+    {"comment": "title-only", "text": "this is tremors", "at_ms": 5406000, "author": "fan-23"},
+    {"comment": "artist-only", "text": "this is Fixture Artist", "at_ms": 5410000, "author": "fan-24"},
+    {"comment": "right-name-wrong-place", "text": "HLT - Cold Start", "at_ms": 3600000, "author": "fan-25"},
+    {"comment": "right-name-just-out-of-reach", "text": "HLT - Cold Start", "at_ms": 2810000, "author": "fan-26"},
+    {"comment": "placeholder-title", "text": "Mirrorball - ID", "at_ms": 4218000, "author": "fan-27"}
+  ],
+  "expect": {
+    "attaches": {
+      "reply-swapped": "senses",
+      "between-windows": "senses",
+      "other-remix": "senses",
+      "collaborator-left-out": "good4u",
+      "ft-spelling": "drive",
+      "hedged": "harbour",
+      "initials-unreleased": "cold",
+      "joined-words": "tooth",
+      "near-spelling": "gardens",
+      "bare-hyphen": "gardens",
+      "ahead-of-the-lock": "tremors",
+      "just-after": "tremors",
+      "ahead-of-two-plays": "late"
+    },
+    "never": [
+      "q-senses",
+      "same-artist-other-title",
+      "same-title-other-artist",
+      "title-that-starts-the-same",
+      "title-only",
+      "artist-only",
+      "right-name-wrong-place",
+      "right-name-just-out-of-reach",
+      "placeholder-title"
+    ],
+    "hint_supported": ["senses", "good4u", "drive", "harbour", "cold", "tooth", "gardens", "tremors", "late"],
+    "not_hint_supported": ["runit", "late-fragment"],
+    "needs_the_fix": [
+      "between-windows",
+      "hedged",
+      "initials-unreleased",
+      "joined-words",
+      "near-spelling",
+      "bare-hyphen",
+      "ahead-of-the-lock",
+      "just-after",
+      "ahead-of-two-plays"
+    ]
+  }
+}
