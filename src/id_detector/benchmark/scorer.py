@@ -95,6 +95,8 @@ _RECORDING_NAMESPACES = frozenset(
 )
 _DIMENSIONS = ("work", "version", "start", "end", "boundary")
 _CERTIFICATION_TIERS = ("possible", "likely", "verified")
+#: A tier is certified only over at least this many test sets with predictions in it.
+CERTIFICATION_MIN_SETS = 10
 
 #: The plan certifies only the real-mix strata (strata 1--2: catalogue-covered and reference-pool
 #: real mixes, plus the annotated real-mix subtypes).  This is an **allowlist**: any stratum not
@@ -1514,6 +1516,136 @@ def corpus_independent(path: Path, truths: list[GroundTruthRecord]) -> bool:
     return not any(_manifest_records_exposure(manifest, truth.set_id) for truth in truths)
 
 
+@dataclass(frozen=True)
+class CertificationScope:
+    """Whether a list of truth paths is exactly one whole frozen corpus, judged over all of it.
+
+    A score may be called certifiable only when ``complete`` and ``independent`` are both true.
+    ``reasons`` says, in ordinary words, why it is not and what to do next.
+    """
+
+    #: Every path belongs to one frozen corpus and together they name exactly its frozen inventory.
+    complete: bool
+    #: Independence over the *complete* frozen inventory, never the caller's subset; ``None`` when
+    #: the paths are not inside one frozen corpus, so there is no complete inventory to judge.
+    independent: bool | None
+    corpus_root: Path | None
+    reasons: tuple[str, ...]
+
+    @property
+    def certifiable(self) -> bool:
+        return self.complete and self.independent is True
+
+
+def certification_scope(truth_paths: list[Path]) -> CertificationScope:
+    """Judge the certification scope of the truth a score was computed over.
+
+    The rule: every truth path must belong to ONE frozen corpus, the records they name must EXACTLY
+    equal that corpus's frozen manifest inventory, and independence is evaluated across that
+    complete inventory.  Leaving a set out of a run list (for example the one set reviewed with
+    IDea's predictions on screen) therefore never yields a certifiable score of the rest.  A
+    partial list is still scoreable for development; it just cannot be certifiable.
+
+    Read only through the corpus gateway.  A frozen corpus whose on-disk population differs from
+    its manifest is refused outright (:func:`require_frozen_inventory`), as everywhere else.
+    Reasons name folders and sets, never absolute paths, so a report reads the same on any machine.
+    """
+
+    roots: dict[str, Path] = {}
+    standalone: list[Path] = []
+    for path in truth_paths:
+        refuse_link_components(path)
+        root = _population_root(path)
+        if root is None:
+            standalone.append(path)
+        else:
+            roots.setdefault(path_key(root), root)
+    if standalone:
+        names = ", ".join(path.name for path in standalone)
+        return CertificationScope(
+            complete=False,
+            independent=None,
+            corpus_root=None,
+            reasons=(
+                f"{names} is a standalone truth file, not a set inside a frozen corpus. Only "
+                f"truth stored as <corpus>/<set>/{TRUTH_RECORD_NAME} inside a frozen corpus can "
+                "back a certified score; this score is for development only",
+            ),
+        )
+    if len(roots) != 1:
+        names = ", ".join(sorted(root.name for root in roots.values()))
+        return CertificationScope(
+            complete=False,
+            independent=None,
+            corpus_root=None,
+            reasons=(
+                f"the truth files come from {len(roots)} different corpora ({names}). A "
+                "certifiable score covers exactly one frozen corpus; give each corpus its own "
+                "run list",
+            ),
+        )
+    (root,) = roots.values()
+    with open_corpus(root, mutate=False, require_records=False) as handle:
+        manifest = frozen_manifest(handle)
+        if manifest is None:
+            return CertificationScope(
+                complete=False,
+                independent=None,
+                corpus_root=handle.root,
+                reasons=(
+                    f"the corpus {handle.root.name} is not frozen, so this is a development score "
+                    "of draft truth. Keep checking the tracklists by ear; once every one is "
+                    "checked and certification is switched on, the owner freezes the corpus with "
+                    "`idea truth freeze` and scores the same run list again",
+                ),
+            )
+        require_frozen_inventory(handle, manifest)
+        named = {
+            path_key(candidate)
+            for path in truth_paths
+            for candidate in _truth_candidates(path, handle)
+        }
+        set_ids = {
+            str(item.get("path")): str(item.get("set_id"))
+            for item in manifest.get("sets", [])
+            if isinstance(item, dict)
+        }
+        left_out: list[str] = []
+        exposed: list[str] = []
+        for record in handle.truth_files:
+            relative = record.relative_to(handle.root).as_posix()
+            set_id = set_ids.get(relative, record.parent.name)
+            if path_key(record) not in named:
+                left_out.append(f"{set_id} ({relative})")
+            visible = prediction_exposure(record)["predictions_visible_during_review"]
+            if visible or _manifest_records_exposure(manifest, set_id):
+                exposed.append(set_id)
+        total = len(handle.truth_files)
+        corpus_root = handle.root
+    reasons: list[str] = []
+    if left_out:
+        reasons.append(
+            f"this run list scores only {total - len(left_out)} of the {total} sets frozen in "
+            f"{corpus_root.name}; it leaves out {', '.join(sorted(left_out))}. A certifiable score "
+            "must cover every set in the frozen corpus, so add the missing sets to the run list "
+            "and score again. A partial run list is fine for development"
+        )
+    if exposed:
+        reasons.append(
+            f"the frozen corpus {corpus_root.name} is not independent of IDea's predictions: "
+            f"{', '.join(sorted(exposed))} was reviewed with the predictions visible. That is "
+            "judged over the whole frozen corpus, whether or not the run list names the set, so "
+            "no score over this corpus can be certified. A certifiable corpus needs truth made "
+            "without seeing IDea's answers"
+        )
+    return CertificationScope(
+        complete=not left_out,
+        independent=not exposed,
+        corpus_root=corpus_root,
+        reasons=tuple(reasons),
+    )
+
+
 def score_corpus(
     truth_path: Path,
     predictions_path: Path,
@@ -1543,6 +1675,9 @@ def score_corpus_detailed(
     verified = truth_is_frozen_verified(truth_path, truths)
     # Certification needs truth made without seeing IDea's answers; verified alone is not enough.
     independent = corpus_independent(truth_path, truths)
+    # ... and it needs the WHOLE frozen corpus: a single record named out of a frozen corpus is a
+    # subset, and independence is judged over the complete frozen inventory, not over that subset.
+    whole_corpus = verified and independent and certification_scope([truth_path]).certifiable
     derived_unverified = not verified
     if document.unverified_seed_comparison != derived_unverified:
         raise ValueError(
@@ -1616,12 +1751,11 @@ def score_corpus_detailed(
                         CERTIFICATION_DISABLED
                         if not certification_enabled()
                         else "certified"
-                        if verified
-                        and independent
+                        if whole_corpus
                         and target is not None
                         and cp_lower >= target
                         and cluster_lower >= target
-                        and n_sets >= 10
+                        and n_sets >= CERTIFICATION_MIN_SETS
                         else "provisional"
                     ),
                 }

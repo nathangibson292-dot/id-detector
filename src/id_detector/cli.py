@@ -76,6 +76,7 @@ from id_detector.retention import collect
 from id_detector.shazam import HTTPClientInterface
 from id_detector.truth import (
     CERTIFICATION_DISABLED,
+    CERTIFICATION_DISABLED_NEXT_STEP,
     FREEZE_MANIFEST_NAME,
     certification_enabled,
     freeze_truth,
@@ -1268,7 +1269,7 @@ def benchmark_score(
         f"{report.overall.identification_work.precision_e4}/10000; report={out}"
     )
     if not certification_enabled():
-        typer.echo(f"certification: {CERTIFICATION_DISABLED}")
+        typer.echo(f"certification: {CERTIFICATION_DISABLED}. {CERTIFICATION_DISABLED_NEXT_STEP}")
 
 
 @benchmark_app.command("render")
@@ -1482,8 +1483,11 @@ def benchmark_certify(
         )
     except KeyboardInterrupt:
         raise typer.Exit(130) from None
+    except CertificationDisabled as exc:
+        # The exact disabled message, then what to do about it.
+        typer.echo(f"{exc}. {CERTIFICATION_DISABLED_NEXT_STEP}", err=True)
+        raise typer.Exit(2) from None
     except (
-        CertificationDisabled,
         CorpusNotFrozen,
         CorpusNotIndependent,
         DuplicateTestVersion,
@@ -1493,8 +1497,10 @@ def benchmark_certify(
     except (ValueError, RuntimeError, OSError, json.JSONDecodeError) as exc:
         typer.echo(redact_text(str(exc)), err=True)
         raise typer.Exit(1) from None
+    # "certified" only when something was: a run in which no triple certifies was evaluated.
+    verb = "certified" if result.n_certified else "evaluated"
     typer.echo(
-        f"certified corpus={corpus} profile={profile} test_version={test_version}; "
+        f"{verb} corpus={corpus} profile={profile} test_version={test_version}; "
         f"certified_triples={result.n_certified}; n_test_predictions={result.n_test_predictions}; "
         f"report={result.report_path}"
     )

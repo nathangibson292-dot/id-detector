@@ -77,6 +77,14 @@ Draft truth (rows with ``draft: true`` — e.g. the seeded ``data/corpus/release
 their placeholder equal-slice timings) is accepted, but the output is labelled ``"truth_status":
 "draft"``; only truth covered by a frozen, hash-checked ``corpus-version.json`` with every row
 verified reads ``"verified"``, and only that, matched by time, can back the L3 numbers.
+
+``l3.certifiable`` is true only when, on top of that, the run list is exactly ONE WHOLE frozen
+corpus: every truth path belongs to the same frozen corpus, the run list names exactly that
+corpus's frozen manifest inventory, and independence is judged over that complete inventory
+(``benchmark.scorer.certification_scope``).  Leaving a set out -- say, the one reviewed with IDea's
+predictions on screen -- never makes the rest certifiable.  A partial or draft run list is still
+scored, for development; ``l3.not_certifiable_because`` says in ordinary words why it is not
+certifiable and what to do next, and ``l3.scope`` carries the scope verdict on its own.
 """
 
 from __future__ import annotations
@@ -98,11 +106,13 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_valida
 from id_detector.benchmark.corpus import prediction_set_from_fusion
 from id_detector.benchmark.scorer import (
     TIER_ORDER,
+    CertificationScope,
     PredictionDocument,
     ScoreState,
     ScoringConfigSnapshot,
     SetScore,
     _ratio_e4,
+    certification_scope,
     corpus_independent,
     load_truth_directory,
     pooled_metrics,
@@ -133,6 +143,7 @@ from id_detector.io import (
 from id_detector.present.exports import flatten_tracklist, hidden_reason
 from id_detector.truth import (
     CERTIFICATION_DISABLED,
+    CERTIFICATION_DISABLED_NEXT_STEP,
     certifiable_under_gate,
     certification_enabled,
     refuse_generated_output,
@@ -1046,7 +1057,13 @@ def score_run_list(
         # unjudged (null), never reported as met.
         thresholds_met = None
     status = min((mix.truth_status for mix in mixes), key=_TRUTH_RANK.__getitem__)
-    independent = all(mix.independent for mix in mixes)
+    # The scope of the claim: every truth path in ONE frozen corpus, the run list naming EXACTLY
+    # that corpus's frozen inventory, and independence judged over that complete inventory -- so
+    # leaving an exposed set out of the run list never makes the rest certifiable.
+    scope = certification_scope([mix.entry.truth for mix in mixes])
+    independent = all(mix.independent for mix in mixes) and scope.independent is not False
+    eligible = status == "verified" and mode == "time" and independent and scope.certifiable
+    not_certifiable = _not_certifiable_reasons(mixes, status=status, mode=mode, scope=scope)
     hidden_total: Counter[str] = Counter()
     for mix in mixes:
         hidden_total.update(mix.hidden_by_reason)
@@ -1067,12 +1084,19 @@ def score_run_list(
             # Frozen, verified and timed is not enough: truth reviewed while IDea's predictions
             # were on screen is not independent of them, and can back no L3 claim however it scores.
             "independent": independent,
-            # Refused outright until the certification follow-up lands: the owner has not allowed
-            # freezing or certification, and a run list may still name a subset of a frozen corpus.
-            "certifiable": certifiable_under_gate(
-                status == "verified" and mode == "time" and independent
-            ),
+            # Certifiable only for frozen, verified, timed, independent truth whose run list is
+            # exactly one whole frozen corpus (see `certification_scope`), and never while the
+            # certification gate is closed.
+            "certifiable": certifiable_under_gate(eligible),
             "certification": None if certification_enabled() else CERTIFICATION_DISABLED,
+            # Every reason this score is not certifiable, in ordinary words; empty when it is.
+            "not_certifiable_because": not_certifiable,
+            # The scope reasons alone: what `--print` adds to a score of frozen truth.
+            "scope": {
+                "whole_frozen_corpus": scope.complete,
+                "corpus_independent": scope.independent,
+                "reasons": list(scope.reasons),
+            },
         },
         "counts": {
             "mixes": len(mixes),
@@ -1126,6 +1150,39 @@ def score_run_list(
             for mix in mixes
         ],
     }
+
+
+def _not_certifiable_reasons(
+    mixes: list[MixScore], *, status: TruthStatus, mode: MatchMode, scope: CertificationScope
+) -> list[str]:
+    """Every reason a score cannot be called certifiable, each saying what to do next."""
+
+    reasons: list[str] = []
+    if not certification_enabled():
+        reasons.append(CERTIFICATION_DISABLED)
+    # One unfrozen corpus: the scope reason below already says so, and what to do about it.
+    one_unfrozen_corpus = scope.corpus_root is not None and scope.independent is None
+    if status != "verified" and not one_unfrozen_corpus:
+        unsettled = ", ".join(mix.entry.mix_id for mix in mixes if mix.truth_status != "verified")
+        reasons.append(
+            f"the truth for {unsettled} is not frozen and verified (this score is labelled "
+            f"{status}), so this is a development score. Finish checking those tracklists by "
+            "ear; a frozen corpus needs every row verified before `idea truth freeze`"
+        )
+    if mode != "time":
+        reasons.append(
+            "the tracks were matched by name only, not by when they played, because some truth "
+            "has no real start times yet. Add start times to every row so the score can be "
+            "matched by time"
+        )
+    exposed = ", ".join(mix.entry.mix_id for mix in mixes if not mix.independent)
+    if exposed:
+        reasons.append(
+            f"the truth for {exposed} was reviewed with IDea's predictions visible, so it is not "
+            "independent of them. It can be scored, but it can never back a certified number"
+        )
+    reasons.extend(scope.reasons)
+    return reasons
 
 
 def _pct(e4: int) -> str:
@@ -1263,6 +1320,11 @@ def summary(document: dict[str, Any], out: Path | None) -> str:
             verdict += ", and a non-verified score cannot clear L3 either way"
     gate = document["l3"].get("certification")
     gated = f" {gate}." if gate and gate not in verdict else ""
+    # A score of frozen truth says why its scope cannot be certified (a partial run list, an
+    # exposed frozen sibling); draft truth is already called a draft above.
+    scope_reasons = document["l3"].get("scope", {}).get("reasons", [])
+    if status == "verified":
+        gated += "".join(f" NOT CERTIFIABLE: {reason}." for reason in scope_reasons)
     return (
         f"The {document['recipe']} recipe was scored over {counts['mixes']} mix(es) ({mix_ids}) "
         f"against {truth_note}. {_matching_note(document)}. Of the "
@@ -1421,13 +1483,19 @@ def main(argv: list[str] | None = None) -> int:
             f"recall {document['work_recall_e4']}/10000; report={out}"
         )
         if document["l3"].get("certification"):
-            print(f"NOT CERTIFIABLE: {document['l3']['certification']}")
-        if document["l3"]["independent"] is False:
-            exposed = [mix["mix_id"] for mix in document["mixes"] if mix["independent"] is False]
+            print(
+                f"NOT CERTIFIABLE: {document['l3']['certification']}. "
+                f"{CERTIFICATION_DISABLED_NEXT_STEP}"
+            )
+        exposed = [mix["mix_id"] for mix in document["mixes"] if mix["independent"] is False]
+        if exposed:
             print(
                 f"NOT CERTIFIABLE: the truth for {', '.join(exposed)} is not independent of "
                 "IDea's predictions (they were visible while it was reviewed); it cannot back L3"
             )
+        if document["truth_status"] == "verified":
+            for reason in document["l3"]["scope"]["reasons"]:
+                print(f"NOT CERTIFIABLE: {reason}")
     return 0
 
 

@@ -41,6 +41,7 @@ from pathlib import Path
 
 import pytest
 
+import id_detector.truth as truth_module
 from id_detector.benchmark.corpus import _prediction_set, prediction_set_from_fusion
 from id_detector.benchmark.scorer import (
     PredictionDocument,
@@ -51,7 +52,7 @@ from id_detector.benchmark.scorer import (
 from id_detector.contracts import EpisodesFile, GroundTruthRecord, IdentitiesRecord, TruthWork
 from id_detector.fuse.identity import _word_sets_corroborate
 from id_detector.io import canonical_json_bytes
-from id_detector.truth import seed_truth
+from id_detector.truth import CERTIFICATION_DISABLED, seed_truth
 from scripts.score_corpus import (
     L3_THRESHOLDS,
     ListedWork,
@@ -83,6 +84,12 @@ EXPECTED_TIME = json.loads((FIXTURE / "expected-time.json").read_text("utf-8"))
 HEADLINE = ("likely_precision_e4", "listed_precision_e4", "work_precision_e4", "work_recall_e4")
 L3_KEYS = ("likely_precision_e4", "listed_precision_e4", "work_recall_e4")
 WORK_KEYS = ("likely_precision_e4", "work_precision_e4", "work_recall_e4")
+#: Why a score of the unfrozen corpus-mini fixture is not certifiable: draft truth, clearly said.
+NOT_FROZEN = (
+    "the corpus corpus-mini is not frozen, so this is a development score of draft truth. Keep "
+    "checking the tracklists by ear; once every one is checked and certification is switched on, "
+    "the owner freezes the corpus with `idea truth freeze` and scores the same run list again"
+)
 
 
 def _episode_id(key: str) -> str:
@@ -268,7 +275,13 @@ def test_time_mode_numbers_on_corpus_mini_are_unchanged(tmp_path: Path) -> None:
         "thresholds_met": False,
         "independent": True,
         "certifiable": False,
-        "certification": "certification is disabled until the certification follow-up lands",
+        "certification": CERTIFICATION_DISABLED,  # production keeps the gate closed
+        "not_certifiable_because": [CERTIFICATION_DISABLED, NOT_FROZEN],
+        "scope": {
+            "whole_frozen_corpus": False,
+            "corpus_independent": None,
+            "reasons": [NOT_FROZEN],
+        },
     }
     by_mix = {mix["mix_id"]: mix for mix in document["mixes"]}
     assert [by_mix["mini-a"][key] for key in L3_KEYS] == [10_000, 6_000, 10_000]
@@ -446,7 +459,12 @@ def test_draft_truth_is_scored_but_labelled_draft() -> None:
     assert EXPECTED["l3"]["thresholds_met"] is None
 
 
-def test_truth_status_unverified_then_verified_under_a_frozen_manifest(tmp_path: Path) -> None:
+@pytest.mark.parametrize("gate_open", [True, False], ids=["gate open", "gate closed"])
+def test_truth_status_unverified_then_verified_under_a_frozen_manifest(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, gate_open: bool
+) -> None:
+    monkeypatch.setattr(truth_module, "CERTIFICATION_ENABLED", gate_open)
+    disabled = None if gate_open else CERTIFICATION_DISABLED
     root = _copy_fixture(tmp_path)
     for set_id in ("mini-a", "mini-b"):
         _mark_verified(root / set_id / "ground_truth.json")
@@ -462,13 +480,11 @@ def test_truth_status_unverified_then_verified_under_a_frozen_manifest(tmp_path:
     assert code == 0
     assert document["truth_status"] == "verified"
     assert [mix["truth_status"] for mix in document["mixes"]] == ["verified", "verified"]
-    # Round 8: frozen, verified, timed and independent would have been certifiable, but
-    # certification is disabled until the certification follow-up lands.
-    assert document["l3"]["certifiable"] is False
-    assert (
-        document["l3"]["certification"]
-        == "certification is disabled until the certification follow-up lands"
-    )
+    # Frozen, verified, timed, independent and the WHOLE frozen corpus: certifiable, unless the
+    # certification gate is closed (tests/test_certification_followup.py covers partial lists).
+    assert document["l3"]["certifiable"] is gate_open
+    assert document["l3"]["certification"] == disabled
+    assert document["l3"]["not_certifiable_because"] == ([] if gate_open else [disabled])
     report = json.loads((tmp_path / "frozen" / document["mixes"][0]["report"]).read_text("utf-8"))
     assert report["unverified_seed_comparison"] is False
 
@@ -478,12 +494,18 @@ def test_truth_status_unverified_then_verified_under_a_frozen_manifest(tmp_path:
     assert code == 0
     assert document["truth_status"] == "verified"
     assert document["match_mode"] == "work"
+    by_name = (
+        "the tracks were matched by name only, not by when they played, because some truth has "
+        "no real start times yet. Add start times to every row so the score can be matched by time"
+    )
     assert document["l3"] == {
         "thresholds": L3_THRESHOLDS["deep"],
         "thresholds_met": None,
         "independent": True,
         "certifiable": False,
-        "certification": "certification is disabled until the certification follow-up lands",
+        "certification": disabled,
+        "not_certifiable_because": [by_name] if gate_open else [disabled, by_name],
+        "scope": {"whole_frozen_corpus": True, "corpus_independent": True, "reasons": []},
     }
 
     # One draft mix drags the whole run back to draft.

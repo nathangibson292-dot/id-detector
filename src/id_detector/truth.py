@@ -430,8 +430,20 @@ TRUTH_RECORD_NAME = "ground_truth.json"
 #: The owner's freeze and certification moratorium: one gate, ``False`` in production.  Every
 #: freeze and certification emitter reads it through :func:`certification_enabled` at call time;
 #: tests of the logic underneath open it with the ``certification_gate_open`` fixture (a
-#: monkeypatch), never a production flag.  :data:`CERTIFICATION_DISABLED` is the exact message.
+#: monkeypatch), never a production flag, and tests of the closed state may pin it with
+#: ``certification_gate_closed``.  :data:`CERTIFICATION_DISABLED` is the exact message.  The
+#: certification follow-up closed the two deferred scope defects but its review found more; the
+#: gate stays closed until everything under "Required before the certification gate may open" in
+#: ``docs/reviews/followup-certification.md`` is built.
 CERTIFICATION_ENABLED = False
+
+#: What a closed gate tells a person, after :data:`CERTIFICATION_DISABLED`.
+CERTIFICATION_DISABLED_NEXT_STEP = (
+    "Nothing is wrong and there is nothing to fix on your side: freezing and certifying stay "
+    "switched off until the remaining certification work is built (it is listed in "
+    "docs/reviews/followup-certification.md). Scoring draft truth with scripts/score_corpus.py "
+    "still works and is how accuracy is measured meanwhile"
+)
 
 
 def certification_enabled() -> bool:
@@ -1243,6 +1255,64 @@ def refuse_generated_output(path: Path, *, work_root: Path | None = None) -> Pat
                 f"refusing to write generated output into {path}: it contains corpus files "
                 f"({below})"
             )
+    return absolute
+
+
+def scratch_corpus_ancestor(path: Path) -> Path | None:
+    """The corpus ``path`` lies in, at ANY depth, whether or not that corpus has a manifest.
+
+    The gateway's two ancestor checks, applied at every ancestor up to the filesystem root rather
+    than only at the nearest one: :func:`corpus_ancestor` (an ancestor holding a corpus file
+    directly, ``lstat`` only) and :func:`_holds_truth_bearing_set` (an ancestor holding set folders
+    directly, as a corpus without a manifest such as ``release-1`` does).  So an ordinary existing
+    subfolder several levels inside ``release-1`` is still inside ``release-1``.  Each existing
+    ancestor is listed once and in full -- the system temporary folder routinely holds more entries
+    than :data:`CORPUS_LISTING_LIMIT` -- which is affordable because this runs once per calibration
+    validation, never per corpus open (the gateway itself stays O(depth) ``lstat``).
+    """
+
+    absolute = Path(os.path.abspath(path))
+    marked = corpus_ancestor(absolute)
+    if marked is not None:
+        return marked
+    for ancestor in absolute.parents:
+        if os.path.isdir(native_path(ancestor)) and _holds_truth_bearing_set(
+            ancestor, skip=None, limit=None
+        ):
+            return ancestor
+    return None
+
+
+def refuse_scratch_destination(scratch: Path, *, work_root: Path | None) -> Path:
+    """Refuse a scratch corpus folder that is not yet created unless it is safe to create.
+
+    Checked on the path as spelled, BEFORE any file or folder is made: a link anywhere on it; a
+    folder beneath ``work_root`` (which ``idea gc`` prunes, and which the owner may point anywhere,
+    the system temporary folder included); a folder that already exists; and a folder inside any
+    corpus AT ANY DEPTH (:func:`scratch_corpus_ancestor`).  Returns the absolute path.
+    """
+
+    absolute = Path(os.path.abspath(scratch))
+    refuse_link_components(absolute)
+    if work_root is not None and is_within(absolute, work_root):
+        raise ValueError(
+            f"refusing to build the scratch corpus at {absolute}: it is inside the work folder "
+            f"{work_root}, which `idea gc` cleans up. Choose a --work-root that is not the "
+            "temporary folder (or a folder above it), or point the TEMP environment variable at "
+            "a folder outside the work folder, and run again"
+        )
+    if os.path.lexists(native_path(absolute)):
+        raise ValueError(
+            f"refusing to build the scratch corpus at {absolute}: something already exists "
+            "there. Run the command again; a fresh folder name is chosen each time"
+        )
+    inside = scratch_corpus_ancestor(absolute)
+    if inside is not None:
+        raise ValueError(
+            f"refusing to build the scratch corpus at {absolute}: it is inside the corpus "
+            f"{inside}. Point the TEMP environment variable at an ordinary folder that holds no "
+            "truth files, and run again"
+        )
     return absolute
 
 
@@ -2276,7 +2346,7 @@ def freeze_truth(
     if not certification_enabled():
         raise ValueError(
             f"{CERTIFICATION_DISABLED}: freezing a corpus is part of certification, so freeze "
-            "refuses until then; nothing was read or written"
+            f"refuses until then; nothing was read or written. {CERTIFICATION_DISABLED_NEXT_STEP}"
         )
     with open_corpus(
         truth_dir,
@@ -2338,6 +2408,25 @@ def _freeze_truth_locked(
             work_root=work_root,
             corpus_version=corpus_version,
         )
+
+
+#: The most problems a refused freeze lists; a half-checked corpus has hundreds of draft rows.
+FREEZE_REFUSAL_LIMIT = 25
+
+
+def _freeze_refusal(truth_dir: Path, errors: list[str]) -> str:
+    """The refusal a freeze gives: nothing changed, what is wrong, and what to do next."""
+
+    shown = errors[:FREEZE_REFUSAL_LIMIT]
+    more = len(errors) - len(shown)
+    return (
+        f"cannot freeze {truth_dir}: {len(errors)} problem(s) must be fixed first, and nothing "
+        "was changed. A row that is still draft or has no verification has not been checked by "
+        "ear yet: open its set with `idea truth review`, check it and save, then run freeze "
+        "again. Freezing is final, so only freeze once every tracklist has been checked.\n"
+        + "\n".join(shown)
+        + (f"\n... and {more} more" if more else "")
+    )
 
 
 def _freeze_locked(
@@ -2436,7 +2525,7 @@ def _freeze_locked(
                 errors.append(f"{truth.set_id} invalid independent annotation record: {exc}")
         truths.append((path, truth))
     if errors:
-        raise ValueError("cannot freeze:\n" + "\n".join(errors))
+        raise ValueError(_freeze_refusal(truth_dir, errors))
     if len({truth.set_id for _, truth in truths}) != len(truths):
         raise ValueError("cannot freeze duplicate set_id values")
     manifest_file = _manifest_destination(out_path, candidates, work_root, real_path(truth_dir))

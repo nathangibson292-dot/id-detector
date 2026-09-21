@@ -31,6 +31,18 @@
     "certifiable": false,
     "certification": "certification is disabled until the certification follow-up lands",
     "independent": true,
+    "not_certifiable_because": [
+      "certification is disabled until the certification follow-up lands",
+      "the tracks were matched by name only, not by when they played, because some truth has no real start times yet. Add start times to every row so the score can be matched by time",
+      "the corpus corpus-mini is not frozen, so this is a development score of draft truth. Keep checking the tracklists by ear; once every one is checked and certification is switched on, the owner freezes the corpus with `idea truth freeze` and scores the same run list again"
+    ],
+    "scope": {
+      "corpus_independent": null,
+      "reasons": [
+        "the corpus corpus-mini is not frozen, so this is a development score of draft truth. Keep checking the tracklists by ear; once every one is checked and certification is switched on, the owner freezes the corpus with `idea truth freeze` and scores the same run list again"
+      ],
+      "whole_frozen_corpus": false
+    },
     "thresholds": {
       "likely_precision_e4": 9000,
       "listed_precision_e4": 8000,

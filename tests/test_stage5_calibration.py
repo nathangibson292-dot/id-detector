@@ -7,10 +7,12 @@ from pathlib import Path
 
 import pytest
 
+import id_detector.truth as truth_module
 from id_detector.benchmark.corpus import _real_analyse_command
 from id_detector.calibrate.certify import (
     CERTIFICATION_DISABLED,
     CertificationDisabled,
+    CorpusNotFrozen,
     DuplicateTestVersion,
     _guard_test_version,
     _population_prediction_count,
@@ -329,11 +331,22 @@ def _write_manifest(project_root: Path, corpus: str, *, frozen: bool) -> None:
     )
 
 
-def test_certify_refuses_unfrozen_corpus(tmp_path: Path) -> None:
+def _certify_refusal(gate_open: bool, otherwise: type[Exception]) -> type[Exception]:
+    """With the gate closed every certify call is refused as disabled, before any other guard."""
+
+    return otherwise if gate_open else CertificationDisabled
+
+
+@pytest.mark.parametrize("gate_open", [True, False], ids=["gate open", "gate closed"])
+def test_certify_refuses_unfrozen_corpus(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, gate_open: bool
+) -> None:
+    monkeypatch.setattr(truth_module, "CERTIFICATION_ENABLED", gate_open)
     _write_manifest(tmp_path, "draftcorpus", frozen=False)
-    # Round 8: certification is disabled until the certification follow-up lands, so it is
-    # refused before the corpus is opened (the frozen guard itself is tested directly).
-    with pytest.raises(CertificationDisabled, match=CERTIFICATION_DISABLED):
+    # Gate open: the frozen guard refuses a draft inventory.  Gate closed: refused as disabled,
+    # before the corpus is opened.
+    message = "cannot be certified" if gate_open else CERTIFICATION_DISABLED
+    with pytest.raises(_certify_refusal(gate_open, CorpusNotFrozen), match=message):
         __import__("asyncio").run(
             run_certify(
                 corpus_version="draftcorpus",
@@ -345,14 +358,20 @@ def test_certify_refuses_unfrozen_corpus(tmp_path: Path) -> None:
         )
 
 
-def test_certify_with_a_repeated_test_version_is_refused_as_disabled(tmp_path: Path) -> None:
+@pytest.mark.parametrize("gate_open", [True, False], ids=["gate open", "gate closed"])
+def test_certify_refuses_a_repeated_test_version(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, gate_open: bool
+) -> None:
+    monkeypatch.setattr(truth_module, "CERTIFICATION_ENABLED", gate_open)
     _write_manifest(tmp_path, "frozencorpus", frozen=True)
     registry = (
         tmp_path / "data" / "local" / "certification" / "frozencorpus" / "free" / "registry.json"
     )
     atomic_write_json(registry, {"test_versions": ["v1"]})
-    # Round 8: refused as disabled before the test-version registry is consulted.
-    with pytest.raises(CertificationDisabled, match=CERTIFICATION_DISABLED):
+    # Gate open: a test version is evaluated exactly once.  Gate closed: refused as disabled
+    # before the test-version registry is consulted.
+    message = "already certified" if gate_open else CERTIFICATION_DISABLED
+    with pytest.raises(_certify_refusal(gate_open, DuplicateTestVersion), match=message):
         __import__("asyncio").run(
             run_certify(
                 corpus_version="frozencorpus",
@@ -365,7 +384,7 @@ def test_certify_with_a_repeated_test_version_is_refused_as_disabled(tmp_path: P
 
 
 def test_guard_test_version_refuses_a_reused_version(tmp_path: Path) -> None:
-    """The retained repeated-version guard, tested directly; production certification stays off."""
+    """The repeated-version guard, tested directly."""
 
     registry = (
         tmp_path / "data" / "local" / "certification" / "frozencorpus" / "free" / "registry.json"

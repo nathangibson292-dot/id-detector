@@ -527,8 +527,10 @@ class DurationsRecord(Record):
     unscanned_ms: NonNegativeInt
 
 
-#: The exact message every freeze and certification refusal carries while the owner's moratorium
-#: holds (see ``truth.CERTIFICATION_ENABLED``), and the non-certified benchmark status it produces.
+#: The exact message every freeze and certification refusal carries while the certification gate is
+#: closed (see ``truth.CERTIFICATION_ENABLED``), and the non-certified benchmark status it produces.
+#: The wording is a persisted status value, so it is kept as first written; what it means for a
+#: person is said by ``truth.CERTIFICATION_DISABLED_NEXT_STEP``.
 CERTIFICATION_DISABLED = "certification is disabled until the certification follow-up lands"
 
 

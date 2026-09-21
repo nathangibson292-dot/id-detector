@@ -111,7 +111,23 @@ throwaway host to replace the **provisional 2,000/day Shazam attempt budget** wi
 
 **Update 2026-09-14.** Also committed: **4b-i** durable queue and worker (`8e937ab`); **`idea truth review`** (`ef94b70`) plus a corpus furniture fix and audit check (`362ae10`); and **4a-ii** FastAPI parity (`3cb5dc2`): one FastAPI/uvicorn server for `idea serve` and `idea truth review`, a durable local job queue at `work/.idea/app.db` with a worker process supervised by `idea serve`, no writes on GET, bounded request bodies, streamed audio, and `http`/`https`-only buy and download links. Test suite: 1287 passed offline.
 
-**Follow-ups landed (2026-09-15).** The sol-xhigh retro-reviews of 4a-i, 4b-i and the truth tool (see `docs/reviews/retro-review-*.md`) are closed by three follow-up fixes: long-path retention (`91d2990`), money and resume (`bb57b70`) and the truth corpus gateway. **Paid Deep scans are allowed again**: SQLite is the single money authority for `idea serve`/`idea.cmd`, a paid clip is never re-sent after a crash, cancel or restart, and every run settles its spend exactly once. Paid engines stay refused in hosted mode until a hosted review. The truth corpus now goes through one gateway: links, nested layouts and paths inside another corpus are refused, every mutation takes one corpus lock, and no report, config or render output can overwrite corpus files. **Freezing and certification are switched off** in code (`idea truth freeze`, `idea benchmark certify` and every certified or thresholds-met claim refuse) until a certification follow-up closes the deferred items in `docs/reviews/followup-truth-corpus.md`. `idea truth seed` now needs an existing corpus folder outside any other corpus. Verifying truth rows in `idea truth review` is fine. **idea gc --apply is safe again** since commit 91d2990 (Windows long-path safety and link refusal in retention; the preview now plans exactly what --apply does).
+**Follow-ups landed (2026-09-15).** The sol-xhigh retro-reviews of 4a-i, 4b-i and the truth tool (see `docs/reviews/retro-review-*.md`) are closed by three follow-up fixes: long-path retention (`91d2990`), money and resume (`bb57b70`) and the truth corpus gateway. **Paid Deep scans are allowed again**: SQLite is the single money authority for `idea serve`/`idea.cmd`, a paid clip is never re-sent after a crash, cancel or restart, and every run settles its spend exactly once. Paid engines stay refused in hosted mode until a hosted review. The truth corpus now goes through one gateway: links, nested layouts and paths inside another corpus are refused, every mutation takes one corpus lock, and no report, config or render output can overwrite corpus files. **Freezing and certification remain switched off** in code (`truth.CERTIFICATION_ENABLED = False`: `idea truth freeze`, `idea benchmark certify` and every certified or thresholds-met claim refuse). This does not limit everyday use: scoring draft truth with `scripts/score_corpus.py` is how accuracy is measured, and it works with the gate closed. `idea truth seed` now needs an existing corpus folder outside any other corpus. Verifying truth rows in `idea truth review` is fine. **idea gc --apply is safe again** since commit 91d2990 (Windows long-path safety and link refusal in retention; the preview now plans exactly what --apply does).
+
+**Certification follow-up (2026-09-20): landed with the gate still closed.** The two items the truth
+follow-up deferred are fixed (`docs/reviews/followup-certification.md`): a run list that names only
+part of a frozen corpus can never be called certifiable (one frozen corpus, exactly its frozen sets,
+independence judged over all of them; partial and draft run lists still score, and the report says
+why they are not certifiable), and calibration validation's scratch corpus is checked against the
+configured `--work-root` and against every corpus, at every folder depth, before anything is
+created. Also landed: guards on all three `idea benchmark certify` outputs (report, predictions,
+registry), rechecked just before each write, and plainer refusal messages. The second-model review
+of that work found more that must be built **before the certification gate may open**: L3
+"thresholds met" must use the same whole-corpus scope as "certifiable"; freezing must mark every
+set non-certifiable when any frozen set was exposed to predictions; link scores, profile feature
+flags and calibrated episode tiers must not carry certification meaning unless bound to one
+verified, complete, independent corpus; and a `(profile, test version)` must be reserved and locked
+before any evaluation work. Until then, do not expect `idea truth freeze` or `idea benchmark
+certify` to run; keep checking the `release-1` tracklists by ear in `idea truth review`.
 
 ## Acceptance status at a glance
 

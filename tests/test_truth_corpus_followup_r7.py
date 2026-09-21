@@ -445,13 +445,16 @@ def test_calibration_scores_a_scratch_corpus_outside_work_and_every_corpus(
     monkeypatch.setattr(validate_module, "score_corpus", fake_score)
     monkeypatch.setattr(certify_module, "build_prediction_document", lambda **_: {})
     monkeypatch.setattr(certify_module, "registered_targets", lambda _profile: [])
-    assert "work_root" not in inspect.signature(validate_module._score_certification).parameters
+    # The certification follow-up: the configured work root is passed in and the scratch
+    # destination validated against it (tests/test_certification_followup.py).
+    assert "work_root" in inspect.signature(validate_module._score_certification).parameters
     entries = validate_module._score_certification(
         corpus_version="fx-v1",
         project_root=tmp_path / "project",
         test_ids=[SET_ID],
         prediction_sets=[],
         corpus_dir=corpus,
+        work_root=tmp_path / "work",
     )
     truth_dir = seen["truth_dir"]
     assert is_within(truth_dir, tempfile.gettempdir())

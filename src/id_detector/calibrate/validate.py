@@ -14,8 +14,11 @@ block is all ``provisional`` with ``n_test_predictions: 0``.
 from __future__ import annotations
 
 import json
+import os
 import random
+import shutil
 import tempfile
+import uuid
 from dataclasses import dataclass
 from hashlib import sha256
 from pathlib import Path
@@ -71,6 +74,7 @@ from id_detector.truth import (
     frozen_manifest,
     open_corpus,
     refuse_generated_output,
+    refuse_scratch_destination,
     require_corpus_member,
     write_corpus_file_through_gateway,
 )
@@ -316,6 +320,12 @@ def _frozen_subset_truth(corpus_dir: Path, set_ids: list[str], destination: Path
     return destination
 
 
+def _new_scratch_path() -> Path:
+    """A fresh, not-yet-created scratch folder name in the system temporary folder."""
+
+    return Path(tempfile.gettempdir()) / f"idea-calibration-validation-{uuid.uuid4().hex}"
+
+
 def _write_calibration_model(model_path: Path, model: Any) -> None:
     """Write the fitted model and its completion sidecar, each guarded immediately before its write.
 
@@ -360,6 +370,9 @@ async def run_calibration_validation(
     validation_path = validation_report_path(project_root, corpus_version, out_path)
     if model_out is not None:
         refuse_generated_output(model_out)
+    # So is the scratch corpus's home: a work root that is, or contains, the temporary folder is
+    # refused now, not after the whole corpus has been analysed (and again where it is created).
+    refuse_scratch_destination(_new_scratch_path(), work_root=work_root)
     corpus_dir = project_root / "data" / "corpus" / corpus_version
     with open_corpus(corpus_dir, mutate=False) as handle:
         if frozen_manifest(handle) is None:
@@ -459,6 +472,7 @@ async def run_calibration_validation(
         test_ids=test_ids,
         prediction_sets=calibrated_prediction_sets,
         corpus_dir=corpus_dir,
+        work_root=work_root,
     )
 
     n_test_predictions = sum(len(outcomes) for outcomes in outcomes_by_set.values())
@@ -510,11 +524,17 @@ def _score_certification(
     test_ids: list[str],
     prediction_sets: list[dict[str, Any]],
     corpus_dir: Path,
+    work_root: Path,
 ) -> list[CalibrationCertEntry]:
     """Score the calibrated test split with pre-registered targets; the block is all-provisional.
 
     Controlled sets are excluded from the real-mix test population by construction, so the scorer's
     certification is provisional with a zero denominator no matter how accurate the machinery is.
+
+    The scratch corpus is a fresh folder in the system temporary folder.  Its destination is
+    validated against the configured ``work_root`` and every corpus BEFORE any file or folder is
+    created (:func:`id_detector.truth.refuse_scratch_destination`): a ``--work-root`` that is, or
+    contains, the temporary folder is refused rather than quietly holding a truth corpus.
     """
 
     from id_detector.calibrate.certify import build_prediction_document, registered_targets
@@ -527,13 +547,18 @@ def _score_certification(
         project_root=project_root,
         unverified=False,
     )
-    # The scratch corpus lives in a temporary directory outside work/ (which idea gc prunes) and
-    # outside every corpus; it is scored and then removed.
-    with tempfile.TemporaryDirectory(prefix="idea-calibration-validation-") as scratch:
-        truth_dir = _frozen_subset_truth(corpus_dir, test_ids, Path(scratch) / "truth")
-        predictions_path = Path(scratch) / "predictions.json"
+    # The scratch corpus lives in a fresh temporary folder that is validated -- before anything is
+    # created -- to be outside the configured work root (which idea gc prunes) and outside every
+    # corpus; it is scored and then removed.
+    scratch = refuse_scratch_destination(_new_scratch_path(), work_root=work_root)
+    os.mkdir(scratch)  # create-only: never an existing folder
+    try:
+        truth_dir = _frozen_subset_truth(corpus_dir, test_ids, scratch / "truth")
+        predictions_path = scratch / "predictions.json"
         atomic_write_json(predictions_path, document)
         report = score_corpus(truth_dir, predictions_path)
+    finally:
+        shutil.rmtree(scratch, ignore_errors=True)
     entries: list[CalibrationCertEntry] = []
     by_key = {(item.dimension, item.tier): item for item in report.certification}
     for dimension in CERT_DIMENSIONS:

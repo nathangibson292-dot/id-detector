@@ -54,3 +54,17 @@ def certification_gate_open(monkeypatch: pytest.MonkeyPatch) -> None:
     import id_detector.truth as truth
 
     monkeypatch.setattr(truth, "CERTIFICATION_ENABLED", True)
+
+
+@pytest.fixture
+def certification_gate_closed(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Pin the freeze/certification gate closed for one test: the production state today.
+
+    Tests that assert the closed-gate behaviour (freeze and certify refuse, nothing is ever called
+    certified, every L3 block carries the disabled message) pin it here, by monkeypatch only, so
+    they keep testing the closed state whatever the production default later becomes.
+    """
+
+    import id_detector.truth as truth
+
+    monkeypatch.setattr(truth, "CERTIFICATION_ENABLED", False)

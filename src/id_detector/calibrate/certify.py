@@ -43,6 +43,7 @@ from id_detector.truth import (
     frozen_manifest,
     open_corpus,
     prediction_exposure,
+    refuse_generated_output,
     require_frozen_inventory,
 )
 from id_detector.truth_paths import is_link, link_refusal
@@ -63,7 +64,7 @@ class DuplicateTestVersion(ValueError):
 
 
 class CertificationDisabled(ValueError):
-    """Raised by every certification entry point until the certification follow-up lands."""
+    """Raised by every certification entry point while the certification gate is closed."""
 
 
 @dataclass(frozen=True)
@@ -158,12 +159,17 @@ def _require_frozen(corpus_dir: Path, corpus_version: str) -> None:
             raise link_refusal(handle.manifest_path, handle.manifest_path)
         if not handle.manifest_path.is_file():
             raise CorpusNotFrozen(
-                f"corpus {corpus_version} has no freeze manifest; certification refused"
+                f"corpus {corpus_version} has not been frozen, so it cannot be certified. When "
+                "every tracklist in it has been checked by ear, freeze it with `idea truth "
+                "freeze`, then run certify again. Until then, score it as a draft with "
+                "scripts/score_corpus.py"
             )
         manifest = frozen_manifest(handle)
         if manifest is None:
             raise CorpusNotFrozen(
-                f"corpus {corpus_version} is not frozen; freeze it before certification"
+                f"corpus {corpus_version} only has a draft inventory, not a freeze, so it cannot "
+                "be certified. When every tracklist in it has been checked by ear, freeze it with "
+                "`idea truth freeze`, then run certify again"
             )
         require_frozen_inventory(handle, manifest)
 
@@ -197,7 +203,8 @@ def _require_independent(corpus_dir: Path, corpus_version: str) -> None:
         raise CorpusNotIndependent(
             f"corpus {corpus_version} is not independent of IDea's predictions: "
             f"{', '.join(sorted(exposed))} was reviewed with predictions visible; certification "
-            "refused"
+            "refused. This corpus can still be scored for development, but a certified number "
+            "needs a corpus whose truth was made without seeing IDea's answers"
         )
 
 
@@ -219,9 +226,38 @@ def _guard_test_version(registry_path: Path, profile: str, test_version: str) ->
         used = list(json.loads(read_text(registry_path)).get("test_versions", []))
     if test_version in used:
         raise DuplicateTestVersion(
-            f"({profile}, {test_version}) already certified; use a new --test-version"
+            f"({profile}, {test_version}) already certified; a test version is evaluated exactly "
+            "once, so run again with a new --test-version name"
         )
     return used
+
+
+def _publish_certification(
+    document: PredictionDocument,
+    *,
+    corpus_dir: Path,
+    predictions_path: Path,
+    report_path: Path,
+    registry_path: Path,
+    test_versions: list[str],
+    work_root: Path,
+) -> BenchmarkReportRecord:
+    """Write the predictions, the report and the registry, each revalidated just before its write.
+
+    Every destination passes ``refuse_generated_output(..., work_root=work_root)`` immediately
+    before its own write, so a path that became a link, a corpus or part of the work tree while
+    the evaluation ran is refused rather than written.  The report is scored first and written
+    here (not by the scorer, whose own revalidation does not know the work root).
+    """
+
+    refuse_generated_output(predictions_path, work_root=work_root)
+    atomic_write_json(predictions_path, document)
+    report = score_corpus(corpus_dir, predictions_path)
+    refuse_generated_output(report_path, work_root=work_root)
+    atomic_write_json(report_path, report)
+    refuse_generated_output(registry_path, work_root=work_root)
+    atomic_write_json(registry_path, {"test_versions": test_versions})
+    return report
 
 
 async def run_certify(
@@ -237,16 +273,6 @@ async def run_certify(
     if not certification_enabled():
         # Refused before any corpus is opened or read, and before any report is written.
         raise CertificationDisabled(CERTIFICATION_DISABLED)
-    corpus_dir = project_root / "data" / "corpus" / corpus_version
-    _require_frozen(corpus_dir, corpus_version)
-    _require_independent(corpus_dir, corpus_version)
-    try:
-        profile_record = load_profile(project_root, profile)
-    except UnknownProfile as exc:
-        raise ValueError(str(exc)) from None
-    registry_path = _registry_path(project_root, corpus_version, profile)
-    used = _guard_test_version(registry_path, profile, test_version)
-
     report_path = out_path or (
         project_root
         / "data"
@@ -256,9 +282,26 @@ async def run_certify(
         / profile
         / f"certification-{test_version}.json"
     )
+    predictions_path = report_path.with_name(f"predictions-{test_version}.json")
+    registry_path = _registry_path(project_root, corpus_version, profile)
+    # All three files this run writes -- the report, the predictions beside it and the test-version
+    # registry -- are validated before anything is read or run, and again immediately before each
+    # write (`_publish_certification`): never a link, never in the work tree, never in a corpus.
+    for destination in (report_path, predictions_path, registry_path):
+        refuse_generated_output(destination, work_root=work_root)
+    corpus_dir = project_root / "data" / "corpus" / corpus_version
+    _require_frozen(corpus_dir, corpus_version)
+    _require_independent(corpus_dir, corpus_version)
+    try:
+        profile_record = load_profile(project_root, profile)
+    except UnknownProfile as exc:
+        raise ValueError(str(exc)) from None
+    used = _guard_test_version(registry_path, profile, test_version)
+
     if report_path.exists():
         raise DuplicateTestVersion(
-            f"certification report already exists for {test_version}: {report_path}"
+            f"certification report already exists for {test_version}: {report_path}. A test "
+            "version is evaluated exactly once, so run again with a new --test-version name"
         )
 
     # The frozen profile is loaded to enforce that certification runs a real frozen profile; a
@@ -323,11 +366,15 @@ async def run_certify(
             wall_ms=sum(item.wall_ms for item in costs),
         ),
     )
-    predictions_path = report_path.with_name(f"predictions-{test_version}.json")
-    atomic_write_json(predictions_path, document)
-    report = score_corpus(corpus_dir, predictions_path, out_path=report_path)
-
-    atomic_write_json(registry_path, {"test_versions": sorted({*used, test_version})})
+    report = _publish_certification(
+        document,
+        corpus_dir=corpus_dir,
+        predictions_path=predictions_path,
+        report_path=report_path,
+        registry_path=registry_path,
+        test_versions=sorted({*used, test_version}),
+        work_root=work_root,
+    )
     n_test = _population_prediction_count(truths, prediction_sets)
     n_certified = sum(entry.status == "certified" for entry in report.certification)
     return CertifyResult(
