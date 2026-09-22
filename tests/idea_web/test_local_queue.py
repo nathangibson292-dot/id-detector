@@ -24,7 +24,7 @@ import psutil
 import pytest
 
 from id_detector.recipes import DEEP_RECIPE
-from id_detector.webapp.jobs import Job, JobContext, JobWaiting
+from id_detector.webapp.jobs import RUNNING, Job, JobContext, JobWaiting
 from idea_web.application import ASSET_VERSION, STATIC_JS, create_app
 from idea_web.jobs.local import (
     ABANDONED,
@@ -32,6 +32,7 @@ from idea_web.jobs.local import (
     LocalWorker,
     LocalWorkerSupervisor,
     local_database,
+    snapshot,
 )
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -117,6 +118,70 @@ def test_submission_only_enqueues_and_the_worker_drives_the_same_job_state(tmp_p
         id="a" * 32, target=MIX, display=MIX, profile=None, acquire=False, build_index=False
     )
     assert set(done.status_dict()) == set(reference.status_dict())
+
+
+def test_a_local_worker_restart_mid_recognition_carries_the_real_bar_forward(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A replacement attempt restores elapsed work from the durable queue row."""
+
+    now = [10_000.0]
+    jobs = LocalJobs(tmp_path, clock=lambda: now[0])
+    job_id = jobs.submit(MIX)
+    first_worker = _worker(tmp_path, lambda context: None, clock=lambda: now[0])
+    row = first_worker.queue.claim("first-worker", lease_seconds=300.0)
+    assert row is not None and row.id == job_id and row.attempt == 1
+    job = Job(
+        id=job_id,
+        target=MIX,
+        display="Fixture mix",
+        profile="free",
+        acquire=False,
+        build_index=False,
+        created_at=9_990.0,
+        started_at=10_000.0,
+        status=RUNNING,
+        phase="recognise",
+        phase_started_at=10_027.0,
+        phase_seconds={"intake": 2.0, "ingest": 20.0, "decode": 3.0, "windows": 2.0},
+        windows_done=135,
+        windows_total=450,
+        run_id=row.run_id,
+    )
+    now[0] = 10_207.0  # three minutes into recognition
+    before = job.progress_percent(now[0])
+    assert before > 0
+    assert first_worker.queue.update_progress(
+        row.id,
+        row.token,
+        {"local": snapshot(job)},
+        lease_seconds=300.0,
+    )
+    first_worker.queue.fail(row, row.token, "simulated worker loss")
+    persisted = jobs.queue.get(job_id)
+    assert persisted.attempt == 1 and persisted.claim_token is None
+
+    observed: dict[str, float | int] = {}
+
+    def replacement(context: JobContext) -> None:
+        restarted = context._job
+        observed["carried"] = restarted.carried_seconds
+        observed["before"] = restarted.progress_percent(now[0])
+        observed["windows_done"] = restarted.windows_done
+        observed["windows_total"] = restarted.windows_total
+        now[0] += 17.0
+        context.progress("intake", 0, 1, "resuming")
+        observed["after"] = restarted.progress_percent(now[0])
+
+    monkeypatch.setattr("id_detector.webapp.jobs.time.time", lambda: now[0])
+    replacement_worker = _worker(tmp_path, replacement, clock=lambda: now[0])
+    assert replacement_worker.run_once() == job_id
+
+    assert observed["carried"] == pytest.approx(207.0)
+    assert observed["before"] >= before and observed["before"] > 0
+    assert observed["after"] >= observed["before"]
+    assert (observed["windows_done"], observed["windows_total"]) == (135, 450)
+    assert jobs.queue.get(job_id).attempt == 2
 
 
 def test_cancelling_a_queued_job_is_immediate_and_it_never_runs(tmp_path: Path) -> None:

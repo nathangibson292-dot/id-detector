@@ -73,6 +73,7 @@ from idea_web.jobs.worker import (
     stored_reservation,
 )
 from idea_web.jobs.worker import Job as QueueJob
+from idea_web.progress import worked_seconds
 
 LOCAL_DATABASE = Path(".idea") / "app.db"
 SUPERVISOR_LOCK = Path(".idea") / "worker-supervisor.lock"
@@ -696,8 +697,8 @@ class LocalWorker:
             self.queue.fail(row, token, f"{type(exc).__name__}: {redact_text(str(exc))[:300]}")
         return row.id
 
-    @staticmethod
-    def _restarted(job: Job) -> Job:
+    def _restarted(self, job: Job) -> Job:
+        document = snapshot(job)
         restarted = Job(
             id=job.id,
             target=job.target,
@@ -708,6 +709,17 @@ class LocalWorker:
             known_tracklist=job.known_tracklist,
             created_at=job.created_at,
             run_id=job.run_id,
+            started_at=job.started_at,
+            recognise_started_at=job.recognise_started_at,
+            resolved_title=job.resolved_title,
+            audio_path=job.audio_path,
+            windows_done=job.windows_done,
+            windows_total=job.windows_total,
+            carried_seconds=worked_seconds(document),
+            progress_max=job.progress_max,
+            progress_value=max(job.progress_value, float(job.progress_max)),
+            # A restarted attempt gets a fresh smoothing clock, just as a hosted retry does.
+            progress_at=self.clock(),
         )
         restarted.log = deque(job.log, maxlen=LOG_RING)
         restarted.log.append(f"{_stamp()} restarted after the analysis worker stopped unexpectedly")

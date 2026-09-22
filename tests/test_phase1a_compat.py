@@ -65,7 +65,7 @@ def test_serves_table(old, new, flag, expected):
 @pytest.mark.parametrize(
     "field,value",
     [
-        ("algorithm_version", "targeting:2,fusion:3"),
+        ("algorithm_version", "targeting:2,fusion:4"),
         ("adapter_versions", {"shazam": 2, "audd_clip": 2}),
         ("compat_version", 2),
         ("analysis_key", "b" * 64),
@@ -322,10 +322,10 @@ def test_recipe_version_bumps_invalidate_serving(monkeypatch):
 
 def test_results_are_stamped_with_what_they_ran_and_deep_bumps_spare_free(monkeypatch):
     free_stamp = request("free").metadata()
-    assert free_stamp["algorithm_version"] == "fusion:3"
+    assert free_stamp["algorithm_version"] == "fusion:4"
     assert free_stamp["adapter_versions"] == {"shazam": 1}
     free_result, deep_result = stored(request("free")), stored(request("deep"))
-    bumped = replace(get_recipe("deep"), algorithm_version="targeting:2,fusion:3")
+    bumped = replace(get_recipe("deep"), algorithm_version="targeting:2,fusion:4")
     monkeypatch.setattr(compat, "RECIPES", {**RECIPES, "deep": bumped})
     # A Deep-only bump retires Deep results and leaves Free results -- and their reuse as Deep
     # evidence -- untouched: a Free result never ran the component that moved.

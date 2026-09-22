@@ -156,9 +156,9 @@ def _tree(*roots: Path) -> dict[str, str]:
 # The compatibility contract
 # --------------------------------------------------------------------------------------------------
 def test_a_fusion_2_result_is_stale_for_serving_and_reusable_for_recognition(monkeypatch) -> None:
-    assert FUSION_VERSION == 3
-    assert FREE_RECIPE.algorithm_version == "fusion:3"
-    assert DEEP_RECIPE.algorithm_version == "targeting:1,fusion:3"
+    assert FUSION_VERSION == 4
+    assert FREE_RECIPE.algorithm_version == "fusion:4"
+    assert DEEP_RECIPE.algorithm_version == "targeting:1,fusion:4"
     for name, old in (("free", OLD_FREE), ("deep", OLD_DEEP)):
         req = request(name)
         was = stored(compat.RunRequest(replace(req.inputs, recipe_id=old.recipe_id), old))
@@ -207,11 +207,11 @@ def test_analyse_re_fuses_a_fusion_2_result_without_a_single_provider_request(
     assert new_bundle != old_bundle
     assert _titles(new_bundle) == {PHANTOM, FIRST, SECOND}  # what the three fixes list
     manifest = read_bundle_manifest(new_bundle)
-    assert manifest["compatibility"]["algorithm_version"] == "fusion:3"
+    assert manifest["compatibility"]["algorithm_version"] == "fusion:4"
     assert manifest["refusion"] == {
         "source_run_id": read_bundle_manifest(old_bundle)["run_id"],
         "source_bundle": old_bundle.name,
-        "fusion_version": 3,
+        "fusion_version": 4,
     }
     # Superseded, not corrupted or orphaned: every old byte is where it was (the recognition
     # evidence and the mutable fuse tree included) and the pointer has moved on.
@@ -220,12 +220,42 @@ def test_analyse_re_fuses_a_fusion_2_result_without_a_single_provider_request(
     assert result_dir(media) == new_bundle
     assert read_text(media / "present" / "current").strip() == new_bundle.name
     provenance = json.loads(read_text(media / manifest["fuse_run"] / "refusion.json"))
-    assert provenance["source_fusion_version"] == 2 and provenance["fusion_version"] == 3
+    assert provenance["source_fusion_version"] == 2 and provenance["fusion_version"] == 4
     assert any(key.startswith("recognise/") for key in provenance["inputs"])
     # The next identical request is an ordinary cache hit on the re-fused bundle — the stale
     # bundle still lying beside it is no longer what the offline lookup names.
     code, audd, shazam, again = _analyse(work, audio, FREE_RECIPE)
     assert code == 0 and again == [new_bundle] and audd.calls == 0 and shazam.requests == 0
+
+
+def test_a_later_fusion_bump_follows_a_prior_refusion_to_its_original_evidence(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A re-fused run seals outputs, not a fake copy of its source run's completion sidecars."""
+
+    work, audio, _old_bundle, _ = _stored_under_fusion_2(tmp_path, monkeypatch)
+    code, _audd, _shazam, paths = _analyse(work, audio, FREE_RECIPE)
+    assert code == 0
+    (prior_refusion,) = paths
+    prior_manifest = read_bundle_manifest(prior_refusion)
+    assert prior_manifest is not None and prior_manifest["refusion"]["source_bundle"] is not None
+    path = prior_refusion / "manifest.json"
+    stored = json.loads(read_text(path))
+    stored["compatibility"]["algorithm_version"] = "fusion:3"
+    stored["refusion"]["fusion_version"] = 3
+    path.write_text(json.dumps(stored), encoding="utf-8")
+
+    async def forbidden(*args, **kwargs):
+        pytest.fail("a later re-fusion must still be wholly offline")
+
+    monkeypatch.setattr(pipeline, "decode", forbidden)
+    code, audd, shazam, paths = _analyse(work, audio, FREE_RECIPE)
+    assert code == 0 and audd.calls == 0 and shazam.requests == 0
+    (new_bundle,) = paths
+    manifest = read_bundle_manifest(new_bundle)
+    assert new_bundle != prior_refusion
+    assert manifest is not None and manifest["refusion"]["source_bundle"] == prior_refusion.name
+    assert _titles(new_bundle) == {PHANTOM, FIRST, SECOND}
 
 
 def test_pipeline_re_fuses_stale_result_found_through_a_sibling_source_alias(
@@ -522,9 +552,9 @@ def test_the_upkeep_pass_re_fuses_stored_results_offline(
     assert refresh_stale_pages(work, CONFIG) == 1
     new_bundle = result_dir(media)
     manifest = read_bundle_manifest(new_bundle)
-    assert manifest is not None and manifest["refusion"]["fusion_version"] == 3
+    assert manifest is not None and manifest["refusion"]["fusion_version"] == 4
     assert new_bundle != old_bundle and _titles(new_bundle) == {PHANTOM, FIRST, SECOND}
-    assert stored_fusion_version(manifest) == 3
+    assert stored_fusion_version(manifest) == 4
     assert 'content="25"' in read_text(new_bundle / "index.html")[:4096]
     assert _tree(media / "fuse" / "episodes.json", media / "recognise") == flat
     # Idempotent: the next start-up has nothing left to do.
@@ -539,6 +569,7 @@ def test_a_deep_result_is_left_as_it_is_by_the_upkeep_pass(
     media = old_bundle.parents[2]
     outcome = refuse_stale_result(media, config=CONFIG)
     assert outcome.state == "unrebuildable" and "paid (Deep) result" in outcome.why
+    assert outcome.recipe == "deep"
     assert result_dir(media) == old_bundle and not list((media / "fuse/runs").glob("refuse*"))
 
 
@@ -563,6 +594,7 @@ def test_owner_visible_upkeep_skips(tmp_path: Path, monkeypatch: pytest.MonkeyPa
     assert len(deep_report.skipped) == 1
     assert deep_report.skipped[0][0] == "Speed Garage & Bass Mix - Holly Olivia (March 26)"
     assert "paid (Deep) result" in deep_report.skipped[0][1]
+    assert deep_report.skipped[0][2] == "deep"
 
     benwal_root = tmp_path / "benwal"
     benwal_root.mkdir()
@@ -582,30 +614,58 @@ def test_owner_visible_upkeep_skips(tmp_path: Path, monkeypatch: pytest.MonkeyPa
     assert len(benwal_report.skipped) == 1
     assert benwal_report.skipped[0][0] == "BENWAL"
     assert "stored records disagree with each other" in benwal_report.skipped[0][1]
+    assert benwal_report.skipped[0][2] == "free"
+    # Its safe page-only refresh creates a compatibility-less ``legacy-*`` bundle.  That wrapper
+    # must not hide the validated Free journal on the next startup.
+    benwal_again = Upkeep(benwal_work, CONFIG).run_all()
+    assert len(benwal_again.skipped) == 1 and benwal_again.skipped[0][2] == "free"
+
+    unknown_root = tmp_path / "unknown"
+    unknown_root.mkdir()
+    unknown_work, _audio_path, _unknown_bundle, _ = _stored_under_fusion_2(
+        unknown_root, monkeypatch, OLD_DEEP
+    )
+    (unknown_media,) = [path.parent for path in unknown_work.glob("*/*/present")]
+    _as_pre_bundle(unknown_media)
+    _damage_legacy_metadata(unknown_media, "malformed")
+    unknown_source_path = unknown_media / "ingest/source.json"
+    unknown_source = json.loads(read_text(unknown_source_path))
+    unknown_source["title"] = "Unknown recipe mix"
+    unknown_source_path.write_text(json.dumps(unknown_source), encoding="utf-8")
+    unknown_report = Upkeep(unknown_work, CONFIG).run_all()
+    assert len(unknown_report.skipped) == 1
+    assert unknown_report.skipped[0][2] == "unknown"
 
     report = UpkeepReport(
         updated=[f"updated {index}" for index in range(11)],
         refreshed=["BENWAL"],  # page-only work does not mean its inconsistent result improved
         skipped=[
             deep_report.skipped[0],
-            ("Garage Mix - Dec 25", deep_report.skipped[0][1]),
+            ("Garage Mix - Dec 25", deep_report.skipped[0][1], "deep"),
             benwal_report.skipped[0],
+            unknown_report.skipped[0],
         ],
     )
     report.finished.set()
     lines = report.owner_status_lines()
     assert lines == [
-        "Saved-result upkeep complete: 11 mixes improved; 3 deliberately left as they are.",
+        "Saved-result upkeep complete: 11 mixes improved; 4 deliberately left as they are.",
         "Speed Garage & Bass Mix - Holly Olivia (March 26): The result was left as it is because "
         "it is a paid (Deep) result, and the windows its second opinion checked were chosen by "
-        "the older fusion rules, so it cannot simply be rebuilt.",
+        "the older fusion rules, so it cannot simply be rebuilt. Warning: re-running this one "
+        "will spend real AudD credit.",
         "Garage Mix - Dec 25: The result was left as it is because it is a paid (Deep) result, "
         "and the windows its second opinion checked were chosen by the older fusion rules, so it "
-        "cannot simply be rebuilt.",
+        "cannot simply be rebuilt. Warning: re-running this one will spend real AudD credit.",
         "BENWAL: The result was left as it is because its stored records disagree with each "
-        "other: the final generation reference disagrees with its generation sidecar.",
-        "To analyse a skipped mix again, re-run it with --refresh. Warning: re-running a paid "
-        "(Deep) mix will spend real AudD credit.",
+        "other: the final generation reference disagrees with its generation sidecar. Re-running "
+        "this one is free: it costs nothing, but it will take time.",
+        "Unknown recipe mix: The result was left as it is because the legacy invocation journal "
+        "is malformed or truncated; without trustworthy legacy metadata it is not safe to assume "
+        "the stored result was Free. Warning: its recipe could not be determined, so ID'er must "
+        "treat it as paid; re-running this one may spend real AudD credit.",
+        "To analyse a skipped mix again, re-run it with --refresh; each line above says whether "
+        "that re-run costs money.",
     ]
 
     app = create_app(tmp_path / "browser", upkeep_report=report)
@@ -1018,7 +1078,7 @@ def test_spawned_process_refusion_crash_and_alias_lock_harness(
     assert first.returncode == second.returncode == 0, (one_err, two_err)
     assert {one_out.strip(), two_out.strip()} <= {"refused", "busy", "current"}
     assert "refused" in {one_out.strip(), two_out.strip()}
-    assert read_bundle_manifest(result_dir(media))["refusion"]["fusion_version"] == 3
+    assert read_bundle_manifest(result_dir(media))["refusion"]["fusion_version"] == 4
     assert len(list((media / "present/bundles").glob("*"))) == 2
 
     # The first process dies after the frozen run is sealed but before publish_result can create or

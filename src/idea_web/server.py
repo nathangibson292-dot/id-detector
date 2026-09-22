@@ -10,7 +10,7 @@ from collections.abc import Callable
 from contextlib import suppress
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 import uvicorn
 
@@ -19,6 +19,7 @@ from id_detector.io import native_path, read_text
 from id_detector.providers.base import AppConfig
 
 LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
+RecipeCost = Literal["free", "deep", "unknown"]
 
 
 def require_loopback(host: str, *, what: str = "present server") -> None:
@@ -40,7 +41,7 @@ class UpkeepReport:
     updated: list[str] = field(default_factory=list)  # re-fused under today's fusion version
     refreshed: list[str] = field(default_factory=list)  # page re-rendered only
     busy: list[str] = field(default_factory=list)  # a run holds the media: nothing published
-    skipped: list[tuple[str, str]] = field(default_factory=list)  # (mix, why not re-fusable)
+    skipped: list[tuple[str, str, RecipeCost]] = field(default_factory=list)
     failed: list[tuple[str, str]] = field(default_factory=list)  # (mix, error) — and carried on
     finished: threading.Event = field(default_factory=threading.Event)
 
@@ -53,20 +54,39 @@ class UpkeepReport:
 
         if not self.finished.is_set() or not self.skipped:
             return []
-        skipped_titles = {title for title, _why in self.skipped}
+        skipped_titles = {title for title, _why, _recipe in self.skipped}
         improved = len((set(self.updated) | set(self.refreshed)) - skipped_titles)
         changed = f"{improved} mix{'es' if improved != 1 else ''} improved"
         left_verb = "they are" if len(self.skipped) != 1 else "it is"
         left = f"{len(self.skipped)} deliberately left as {left_verb}"
         lines = [f"Saved-result upkeep complete: {changed}; {left}."]
-        for title, why in self.skipped:
-            reason = why.rstrip(". ") or "its stored provenance could not be proved"
-            lines.append(f"{title}: The result was left as it is because {reason}.")
+        for title, why, recipe in self.skipped:
+            lines.append(skipped_result_line(title, why, recipe))
         lines.append(
-            "To analyse a skipped mix again, re-run it with --refresh. Warning: re-running a "
-            "paid (Deep) mix will spend real AudD credit."
+            "To analyse a skipped mix again, re-run it with --refresh; each line above says "
+            "whether that re-run costs money."
         )
         return lines
+
+
+def rerun_cost_words(recipe: RecipeCost) -> str:
+    """Owner wording for the cost of rebuilding one refused result."""
+
+    if recipe == "free":
+        return "Re-running this one is free: it costs nothing, but it will take time."
+    if recipe == "deep":
+        return "Warning: re-running this one will spend real AudD credit."
+    return (
+        "Warning: its recipe could not be determined, so ID'er must treat it as paid; "
+        "re-running this one may spend real AudD credit."
+    )
+
+
+def skipped_result_line(title: str, why: str, recipe: RecipeCost) -> str:
+    """The one refusal sentence shared by startup logging, CLI output and browser status."""
+
+    reason = why.rstrip(". ") or "its stored provenance could not be proved"
+    return f"{title}: The result was left as it is because {reason}. {rerun_cost_words(recipe)}"
 
 
 class Upkeep:
@@ -140,15 +160,8 @@ class Upkeep:
                 self.report.busy.append(name)
                 return  # never fall through to a publication the lock did not cover
             if outcome.state == "unrebuildable":
-                self.report.skipped.append((name, outcome.why or ""))
-                reason = (outcome.why or "its stored provenance could not be proved").rstrip(". ")
-                _LOG.warning(
-                    "%s: The result was left as it is because %s. To analyse it again, re-run it "
-                    "with --refresh. Warning: re-running a paid (Deep) mix will spend real AudD "
-                    "credit.",
-                    name,
-                    reason,
-                )
+                self.report.skipped.append((name, outcome.why or "", outcome.recipe))
+                _LOG.warning("%s", skipped_result_line(name, outcome.why or "", outcome.recipe))
                 if not outcome.may_refresh_page:
                     return
             page = refresh_page(media_dir, config=self.config)

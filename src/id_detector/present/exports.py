@@ -157,18 +157,35 @@ def _candidate_label(identities: IdentitiesRecord, candidate_id: str) -> tuple[s
     return _split_label(min(labels) if labels else "Unknown artist - Unknown title")
 
 
-def _display_start(episode: EpisodeRecord) -> int:
-    """Role-aware row placement: an ``incoming`` episode starts at ``best_start_ms`` (its mix-in),
-    any other primary role starts at that role segment's ``from_ms``."""
+def _display_bounds(episode: EpisodeRecord) -> tuple[int, int]:
+    """Chronological row bounds, preserving role-aware placement when the proof permits it.
+
+    A single matched window has crossed one-sided proof bounds: it proves only that the track began
+    no later than the window's end and ended no earlier than its start. Those internal bounds are
+    valid, but copying them literally would publish an end before a start. In that one case the
+    evidence hull is the honest display interval.
+    """
 
     primary = min(
         episode.role_segments,
         key=lambda item: (_ROLE_PRECEDENCE[item.role], item.from_ms, item.to_ms),
         default=None,
     )
-    if primary is None or primary.role == "incoming":
-        return episode.best_start_ms
-    return primary.from_ms
+    start_ms = (
+        episode.best_start_ms if primary is None or primary.role == "incoming" else primary.from_ms
+    )
+    end_ms = episode.best_end_ms
+    if end_ms < start_ms:
+        start_ms = min(int(span[0]) for span in episode.evidence_support_ms)
+        end_ms = max(int(span[1]) for span in episode.evidence_support_ms)
+    assert end_ms >= start_ms, f"episode {episode.id} produced a reversed display row"
+    return start_ms, end_ms
+
+
+def _display_start(episode: EpisodeRecord) -> int:
+    """Role-aware, chronological row placement (see :func:`_display_bounds`)."""
+
+    return _display_bounds(episode)[0]
 
 
 def _support_ms(intervals: list[tuple[int, int]] | list[list[int]]) -> int:
@@ -368,9 +385,7 @@ def _track_entry(
         default=None,
     )
     primary_role = primary.role if primary is not None else "uncertain"
-    start_ms = (
-        episode.best_start_ms if primary_role == "incoming" or primary is None else primary.from_ms
-    )
+    start_ms, end_ms = _display_bounds(episode)
     acquire_episode = acquire_by_episode.get(episode.id)
     # A crowd row's ``alternatives`` are the contradicting comment answers at the same timestamp
     # (fusion lists the best-supported one and carries the others as candidate ids).
@@ -385,7 +400,7 @@ def _track_entry(
         "display_label": f"{artist} — {title}",
         "tier": episode.badge,
         "start_ms": start_ms,
-        "end_ms": episode.best_end_ms,
+        "end_ms": end_ms,
         "hidden_reason": None,
         "episode_id": episode.id,
         "candidate_id": episode.candidate_id,
@@ -576,6 +591,9 @@ def _derive_projection_entries(
             "reason": gap.reason,
         }
         for gap in episodes.gaps
+    )
+    assert all(int(entry["end_ms"]) >= int(entry["start_ms"]) for entry in entries), (
+        "projection produced a row whose end precedes its start"
     )
     ordered = tuple(
         sorted(

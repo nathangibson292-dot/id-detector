@@ -263,9 +263,9 @@ def _expected_confirmations(
 # The recipe identity
 # --------------------------------------------------------------------------------------------------
 def test_deep_algorithm_version_is_bumped_and_a_targeting_0_result_is_incompatible() -> None:
-    assert DEEP_RECIPE.algorithm_version == "targeting:1,fusion:3"
-    assert get_recipe("deep", primary_density=2).algorithm_version == "targeting:1,fusion:3"
-    assert FREE_RECIPE.algorithm_version == "fusion:3"  # the Free recipe is untouched
+    assert DEEP_RECIPE.algorithm_version == "targeting:1,fusion:4"
+    assert get_recipe("deep", primary_density=2).algorithm_version == "targeting:1,fusion:4"
+    assert FREE_RECIPE.algorithm_version == "fusion:4"
     previous = replace(DEEP_RECIPE, algorithm_version="targeting:0,fusion:1")
     assert previous.recipe_id != DEEP_RECIPE.recipe_id  # a bump changes the recipe identity
     # §3.4: a stored result is served only with an *equal* algorithm_version (and adapter
@@ -696,7 +696,7 @@ def test_secondary_under_80_percent_is_degraded(
     counts = entry["counts"]
     assert counts["secondary_allocated"] == 2 and counts["secondary_resolved"] == 1  # type: ignore[index]
     assert shazam.requests == 2
-    assert entry["algorithm_version"] == "targeting:1,fusion:3"
+    assert entry["algorithm_version"] == "targeting:1,fusion:4"
     tracklist = json.loads(
         (shown_result_dir(media_dir) / "tracklist.json").read_text(encoding="utf-8")
     )

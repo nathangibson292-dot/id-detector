@@ -134,7 +134,7 @@ def _re_fused_by_upkeep(work_root: Path) -> tuple[Path, Path]:
     ``analysis_runs`` / ``result_bundles`` row."""
 
     media = work_root / SOURCE / MEDIA
-    run_id = "refuse0003-" + "a" * 32
+    run_id = "refuse0004-" + "a" * 32
     fuse_run = media / "fuse" / "runs" / run_id
     fuse_run.mkdir(parents=True)
     (fuse_run / "episodes.json").write_bytes(b'{"episodes": ["re-fused"]}')
@@ -142,7 +142,7 @@ def _re_fused_by_upkeep(work_root: Path) -> tuple[Path, Path]:
     bundle = media / "present" / "bundles" / bundle_id(run_id, 25)
     bundle.mkdir(parents=True)
     for name in ("index.html", "tracklist.json", "source.json"):
-        (bundle / name).write_bytes(b'{"fusion": 3}')
+        (bundle / name).write_bytes(b'{"fusion": 4}')
     _seal_directory(
         bundle,
         {
@@ -151,7 +151,7 @@ def _re_fused_by_upkeep(work_root: Path) -> tuple[Path, Path]:
             "status": "complete",
             "fuse_run": f"fuse/runs/{run_id}",
             "duration_ms": 1000,
-            "refusion": {"source_run_id": RUN, "source_bundle": None, "fusion_version": 3},
+            "refusion": {"source_run_id": RUN, "source_bundle": None, "fusion_version": 4},
         },
     )
     (media / "present" / "current").write_bytes(bundle.name.encode("ascii"))
@@ -185,7 +185,7 @@ def test_a_re_fused_result_survives_backup_and_restore(tmp_path: Path) -> None:
     current = result_dir(media)
     assert current.name == bundle.name and read_text(media / "present/current") == bundle.name
     manifest = read_bundle_manifest(current)
-    assert manifest is not None and manifest["refusion"]["fusion_version"] == 3
+    assert manifest is not None and manifest["refusion"]["fusion_version"] == 4
     assert sha256_file(media / manifest["fuse_run"] / "episodes.json") == sha256_file(
         fuse_run / "episodes.json"
     )

@@ -20,7 +20,7 @@ What it REFUSES to do, each with a plain reason (:class:`NotRebuildable`):
   file may be absent — retention collects ``windows/`` at once, and the answered observations
   carry the same supports — but a window file that is present must match as well;
 * a paid (Deep) result.  Deep's second-opinion windows were CHOSEN by the old fusion's first pass,
-  so its evidence is not what a ``fusion:3`` run would have gathered; calling a re-fusion of it
+  so its evidence is not what today's fusion would have gathered; calling a re-fusion of it
   "current" would be a claim nobody checked.  It is left exactly as it is;
 * a result scored by a calibration model the caller does not hold.
 
@@ -86,6 +86,7 @@ class Refusion:
     bundle: Path | None = None
     why: str | None = None
     may_refresh_page: bool = True
+    recipe: Literal["free", "deep", "unknown"] = "unknown"
 
 
 @dataclass(frozen=True)
@@ -126,9 +127,32 @@ def is_deep(manifest: dict[str, Any] | None, metadata: dict[str, Any] | None = N
     absence of a bundle must never be interpreted as evidence that a result was Free.
     """
 
-    stored = manifest or metadata or {}
-    compatibility = stored.get("compatibility") or {}
-    return "deep" in {stored.get("achieved"), compatibility.get("recipe_name")}
+    return "deep" in _stored_recipe_names(manifest, metadata)
+
+
+def _stored_recipe_names(
+    manifest: dict[str, Any] | None, metadata: dict[str, Any] | None
+) -> set[str]:
+    names: set[str] = set()
+    for stored in (manifest, metadata):
+        if not stored:
+            continue
+        compatibility = stored.get("compatibility") or {}
+        for name in (stored.get("achieved"), compatibility.get("recipe_name")):
+            if name in {"free", "deep"}:
+                names.add(str(name))
+    return names
+
+
+def stored_recipe(
+    manifest: dict[str, Any] | None, metadata: dict[str, Any] | None = None
+) -> Literal["free", "deep", "unknown"]:
+    """The recipe the stored result proves, with conflicts and omissions left unknown."""
+
+    names = _stored_recipe_names(manifest, metadata)
+    if len(names) != 1:
+        return "unknown"
+    return "deep" if "deep" in names else "free"
 
 
 def _legacy_metadata_problem(metadata: dict[str, Any] | None) -> str | None:
@@ -140,11 +164,48 @@ def _legacy_metadata_problem(metadata: dict[str, Any] | None) -> str | None:
 
 def refused_run_id(source_run_id: str) -> str:
     """Deterministic, so an interrupted re-fusion resumes into the same frozen run; and ordered
-    (``refuse0003-…`` after any hex or ``legacy-`` id, before ``refuse0004-…``), because run id is
+    (``refuseNNNN-…`` after any hex or ``legacy-`` id, ordered by fusion version), because run id is
     the tie-break between two results of one analysis time."""
 
     digest = sha256(f"{source_run_id}|fusion:{FUSION_VERSION}".encode()).hexdigest()[:32]
     return f"refuse{FUSION_VERSION:04d}-{digest}"
+
+
+def _source_fuse_dir(snapshot: RunSnapshot, media_dir: Path) -> Path:
+    """The original run whose proved inputs a chain of offline re-fusions still carries.
+
+    A re-fused run intentionally freezes only its new fusion output; its ``source_bundle`` points
+    back to the immutable run with the completion sidecars.  A legacy source has no bundle, so its
+    byte-preserved flat ``fuse/`` tree is the source.  Following the chain lets a later fusion bump
+    remain offline without pretending the smaller re-fused run contains inputs it does not.
+    """
+
+    from id_detector.present.bundles import read_bundle_manifest
+
+    manifest = snapshot.manifest
+    seen: set[str] = set()
+    while manifest is not None and isinstance(manifest.get("refusion"), dict):
+        source_bundle = manifest["refusion"].get("source_bundle")
+        if source_bundle is None:
+            return media_dir / "fuse"
+        if not isinstance(source_bundle, str) or not _SHA256.fullmatch(source_bundle):
+            raise NotRebuildable("the stored re-fusion has an invalid source bundle reference")
+        if source_bundle in seen:
+            raise NotRebuildable("the stored re-fusion source bundle chain contains a cycle")
+        seen.add(source_bundle)
+        manifest = read_bundle_manifest(media_dir / "present" / "bundles" / source_bundle)
+        if manifest is None:
+            raise NotRebuildable("the stored re-fusion's source bundle is missing or damaged")
+    if manifest is None:
+        return media_dir / "fuse"
+    fuse_run = manifest.get("fuse_run")
+    if not isinstance(fuse_run, str):
+        raise NotRebuildable("the stored source bundle does not name its frozen fusion run")
+    directory = (media_dir / fuse_run).resolve()
+    allowed = (media_dir / "fuse" / "runs").resolve()
+    if not directory.is_relative_to(allowed) or directory.parent != allowed:
+        raise NotRebuildable("the stored source bundle names an unsafe fusion run")
+    return directory
 
 
 def _records(payload: bytes, model: Any) -> tuple[Any, ...]:
@@ -381,7 +442,7 @@ def refuse_snapshot(
             "by the older fusion rules, so it cannot simply be rebuilt"
         )
     source_run_id = str(snapshot.metadata["run_id"])
-    fuse_dir = media_dir / manifest["fuse_run"] if manifest is not None else media_dir / "fuse"
+    fuse_dir = _source_fuse_dir(snapshot, media_dir)
     run_id = refused_run_id(source_run_id)
     frozen = media_dir / "fuse" / "runs" / run_id
     if read_manifest(frozen) is not None:
@@ -495,11 +556,13 @@ def refuse_stale_result(media_dir: Path, *, config: AppConfig | None = None) -> 
 
         selected = result_dir(media_dir)
         manifest = read_bundle_manifest(selected)
-        legacy_metadata = legacy_result_metadata(media_dir) if manifest is None else None
+        legacy_layout = manifest is None or str(manifest.get("run_id") or "").startswith("legacy-")
+        legacy_metadata = legacy_result_metadata(media_dir) if legacy_layout else None
         stored = manifest or legacy_metadata
         if stored_fusion_version(stored) >= FUSION_VERSION:
             return Refusion("current")
         metadata_problem = _legacy_metadata_problem(legacy_metadata)
+        recipe = stored_recipe(manifest, legacy_metadata)
         if metadata_problem is not None:
             return Refusion(
                 "unrebuildable",
@@ -508,6 +571,7 @@ def refuse_stale_result(media_dir: Path, *, config: AppConfig | None = None) -> 
                     "assume the stored result was Free"
                 ),
                 may_refresh_page=False,
+                recipe="unknown",
             )
         if is_deep(manifest, legacy_metadata):
             return Refusion(
@@ -517,12 +581,13 @@ def refuse_stale_result(media_dir: Path, *, config: AppConfig | None = None) -> 
                     "chosen by the older fusion rules, so it cannot simply be rebuilt"
                 ),
                 may_refresh_page=False,
+                recipe=recipe,
             )
         snapshot = load_run_snapshot(media_dir)
         if stored_fusion_version(snapshot.manifest or snapshot.metadata) >= FUSION_VERSION:
             return Refusion("current")
         if snapshot.metadata.get("status", "complete") not in {"complete", "degraded", "partial"}:
-            return Refusion("unrebuildable", why="it is not a finished result")
+            return Refusion("unrebuildable", why="it is not a finished result", recipe=recipe)
         try:
             bundle = refuse_snapshot(
                 snapshot,
@@ -530,7 +595,7 @@ def refuse_stale_result(media_dir: Path, *, config: AppConfig | None = None) -> 
                 config=config if config is not None else _load_config(),
             )
         except NotRebuildable as exc:
-            return Refusion("unrebuildable", why=str(exc))
+            return Refusion("unrebuildable", why=str(exc), recipe=recipe)
         return Refusion("refused", bundle=bundle)
     finally:
         lock.release()

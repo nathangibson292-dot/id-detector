@@ -222,3 +222,23 @@ def test_flattened_json_shape_unchanged_for_existing_consumers(tmp_path: Path) -
     entry = payload["entries"][0]
     for key in ("kind", "start_ms", "badge", "version_status", "primary_role"):
         assert key in entry
+
+
+def test_a_single_window_row_uses_its_support_hull_when_proved_bounds_cross() -> None:
+    """One-sided proof bounds may cross internally, but a published interval never may."""
+
+    episode = _episode(0, 100_000, 112_000, [], "incoming")
+    episode.update(
+        {
+            "start_no_later_than_ms": 112_000,
+            "end_no_earlier_than_ms": 100_000,
+            "best_start_ms": 112_000,
+            "best_end_ms": 100_000,
+        }
+    )
+    episodes = EpisodesFile.model_validate(
+        {**_overlapping_episodes_file().model_dump(mode="json"), "episodes": [episode]}
+    )
+
+    (row,) = flatten_tracklist(episodes, _identities(), collapse=False)
+    assert (row["start_ms"], row["end_ms"]) == (100_000, 112_000)

@@ -785,11 +785,16 @@ def build_episodes(
     directly_backed: set[tuple[str, int]] = set()
     for hint in hints:
         hint_work_id = identity.hint_work_ids.get(hint.id)
-        if (
-            hint_work_id is None
-            or hint.position_range_ms is None
-            or not _eligible_tracklist_hint(hint)
-        ):
+        if hint_work_id is None or not _eligible_tracklist_hint(hint):
+            continue
+        if hint.position_range_ms is None:
+            # Identity fusion has already applied the field-level matcher and ambiguity veto.
+            # With no position it can support that work only when the mix contains exactly one
+            # recognised occurrence. More than one is the same ambiguity at a finer level: the
+            # evidence does not say which play it means, so guessing would back the wrong fragment.
+            plays = plays_by_work.get(hint_work_id, {})
+            if len(plays) == 1:
+                hints_by_play[next(iter(plays))].append(hint)
             continue
         backed = hint_backed_play(
             hint.position_range_ms, plays_by_work.get(hint_work_id, {}), duration_ms
@@ -964,7 +969,11 @@ def build_episodes(
                 episode_id=item["id"],
                 candidate_id=item["candidate_id"],
                 votes=tuple(item["votes"]),
-                supporting_hints=tuple(item["supporting_hints"]),
+                # An untimed hint supports work identity only.  Keeping it out of a calibrated
+                # boundary model guarantees that it cannot move or extend the audio episode.
+                supporting_hints=tuple(
+                    hint for hint in item["supporting_hints"] if hint.position_range_ms is not None
+                ),
                 n_alignment_segments=len(alignment.segments) if alignment is not None else 0,
                 max_residual_ms=(
                     max((segment.residual_ms for segment in alignment.segments), default=0)

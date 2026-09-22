@@ -139,6 +139,90 @@ def doctor() -> None:
     raise typer.Exit(run_doctor())
 
 
+def _snapshot_command(arguments: list[str]) -> None:
+    """Run the existing snapshot entry point behind an ``idea`` command name."""
+
+    from idea_web.backup import BackupRefused
+    from idea_web.backup import main as snapshot_main
+
+    try:
+        status = snapshot_main(arguments)
+    except (BackupRefused, OSError, ValueError, json.JSONDecodeError) as exc:
+        typer.echo(str(exc), err=True)
+        raise typer.Exit(1) from None
+    raise typer.Exit(status)
+
+
+@app.command("backup")
+def backup_command(
+    into: Annotated[
+        Path,
+        typer.Option(
+            "--into",
+            help=(
+                "New empty destination for the sealed snapshot "
+                "(outside work, database and corpus trees)."
+            ),
+        ),
+    ],
+    work_root: Annotated[
+        Path,
+        typer.Option("--work-root", help="Work tree to read; it is never changed by the backup."),
+    ] = DEFAULT_WORK_ROOT,
+    database: Annotated[
+        Path | None,
+        typer.Option("--database", help="Queue database; defaults to <work-root>/.idea/app.db."),
+    ] = None,
+    hint_cache: Annotated[
+        Path | None,
+        typer.Option("--hint-cache", help="Read-only connector cache used to seal hint evidence."),
+    ] = None,
+) -> None:
+    """Create a sealed database/result snapshot without copying audio or touching any corpus."""
+
+    arguments = ["backup", "--work-root", str(work_root), "--into", str(into)]
+    if database is not None:
+        arguments.extend(("--database", str(database)))
+    if hint_cache is not None:
+        arguments.extend(("--hint-cache", str(hint_cache)))
+    _snapshot_command(arguments)
+
+
+@app.command("restore")
+def restore_command(
+    snapshot: Annotated[
+        Path,
+        typer.Option("--snapshot", help="Sealed snapshot directory to verify and restore."),
+    ],
+    work_root: Annotated[
+        Path,
+        typer.Option("--work-root", help="Work tree to restore; ID'er must be stopped first."),
+    ] = DEFAULT_WORK_ROOT,
+    database: Annotated[
+        Path | None,
+        typer.Option("--database", help="Database inside the work tree; defaults to .idea/app.db."),
+    ] = None,
+) -> None:
+    """Restore the database and saved-result artefacts, not audio or any truth corpus."""
+
+    arguments = ["restore", "--snapshot", str(snapshot), "--work-root", str(work_root)]
+    if database is not None:
+        arguments.extend(("--database", str(database)))
+    _snapshot_command(arguments)
+
+
+@app.command("verify-artefacts")
+def verify_artefacts_command(
+    snapshot: Annotated[
+        Path,
+        typer.Option("--snapshot", help="Sealed snapshot directory to check without changing it."),
+    ],
+) -> None:
+    """Verify hashes, manifests and sidecars without changing work, data or the snapshot."""
+
+    _snapshot_command(["verify", "--snapshot", str(snapshot)])
+
+
 @app.command("panako-setup")
 def panako_setup_command(
     tool_dir: Path = typer.Option(  # noqa: B008

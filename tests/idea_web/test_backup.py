@@ -18,8 +18,9 @@ import time
 from pathlib import Path
 
 import pytest
+from typer.testing import CliRunner
 
-from id_detector import retention
+from id_detector import cli, retention
 from id_detector.io import (
     SCHEMA_VERSION as SIDECAR_SCHEMA_VERSION,
 )
@@ -96,6 +97,58 @@ def _work_root(tmp_path: Path) -> tuple[Path, Database, Path]:
     with database.write() as connection:
         connection.execute("UPDATE result_bundles SET path=?", (str(bundle.resolve()),))
     return work_root, database, bundle
+
+
+def test_snapshot_commands_run_end_to_end_through_the_idea_cli(tmp_path: Path) -> None:
+    runner = CliRunner()
+    help_expectations = {
+        "backup": ("sealed database/result snapshot", "without copying audio", "corpus"),
+        "restore": ("saved-result artefacts", "not audio", "truth corpus"),
+        "verify-artefacts": ("Verify hashes", "without changing", "snapshot"),
+    }
+    for command, words in help_expectations.items():
+        shown = runner.invoke(cli.app, [command, "--help"])
+        assert shown.exit_code == 0, shown.output
+        plain = " ".join(shown.output.split())
+        assert all(word in plain for word in words)
+
+    work_root, database, _bundle = _work_root(tmp_path)
+    snapshot = tmp_path / "cli-snapshot"
+    taken = runner.invoke(
+        cli.app,
+        [
+            "backup",
+            "--work-root",
+            str(work_root),
+            "--database",
+            str(database.path),
+            "--into",
+            str(snapshot),
+        ],
+    )
+    assert taken.exit_code == 0, taken.output
+    assert json.loads(taken.output)["schema_version"] == backup_module.SCHEMA_VERSION
+
+    checked = runner.invoke(cli.app, ["verify-artefacts", "--snapshot", str(snapshot)])
+    assert checked.exit_code == 0, checked.output
+    assert json.loads(checked.output) == {"errors": [], "ok": True}
+
+    restored = tmp_path / "cli-restored"
+    put = runner.invoke(
+        cli.app,
+        ["restore", "--snapshot", str(snapshot), "--work-root", str(restored)],
+    )
+    assert put.exit_code == 0, put.output
+    payload = json.loads(put.output)
+    assert payload["artefacts"] > 0
+    assert verify_artefacts(restored, backup_module.read_snapshot(snapshot)) == []
+
+    listed = backup_module.entries_of(backup_module.read_snapshot(snapshot))
+    damaged = snapshot / ARTEFACTS_DIR / listed[0].path
+    damaged.write_bytes(damaged.read_bytes() + b"damage")
+    failed = runner.invoke(cli.app, ["verify-artefacts", "--snapshot", str(snapshot)])
+    assert failed.exit_code != 0
+    assert json.loads(failed.output)["ok"] is False
 
 
 def _seal_directory(directory: Path, metadata: dict) -> None:

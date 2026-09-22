@@ -215,7 +215,7 @@ def test_all_requirements_met_is_complete_with_the_gate_money_figures(tmp_path: 
     code, audd, shazam, entry, media_dir = _run(tmp_path, "gate0a-deep.json")
     assert code == 0
     assert (entry["status"], entry["reason"], entry["achieved"]) == ("complete", None, "deep")
-    assert entry["algorithm_version"] == "targeting:1,fusion:3"  # bumped in 1b-i
+    assert entry["algorithm_version"] == "targeting:1,fusion:4"
     assert entry["usd_e6_reserved"] == 36_750
     assert entry["usd_e6_spent"] == 35_000 and entry["usd_e2_spent"] == 4
     assert audd.calls == 7
@@ -267,7 +267,7 @@ def test_allow_degrade_restarts_as_the_free_recipe_before_any_paid_work(
     assert entry["achieved"] == "free"
     # Requested stays Deep; the result was produced by the Free pipeline.
     assert entry["requested_recipe_id"] == DEEP_RECIPE.recipe_id
-    assert entry["algorithm_version"] == FREE_RECIPE.algorithm_version == "fusion:3"
+    assert entry["algorithm_version"] == FREE_RECIPE.algorithm_version == "fusion:4"
     # Zero further AudD attempts after the refusal; the free sweep covers every frozen window.
     assert audd.billed_units == 0
     assert shazam.requests == 7

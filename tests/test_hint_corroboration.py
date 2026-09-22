@@ -28,6 +28,7 @@ from id_detector.fuse.identity import (
 )
 from id_detector.hints.parse import HintInput, parse_hint_inputs
 from id_detector.hints.relations import apply_relations
+from id_detector.present.exports import flatten_tracklist
 from tests.test_phase1b_fusion import MEDIA_KEY, _fuse, _hint_id, _shazam_vote, _window
 
 CASE = json.loads(
@@ -69,8 +70,8 @@ def _hints(comments: list[dict] | None = None) -> list[HintRecord]:
             connector="sc_comments",
             source_record_id=comment["comment"],
             text=comment["text"],
-            position_ms=comment["at_ms"],
-            position_kind="comment_timestamp",
+            position_ms=comment.get("at_ms"),
+            position_kind=("comment_timestamp" if comment.get("at_ms") is not None else "none"),
             author_pseudo_id=comment["author"],
             parent_source_id=comment.get("reply_to"),
         )
@@ -316,6 +317,10 @@ def _votes(artist: str, title: str, starts: list[int], key: str) -> list[Observa
 
 def _comment(name: str, text: str, at_ms: int) -> dict:
     return {"comment": name, "text": text, "at_ms": at_ms, "author": f"fan-{name}"}
+
+
+def _untimed(name: str, text: str) -> dict:
+    return {"comment": name, "text": text, "at_ms": None, "author": f"fan-{name}"}
 
 
 def _work_of(identity: IdentityBuildResult, observation: ObservationRecord) -> str:
@@ -576,3 +581,103 @@ def test_an_uncredited_label_still_joins_the_one_credited_version_there_is() -> 
     hints = _hints([_comment("c", "song - fixture artist", 606_000)])
     _episodes, identity = _fuse([*plain, *credited], duration_ms=CASE["duration_ms"], hints=hints)
     assert identity.hint_work_ids[hints[0].id] == _work_of(identity, plain[0])
+
+
+# --------------------------------------------------------------------------------------------------
+# Polish pass: an unambiguous untimed label supports the recognised work, and nothing positional.
+# --------------------------------------------------------------------------------------------------
+def test_an_untimed_hint_supports_the_one_recognised_work_without_retiming_it() -> None:
+    audio = _votes("Fixture Artist", "Night Drive", [600_000, 612_000], "heard")
+    baseline, _identity = _fuse(audio, duration_ms=CASE["duration_ms"], hints=[])
+    hints = _hints([_untimed("c", "night drive - fixture artist")])
+    episodes, identity = _fuse(audio, duration_ms=CASE["duration_ms"], hints=hints)
+    before = _episode_of(baseline, audio)
+    after = _episode_of(episodes, audio)
+
+    assert identity.hint_work_ids[hints[0].id] == _work_of(identity, audio[0])
+    assert "hint_supported" in after.flags and hints[0].id in after.evidence
+    assert after.evidence_support_ms == before.evidence_support_ms
+    assert after.start_no_later_than_ms == before.start_no_later_than_ms
+    assert after.end_no_earlier_than_ms == before.end_no_earlier_than_ms
+    assert after.best_start_ms == before.best_start_ms and after.best_end_ms == before.best_end_ms
+
+
+def test_an_untimed_hint_backs_no_occurrence_when_its_work_plays_twice() -> None:
+    """An unpositioned label cannot choose between a true row and a later false fragment."""
+
+    first = _votes("Fixture Artist", "Night Drive", [60_000, 72_000, 84_000], "repeat-main")
+    second = _votes("Fixture Artist", "Night Drive", [3_000_000], "repeat-fragment")
+    hints = _hints(
+        [
+            _untimed("unpositioned", "Fixture Artist - Night Drive"),
+            # The timed truth names only the first occurrence.  It is independently eligible to
+            # publish that row, while the second 12-second fragment remains below the floor.
+            _comment("timed-truth", "Fixture Artist - Night Drive", 66_000),
+        ]
+    )
+    episodes, identity = _fuse([*first, *second], duration_ms=CASE["duration_ms"], hints=hints)
+    untimed = next(hint for hint in hints if hint.position_range_ms is None)
+    timed = next(hint for hint in hints if hint.position_range_ms is not None)
+    first_episode = _episode_of(episodes, first)
+    second_episode = _episode_of(episodes, second)
+
+    assert identity.hint_work_ids[untimed.id] == _work_of(identity, first[0])
+    assert all(untimed.id not in episode.evidence for episode in episodes.episodes)
+    assert timed.id in first_episode.evidence
+    assert "hint_supported" not in second_episode.flags
+
+    rows = flatten_tracklist(episodes, identity.record, collapse=False, min_track_ms=30_000)
+    shown = [row for row in rows if row["kind"] == "track"]
+    assert [row["episode_id"] for row in shown] == [first_episode.id]
+
+
+def test_an_untimed_hint_that_fits_two_recognised_works_backs_neither() -> None:
+    solo = _votes("Fixture Artist", "Night Drive", [60_000, 72_000], "solo")
+    collab = _votes("Fixture Artist & Second Act", "Night Drive", [600_000, 612_000], "co")
+    hints = _hints([_untimed("c", "Fixture Artist - Night Drive")])
+    episodes, identity = _fuse([*solo, *collab], duration_ms=CASE["duration_ms"], hints=hints)
+
+    assert not identity.hint_work_ids
+    assert all("hint_supported" not in episode.flags for episode in episodes.episodes)
+    assert all(hints[0].id not in episode.evidence for episode in episodes.episodes)
+    assert not any("hint_only" in episode.flags for episode in episodes.episodes)
+
+    # The same label does attach when there is only one recognised work.  Keeping the positive
+    # control in this guard test makes it prove the new untimed policy as well as its ambiguity
+    # veto (and makes reverting the policy fail this test, rather than pass vacuously).
+    solo_episodes, _identity = _fuse(solo, duration_ms=CASE["duration_ms"], hints=hints)
+    assert "hint_supported" in _episode_of(solo_episodes, solo).flags
+
+
+def test_an_untimed_hint_never_creates_a_crowd_only_track() -> None:
+    heard = _votes("Fixture Artist", "Night Drive", [600_000, 612_000], "heard")
+    hints = _hints(
+        [
+            _untimed("heard", "Fixture Artist - Night Drive"),
+            _untimed("unheard", "Fixture Artist - Unheard Song"),
+        ]
+    )
+    episodes, identity = _fuse(heard, duration_ms=CASE["duration_ms"], hints=hints)
+
+    assert "hint_supported" in _episode_of(episodes, heard).flags
+    assert hints[1].id in identity.hint_work_ids  # it names a work, but no recogniser heard it
+    assert all(hints[1].id not in episode.evidence for episode in episodes.episodes)
+    assert not any("hint_only" in episode.flags for episode in episodes.episodes)
+
+
+def test_an_untimed_hint_never_overrides_scatter_or_contradicted() -> None:
+    scattered = _votes("Fixture Artist", "Night Drive", [600_000, 700_000, 800_000], "s")
+    support = _untimed("yes", "night drive - fixture artist")
+    episodes, _identity = _fuse(scattered, duration_ms=CASE["duration_ms"], hints=_hints([support]))
+    episode = _episode_of(episodes, scattered)
+    assert "hint_supported" in episode.flags and episode.suppressed == "scatter"
+
+    continuous = _votes("Fixture Artist", "Night Drive", [600_000, 612_000, 624_000], "c")
+    contradiction = _comment("no", "Somebody Else - Another Song", 615_000)
+    episodes, _identity = _fuse(
+        continuous,
+        duration_ms=CASE["duration_ms"],
+        hints=_hints([support, contradiction]),
+    )
+    episode = _episode_of(episodes, continuous)
+    assert "hint_supported" in episode.flags and episode.suppressed == "contradicted"

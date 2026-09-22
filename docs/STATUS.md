@@ -105,6 +105,21 @@ A measured miss analysis ([report](accuracy/release-1-miss-analysis.md)) then ch
 safety for pre-bundle results — the owner's ordinary case. A stale result whose inputs cannot be proved now stops
 before hints, reservation or dispatch; 11 of his 14 cached mixes rebuild offline in ~24 s with zero provider calls,
 and the three that do not are refused and explained (two proven Deep, one with self-inconsistent stored provenance).
+
+**Polish pass LANDED (2026-09-22)** — the owner asked for "all the small annoyances" fixed so that the only
+thing left for him is topping up ([build notes](reviews/build-local-polish.md)). A local worker restart now
+carries its elapsed time forward instead of restarting the bar at zero. Untimed comment tracklists can back a
+track the recogniser heard, but only when the hint names exactly one work **and** that work plays exactly once
+in the mix: the first version backed every occurrence and published a wrong second row, so several occurrences
+now back nothing rather than guessing which. 16 of 18 untimed hints attach, listed rows go 386 → 387 across the
+14 cached mixes and release-1 recall 154 → 155 of 218 — one real track (`The Bug — Jah War`), verified against
+timed truth rather than a time-blind name match. A pre-existing fault that could publish a row whose end
+preceded its start is closed by one chronological invariant over every published row. Refusals now say whether
+re-running costs money (Free is free, Deep spends real AudD credit, an undetermined recipe is treated as paid),
+and `idea backup`, `idea restore` and `idea verify-artefacts` are real commands. Fusion is `fusion:4`, so saved
+Free results take the change through the offline re-fusion path at next start-up, spending nothing.
+**Next, and it needs the owner:** top up AudD (~$20) and run the Deep comparison on the corpus to measure what
+the paid engine adds over the free ceiling (~173/218 by the miss analysis).
 **When the hosted build resumes, next in plan order:** 4d-i (tenancy schema, lots,
 worker-side reservations), then 4d-ii and 4d-iii + 4d-iv. **Not started:** 6a–6b (ingest policy,
 container, launch checklist), then M2 (billing, Stripe sandbox) — see PLAN-v2 §5.

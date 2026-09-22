@@ -62,7 +62,7 @@ SNAPSHOT_FIELDS = tuple(
 #: Fields a retry must NOT inherit: the previous attempt's identity, its outcome, its clock and
 #: its per-phase state. The high-water mark (``progress_max`` and its unrounded twin
 #: ``progress_value``) and the window counts deliberately carry; the time already worked carries
-#: as ``carried_seconds`` (see :func:`_worked_seconds`), never as finished phases.
+#: as ``carried_seconds`` (see :func:`worked_seconds`), never as finished phases.
 _NOT_RESUMED = frozenset(
     {
         "id",
@@ -106,7 +106,7 @@ def _number(value: Any) -> float | None:
     return float(value) if isinstance(value, (int, float)) and not isinstance(value, bool) else None
 
 
-def _worked_seconds(document: Mapping[str, Any]) -> float:
+def worked_seconds(document: Mapping[str, Any]) -> float:
     """The working time every earlier attempt spent, from the document the last one left.
 
     What that attempt itself inherited, plus each phase it measured. A settled attempt has folded
@@ -191,7 +191,7 @@ class PageProgress:
         )
         if isinstance(resume, Mapping):
             self.job.log = deque((str(line) for line in resume.get("log") or ()), maxlen=LOG_RING)
-            self.job.carried_seconds = _worked_seconds(resume)
+            self.job.carried_seconds = worked_seconds(resume)
             # Smoothing starts now: without a last-evaluation time the first poll of the retry
             # would be exempt from the climb limit.
             self.job.progress_at = clock()

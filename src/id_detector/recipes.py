@@ -17,7 +17,8 @@ RecipeName = Literal["free", "deep"]
 #: (:mod:`id_detector.refusion`) — recognition is never repeated and nothing is re-spent.
 #: 3 = hint corroboration by reach and field-level labels; smeared ``likely`` rows are scatter and
 #: bury only under proved audio; edge answers; short rows by an artist solidly in the mix.
-FUSION_VERSION = 3
+#: 4 = an unambiguous untimed hint may support a recognised work without changing its timing.
+FUSION_VERSION = 4
 _FUSION = f"fusion:{FUSION_VERSION}"
 
 

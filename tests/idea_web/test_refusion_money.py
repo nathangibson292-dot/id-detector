@@ -42,8 +42,8 @@ def _stamp_as_fusion_2(bundle: Path) -> None:
     path = Path(native_path(bundle / "manifest.json"))
     manifest = json.loads(read_text(path))
     version = manifest["compatibility"]["algorithm_version"]
-    assert version.endswith("fusion:3")
-    manifest["compatibility"]["algorithm_version"] = version.replace("fusion:3", "fusion:2")
+    assert version.endswith("fusion:4")
+    manifest["compatibility"]["algorithm_version"] = version.replace("fusion:4", "fusion:2")
     path.write_text(json.dumps(manifest), encoding="utf-8")
     assert read_bundle_manifest(bundle) is not None
 
@@ -95,7 +95,7 @@ def _make_pre_bundle(media: Path) -> None:
         shutil.copy2(bundle / name, media / "present" / name)
     lines = [json.loads(line) for line in read_text(media / "invocations.jsonl").splitlines()]
     completed = next(line for line in reversed(lines) if line["status"] == "complete")
-    completed["algorithm_version"] = completed["algorithm_version"].replace("fusion:3", "fusion:2")
+    completed["algorithm_version"] = completed["algorithm_version"].replace("fusion:4", "fusion:2")
     completed.update(analysis_key=None, compatibility=None, bundle_id=None, fuse_run=None)
     (media / "invocations.jsonl").write_text(
         "".join(json.dumps(line) + "\n" for line in lines), encoding="utf-8"
