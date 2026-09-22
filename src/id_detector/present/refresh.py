@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import re
 from pathlib import Path
+from typing import Literal
 
 from id_detector.io import native_path, path_is_file
+from id_detector.jobs import JobStoreLocked, ProcessLock
 from id_detector.present.bundles import load_run_snapshot, publish_snapshot, result_dir
 from id_detector.present.page import PAGE_VERSION
 from id_detector.providers.base import AppConfig
@@ -44,14 +46,38 @@ def regenerate_page(media_dir: Path, *, config: AppConfig | None = None) -> Path
     return publish_snapshot(snapshot, media_dir=media_dir, config=app_config) / "index.html"
 
 
-def ensure_fresh_page(media_dir: Path, *, config: AppConfig | None = None) -> bool:
-    """Best-effort refresh; a missing input leaves the existing result available."""
+def refresh_page(
+    media_dir: Path, *, config: AppConfig | None = None
+) -> Literal["fresh", "refreshed", "busy", "failed"]:
+    """Re-render a stale page UNDER THE MEDIA LOCK — publication is never unlocked.
 
+    ``busy`` means a run (or another ID'er process) holds the lock: nothing was published, and
+    the caller must not publish either; that run, or the next upkeep pass, brings the page up.
+    """
+
+    media_dir = Path(native_path(media_dir))
     index_html = result_dir(media_dir) / "index.html"
     if not path_is_file(index_html) or page_version(index_html) >= PAGE_VERSION:
-        return False
+        return "fresh"
+    lock = ProcessLock(media_dir / ".media.lock")
     try:
-        regenerated = regenerate_page(media_dir, config=config)
-    except Exception:  # noqa: BLE001 - never let a refresh break serving the existing page
-        return False
-    return regenerated != index_html
+        lock.acquire()
+    except JobStoreLocked:
+        return "busy"
+    try:
+        index_html = result_dir(media_dir) / "index.html"  # re-read under the lock
+        if not path_is_file(index_html) or page_version(index_html) >= PAGE_VERSION:
+            return "fresh"
+        try:
+            regenerated = regenerate_page(media_dir, config=config)
+        except Exception:  # noqa: BLE001 - never let a refresh break serving the existing page
+            return "failed"
+        return "refreshed" if regenerated != index_html else "fresh"
+    finally:
+        lock.release()
+
+
+def ensure_fresh_page(media_dir: Path, *, config: AppConfig | None = None) -> bool:
+    """Best-effort refresh; a missing input or a busy media leaves the existing result available."""
+
+    return refresh_page(media_dir, config=config) == "refreshed"

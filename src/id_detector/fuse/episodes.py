@@ -195,6 +195,29 @@ CORROBORATION_SEPARATION_MIN_MS = 60_000
 #: hint naming this very work is close enough to be about this play of it.
 HINT_LEAD_IN_MS = 180_000
 HINT_TRAIL_MS = 90_000
+#: ``scatter``: a few matches fused across a span far larger than the time actually matched.
+SCATTER_MIN_HULL_MS = 120_000
+SCATTER_HULL_TO_ON_AIR = 3
+#: A ``likely`` badge is earned by COUNTING windows (four independent trials across 40 s), so a
+#: famous track "heard" for one window here and another ten minutes later earns it as easily as a
+#: track that really played.  The badge therefore only overrides ``scatter`` when the episode also
+#: has a CORE: one unbroken stretch of matched audio this long (five back-to-back windows at the
+#: 9 s hop) — which a smear of single windows never has, and a track that really played for
+#: minutes almost always does.
+LIKELY_CORE_RUN_MS = 45_000
+#: A confident episode hides ("buries") what lies under the audio it PROVED, not under its hull.
+#: Two matched windows count as one stretch only when they are truly adjacent — the hole between
+#: them is shorter than ONE window, which is all a density-2 sweep (12 s windows every 18 s)
+#: leaves inside a continuously matched track.  Any wider hole covers nothing, however confident
+#: the episode is: a real track that played wholly inside it was never under this one's audio.
+COVER_RUN_GAP_MS = 12_000
+#: A listener's ANSWER in the first or last seconds of a long episode is about the blend — the
+#: track before or after — not a verdict on this one: a comment marks where a track is first
+#: HEARD, which is while the previous one is still being matched.  "Long" is measured in matched
+#: audio, so a short or thinly matched episode keeps the old rule (any answer inside its span).
+#: An explicit CORRECTION is a listener saying "this is not that": it contradicts wherever it sits.
+EDGE_ANSWER_MS = 15_000
+EDGE_ANSWER_MIN_ON_AIR_MS = 60_000
 
 
 def trust_family(provider: str) -> str:
@@ -1036,9 +1059,11 @@ def build_episodes(
     # presentation layer honours EpisodeRecord.suppressed (hidden behind the "hidden matches"
     # toggle — never deleted).  A likely/verified badge, a corroborating hint or two cross-family
     # agreements ``separation_min_ms`` apart make it immune; one agreement alone does not (plan
-    # §2.3.4 step 5).
+    # §2.3.4 step 5) — and neither does a ``likely`` badge counted up from scattered single
+    # windows (``LIKELY_CORE_RUN_MS``): that is how a famous track "heard" in every mix used to be
+    # listed as ``likely`` and bury the real tracks under its minutes-long hull.
     answer_positions = [
-        (hint.position_range_ms, identity.hint_work_ids.get(hint.id))
+        (hint.position_range_ms, identity.hint_work_ids.get(hint.id), hint.kind == "correction")
         for hint in hints
         if hint.kind in {"answer", "correction"}
         and hint.mirror_status == "verified"
@@ -1054,25 +1079,55 @@ def build_episodes(
         )
         return sum(b - a for a, b in clipped) / (hi - lo)
 
+    def _merged_supports(episode: EpisodeRecord) -> list[tuple[int, int]]:
+        return normalise_intervals(
+            [tuple(item) for item in episode.evidence_support_ms], duration_ms
+        )
+
+    def _scattered(episode: EpisodeRecord) -> bool:
+        """A few matches fused across a span far larger than the time actually matched — a real
+        track plays continuously (hull ≈ summed); this is noise smeared over minutes."""
+
+        hull = episode.evidence_support_ms[-1][1] - episode.evidence_support_ms[0][0]
+        summed = sum(b - a for a, b in _merged_supports(episode))
+        return (
+            hull >= SCATTER_MIN_HULL_MS and summed > 0 and hull >= SCATTER_HULL_TO_ON_AIR * summed
+        )
+
+    def _has_core(episode: EpisodeRecord) -> bool:
+        """One unbroken stretch of matched audio at least ``LIKELY_CORE_RUN_MS`` long."""
+
+        return any(b - a >= LIKELY_CORE_RUN_MS for a, b in _merged_supports(episode))
+
+    def _contradicted(episode: EpisodeRecord) -> bool:
+        """A trusted comment answer at this position names a DIFFERENT identity work.
+
+        Anywhere inside the span for an ordinary episode.  For a LONG one (at least
+        ``EDGE_ANSWER_MIN_ON_AIR_MS`` of matched audio) an answer that only touches its first or
+        last ``EDGE_ANSWER_MS`` is about the neighbouring track in the blend and is not counted;
+        one that reaches any further in still is.  An explicit CORRECTION gets no such allowance:
+        it contradicts anywhere in the span, so the wrong episode is hidden and the corrected
+        work is free to be listed from the comment.
+        """
+
+        span = (episode.evidence_support_ms[0][0], episode.evidence_support_ms[-1][1])
+        interior = span
+        if sum(b - a for a, b in _merged_supports(episode)) >= EDGE_ANSWER_MIN_ON_AIR_MS:
+            interior = (span[0] + EDGE_ANSWER_MS, span[1] - EDGE_ANSWER_MS)
+        episode_work = candidate_by_id[episode.candidate_id].work_id
+        return any(
+            work is not None
+            and work != episode_work
+            and _intersects(position, span if correction else interior)
+            for position, work, correction in answer_positions
+        )
+
     def _own_fault(episode: EpisodeRecord) -> str | None:
         """``scatter`` / ``contradicted``: what is wrong with this episode's OWN evidence."""
 
-        span = (episode.evidence_support_ms[0][0], episode.evidence_support_ms[-1][1])
-        hull = span[1] - span[0]
-        merged = normalise_intervals(
-            [tuple(item) for item in episode.evidence_support_ms], duration_ms
-        )
-        summed = sum(b - a for a, b in merged)
-        # scatter: a few matches fused across a span far larger than the time actually matched — a
-        # real track plays continuously (hull ≈ summed); this is noise smeared over minutes.
-        if hull >= 120_000 and summed > 0 and hull >= 3 * summed:
+        if _scattered(episode):
             return "scatter"
-        # contradicted: a trusted comment answer at this position names a DIFFERENT identity work.
-        episode_work = candidate_by_id[episode.candidate_id].work_id
-        for position, work in answer_positions:
-            if work is not None and work != episode_work and _intersects(position, span):
-                return "contradicted"
-        return None
+        return "contradicted" if _contradicted(episode) else None
 
     def _immune(episode: EpisodeRecord) -> bool:
         """A strong badge, separated engine agreement, or a hint ON one of the matched windows.
@@ -1087,6 +1142,10 @@ def build_episodes(
         if (
             episode.badge in {"likely", "verified"}
             and episode.id not in badge_owed_to_indirect_hint
+            # ... nor a badge counted up from single windows smeared over minutes: without a core
+            # the badge is no proof against ``scatter``.  (A hint ON a matched window, or two
+            # separated engine agreements, below, still are.)
+            and (_has_core(episode) or not _scattered(episode))
         ):
             return True
         if "engine_corroborated_separated" in episode.flags:
@@ -1095,8 +1154,21 @@ def build_episodes(
             return False
         return episode.id not in indirectly_backed_episodes or _own_fault(episode) is None
 
-    confident_spans = [
-        (episode.evidence_support_ms[0][0], episode.evidence_support_ms[-1][1])
+    def _runs(episode: EpisodeRecord) -> list[tuple[int, int]]:
+        """The episode's matched windows as runs: windows under ``COVER_RUN_GAP_MS`` apart."""
+
+        runs: list[tuple[int, int]] = []
+        for start, end in _merged_supports(episode):
+            if runs and start - runs[-1][1] < COVER_RUN_GAP_MS:
+                runs[-1] = (runs[-1][0], max(runs[-1][1], end))
+            else:
+                runs.append((start, end))
+        return runs
+
+    #: What each confident episode covers — ``(its hull, the runs it proved)``.  Only the runs
+    #: bury: the unmatched minutes between two runs of a stretched episode cover nothing.
+    confident_cover = [
+        ((episode.evidence_support_ms[0][0], episode.evidence_support_ms[-1][1]), _runs(episode))
         for episode in episode_records
         if _immune(episode)
     ]
@@ -1109,7 +1181,7 @@ def build_episodes(
             return fault
         span = (episode.evidence_support_ms[0][0], episode.evidence_support_ms[-1][1])
         # buried: most of this span already sits under OTHER, more-confident/hint-backed tracks.
-        others = [item for item in confident_spans if item != span]
+        others = [run for hull, runs in confident_cover if hull != span for run in runs]
         if span[1] > span[0] and _covered_fraction(span, others) >= 0.6:
             return "buried"
         return None

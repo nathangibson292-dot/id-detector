@@ -41,6 +41,7 @@ _SHOWN = ("degraded", "partial")
 #: however well its files hash; selecting or pointing at one would crash or mislabel the library.
 _BUNDLE_FIELDS = ("run_id", "presentation_version", "status", "fuse_run")
 _BUNDLE_FILES = ("index.html", "tracklist.json", "source.json")
+LEGACY_METADATA_ERROR = "legacy_metadata_error"
 
 
 def bundle_id(run_id: str, presentation_version: int) -> str:
@@ -215,6 +216,132 @@ def _legacy_metadata(media_dir: Path) -> dict[str, Any]:
     return {"run_id": "legacy-" + media_dir.name, "status": "complete"}
 
 
+def legacy_result_metadata(media_dir: Path) -> dict[str, Any] | None:
+    """Validated invocation metadata for a finished pre-bundle result.
+
+    Compatibility discovery must never turn an absent bundle manifest into an assumed Free run.
+    A legacy result therefore participates only when its own completed invocation validates.
+    Newer legacy rows may carry a compatibility stamp; the oldest still carry the top-level
+    ``achieved`` recipe needed to refuse Deep safely.  The permissive deterministic stand-in used
+    by presentation is intentionally not accepted here.
+    """
+
+    from id_detector.contracts import InvocationJournalEntry
+
+    media_dir = Path(native_path(media_dir))
+    # A flat presentation is durable evidence that a pre-bundle result exists even when its
+    # journal is missing or damaged.  Mutable fusion output alone may belong to an interrupted run
+    # that never produced a result, and therefore cannot create a stale-result guard by itself.
+    flat_files = (media_dir / "present/index.html", media_dir / "present/tracklist.json")
+    has_flat_result = any(path_is_file(path) for path in flat_files)
+    if not has_flat_result:
+        return None
+    try:
+        text = read_text(media_dir / "invocations.jsonl")
+    except OSError:
+        return {LEGACY_METADATA_ERROR: "the legacy invocation journal is missing or unreadable"}
+    if not text.strip():
+        return {LEGACY_METADATA_ERROR: "the legacy invocation journal is empty"}
+
+    old_fields = {
+        "schema_version",
+        "generated_by",
+        "invocation_id",
+        "command",
+        "started_at",
+        "finished_at",
+        "status",
+        "exit_code",
+        "duration_ms",
+        "tool_versions",
+        "timings",
+        "counts",
+        "costs",
+        "source_ids",
+    }
+
+    def old_entry(value: object) -> dict[str, Any] | None:
+        """The complete pre-money-authority journal schema, recognized without defaults."""
+
+        if not isinstance(value, dict) or set(value) != old_fields:
+            return None
+        if not isinstance(value.get("invocation_id"), str) or not re.fullmatch(
+            r"[a-f0-9]{32}", value["invocation_id"]
+        ):
+            return None
+        command = value.get("command")
+        if not isinstance(command, list) or not command or command[0] != "analyse":
+            return None
+        if value.get("status") not in {"succeeded", "failed", "cancelled"}:
+            return None
+        if any(
+            not isinstance(value.get(name), dict)
+            for name in ("tool_versions", "timings", "counts", "costs")
+        ):
+            return None
+        if not isinstance(value.get("source_ids"), list):
+            return None
+        return value
+
+    entries: list[dict[str, Any]] = []
+    for line in text.splitlines():
+        if not line.strip():
+            return {LEGACY_METADATA_ERROR: "the legacy invocation journal contains a blank row"}
+        try:
+            value = json.loads(line)
+        except (TypeError, ValueError):
+            return {
+                LEGACY_METADATA_ERROR: "the legacy invocation journal is malformed or truncated"
+            }
+        try:
+            entry = InvocationJournalEntry.model_validate(value)
+        except ValueError:
+            old = old_entry(value)
+            if old is None:
+                return {LEGACY_METADATA_ERROR: "the legacy invocation journal has an invalid row"}
+            if old["status"] == "succeeded":
+                entries.append({**old, "status": "complete", "run_id": old["invocation_id"]})
+            continue
+        if (
+            entry.status in {"complete", "degraded", "partial"}
+            and entry.bundle_id is None
+            and entry.fuse_run is None
+        ):
+            metadata = entry.model_dump(mode="json")
+            entries.append({**metadata, "run_id": entry.invocation_id})
+    if not entries:
+        return {LEGACY_METADATA_ERROR: "no finished invocation can be associated with the result"}
+    ids = [entry["run_id"] for entry in entries]
+    if len(ids) != len(set(ids)):
+        return {LEGACY_METADATA_ERROR: "the legacy result has ambiguous invocation metadata"}
+    metadata = entries[-1]  # successful legacy runs replaced the same flat files in journal order
+    if metadata.get("achieved") in {"free", "deep"}:
+        return metadata
+
+    # The old schema predates ``achieved``.  Its selected generation sidecar is the durable record
+    # of which providers actually fed the flat result: AudD inputs prove Deep; their absence proves
+    # this was the Free sweep.  Full digest/category verification still happens before re-fusion.
+    try:
+        final = json.loads(read_text(media_dir / "fuse/episodes.done.json"))["upstream"]
+        generation_keys = [
+            key for key in final if re.fullmatch(r"fuse/episodes\.gen\d+\.json", key)
+        ]
+        if len(final) != 1 or len(generation_keys) != 1:
+            raise ValueError
+        done_name = Path(generation_keys[0]).name.replace(".json", ".done.json")
+        upstream = json.loads(read_text(media_dir / "fuse" / done_name))["upstream"]
+        if not isinstance(upstream, dict) or not any(
+            key.startswith("recognise/") for key in upstream
+        ):
+            raise ValueError
+    except (OSError, KeyError, TypeError, ValueError):
+        return {
+            LEGACY_METADATA_ERROR: "the old legacy journal has no trustworthy provider provenance"
+        }
+    achieved = "deep" if any("/live-audd-" in key for key in upstream) else "free"
+    return {**metadata, "achieved": achieved}
+
+
 def publish_result(
     *,
     media_dir: Path,
@@ -362,6 +489,11 @@ def publish_result(
                 "duration_ms": duration_ms,
                 "fuse_run": fuse_run.relative_to(media_dir).as_posix(),
             }
+            if metadata.get("refusion") is not None:
+                # Only on a re-fused result (``id_detector.refusion``): which stored run's evidence
+                # this is, and the fusion version that decided it.  Every other manifest is
+                # byte-for-byte what it always was.
+                manifest["refusion"] = metadata["refusion"]
             _seal(directory, manifest)
         else:
             # Reuse: the pointer is about to name this bundle, so prove its frozen run is intact
@@ -373,6 +505,45 @@ def publish_result(
 
             rebuild_index(media_dir.parents[1])
     return directory
+
+
+def freeze_refused_run(
+    media_dir: Path,
+    run_id: str,
+    *,
+    episodes: EpisodesFile,
+    identities: IdentitiesRecord,
+    provenance: dict[str, Any],
+    carried: dict[str, bytes],
+) -> Path:
+    """Seal the frozen run of a RE-FUSION: its own episodes, never a copy of the mutable tree.
+
+    ``publish_result`` freezes a first-time run by copying ``fuse/`` — which here still holds the
+    OLD fusion's files, and may by now belong to a newer run altogether.  A re-fusion therefore
+    writes its frozen run itself, before publishing; ``publish_result`` then finds it sealed and
+    leaves it alone.  An interrupted, unsealed attempt is finished in place (nothing can reference
+    it); a sealed one is never rewritten.
+    """
+
+    media_dir = Path(native_path(media_dir))
+    if not re.fullmatch(r"[A-Za-z0-9_-]+", run_id):
+        raise ValueError("unsafe run_id")
+    fuse_run = media_dir / "fuse" / "runs" / run_id
+    with _PUBLICATION_LOCK:
+        if read_manifest(fuse_run) is not None:
+            return fuse_run
+        if path_is_file(fuse_run / "manifest.json"):
+            raise ValueError("damaged frozen run; refusing to reseal")
+        fuse_run.mkdir(parents=True, exist_ok=True)
+        atomic_write_json(fuse_run / "episodes.json", episodes)
+        atomic_write_json(fuse_run / "presentation-identities.json", identities)
+        atomic_write_json(fuse_run / "refusion.json", provenance)
+        for name, payload in sorted(carried.items()):
+            if Path(name).name != name:
+                raise ValueError("unsafe carried file name")
+            atomic_write_bytes(fuse_run / name, payload)
+        _seal(fuse_run, {"run_id": run_id})
+    return fuse_run
 
 
 @dataclass(frozen=True)

@@ -45,6 +45,14 @@ class ProcessLock:
     """Non-blocking cross-process lock keyed by a resolved workspace path."""
 
     def __init__(self, path: Path) -> None:
+        # A media's bytes may be filed below several source-key aliases.  All such directories
+        # have the same media-key basename, so give ``.media.lock`` one work-root lock instead of
+        # one lock per alias.  Besides preventing competing publication, this means no caller ever
+        # has to hold two media locks in an order that another process could reverse.
+        path = Path(path)
+        if path.name == ".media.lock" and len(path.parents) >= 3:
+            media_dir = path.parent
+            path = media_dir.parents[1] / ".locks" / f"media-{media_dir.name}.lock"
         resolved = str(path.resolve())
         if sys.platform == "win32" and resolved.startswith("\\\\?\\UNC\\"):
             resolved = "\\\\" + resolved[8:]

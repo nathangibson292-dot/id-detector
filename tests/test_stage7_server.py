@@ -167,9 +167,10 @@ def test_build_rescan_request_hashes_episodes_when_present(tmp_path: Path) -> No
     assert json.loads(request.model_dump_json())["trigger"] == "gap"
 
 
-def test_stale_result_page_is_regenerated_on_open(tmp_path: Path) -> None:
-    """A page written by an older build (no version stamp) is re-rendered from the artefacts the
-    first time the server serves it — no re-analysis, and the artefacts themselves are untouched."""
+def test_stale_result_page_without_invocation_metadata_is_preserved_on_open(
+    tmp_path: Path,
+) -> None:
+    """A legacy page with no invocation provenance is served without being republished."""
 
     from id_detector.present.page import PAGE_VERSION
     from id_detector.present.refresh import ensure_fresh_page, page_version
@@ -186,22 +187,25 @@ def test_stale_result_page_is_regenerated_on_open(tmp_path: Path) -> None:
     assert page_version(index_html) == PAGE_VERSION
     assert ensure_fresh_page(media_dir) is False
 
-    # An old page (pre-stamp) is rewritten when served.
+    # An old page (pre-stamp) with no invocation journal is unsafe to republish.
     index_html.write_bytes(b"<!doctype html><title>old page</title><p>Fixture Live Set</p>")
     assert page_version(index_html) == 0
     running = serve_in_background(tmp_path, port=0)
     try:
+        assert httpx.get(f"{running.base_url}/healthz", timeout=TIMEOUT).status_code == 200
+        assert running.server.upkeep.report.finished.wait(timeout=10.0)
         page_url = f"{running.base_url}/{source.source_key}/{source.media_key}/present/index.html"
         page = httpx.get(page_url, timeout=TIMEOUT)
         assert page.status_code == 200
-        assert f'<meta name="id-detector-page" content="{PAGE_VERSION}">' in page.text
-        assert '<tr class="track"' in page.text
+        assert "<title>old page</title>" in page.text
+        assert f'content="{PAGE_VERSION}"' not in page.text
     finally:
         running.shutdown()
     from id_detector.present.bundles import result_dir
 
-    assert page_version(result_dir(media_dir) / "index.html") == PAGE_VERSION
-    assert page_version(index_html) == 0  # Legacy bytes are never rewritten.
+    assert result_dir(media_dir) == Path(native_path(media_dir / "present"))
+    assert page_version(index_html) == 0
+    assert not (media_dir / "present/bundles").exists()
     assert (media_dir / "fuse" / "episodes.json").read_bytes() == episodes_before
 
     # A page that cannot be regenerated (artefact missing) is served as-is, never an error.  It

@@ -15,6 +15,7 @@ from id_detector.contracts import (
     IdentitiesRecord,
 )
 from id_detector.fuse.episodes import plausible_crowd_label
+from id_detector.fuse.identity import audio_work_key
 from id_detector.io import atomic_write_bytes, atomic_write_json, write_completion_sidecar
 from id_detector.semantics import interval_length, subtract_intervals
 
@@ -52,6 +53,8 @@ class ProjectionEntry(TypedDict):
     gap_id: NotRequired[str]
     artist: NotRequired[str]
     title: NotRequired[str]
+    #: Present (and true) only on a short row kept because its artist is solidly in the mix.
+    same_artist_supported: NotRequired[bool]
 
 
 @dataclass(frozen=True)
@@ -209,7 +212,9 @@ def short_track(entry: dict[str, Any], min_track_ms: int) -> bool:
     ``min_track_ms`` is treated as short — UNLESS its badge is ``likely``/``verified``, a text
     hint supports it, or two trust families agreed on it at two moments far enough apart
     (``engine_corroborated_separated``; one shared window is "confirmed twice" but still short —
-    plan §2.3.4 step 5).  ``0`` disables the rule; ID gaps are never short.
+    plan §2.3.4 step 5), or the projection marked it ``same_artist_supported`` (a two-window row
+    by an artist who is solidly in this mix — :func:`mark_same_artist_rows`, the one exemption
+    that needs the whole tracklist).  ``0`` disables the rule; ID gaps are never short.
     """
 
     if min_track_ms <= 0 or entry.get("kind") != "track":
@@ -217,6 +222,8 @@ def short_track(entry: dict[str, Any], min_track_ms: int) -> bool:
     if entry.get("badge") in _KEEP_SHORT_BADGES or entry.get("hint_supported"):
         return False
     if entry.get("engine_corroborated_separated"):  # two families agree twice, well apart
+        return False
+    if entry.get("same_artist_supported"):  # see :func:`mark_same_artist_rows`
         return False
     return int(entry.get("on_air_ms") or 0) < min_track_ms
 
@@ -237,6 +244,92 @@ def hidden_reason(entry: dict[str, Any], min_track_ms: int) -> str | None:
     if suppressed:
         return str(suppressed)
     return "short" if short_track(entry, min_track_ms) else None
+
+
+#: What makes an artist SOLIDLY in a mix: a listed row of theirs that the audio alone badged
+#: ``likely`` or better (the tier that is right ~98 % of the time) AND that was matched for at
+#: least this long.  A ``possible`` row never vouches, however long — that is the tier the
+#: sample-of-another-track and the phantom rows live in — and neither does a crowd row.
+SOLID_ARTIST_ROW_MS = 45_000
+#: The short row that may be vouched for was matched in at least two windows at different
+#: positions: more on-air time than one 12 s window (or a stack of rescans of it) can prove.
+SAME_ARTIST_MIN_ON_AIR_MS = 20_000
+#: Artist fields that name nobody in particular.
+_NOBODY = frozenset({"unknown", "various", "artist", "artists", "va"})
+
+
+def _artist_and_title(entry: dict[str, Any]) -> tuple[frozenset[frozenset[str]], tuple[str, ...]]:
+    """A row's credited artist names (each a whole name; nobody-names dropped) and its bare title
+    (version brackets and featuring credits set aside), read the way fusion reads a label."""
+
+    names, title = audio_work_key(str(entry.get("artist") or ""), str(entry.get("title") or ""))
+    return frozenset(name for name in names if not name <= _NOBODY), title
+
+
+def _same_track(
+    left: tuple[frozenset[frozenset[str]], tuple[str, ...]],
+    right: tuple[frozenset[frozenset[str]], tuple[str, ...]],
+) -> bool:
+    """Two labels of one track: a shared artist name and one title that starts the other
+    ("Where's The Party" / "Where's The Party At?").  Deliberately wide — it only ever REFUSES
+    a lift."""
+
+    (left_names, left_title), (right_names, right_title) = left, right
+    shorter = min(len(left_title), len(right_title))
+    return bool(left_names & right_names) and left_title[:shorter] == right_title[:shorter]
+
+
+def mark_same_artist_rows(
+    entries: list[dict[str, Any]], work_by_candidate: dict[str, str], min_track_ms: int
+) -> None:
+    """Let a short two-window row through the on-air floor when its artist is solidly in the mix.
+
+    DJs play several tracks by one artist (their own above all), and the recogniser often knows
+    the second one for two windows only; a false positive rarely shares an artist with a track
+    that was confidently played.  So a row hidden ONLY as ``short`` is marked
+    ``same_artist_supported`` — which :func:`short_track` honours — when all of this holds:
+
+    * it has at least ``SAME_ARTIST_MIN_ON_AIR_MS`` on air (one window is never enough);
+    * one whole credited name of its artist field is a whole credited name of the artist field of
+      a SOLID row: listed, audio-backed, ``likely`` or better, ``SOLID_ARTIST_ROW_MS`` on air;
+    * its own track is not already listed under any label — a fragment never vouches for another
+      fragment of the same track, and a second row of a track the tracklist already has adds
+      nothing (and, were that row wrong, would repeat the mistake).
+
+    Fusion's ``suppressed`` verdicts are untouched: a buried, scattered or contradicted row is
+    never lifted.  A lifted row vouches for nobody (it is not ``likely``), so the rule cannot chain.
+    """
+
+    if min_track_ms <= 0:
+        return
+    tracks = [entry for entry in entries if entry.get("kind") == "track"]
+    listed = [entry for entry in tracks if hidden_reason(entry, min_track_ms) is None]
+    listed_labels = [_artist_and_title(entry) for entry in listed]
+    listed_works = {work_by_candidate.get(str(entry.get("candidate_id"))) for entry in listed}
+    solid_names = {
+        name
+        for entry, (names, _) in zip(listed, listed_labels, strict=True)
+        if entry.get("badge") in _KEEP_SHORT_BADGES
+        and not entry.get("hint_only")
+        and int(entry.get("on_air_ms") or 0) >= SOLID_ARTIST_ROW_MS
+        for name in names
+    }
+    if not solid_names:
+        return
+    for entry in tracks:
+        if hidden_reason(entry, min_track_ms) != "short":
+            continue
+        if int(entry.get("on_air_ms") or 0) < SAME_ARTIST_MIN_ON_AIR_MS:
+            continue
+        label = _artist_and_title(entry)
+        if not label[0] & solid_names:
+            continue
+        work = work_by_candidate.get(str(entry.get("candidate_id")))
+        if work is not None and work in listed_works:
+            continue
+        if any(_same_track(label, other) for other in listed_labels):
+            continue
+        entry["same_artist_supported"] = True
 
 
 def _acquire_summary(episode: AcquireEpisode) -> dict[str, Any]:
@@ -493,6 +586,14 @@ def _derive_projection_entries(
                 item.get("episode_id", item.get("gap_id", "")),
             ),
         )
+    )
+    # The one floor exemption that needs the whole tracklist: a short row by an artist who is
+    # solidly in this mix.  Marked ON the row, so every later reader of the row (the page, the
+    # exports, the corpus scorer's own ``hidden_reason`` call) decides the same way.
+    mark_same_artist_rows(
+        list(ordered),
+        {candidate.canonical_id: candidate.work_id for candidate in identities.candidates},
+        min_track_ms,
     )
     judged = [dict(entry, hidden_reason=hidden_reason(entry, min_track_ms)) for entry in ordered]
     # A hidden identity must not survive as a shown row's overlap note either — that note is what

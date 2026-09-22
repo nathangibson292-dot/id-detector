@@ -76,7 +76,9 @@ def priced(unit_usd_e6: int):
     return configure
 
 
-def fake_pipeline_runner(work_root: Path, config: Path, *, audd=None, unit_usd_e6=None):
+def fake_pipeline_runner(
+    work_root: Path, config: Path, *, audd=None, shazam=None, unit_usd_e6=None
+):
     """The production :func:`make_pipeline_runner` with the offline fake providers injected."""
 
     from id_detector.webapp.runner import make_pipeline_runner
@@ -88,7 +90,7 @@ def fake_pipeline_runner(work_root: Path, config: Path, *, audd=None, unit_usd_e
         project_root=ROOT,
         config_path=config,
         paid_scan_adapters={"audd": audd if audd is not None else FakeAudD(script)},
-        shazam_http_client=FakeShazamHTTP(script),
+        shazam_http_client=shazam if shazam is not None else FakeShazamHTTP(script),
         paid_sleep=no_backoff,
         configure=priced(unit_usd_e6) if unit_usd_e6 is not None else None,
     )

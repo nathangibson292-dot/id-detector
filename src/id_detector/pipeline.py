@@ -31,6 +31,7 @@ from id_detector.compat import (
     AnalysisInputs,
     RunRequest,
     find_result,
+    find_stale_result,
     hints_snapshot,
     index_identity,
     load_free_observations,
@@ -50,7 +51,7 @@ from id_detector.io import (
     read_text,
     sha256_file,
 )
-from id_detector.jobs import ProcessLock
+from id_detector.jobs import JobStoreLocked, ProcessLock
 from id_detector.journal import InvocationTimer, append_invocation, has_invocation
 from id_detector.local_index import run_local_index_recognition
 from id_detector.money import (
@@ -179,6 +180,95 @@ def _money_journal_fields(
         "pricing_version": app_config.pricing_version,
         "audd_usd_e6_per_request": app_config.audd_usd_e6_per_request,
     }
+
+
+def _refuse_stored(
+    stale: Path,
+    *,
+    request: RunRequest,
+    analysis_key: str,
+    config: AppConfig,
+    calibrator: object | None,
+    local: bool,
+    own_media_dir: Path,
+) -> Path:
+    """Re-fuse the stored bundle ``stale`` under today's fusion version, stamped as the answer to
+    ``request``.  Offline by construction (:mod:`id_detector.refusion`).  Raises
+    :class:`~id_detector.refusion.NotRebuildable`, with the reason in plain words, when it cannot
+    be done faithfully — the caller then STOPS; it never analyses afresh on its own initiative."""
+
+    from id_detector.present.bundles import (
+        LEGACY_METADATA_ERROR,
+        legacy_result_metadata,
+        load_run_snapshot,
+        read_bundle_manifest,
+    )
+    from id_detector.refusion import NotRebuildable, is_deep, refuse_snapshot
+
+    stale_manifest = read_bundle_manifest(stale)
+    legacy = stale_manifest is None
+    stored_dir = stale.parent if legacy else stale.parents[2]
+    lock: ProcessLock | None = None
+    try:
+        if stored_dir.resolve() != own_media_dir.resolve():
+            # A source alias of the same bytes: its evidence lives in ITS directory.
+            stored_lock = ProcessLock(stored_dir / ".media.lock")
+            held_lock = ProcessLock(own_media_dir / ".media.lock")
+            # Source aliases have different directories but the same media key, so ProcessLock
+            # deliberately maps both paths to one canonical work-root lock.  The pipeline already
+            # owns that lock for ``own_media_dir``; trying to acquire it again would reject this
+            # legitimate in-process re-fusion as busy forever.
+            if stored_lock.path != held_lock.path:
+                lock = stored_lock
+                lock.acquire()
+        stored_metadata = legacy_result_metadata(stored_dir) if legacy else stale_manifest
+        metadata_problem = (stored_metadata or {}).get(LEGACY_METADATA_ERROR)
+        if metadata_problem:
+            raise NotRebuildable(
+                f"{metadata_problem}; without trustworthy legacy metadata it is not safe to "
+                "assume the stored result was Free"
+            )
+        if is_deep(stale_manifest, stored_metadata):
+            # Refuse from the result's own provenance before touching evidence. Retention may
+            # legitimately have removed PCM/windows, but that is never permission for a new paid
+            # sweep.
+            raise NotRebuildable(
+                "it is a paid (Deep) result, and the windows its second opinion checked were "
+                "chosen by the older fusion rules, so it cannot simply be rebuilt"
+            )
+        snapshot = load_run_snapshot(stored_dir, directory=None if legacy else stale)
+        stored = (snapshot.manifest or snapshot.metadata).get("compatibility") or {}
+        achieved = get_recipe(
+            str(
+                (snapshot.manifest or snapshot.metadata).get("achieved")
+                or stored.get("recipe_name")
+            ),
+            primary_density=int(stored.get("primary_density") or 1),
+        )
+        return refuse_snapshot(
+            snapshot,
+            media_dir=stored_dir,
+            config=config,
+            calibrator=calibrator,
+            compatibility={**request.metadata(achieved), "analysis_key": analysis_key},
+            local=local,
+        )
+    except JobStoreLocked as exc:
+        raise NotRebuildable("another analysis of the same audio is running right now") from exc
+    except (OSError, ValueError, KeyError) as exc:
+        raise NotRebuildable(f"the stored result could not be read ({exc})") from exc
+    finally:
+        if lock is not None:
+            lock.release()
+
+
+#: What a run reports when a stored result exists, is only out of date, and could not be rebuilt.
+STALE_RESULT_REASON = (
+    "stale_result: this mix already has a result, made by older track-matching rules, and it "
+    "could not be rebuilt offline because {why}. Nothing was spent and nothing was sent to any "
+    "recognition service; the stored result is still shown as it was. To analyse the mix again "
+    "from scratch - a paid recipe will reserve and spend again - run it again with --refresh."
+)
 
 
 def _achieved(resolved: int, planned: int, fraction: float) -> bool:
@@ -592,27 +682,54 @@ async def run_analysis(
             ingest_artefacts = (*ingest_artefacts, ingested.original_path)
         _checkpoint("ingest", ingest_artefacts)
 
+        kind = source_kind or ("local" if ingested.record.platform == "file" else "platform")
+        manual_hash = sha256_file(tracklist) if tracklist is not None else ""
+        panako_id = index_identity(index_root, local_index_label)
+        scope = tenant_scope or (
+            LOCAL_OWNER_SCOPE if kind == "upload" or manual_hash or panako_id else "public"
+        )
+        # A fusion bump retires every stored result for SERVING, never its recognition.  Asked
+        # BEFORE any hint connector runs (so this path is offline end to end) and before the
+        # breaker check, the reservation and every dispatch: is the newest stored answer to this
+        # request only a fusion version behind?  Then it is re-fused from its own recorded
+        # observations and served like any stored result — or, when that cannot be done
+        # faithfully, the run STOPS with the reason.  It never goes on to a fresh analysis by
+        # itself: for a paid recipe that would silently pay for the same sweep twice.  Only an
+        # explicit ``--refresh`` analyses again.
+        stale_found = (
+            None
+            if refresh
+            else find_stale_result(
+                media_dir,
+                recipe=requested_recipe,
+                source_kind=kind,
+                tenant_scope=scope,
+                manual_tracklist_sha256=manual_hash,
+                panako_index_id=panako_id,
+                with_hints=not no_hints,
+                accept_degraded=accept_degraded,
+            )
+        )
         from id_detector.present.bundles import read_bundle_manifest
 
         retained_manifest = read_bundle_manifest(ingested.source_path.parent) if retained else None
         decoded = None
-        if "decode" in completed_phases:
-            decoded = load_decode(media_dir)
-            ffmpeg_version = decoded.record.decoder.ffmpeg_version
-            duration_ms = decoded.record.pcm.duration_ms
-        elif retained_manifest is not None:
-            duration_ms = retained_manifest["duration_ms"]
-        else:
-            _report(progress, "decode", 0, 1, "decoding audio")
-            timer.start_stage("decode_ms")
-            decoded = await decode(ingested)
-            timer.finish_stage("decode_ms")
-            ffmpeg_version = decoded.record.decoder.ffmpeg_version
-            duration_ms = decoded.record.pcm.duration_ms
-            _report(progress, "decode", 1, 1, "audio decoded")
-
+        duration_ms = int(retained_manifest["duration_ms"]) if retained_manifest is not None else 0
+        if stale_found is None:
+            if "decode" in completed_phases:
+                decoded = load_decode(media_dir)
+                ffmpeg_version = decoded.record.decoder.ffmpeg_version
+                duration_ms = decoded.record.pcm.duration_ms
+            elif retained_manifest is None:
+                _report(progress, "decode", 0, 1, "decoding audio")
+                timer.start_stage("decode_ms")
+                decoded = await decode(ingested)
+                timer.finish_stage("decode_ms")
+                ffmpeg_version = decoded.record.decoder.ffmpeg_version
+                duration_ms = decoded.record.pcm.duration_ms
+                _report(progress, "decode", 1, 1, "audio decoded")
         hint_result = None
-        if not no_hints:
+        if not no_hints and stale_found is None:
             _report(progress, "hints", 0, 1, "reading tracklist hints")
             timer.start_stage("hints_ms")
             hint_result = await run_hints(
@@ -630,37 +747,67 @@ async def run_analysis(
             counts["hints"] = len(hint_result.hints)
             _report(progress, "hints", 1, 1, f"{len(hint_result.hints)} hints")
 
-        kind = source_kind or ("local" if ingested.record.platform == "file" else "platform")
-        manual_hash = sha256_file(tracklist) if tracklist is not None else ""
-        panako_id = index_identity(index_root, local_index_label)
-        scope = tenant_scope or (
-            LOCAL_OWNER_SCOPE if kind == "upload" or manual_hash or panako_id else "public"
-        )
-        request = RunRequest(
-            AnalysisInputs(
-                ingested.record.media_key,
-                requested_recipe.recipe_id,
-                kind,
-                scope,
-                hints_snapshot(hint_result.hints if hint_result else ()),
-                manual_hash,
-                panako_id,
-            ),
-            requested_recipe,
-            accept_degraded=accept_degraded,
+        request = (
+            stale_found[1]
+            if stale_found is not None
+            else RunRequest(
+                AnalysisInputs(
+                    ingested.record.media_key,
+                    requested_recipe.recipe_id,
+                    kind,
+                    scope,
+                    hints_snapshot(hint_result.hints if hint_result else ()),
+                    manual_hash,
+                    panako_id,
+                ),
+                requested_recipe,
+                accept_degraded=accept_degraded,
+            )
         )
         effective_analysis_key = supplied_analysis_key or request.inputs.analysis_key
         compatibility = request.metadata()
         compatibility["analysis_key"] = effective_analysis_key
         timer.analysis_key = effective_analysis_key
         timer.compatibility = compatibility
-        compatible = (
-            None
-            if refresh
-            else find_result(
-                media_dir, request, serve_free_from_deep=app_config.serve_free_from_deep
+        if stale_found is not None:
+            from id_detector.refusion import NotRebuildable
+
+            try:
+                compatible = _refuse_stored(
+                    stale_found[0],
+                    request=request,
+                    analysis_key=effective_analysis_key,
+                    config=app_config,
+                    calibrator=calibrator,
+                    local=presentation_local,
+                    own_media_dir=media_dir,
+                )
+            except NotRebuildable as exc:
+                stale_reason = STALE_RESULT_REASON.format(why=str(exc))
+                stale_settlement = _settle()
+                entry = timer.entry(
+                    status="failed",
+                    reason=stale_reason,
+                    exit_code=1,
+                    counts=counts,
+                    costs={"usd_e2": stale_settlement.usd_e2_spent},
+                    source_ids=source_ids,
+                    ffmpeg_version=ffmpeg_version,
+                    **_money_journal_fields(stale_settlement, requested_recipe, app_config),
+                )
+                _append_settlement(media_dir / "invocations.jsonl", entry)
+                typer.echo(stale_reason, err=True)
+                return _finish(
+                    exit_code=1, status="failed", reason=stale_reason, settlement=stale_settlement
+                )
+        else:
+            compatible = (
+                None
+                if refresh
+                else find_result(
+                    media_dir, request, serve_free_from_deep=app_config.serve_free_from_deep
+                )
             )
-        )
         if compatible is not None:
             # §3.4 compatibility serving: the stored result answers this request without a
             # single provider call, so the served bundle's own status is reported and THIS

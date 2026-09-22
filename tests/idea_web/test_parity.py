@@ -247,7 +247,7 @@ def test_job_titles_are_escaped_on_the_progress_page(tmp_path: Path) -> None:
 
 
 # --------------------------------------------------------------------------------------------------
-# P0-2: GET serves sealed artefacts read-only; stale pages are refreshed at server start
+# P0-2: GET serves sealed artefacts read-only; unsafe legacy pages stay untouched at server start
 # --------------------------------------------------------------------------------------------------
 def _tree(root: Path) -> dict[str, bytes]:
     return {
@@ -257,7 +257,7 @@ def _tree(root: Path) -> dict[str, bytes]:
     }
 
 
-def test_get_never_publishes_and_the_server_start_makes_stale_pages_current(
+def test_get_and_startup_leave_a_legacy_page_without_invocation_metadata_untouched(
     tmp_path: Path,
 ) -> None:
     source = _source("soundcloud")
@@ -271,7 +271,7 @@ def test_get_never_publishes_and_the_server_start_makes_stale_pages_current(
     before = _tree(tmp_path)
 
     for app in (create_app(tmp_path), create_app(tmp_path, jobs=LocalJobs(tmp_path))):
-        # A pre-bundle result has only its page; its exports appear once the page is refreshed.
+        # A pre-bundle result has only its page; reads never try to manufacture provenance.
         for path in ("/", "/index.html", prefix + "/index.html"):
             assert request(app, "GET", path).status_code == 200
             assert request(app, "HEAD", path).status_code == 200
@@ -282,10 +282,14 @@ def test_get_never_publishes_and_the_server_start_makes_stale_pages_current(
 
     running = serve_in_background(tmp_path, port=0)
     try:
+        assert httpx.get(f"{running.base_url}/healthz", timeout=TIMEOUT).status_code == 200
+        assert running.server.upkeep.report.finished.wait(timeout=10.0)
         page = httpx.get(running.base_url + prefix + "/index.html", timeout=TIMEOUT)
     finally:
         running.shutdown()
-    assert page.status_code == 200 and f'content="{PAGE_VERSION}"' in page.text
+    assert page.status_code == 200 and "<title>old</title>" in page.text
+    assert f'content="{PAGE_VERSION}"' not in page.text
+    assert not (media / "present" / "bundles").exists()
     assert page_version(old) == 0  # the legacy bytes themselves are never rewritten
 
 

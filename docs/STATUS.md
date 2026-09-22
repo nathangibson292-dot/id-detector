@@ -101,9 +101,10 @@ Work has moved to the owner's own local tool: a wall-clock progress bar
 ([build notes](reviews/build-local-progress-bar.md)) has landed, and so has hint-corroboration accuracy ([build notes](reviews/build-local-hint-corroboration.md)).
 A measured miss analysis ([report](accuracy/release-1-miss-analysis.md)) then chose three accuracy fixes worth
 143 → 154 of 218 on the owner's seven mixes, with an offline re-fusion step so they reach mixes already scanned.
-**That build is PAUSED, uncommitted and not merged (2026-09-21):** its review found it could block the `idea.cmd`
-launcher at start-up, fall through to a fresh paid scan when a Deep result cannot be rebuilt, and miss the re-fused
-result in backups. Its hand-off note is `HANDOFF-PAUSED.md` in the worktree `.claude/worktrees/agent-abb9ec8cc9ac490fd`.
+**That build LANDED (2026-09-22)** after four fix passes and five read-only reviews, all of which turned on paid
+safety for pre-bundle results — the owner's ordinary case. A stale result whose inputs cannot be proved now stops
+before hints, reservation or dispatch; 11 of his 14 cached mixes rebuild offline in ~24 s with zero provider calls,
+and the three that do not are refused and explained (two proven Deep, one with self-inconsistent stored provenance).
 **When the hosted build resumes, next in plan order:** 4d-i (tenancy schema, lots,
 worker-side reservations), then 4d-ii and 4d-iii + 4d-iv. **Not started:** 6a–6b (ingest policy,
 container, launch checklist), then M2 (billing, Stripe sandbox) — see PLAN-v2 §5.

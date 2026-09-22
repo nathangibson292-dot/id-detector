@@ -20,6 +20,7 @@ from id_detector.attempts import AttemptJournal, DispatchRefused
 from id_detector.compat import (
     LOCAL_OWNER_SCOPE,
     AnalysisInputs,
+    find_stale_result,
     hints_snapshot,
     index_identity,
     serves,
@@ -27,7 +28,7 @@ from id_detector.compat import (
 from id_detector.compat import (
     RunRequest as CompatibilityRequest,
 )
-from id_detector.contracts import ProviderAttemptEvent
+from id_detector.contracts import PcmRecord, ProviderAttemptEvent
 from id_detector.decode import decode
 from id_detector.hints.pipeline import run_hints
 from id_detector.ingest import _load_cached, ingest
@@ -2843,6 +2844,20 @@ class Worker:
             ingested = retained or await ingest(target_value, self.work_root)
             media_lock = ProcessLock(ingested.media_dir / ".media.lock")
             media_lock.acquire()
+            panako_id = index_identity(options.index_root, options.local_index_label)
+            stale_found = (
+                None
+                if options.refresh
+                else find_stale_result(
+                    ingested.media_dir,
+                    recipe=job.recipe,
+                    source_kind=source_kind,
+                    tenant_scope=job.tenant_scope,
+                    manual_tracklist_sha256="",
+                    panako_index_id=panako_id,
+                    with_hints=not options.no_hints,
+                )
+            )
             # A retained result keeps its duration in the bundle manifest after retention has
             # pruned the PCM and the original. Decoding unconditionally here turned a servable
             # stored bundle into three failed attempts and a dead letter.
@@ -2850,13 +2865,25 @@ class Worker:
                 read_bundle_manifest(ingested.source_path.parent) if retained else None
             )
             decoded = None
-            if retained_manifest is not None:
+            stale_manifest = (
+                read_bundle_manifest(stale_found[0]) if stale_found is not None else None
+            )
+            if stale_manifest is not None:
+                duration_ms = int(stale_manifest["duration_ms"])
+            elif stale_found is not None:
+                # Legacy results have no manifest.  Intake needs a duration row but must not run
+                # connectors first; the validated PCM record is the same local source the later
+                # provenance check will prove before any re-fusion is published.
+                duration_ms = PcmRecord.model_validate_json(
+                    read_text(ingested.media_dir / "decode/pcm.json")
+                ).pcm.duration_ms
+            elif retained_manifest is not None:
                 duration_ms = int(retained_manifest["duration_ms"])
             else:
                 decoded = await decode(ingested)
                 duration_ms = decoded.record.pcm.duration_ms
             hint_result = None
-            if not options.no_hints:
+            if not options.no_hints and stale_found is None:
                 config = options.app_config or AppConfig()
                 hint_result = await run_hints(
                     source=ingested.record,
@@ -2869,15 +2896,18 @@ class Worker:
                     refresh=options.refresh,
                     disabled_connectors=config.disabled_hint_connectors,
                 )
-            panako_id = index_identity(options.index_root, options.local_index_label)
-            inputs = AnalysisInputs(
-                media_key=ingested.record.media_key,
-                recipe_id=job.recipe.recipe_id,
-                source_kind=source_kind,  # type: ignore[arg-type]
-                tenant_scope=job.tenant_scope,
-                hints_snapshot_id=hints_snapshot(hint_result.hints if hint_result else ()),
-                manual_tracklist_sha256="",
-                panako_index_id=panako_id,
+            inputs = (
+                stale_found[1].inputs
+                if stale_found is not None
+                else AnalysisInputs(
+                    media_key=ingested.record.media_key,
+                    recipe_id=job.recipe.recipe_id,
+                    source_kind=source_kind,  # type: ignore[arg-type]
+                    tenant_scope=job.tenant_scope,
+                    hints_snapshot_id=hints_snapshot(hint_result.hints if hint_result else ()),
+                    manual_tracklist_sha256="",
+                    panako_index_id=panako_id,
+                )
             )
             ingest_artefacts = [str(ingested.source_path.resolve())]
             if path_is_file(ingested.original_path):

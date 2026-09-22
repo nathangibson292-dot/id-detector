@@ -110,6 +110,7 @@ RESTORE_IN_PROGRESS = "a restore is in progress; wait for it to finish"
 #: whose bytes live in the project's hint cache at ``<connector>/<source_key>/<job>/result.json``.
 #: A snapshot seals those bytes into the medium at exactly that media-relative key.
 EVIDENCE_DIR = "local-cache"
+_POINTER_KEY = re.compile(r"[a-f0-9]{64}")
 _EVIDENCE_KEY = re.compile(r"local-cache/([A-Za-z0-9._-]+)/([A-Za-z0-9._-]+)/result\.json")
 #: The ONLY upstreams a snapshot may lack: decoded audio, analysis windows, and the original
 #: media. None of them is ever snapshotted. Matched exactly, against the pipeline's own spellings.
@@ -376,7 +377,13 @@ class _Plan:
 def _referenced(
     connection: sqlite3.Connection, work_root: Path
 ) -> tuple[dict[Path, _Plan], list[Skipped]]:
-    """What the database names, grouped by medium, plus what is skipped before any lock is taken."""
+    """What the database or a current-result pointer names, grouped by medium.
+
+    Startup upkeep can publish a re-fused result without creating an ``analysis_runs`` or
+    ``result_bundles`` row.  Its plain ``present/current`` pointer is therefore an independent
+    root of the backup graph, not merely an extra file of a database-discovered medium.  The
+    pointer is followed and verified later while that medium's lock is held.
+    """
 
     plans: dict[Path, _Plan] = {}
     skipped: list[Skipped] = []
@@ -423,6 +430,20 @@ def _referenced(
             relative = _relative(work_root, media_dir / "fuse" / "runs" / run_id)
             if relative is not None:
                 plan.wanted.append(("fuse_run", relative))
+    for current in sorted(Path(native_path(work_root)).glob("*/*/present/current")):
+        media_dir = current.parents[1]
+        if (
+            path_is_file(current)
+            and not is_link(current)
+            and _is_dir(media_dir)
+            and not is_link(media_dir)
+        ):
+            try:
+                key = read_text(current).strip()
+            except OSError:
+                continue
+            if _POINTER_KEY.fullmatch(key):
+                plan_for(_plain(media_dir))
     return plans, skipped
 
 
@@ -520,6 +541,45 @@ def _media_extras(
                     extras.append(("present", relative, None))
     extras.extend(_evidence(work_root, media_dir, hint_cache))
     return extras
+
+
+def _pointed_at(work_root: Path, media_dir: Path) -> list[tuple[str, str]]:
+    """What ``present/current`` names: the sealed bundle and the frozen run that bundle references.
+
+    The database is not the only author of a current result: an offline RE-FUSION
+    (:mod:`id_detector.refusion`) and a stale-page refresh publish a bundle, and move the pointer,
+    without an ``analysis_runs`` or ``result_bundles`` row.  A snapshot that carried the pointer
+    but not what it points at would restore to the OLDER result; so the pointer is followed.
+    Only a bundle and run that verify are added — a dangling or damaged pointer adds nothing, and
+    the medium is captured exactly as it was before this rule.
+    """
+
+    try:
+        key = read_text(media_dir / "present" / "current").strip()
+    except OSError:
+        return []
+    if not _POINTER_KEY.fullmatch(key):
+        return []
+    bundle = media_dir / "present" / "bundles" / key
+    manifest = read_bundle_manifest(bundle) if _is_dir(bundle) and not is_link(bundle) else None
+    if manifest is None:
+        return []
+    wanted: list[tuple[str, str]] = []
+    relative = _relative(work_root, bundle)
+    if relative is not None:
+        wanted.append(("bundle", relative))
+    fuse_run = (media_dir / str(manifest["fuse_run"])).resolve()
+    runs = (media_dir / "fuse" / "runs").resolve()
+    if (
+        fuse_run.is_relative_to(runs)
+        and fuse_run.parent == runs
+        and not is_link(fuse_run)
+        and read_manifest(fuse_run) is not None
+    ):
+        run_relative = _relative(work_root, media_dir / "fuse" / "runs" / fuse_run.name)
+        if run_relative is not None:
+            wanted.append(("fuse_run", run_relative))
+    return wanted
 
 
 def _verified_manifest(directory: Path, kind: str) -> dict[str, Any] | None:
@@ -737,6 +797,10 @@ def backup(
                     )
                     break
                 try:
+                    # Under the lock, so the pointer and what it names are read as one state.
+                    for item in _pointed_at(work_root, media_dir):
+                        if item not in plan.wanted:
+                            plan.wanted.append(item)
                     required: list[_Wanted] = [
                         (kind, relative, None) for kind, relative in sorted(set(plan.wanted))
                     ]

@@ -82,6 +82,28 @@ def activity_list_html(jobs: list[Any], csrf_token: str) -> str:
     )
 
 
+def upkeep_status_html(report: Any) -> str:
+    """Live local-startup status; completed skips use the report's CLI wording verbatim."""
+
+    finished = report.finished.is_set()
+    lines = report.owner_status_lines()
+    if not finished:
+        body = "<p>Checking saved results in the background.</p>"
+    elif not lines:
+        body = ""
+    else:
+        details = "".join(f"<li>{html.escape(line)}</li>" for line in lines[1:-1])
+        body = (
+            f'<h2 class="sec">{html.escape(lines[0])}</h2>'
+            f'<ul class="acts">{details}</ul>'
+            f'<p class="lede reassurance">{html.escape(lines[-1])}</p>'
+        )
+    return (
+        '<section id="upkeep-status" aria-live="polite" '
+        f'data-finished="{1 if finished else 0}">{body}</section>'
+    )
+
+
 #: The library card's Remove button asks first.  The legacy card asks from an inline handler,
 #: which a hashed policy refuses, so the served card carries the question as data and
 #: :data:`CONFIRM_JS` asks it.
@@ -169,6 +191,28 @@ HOME_JS = """
   arm();
 })();
 """.replace("__QUEUED__", json.dumps(QUEUED_LABEL))
+
+#: Startup upkeep is deliberately off the readiness path.  The browser may therefore open before
+#: its report is complete; replace this calm live region once the background pass has an answer.
+UPKEEP_JS = """
+(function(){
+  var status = document.getElementById('upkeep-status');
+  if(!status || status.getAttribute('data-finished') === '1') return;
+  function poll(){
+    fetch('/upkeep/status').then(function(r){
+      if(!r.ok) throw new Error('upkeep ' + r.status);
+      return r.text();
+    }).then(function(markup){
+      var holder = document.createElement('div'); holder.innerHTML = markup.trim();
+      var fresh = holder.firstElementChild;
+      if(!fresh || fresh.id !== 'upkeep-status') throw new Error('upkeep malformed');
+      status.replaceWith(fresh); status = fresh;
+      if(status.getAttribute('data-finished') !== '1') setTimeout(poll, 1000);
+    }).catch(function(){ setTimeout(poll, 2500); });
+  }
+  setTimeout(poll, 1000);
+})();
+"""
 
 #: A form that asks before it acts says so in data-confirm (on the form or its button); no
 #: handler lives in the markup, so the policy can refuse every inline handler outright.
@@ -260,6 +304,7 @@ STATIC_JS = (
     + NEW_MIX_JS
     + CONFIRM_JS
     + HOME_JS
+    + UPKEEP_JS
     + legacy._PLAYER_JS
     + "(function(){\nif(typeof JOB_ID === 'undefined') return;\n"
     + JOB_JS

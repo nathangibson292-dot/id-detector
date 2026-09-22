@@ -11,6 +11,32 @@ from typing import Any, Literal
 
 RecipeName = Literal["free", "deep"]
 
+#: The fusion rules a result was decided by.  Bump it whenever fusion (``fuse/``) or the
+#: presentation floor lists different rows from the same evidence: every stored result then stops
+#: being SERVED as it is, and is re-fused offline from its own recorded observations instead
+#: (:mod:`id_detector.refusion`) — recognition is never repeated and nothing is re-spent.
+#: 3 = hint corroboration by reach and field-level labels; smeared ``likely`` rows are scatter and
+#: bury only under proved audio; edge answers; short rows by an artist solidly in the mix.
+FUSION_VERSION = 3
+_FUSION = f"fusion:{FUSION_VERSION}"
+
+
+def fusion_component(algorithm_version: str | None) -> int | None:
+    """The ``N`` of the ``fusion:N`` component of an ``algorithm_version``, if it has one."""
+
+    for part in (algorithm_version or "").split(","):
+        name, _, number = part.strip().partition(":")
+        if name == "fusion" and number.isdigit():
+            return int(number)
+    return None
+
+
+def without_fusion(algorithm_version: str | None) -> tuple[str, ...]:
+    """Every other component ("targeting:1"): what must still match for a re-fusion to do."""
+
+    parts = [part.strip() for part in (algorithm_version or "").split(",") if part.strip()]
+    return tuple(part for part in parts if part.partition(":")[0] != "fusion")
+
 
 @dataclass(frozen=True)
 class RetryPolicy:
@@ -92,7 +118,7 @@ FREE_RECIPE = Recipe(
     retry_policy=MappingProxyType({"shazam": RetryPolicy(mode="existing_limiter")}),
     max_usd_e2=0,
     adapter_versions=MappingProxyType({"shazam": 1}),
-    algorithm_version="fusion:2",
+    algorithm_version=_FUSION,
     requires=("shazam_sweep",),
 )
 
@@ -137,7 +163,7 @@ DEEP_RECIPE = Recipe(
     ),
     max_usd_e2=900,
     adapter_versions=MappingProxyType({"audd_clip": 2, "shazam": 1}),
-    algorithm_version="targeting:1,fusion:2",
+    algorithm_version=f"targeting:1,{_FUSION}",
     requires=("audd_sweep", "shazam_secondary"),
 )
 

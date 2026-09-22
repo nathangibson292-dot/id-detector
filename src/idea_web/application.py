@@ -17,6 +17,8 @@ from __future__ import annotations
 import json
 import re
 import secrets
+import sys
+import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from http import HTTPStatus
@@ -173,6 +175,7 @@ class _State:
     csrf_token: str
     templates: Environment
     hosted: HostedAuth | None = None
+    upkeep_report: Any = None
     #: Resolved fetched-audio paths per job.  Resolution verifies the download, so it is done once
     #: per job rather than on every 2.5-second status poll.
     audio_paths: dict[str, str] = field(default_factory=dict)
@@ -218,6 +221,10 @@ def _activity_html(state: _State, viewer: _Viewer) -> str:
     return pages.activity_list_html(active, viewer.csrf) if active else ""
 
 
+def _upkeep_html(state: _State) -> str:
+    return pages.upkeep_status_html(state.upkeep_report) if state.upkeep_report is not None else ""
+
+
 def _home_document(state: _State, form_state: legacy._FormState, viewer: _Viewer) -> bytes:
     assert state.jobs is not None
     work_root = state.settings.work_root
@@ -229,6 +236,7 @@ def _home_document(state: _State, form_state: legacy._FormState, viewer: _Viewer
         head=pages.head_html("ID'er — your mixes", hosted=state.hosted is not None),
         topbar=_topbar(viewer, back=False, new=True),
         form=legacy._form_html(csrf_token=csrf, state=form_state),
+        upkeep=_upkeep_html(state),
         activity=_activity_html(state, viewer),
         stats=legacy._library_stats_html(sets),
         mixes=pages.mixes_block(
@@ -246,9 +254,11 @@ def _index_document(state: _State, viewer: _Viewer) -> bytes:
         "index.html",
         head=pages.head_html("ID'er — analysed sets", hosted=state.hosted is not None),
         topbar=_topbar(viewer, back=False, new=False),
+        upkeep=_upkeep_html(state),
         stats=legacy._library_stats_html(sets),
         mixes=pages.mixes_block(sets, allow_new=False),
         footer=legacy._footer_html(),
+        script_src=pages.SCRIPT_SRC,
     )
 
 
@@ -396,6 +406,8 @@ def _get(state: _State, request: Request, viewer: _Viewer) -> Response:
     if route == "/csrf":
         # Readable only by this origin's own scripts (no CORS header is ever sent).
         return json_response(HTTPStatus.OK, {"token": viewer.csrf})
+    if route == "/upkeep/status" and state.upkeep_report is not None:
+        return html_response(HTTPStatus.OK, _upkeep_html(state).encode("utf-8"))
     if route.startswith("/static/"):
         asset = _STATIC.get(route)
         if asset is None and state.hosted is not None and route == pages.HOSTED_STYLESHEET_HREF:
@@ -655,7 +667,18 @@ def _library_remove(
         return bad
     trash = work_root / ".trash" / "library" / f"{source_key}-{media_key}-{secrets.token_hex(4)}"
     trash.parent.mkdir(parents=True, exist_ok=True)
-    target.replace(trash)
+    # Production starts serving before background upkeep finishes.  On Windows an open
+    # ``.media.lock`` handle prevents renaming its parent directory even though the requested
+    # removal is otherwise independent.  Give that short upkeep pass a bounded chance to release
+    # the handle; a genuinely active analysis stays busy and receives a conflict, never a 500.
+    for attempt in range(101):
+        try:
+            target.replace(trash)
+            break
+        except PermissionError:
+            if sys.platform != "win32" or attempt == 100:
+                return bytes_response(HTTPStatus.CONFLICT, b"mix is busy", TEXT)
+            time.sleep(0.01)
     return redirect("/")
 
 
@@ -782,6 +805,7 @@ def create_app(
     jobs: JobQueueAdapter | None = None,
     job_manager: JobQueueAdapter | None = None,
     hosted: HostedSettings | None = None,
+    upkeep_report: Any = None,
 ) -> FastAPI:
     """Create the one IDea application; local mode changes policy, not routing.
 
@@ -830,6 +854,7 @@ def create_app(
         csrf_token=secrets.token_urlsafe(32),
         templates=templates,
         hosted=hosted_auth,
+        upkeep_report=upkeep_report,
     )
     app.state.web = state
     app.state.settings = settings

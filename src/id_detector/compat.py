@@ -10,7 +10,7 @@ from typing import Any, Literal
 
 from id_detector.io import native_path, read_text, sha256_file
 from id_detector.pricing import load_pricing
-from id_detector.recipes import RECIPES, Recipe
+from id_detector.recipes import RECIPES, Recipe, fusion_component, without_fusion
 
 #: Launch-controlled, so it comes from the single pricing authority (plan §3.3) and never from the
 #: owner's config: bumping it in ``pricing.toml`` retires every stored result at once.
@@ -100,6 +100,46 @@ def versions_current(stored: dict[str, Any]) -> bool:
     )
 
 
+def fusion_stale_only(stored: dict[str, Any]) -> bool:
+    """Whether the ONE thing out of date about a stored result is its fusion version.
+
+    Same recipe, same adapters, the same non-fusion algorithm components (``targeting:1``) and an
+    OLDER ``fusion:N``: the recognition evidence is exactly what this build would gather, only the
+    rules that read it have moved.  Such a result is stale for serving — :func:`versions_current`
+    still says no — but fully reusable: :mod:`id_detector.refusion` re-fuses it offline.
+    """
+
+    recipe = RECIPES.get(stored.get("recipe_name"))  # type: ignore[arg-type]
+    if recipe is None or stored.get("adapter_versions") != dict(recipe.adapter_versions):
+        return False
+    version = stored.get("algorithm_version")
+    if not isinstance(version, str) or without_fusion(version) != without_fusion(
+        recipe.algorithm_version
+    ):
+        return False
+    had, has = fusion_component(version), fusion_component(recipe.algorithm_version)
+    return had is not None and has is not None and had < has
+
+
+def serves_once_refused(
+    stored: dict[str, Any], request: RunRequest, *, serve_free_from_deep: bool = False
+) -> bool:
+    """:func:`serves`, read as if the stored result had already been re-fused.
+
+    The recipe id inside ``analysis_key`` hashes the algorithm version, so a Free result's stored
+    key can never equal today's; everything else in that key is ``non_recipe_key``, which
+    :func:`same_inputs` still compares, and the recipe is compared by name.
+    """
+
+    if not fusion_stale_only(stored):
+        return False
+    recipe = RECIPES[stored["recipe_name"]]
+    lifted = {**stored, "algorithm_version": recipe.algorithm_version}
+    if (stored.get("achieved") or stored.get("recipe_name")) == "free":
+        lifted["analysis_key"] = request.inputs.analysis_key
+    return serves(lifted, request, serve_free_from_deep=serve_free_from_deep)
+
+
 def same_inputs(stored: dict[str, Any], request: RunRequest) -> bool:
     return (
         stored.get("compat_version") == COMPAT_VERSION
@@ -107,6 +147,17 @@ def same_inputs(stored: dict[str, Any], request: RunRequest) -> bool:
         and stored.get("tenant_scope") == request.inputs.tenant_scope
         and versions_current(stored)
     )
+
+
+def same_evidence(stored: dict[str, Any], request: RunRequest) -> bool:
+    """:func:`same_inputs` for RECOGNITION reuse: a result whose only staleness is its fusion
+    version recorded exactly the observations this build would gather, so a Deep request may
+    still reuse a ``fusion:2`` Free sweep rather than re-running it."""
+
+    if fusion_stale_only(stored):
+        recipe = RECIPES[stored["recipe_name"]]
+        stored = {**stored, "algorithm_version": recipe.algorithm_version}
+    return same_inputs(stored, request)
 
 
 def serves(
@@ -179,7 +230,7 @@ def find_result(
                     request.recipe.name == "deep"
                     and stored["status"] == "complete"
                     and stored["achieved"] == "free"
-                    and same_inputs(stored, request)
+                    and same_evidence(stored, request)
                     and frozen.is_relative_to((root / "fuse/runs").resolve())
                     and read_manifest(frozen) is not None
                     and (frozen / "shazam-observations.json").is_file()
@@ -189,6 +240,152 @@ def find_result(
                     (manifest.get("started_at", ""), manifest["presentation_version"], directory)
                 )
     return max(candidates)[2] if candidates else None
+
+
+def find_stale_result(
+    media_dir: Path,
+    *,
+    recipe: Recipe,
+    source_kind: str,
+    tenant_scope: str,
+    manual_tracklist_sha256: str,
+    panako_index_id: str,
+    with_hints: bool,
+    accept_degraded: bool = False,
+) -> tuple[Path, RunRequest] | None:
+    """The stored bundle that is only a FUSION version behind this request — found OFFLINE.
+
+    The ordinary lookup needs the request's hints snapshot, and producing one runs the hint
+    connectors.  This one is asked BEFORE any connector runs: the request is read with each
+    stored result's OWN hints snapshot (a request for no hints only matches a result made with
+    none), so the question is "was this mix already analysed this way?", answered from disk.
+
+    Only the NEWEST matching result counts, stale or current.  When that is a current one the
+    answer is ``None`` and the caller carries on exactly as before (hints, then the ordinary
+    lookup) — so a mix that has been re-fused, or analysed again since the bump, is never
+    dragged back to the stale bundle still lying beside it.
+    """
+
+    from id_detector.present.bundles import (
+        LEGACY_METADATA_ERROR,
+        legacy_result_metadata,
+        read_bundle_manifest,
+    )
+
+    media_dir = Path(native_path(media_dir))
+    no_hints_id = hints_snapshot(())
+    found: list[tuple[tuple[str, str, int], bool, Path, RunRequest]] = []
+
+    def consider(
+        *,
+        root: Path,
+        directory: Path,
+        compatibility: dict[str, Any],
+        status: object,
+        achieved: object,
+        started_at: object,
+        run_id: object,
+        presentation_version: object,
+    ) -> None:
+        inputs = compatibility.get("analysis_inputs")
+        if not isinstance(inputs, dict) or not isinstance(inputs.get("hints_snapshot_id"), str):
+            return
+        if not with_hints and inputs["hints_snapshot_id"] != no_hints_id:
+            return
+        try:
+            request = RunRequest(
+                AnalysisInputs(
+                    media_dir.name,
+                    recipe.recipe_id,
+                    source_kind,  # type: ignore[arg-type]
+                    tenant_scope,
+                    inputs["hints_snapshot_id"],
+                    manual_tracklist_sha256,
+                    panako_index_id,
+                ),
+                recipe,
+                accept_degraded=accept_degraded,
+            )
+        except (KeyError, TypeError, ValueError):
+            return
+        stored = {**compatibility, "status": status, "achieved": achieved}
+        stale = serves_once_refused(stored, request)
+        if stale or serves(stored, request):
+            order = (
+                str(started_at or ""),
+                str(run_id or ""),
+                int(presentation_version or 0),
+            )
+            found.append((order, stale, directory, request))
+
+    for root in _alias_dirs(media_dir):
+        for directory in Path(native_path(root / "present/bundles")).glob("*"):
+            manifest = read_bundle_manifest(directory)
+            if not manifest or manifest.get("media_key") != media_dir.name:
+                continue
+            compatibility = manifest.get("compatibility") or {}
+            if not isinstance(compatibility, dict):
+                continue
+            consider(
+                root=root,
+                directory=directory,
+                compatibility=compatibility,
+                status=manifest["status"],
+                achieved=manifest.get("achieved"),
+                started_at=manifest.get("started_at"),
+                run_id=manifest["run_id"],
+                presentation_version=manifest["presentation_version"],
+            )
+        # A page-only refresh or an unrelated bundle does not erase the flat result's provenance.
+        # Legacy discovery is based on the flat presentation itself, not on bundle absence.
+        metadata = legacy_result_metadata(root)
+        if metadata is not None:
+            # A pre-bundle result lives directly in ``present/``.  Its manifest is absent by
+            # definition, so its own validated invocation is the sole authority for recipe and
+            # inputs; missing metadata is not interpreted as Free.
+            compatibility = metadata.get("compatibility")
+            blocks_deep = metadata.get("achieved") == "deep" or LEGACY_METADATA_ERROR in metadata
+            if recipe.name == "deep" and blocks_deep:
+                # A legacy Deep result always requires explicit refresh before another Deep run.
+                # Even a newer pre-bundle journal may carry compatibility inputs that differ from
+                # today's optional inputs; that difference is not permission to spend again.
+                try:
+                    request = RunRequest(
+                        AnalysisInputs(
+                            media_dir.name,
+                            recipe.recipe_id,
+                            source_kind,  # type: ignore[arg-type]
+                            tenant_scope,
+                            no_hints_id,
+                            manual_tracklist_sha256,
+                            panako_index_id,
+                        ),
+                        recipe,
+                        accept_degraded=accept_degraded,
+                    )
+                except ValueError:
+                    continue
+                order = (
+                    str(metadata.get("started_at") or ""),
+                    str(metadata.get("run_id") or ""),
+                    0,
+                )
+                found.append((order, True, root / "present", request))
+            elif isinstance(compatibility, dict):
+                consider(
+                    root=root,
+                    directory=root / "present",
+                    compatibility=compatibility,
+                    status=metadata.get("status"),
+                    achieved=metadata.get("achieved"),
+                    started_at=metadata.get("started_at"),
+                    run_id=metadata.get("run_id"),
+                    presentation_version=0,
+                )
+    if not found:
+        return None
+    _, stale, directory, request = max(found, key=lambda item: item[0])
+    return (directory, request) if stale else None
 
 
 def hints_snapshot(hints: object) -> str:

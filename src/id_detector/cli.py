@@ -917,7 +917,18 @@ def serve(
             typer.echo(str(exc), err=True)
             raise typer.Exit(2) from None
         supervisor = LocalWorkerSupervisor(work_root, config_path=config, jobs=jobs)
-    server = make_server(work_root, host=host, port=port, jobs=jobs)
+
+    def _show_upkeep(report: object) -> None:
+        for line in report.owner_status_lines():  # type: ignore[attr-defined]
+            typer.echo(line, err=True)
+
+    server = make_server(
+        work_root,
+        host=host,
+        port=port,
+        jobs=jobs,
+        on_upkeep_finished=_show_upkeep,
+    )
     bound_host, bound_port = server.server_address[0], server.server_address[1]
     url = f"http://{bound_host}:{bound_port}"
     mode = "analyse + read-only" if analyse else "read-only"

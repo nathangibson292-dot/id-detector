@@ -1,0 +1,48 @@
+{
+  "note": "Authored names on REAL evidence shapes. Every list of window starts (seconds, 12 s windows, 9 s hop) is copied from a cached release-1 mix, as classified in docs/accuracy/release-1-miss-analysis.md; artists and titles are invented so no rule can lean on a name. The anchored_s key lists the windows whose Shazam offset anchor was reliable in the cached run (a phantom's windows mostly return several conflicting offsets and carry no anchor); an empty list is a row that fused as possible in the cached run (no usable alignment); without the key every window is anchored.",
+  "duration_ms": 7200000,
+  "window_ms": 12000,
+  "smeared_phantom": {
+    "note": "Section 4, the live YouTube set: a famous track 'heard' in five windows smeared over ten minutes earned a likely badge, was immune to scatter, and its hull buried two real tracks of 66 s and 72 s.",
+    "phantom": {"artist": "Famous Act", "title": "Stadium Anthem", "starts_s": [3717, 3726, 3753, 3789, 4347], "anchored_s": [3789]},
+    "buried": [
+      {"artist": "Headliner", "title": "Overdue", "starts_s": [4212, 4221, 4230, 4239, 4248, 4257, 4266], "anchored_s": []},
+      {"artist": "Guest Producer & Headliner", "title": "Keep Hold", "starts_s": [4293, 4302, 4311, 4320, 4329, 4356, 4383], "anchored_s": []}
+    ]
+  },
+  "gapped_phantom": {
+    "note": "Section 4, the owner's 81-minute mix: the phantom is NOT scattered (132 s on air in a 282 s hull) and stays listed, but two real tracks sit in the 132 s hole between its two runs.",
+    "phantom": {"artist": "Famous Act", "title": "Stadium Anthem", "starts_s": [918, 927, 936, 945, 954, 972, 990, 999, 1008, 1017, 1161, 1179, 1188], "anchored_s": [1179]},
+    "in_the_gap": [
+      {"artist": "First Local", "title": "Pitch Shift", "starts_s": [1035, 1044, 1053, 1062, 1071, 1080], "anchored_s": []},
+      {"artist": "Second Local", "title": "Sound Clash", "starts_s": [1089, 1098, 1107, 1116, 1125], "anchored_s": []}
+    ],
+    "under_a_run": {"artist": "Stray Label", "title": "Passing Fragment", "starts_s": [963, 981]}
+  },
+  "core_guard": {
+    "note": "Section 8, change 2's side effect: a CORRECT likely row whose hull (318 s) is over three times its on-air time (99 s) but which has an unbroken 57 s core. The near-miss is the same shape with two windows of the core taken out (39 s).",
+    "with_core": {"artist": "Real Artist", "title": "Bridges (Extended Mix)", "starts_s": [2601, 2781, 2790, 2799, 2808, 2817, 2826, 2889, 2898, 2907]},
+    "without_core": {"artist": "Real Artist", "title": "Bridges (Extended Mix)", "starts_s": [2601, 2781, 2790, 2799, 2808, 2889, 2898, 2907]}
+  },
+  "edge_comment": {
+    "note": "Section 4, contradicted: a 123 s episode, and a listener naming the NEXT track two seconds before the episode's last window ends. The next track is recognised from the following window on.",
+    "long_track": {"artist": "Bush Pilot", "title": "Pumping Station", "starts_s": [522, 531, 540, 549, 558, 567, 576, 585, 594, 603, 621, 630, 639], "anchored_s": []},
+    "next_track": {"artist": "Soundboy Teller", "title": "Reckoning", "starts_s": [648, 657, 666, 720]},
+    "comment_text": "reckoning - soundboy teller",
+    "comment_at_ms": 654221,
+    "inside_at_ms": [585000, 626000],
+    "short_track_starts_s": [612, 621, 630, 639]
+  },
+  "same_artist": {
+    "note": "Section 4, short floor: two-window rows (24 s and 21 s) by an artist with a long likely row elsewhere in the same mix; and the near-misses measured while choosing the rule.",
+    "solid": {"artist": "Chasing Status", "title": "Where Is The Spot At?", "starts_s": [3276, 3285, 3294, 3303, 3312, 3321, 3330, 3339, 3348, 3357, 3366]},
+    "two_windows": {"artist": "Chasing Status", "title": "Five In The Morning", "starts_s": [4428, 4446]},
+    "two_windows_collab": {"artist": "Guest Producer & Chasing Status", "title": "Raw Cut", "starts_s": [1359, 1368]},
+    "one_window": {"artist": "Chasing Status", "title": "Brainwave", "starts_s": [1935]},
+    "other_artist": {"artist": "Famous Act", "title": "Stadium Anthem", "starts_s": [2988, 2997]},
+    "same_track_version_label": {"artist": "Chasing Status", "title": "Where Is The Spot At? (Radio Edit)", "starts_s": [3420, 3438]},
+    "same_track_shorter_label": {"artist": "Chasing Status/Second Name", "title": "Where Is The Spot", "starts_s": [3240, 3258]},
+    "possible_backer": {"artist": "Sampled Act", "title": "Touch Me (Clubmix)", "starts_s": [1884, 1893, 1902, 1911, 1920]},
+    "possible_backed": {"artist": "Sampled Act", "title": "Miracle (Radio Edit)", "starts_s": [1950, 1968]}
+  }
+}
