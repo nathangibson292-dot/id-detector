@@ -235,6 +235,7 @@ class PipelineOptions:
     #: dispatch-admission check and the claim fence for terminal settlement (plan §4.6).
     dispatch_admission: object | None = None
     settlement_writer: object | None = None
+    cli_paid_confirm: Callable[[int, int], bool] | None = None
 
 
 def durable_artefact_records(
@@ -790,6 +791,8 @@ def run(request: RunRequest) -> RunResult:
             analysis_kwargs["cli_confirmation"] = options.cli_confirmation
         if options.primary_engine is not None:
             analysis_kwargs["primary_engine"] = options.primary_engine
+        if options.cli_paid_confirm is not None and store.mode == "local":
+            analysis_kwargs["cli_paid_confirm"] = options.cli_paid_confirm
         try:
             returned = asyncio.run(pipeline.run_analysis(target, **analysis_kwargs))
         except Exception as exc:

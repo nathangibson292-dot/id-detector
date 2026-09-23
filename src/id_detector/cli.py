@@ -539,9 +539,66 @@ def gc(
 
 
 @app.command()
+def cost(
+    target: str = typer.Argument(..., help="Cached source URL or media key."),
+    minutes: float | None = typer.Option(None, "--minutes", min=0.0001),
+    work_root: Path = typer.Option(DEFAULT_WORK_ROOT, "--work-root"),  # noqa: B008
+    config: Path = typer.Option(Path("idea.toml"), "--config"),  # noqa: B008
+    profile: str | None = typer.Option(None, "--profile"),
+    density: int | None = typer.Option(None, "--density", min=1, max=2),
+) -> None:
+    """Estimate Deep spending without downloading, decoding or changing the work tree."""
+    from id_detector.cost import cached_mix, estimate
+
+    loaded = _load_app_config(config)
+    selected = profile if profile is not None else loaded.default_profile
+    if selected is not None:
+        loaded = effective_app_config(loaded, _load_profile_or_exit(selected))
+    if density is not None:
+        loaded = replace(loaded, deep_primary_density=density)
+    cached = cached_mix(work_root, target)
+    duration = cached.duration_ms if cached is not None else None
+    if minutes is not None:
+        import math
+
+        if not math.isfinite(minutes):
+            raise typer.BadParameter("minutes must be finite")
+        duration = round(minutes * 60_000)
+    if duration is None or duration <= 0:
+        typer.echo("Length unknown. Supply --minutes to estimate; nothing was fetched or spent.")
+        raise typer.Exit(2)
+    typer.echo(
+        estimate(duration, loaded).render(cached.scanned if cached else "No cached mix found.")
+    )
+
+
+def _confirm_paid(duration: int, windows: int, config: AppConfig, history: str, yes: bool) -> bool:
+    from id_detector.cost import estimate
+
+    typer.echo(estimate(duration, config, windows=windows).render(history))
+    if yes:
+        return True
+    if not sys.stdin.isatty():
+        typer.echo(
+            "cancelled: paid confirmation requires an interactive terminal; "
+            "use --yes for a scripted run.",
+            err=True,
+        )
+        return False
+    try:
+        accepted = typer.confirm("Spend AudD credit on this Deep scan?", default=False)
+    except (EOFError, typer.Abort):
+        accepted = False
+    if not accepted:
+        typer.echo("cancelled: paid scan not confirmed; nothing reserved or spent.", err=True)
+    return accepted
+
+
+@app.command()
 def analyse(
     url: str = typer.Argument(..., help="Public mix URL (or a local media file)."),
     raw: bool = typer.Option(False, "--raw", help="Print raw match tuples with mix times."),
+    yes: bool = typer.Option(False, "--yes", help="Confirm paid spending without a prompt."),
     refresh: bool = typer.Option(False, "--refresh", help="Bypass positive/no-match TTLs."),
     refresh_states: str = typer.Option(
         "no_match",
@@ -803,6 +860,21 @@ def analyse(
         from id_detector.run_ledger import new_run_id
 
         run_id = new_run_id()
+        from id_detector.cost import cached_mix
+
+        cached = cached_mix(work_root, url) if requested_recipe.name == "deep" else None
+        paid_confirm = None
+        if requested_recipe.name == "deep":
+
+            def paid_confirm(duration: int, windows: int) -> bool:
+                return _confirm_paid(
+                    duration,
+                    windows,
+                    loaded_config,
+                    cached.scanned if cached else "No stored scan found.",
+                    yes,
+                )
+
         store = LocalCheckpointStore(
             work_root,
             options=PipelineOptions(
@@ -831,6 +903,7 @@ def analyse(
                 index_root=index_root,
                 panako_tool_dir=panako_tool_dir,
                 keep_intermediates=keep_intermediates,
+                cli_paid_confirm=paid_confirm,
             ),
         )
         result = run(

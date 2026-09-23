@@ -120,6 +120,24 @@ and `idea backup`, `idea restore` and `idea verify-artefacts` are real commands.
 Free results take the change through the offline re-fusion path at next start-up, spending nothing.
 **Next, and it needs the owner:** top up AudD (~$20) and run the Deep comparison on the corpus to measure what
 the paid engine adds over the free ceiling (~173/218 by the miss analysis).
+**Cost preview and the paid comparison LANDED (2026-09-23)** — everything needed to spend real money
+deliberately rather than blindly ([build notes](reviews/build-local-cost-preview.md)). `idea cost`
+answers "what will this cost me?" from a cached mix's stored length without fetching, decoding or
+spending: clips, dollars, the half-price density-2 alternative, the $9.00 per-run recipe ceiling and
+any configured cap. `idea analyse --recipe deep` shows the same estimate and asks before the first
+paid request (`--yes` for scripts; a non-interactive run without it refuses rather than assuming
+yes), and refusing creates no reservation, no dispatch and no settlement. The prompt is
+command-line only — the web app and worker cannot reach it, and hosted paid dispatch stays refused.
+`scripts/compare_deep.py` runs the Free-vs-Deep experiment under a hard dollar budget: dry run by
+default, refusing to start above budget, resumable so an interruption never re-pays, and reporting
+per-mix and pooled recall and precision plus the tracks Deep found that Free missed, by name.
+
+**Measured prices on the owner's own cache** (AudD walk-up $5/1,000, one paid clip per generation-0
+window at a 9-second hop): about **$2.00 per hour of mix** at density 1 and half that at density 2.
+His 14 cached mixes are 15.5 hours — about **$31 for all of them**, about **$16 for the seven that
+have hand-written tracklists**, which are the only ones where the free-versus-paid question can
+actually be answered. **A $20 top-up covers that experiment with headroom.**
+
 **When the hosted build resumes, next in plan order:** 4d-i (tenancy schema, lots,
 worker-side reservations), then 4d-ii and 4d-iii + 4d-iv. **Not started:** 6a–6b (ingest policy,
 container, launch checklist), then M2 (billing, Stripe sandbox) — see PLAN-v2 §5.

@@ -505,6 +505,7 @@ async def run_analysis(
     presentation_local: bool = True,
     dispatch_admission: Callable[[], None] | None = None,
     settlement_writer: Callable[[Path, object], object] | None = None,
+    cli_paid_confirm: Callable[[int, int], bool] | None = None,
 ) -> int:
     """Run one analysis and return its exit code (plan §2.3.5).
 
@@ -931,6 +932,17 @@ async def run_analysis(
         if requested_recipe.name == "deep":
             planned = primary_planned
             counts["paid_planned"] = planned
+            # Only the CLI supplies this additional gate. Refusing a fresh run creates no
+            # reservation, attempt or settlement; durable recovery and all money fences below
+            # remain the authority. A resumed reservation has already been authorised.
+            if (
+                durable_reservation is None
+                and usd_admitter is None
+                and not recovered.any
+                and cli_paid_confirm is not None
+                and not cli_paid_confirm(decoded.record.pcm.duration_ms, frozen_count)
+            ):
+                return _finish(exit_code=130, status="cancelled", reason="paid_not_confirmed")
             if usd_admitter is not None and durable_reservation is None:
                 # The caller's admitter (or one restored from a primary checkpoint written before
                 # reservation records existed) carries the run's original reservation.
