@@ -27,6 +27,7 @@ from id_detector.webapp.jobs import Job, JobContext, JobManager
 from idea_web.database import Database
 from idea_web.jobs.local import LocalJobs, LocalWorker, local_database, snapshot
 from idea_web.jobs.worker import DispatchAdmission, JobQueue
+from tests.fakes.providers import APPROVED_DEEP
 from tests.idea_web.local_runner_fakes import fake_pipeline_runner
 from tests.idea_web.test_followup_review_fixes import UNIT, _config, _invocations
 from tests.idea_web.test_followup_round2 import (
@@ -169,7 +170,7 @@ def test_admission_is_one_transaction_so_a_racing_cancel_or_reclaim_never_lets_a
 def _dead_lettered_paid_job(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     config = _env(tmp_path, monkeypatch)
     jobs = LocalJobs(tmp_path)
-    job_id = jobs.submit(str(AUDIO), "max_accuracy")
+    job_id = jobs.submit(str(AUDIO), "max_accuracy", **APPROVED_DEEP)
     _child_worker_dies(tmp_path, config, kill_on=3)
     return jobs, job_id
 
@@ -231,7 +232,7 @@ def test_a_sweep_restores_a_complete_runs_missing_settlement_line_from_its_row(
 ) -> None:
     config = _env(tmp_path, monkeypatch)
     jobs = LocalJobs(tmp_path)
-    job_id = jobs.submit(str(AUDIO), "max_accuracy")
+    job_id = jobs.submit(str(AUDIO), "max_accuracy", **APPROVED_DEEP)
     runner = fake_pipeline_runner(tmp_path, config)
     LocalWorker(local_database(tmp_path), tmp_path, runner, flush_seconds=0.05).run_once()
     assert jobs.get(job_id).status == "succeeded", jobs.get(job_id).error

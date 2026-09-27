@@ -75,3 +75,34 @@ def test_the_golden_is_canonical_json_with_lf_endings() -> None:
     document = json.loads(raw.decode("utf-8"))
     expected = json.dumps(document, indent=2, ensure_ascii=False, sort_keys=True) + "\n"
     assert raw.decode("utf-8") == expected
+
+
+def _identity_from(produced: object, golden: object) -> object:
+    """``produced`` with ONLY its run identity and timestamps taken from ``golden`` (an identity
+    field the committed golden predates is left out, as the semantic comparison ignores it).
+
+    Every other byte must then match the golden exactly -- including value types, which the
+    semantic comparison cannot see (``True == 1 == 1.0`` in Python)."""
+
+    if isinstance(produced, dict) and isinstance(golden, dict):
+        grafted = {}
+        for key, value in produced.items():
+            if key in IGNORED_KEYS or is_timestamp_key(str(key)):
+                if key in golden:  # an identity field the golden predates stays ignored
+                    grafted[key] = golden[key]
+            else:
+                grafted[key] = _identity_from(value, golden.get(key))
+        return grafted
+    if isinstance(produced, list) and isinstance(golden, list) and len(produced) == len(golden):
+        return [_identity_from(a, b) for a, b in zip(produced, golden, strict=True)]
+    return produced
+
+
+def test_local_free_run_reproduces_the_golden_bytes(tmp_path: Path) -> None:
+    produced = json.loads(run_local_free(tmp_path / "work").read_text(encoding="utf-8"))
+    raw = GOLDEN.read_bytes()
+    golden = json.loads(raw.decode("utf-8"))
+    rendered = json.dumps(
+        _identity_from(produced, golden), indent=2, ensure_ascii=False, sort_keys=True
+    )
+    assert (rendered + "\n").encode("utf-8") == raw

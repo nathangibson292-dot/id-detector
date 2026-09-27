@@ -1,11 +1,11 @@
-"""AudD clip recognition — the Deep recipe's primary sweep.
+"""AudD clip recognition — the Deep recipe's paid check of the free result's gaps.
 
-Recipe-primary deep scans sweep the frozen generation-0 windows at the recipe density and send
-each clip to a paid recogniser's clip endpoint — the same ~12 s clips Shazam already sees, so
-there is no whole-file upload and no third-party-upload consent gate.  The resulting
-``clip_recognizer`` observations are generation 0 for the fuser; the Shazam secondary
-(:mod:`id_detector.secondary_targeting`) then re-fuses alongside them: agreeing lifts a track's
-confidence, disagreeing lets a phantom be demoted, and a catalogue-blind track is recovered.
+The free-first Deep recipe sends a paid recogniser's clip endpoint only the frozen generation-0
+windows its paid policy selects from the finished free result (:mod:`id_detector.additive`), at
+the recipe density — the same ~12 s clips Shazam already heard, so there is no whole-file upload
+and no third-party-upload consent gate.  The resulting ``clip_recognizer`` observations join the
+free evidence in one final fusion, under the additive invariant: agreeing may lift a track's
+confidence and a catalogue-blind stretch may gain a track, but no free-found row is removed.
 
 The sweep (plan §2.3.1–2.3.3) runs ``audd_concurrency`` clips at once behind a token bucket,
 retries only the recipe's zero-cost transient outcomes with its backoff, stops at once on a
@@ -14,10 +14,11 @@ terminal-provider outcome, and records every request in the durable attempt jour
 ``resolved``.  A cancel token — or a progress hook that raises — stops new dispatches while the
 clips already in flight are allowed to resolve, so their spend is never lost.
 
-Only validated match/no-match responses are cached by clip cache-key across runs. Matches are reused
-by default, while cached no-matches are re-queried by default and ``refresh_states`` controls that
-selection. Dollar admission bounds live calls before dispatch; only the live call needs a
-credential.
+Only validated match/no-match responses are cached by clip cache-key across runs;
+``refresh_states`` selects which cached states are re-queried (the Deep recipe passes none: a
+stored paid answer, a no-match included, is never bought again without ``--refresh``). Dollar
+admission bounds live calls before dispatch; only a live call needs a credential, so a sweep
+without one still answers every clip that has a stored answer and sends nothing.
 """
 
 from __future__ import annotations
@@ -407,6 +408,8 @@ async def run_paid_clip_recognition(
     if "audd" not in enabled_engines or not targets:
         return PaidScanResult()
     override = adapters.get("audd") if adapters else None
+    adapter: Any = None
+    adapter_error: ProviderUnavailable | None = None
     try:
         adapter = (
             override
@@ -414,8 +417,7 @@ async def run_paid_clip_recognition(
             else AudDAdapter(AudDCredentials.from_env(), app_config, cli_confirmation)
         )
     except ProviderUnavailable as exc:
-        emit_raw(f"paid clip engine audd skipped: {exc}")
-        return PaidScanResult(skipped=((("audd"), str(exc)),))
+        adapter_error = exc
 
     if primary_density <= 0:
         raise ValueError("primary_density must be positive")
@@ -433,6 +435,33 @@ async def run_paid_clip_recognition(
     selected = _subsample_evenly(eligible[::primary_density], max_clips)
     if not selected:
         return PaidScanResult()
+    cache_dir = media_dir / "recognise" / "invocations" / "live-audd-clip-v1" / "raw"
+    skipped: tuple[tuple[str, str], ...] = ()
+    if adapter is None:
+        # No credential: a clip with a stored answer needs none (the cache is read, nothing is
+        # sent), so only the clips that would need a request are left out -- counted, never sent.
+        # With none answerable the whole sweep is skipped, exactly as before.
+        answerable = (
+            []
+            if refresh
+            else [
+                window
+                for window in selected
+                if _read_cached(
+                    cache_dir / f"{_clip_query(media_key, window).cache_key}.json", refresh_states
+                )
+                is not None
+            ]
+        )
+        if not answerable:
+            emit_raw(f"paid clip engine audd skipped: {adapter_error}")
+            return PaidScanResult(skipped=((("audd"), str(adapter_error)),))
+        left_out = len(selected) - len(answerable)
+        if left_out:
+            reason = f"{left_out} clip(s) without a stored answer not sent: {adapter_error}"
+            emit_raw(f"paid clip engine audd: {reason}")
+            skipped = (("audd", reason),)
+        selected = answerable
 
     policy = retry_policy if retry_policy is not None and retry_policy.mode == "bounded" else None
     retryable = frozenset(policy.retryable_outcomes) if policy is not None else frozenset()
@@ -440,7 +469,6 @@ async def run_paid_clip_recognition(
     backoff = tuple(policy.backoff_seconds) if policy is not None else ()
     pause: SleepFn = sleep or asyncio.sleep
 
-    cache_dir = media_dir / "recognise" / "invocations" / "live-audd-clip-v1" / "raw"
     invocation_dir = _invocation_dir(media_dir, run_id)
     journal = attempt_journal or AttemptJournal(
         attempts_path(media_dir),
@@ -522,6 +550,10 @@ async def run_paid_clip_recognition(
             sweep.attempts += 1
 
         try:
+            if adapter is None:
+                # Defensive: a clip whose stored answer vanished after the check above. Nothing is
+                # admitted or sent; the window stays unresolved.
+                raise ProviderUnavailable(str(adapter_error or "AudD is not configured"))
             response = await adapter.recognize_clip(wav, on_attempt=_admit)
         except ReservationExhausted:
             raise
@@ -703,7 +735,7 @@ async def run_paid_clip_recognition(
         while queue and not _halt_requested():
             await _process(queue.popleft())
 
-    emit(f"identifying the whole mix (paid): {len(selected)} clips")
+    emit(f"paid check of the free result's gaps: {len(selected)} clips")
     _tick()
     workers = [asyncio.create_task(_worker()) for _ in range(min(concurrency, len(selected)))]
     try:
@@ -754,6 +786,7 @@ async def run_paid_clip_recognition(
         observations=observations_out,
         observation_paths=(observation_path,),
         engines_run=("audd",),
+        skipped=skipped,
         requests=sweep.requests,
         resolved=len(observations_out),
         # Windows never reached (a stopped or cancelled sweep) are not failures.

@@ -25,7 +25,7 @@ from id_detector.webapp.jobs import Job
 from idea_web.database import Database
 from idea_web.jobs.local import LocalJobs, LocalWorker, local_database, snapshot
 from idea_web.jobs.worker import JobQueue, Worker
-from tests.fakes.providers import FakeAudD, FakeShazamHTTP
+from tests.fakes.providers import APPROVED_DEEP, FakeAudD, FakeShazamHTTP
 from tests.idea_web.local_runner_fakes import fake_pipeline_runner
 from tests.idea_web.test_followup_queue_money import _audd_rows, _deep_options
 from tests.idea_web.test_followup_review_fixes import UNIT, _attempt_events, _invocations
@@ -58,6 +58,8 @@ def test_an_upgraded_0001_local_row_gets_one_run_id_and_three_deaths_still_settl
             acquire=False,
             build_index=False,
             created_at=time.time(),
+            # Approved in the browser, so its paid step runs (and the worker dies in it).
+            **APPROVED_DEEP,
         )
     )
     legacy.pop("run_id", None)  # a snapshot written before durable run ids existed
@@ -115,7 +117,7 @@ def test_a_death_right_after_the_dead_letter_commit_is_settled_once_by_the_next_
 ) -> None:
     config = _env(tmp_path, monkeypatch)
     jobs = LocalJobs(tmp_path)
-    job_id = jobs.submit(str(AUDIO), "max_accuracy")
+    job_id = jobs.submit(str(AUDIO), "max_accuracy", **APPROVED_DEEP)
     _child_worker_dies(tmp_path, config, kill_on=3)
     _expire(jobs, job_id)
     with jobs.database.write() as connection:  # its attempts are already exhausted
@@ -191,7 +193,7 @@ def test_a_cancel_committed_before_audd_admission_stops_the_local_request(
 ) -> None:
     config = _env(tmp_path, monkeypatch)
     jobs = LocalJobs(tmp_path)
-    job_id = jobs.submit(str(AUDIO), "max_accuracy")
+    job_id = jobs.submit(str(AUDIO), "max_accuracy", **APPROVED_DEEP)
 
     def dispatched() -> int:
         return sum(

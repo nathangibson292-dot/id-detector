@@ -33,6 +33,7 @@ import time
 import uuid
 from collections import deque
 from collections.abc import Callable, Iterator
+from hashlib import sha256
 from pathlib import Path
 from typing import Any
 
@@ -259,6 +260,22 @@ def job_view(row: QueueJob) -> Job | None:
     return job
 
 
+class _OfferAnswered(Exception):
+    """The offer was answered inside the approval transaction; it is rolled back."""
+
+
+def approval_job_id(offer_job_id: str) -> str:
+    """The ONE follow-up job an offer's approval may create (its durable approval identity)."""
+
+    return sha256(f"paid-offer-approval:{offer_job_id}".encode()).hexdigest()[:32]
+
+
+def approval_run_id(offer_job_id: str) -> str:
+    """The ONE service run an offer's approval may start."""
+
+    return sha256(f"paid-offer-approval-run:{offer_job_id}".encode()).hexdigest()[:32]
+
+
 def _mark_stopped(job: Job, message: str, now: float) -> Job:
     job.status = CANCELLED
     job.phase = CANCELLED
@@ -300,6 +317,8 @@ class LocalJobs:
         build_index: bool = False,
         known_tracklist: str | None = None,
         user_id: str | None = None,
+        approved_usd_e6: int | None = None,
+        approved_clips: int | None = None,
     ) -> str:
         validated = validate_target(target)
         try:
@@ -318,6 +337,8 @@ class LocalJobs:
             created_at=self.clock(),
             # ONE durable service run for this job, reused by every worker process that runs it.
             run_id=new_run_id(),
+            approved_usd_e6=approved_usd_e6,
+            approved_clips=approved_clips,
         )
         try:
             queue_target = LocalPath(Path(validated)) if is_file else PlatformUrl(validated)
@@ -369,6 +390,111 @@ class LocalJobs:
         if job is None or job.status not in TERMINAL_STATES:
             return False
         return self.queue.dismiss(job_id)
+
+    def _open_offer(self, job_id: str) -> Job | None:
+        job = self.get(job_id)
+        if (
+            job is None
+            or job.status not in TERMINAL_STATES
+            or not job.paid_offer
+            or job.offer_decision is not None
+        ):
+            return None
+        return job
+
+    def _decide(self, job_id: str, decision: str, follow_up: str | None) -> bool:
+        """Record the owner's answer on a finished job's snapshot, once."""
+
+        with self.database.write() as connection:
+            return (
+                connection.execute(
+                    "UPDATE jobs SET progress=json_set(progress, '$.local.offer_decision', ?, "
+                    "'$.local.follow_up_job', ?), updated_at=? WHERE id=? "
+                    "AND state NOT IN ('intake','waiting','analysis') "
+                    "AND json_extract(progress, '$.local.offer_decision') IS NULL",
+                    (decision, follow_up, self.clock(), job_id),
+                ).rowcount
+                == 1
+            )
+
+    def approve_offer(self, job_id: str) -> str | None:
+        """Approve a finished Max-accuracy job's paid offer: start the Deep job that spends it.
+
+        ONE write transaction consumes the offer and creates the authorised follow-up job, so they
+        commit together or not at all: a concurrent Approve or Skip, a database error or a crash
+        can never leave a paid job queued beside a still-open offer.  The follow-up's job id and
+        run id are derived from the offer's job (the durable approval identity), so one offer can
+        authorise at most one paid run, ever -- a retry after a crash, a cancel or an ambiguous
+        first run finds the offer consumed and creates nothing.
+
+        The new job carries exactly the approved price and clip count; it reuses the free pass
+        just finished, and its paid step runs only while its own exact plan is within the
+        approval.  The reservation, dispatch fence and settlement stay the queue's usual money
+        authority.  Returns the new job's id, or ``None`` when there is nothing to approve.
+        """
+
+        follow_up = approval_job_id(job_id)
+        try:
+            with self.database.write() as connection:
+                row = connection.execute("SELECT * FROM jobs WHERE id=?", (job_id,)).fetchone()
+                if row is None or row["state"] in ACTIVE_RUN_STATES:
+                    return None
+                try:
+                    document = json.loads(row["progress"]).get(_LOCAL) or {}
+                    target = _target_text(self.queue._row(row).target)
+                except (TypeError, ValueError, AttributeError, TargetRefused):
+                    return None
+                offer = document.get("paid_offer")
+                if not isinstance(offer, dict) or document.get("offer_decision") is not None:
+                    return None
+                validated = validate_target(target)
+                try:
+                    is_file = Path(validated).is_file()
+                except (OSError, ValueError):
+                    is_file = False
+                job = Job(
+                    id=follow_up,
+                    target=validated,
+                    display=redact_text(validated),
+                    profile="max_accuracy",
+                    acquire=bool(document.get("acquire")),
+                    build_index=bool(document.get("build_index")),
+                    known_tracklist=document.get("known_tracklist"),
+                    created_at=self.clock(),
+                    run_id=approval_run_id(job_id),
+                    approved_usd_e6=int(offer.get("usd_e6", 0)),
+                    approved_clips=int(offer.get("to_send", 0)),
+                )
+                queue_target = LocalPath(Path(validated)) if is_file else PlatformUrl(validated)
+                self.queue.insert_job(
+                    connection,
+                    queue_target,
+                    DEEP_RECIPE,
+                    job_id=follow_up,
+                    run_id=job.run_id,
+                    tenant_scope=row["tenant_scope"],
+                    progress={_LOCAL: snapshot(job)},
+                    user_id=row["user_id"],
+                )
+                consumed = connection.execute(
+                    "UPDATE jobs SET progress=json_set(progress, "
+                    "'$.local.offer_decision', 'approved', '$.local.follow_up_job', ?), "
+                    "updated_at=? WHERE id=? "
+                    "AND json_extract(progress, '$.local.offer_decision') IS NULL",
+                    (follow_up, self.clock(), job_id),
+                ).rowcount
+                if consumed != 1:
+                    raise _OfferAnswered  # rolls the insert back: nothing was authorised
+        except _OfferAnswered:
+            return None
+        return follow_up
+
+    def skip_offer(self, job_id: str) -> bool:
+        """Skip the paid offer: keep the Free result, spend nothing."""
+
+        if self._open_offer(job_id) is None:
+            return False
+        return self._decide(job_id, "skipped", None)
 
     def cancel_all(self, message: str = ABANDONED) -> int:
         """Stop every job still in flight — when the server stops, or starts after it died."""

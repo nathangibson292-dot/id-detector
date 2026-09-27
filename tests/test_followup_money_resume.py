@@ -327,7 +327,9 @@ def test_a_real_failure_after_paid_work_returns_a_failed_run_result(tmp_path: Pa
     store = _DiesAtPhase(
         work,
         options=_options(audd=FakeAudD(SCRIPT)),
-        phase="fuse1",
+        # Free-first: the paid step runs after ``fuse1``; ``secondary`` is the first checkpoint
+        # written after it has paid.
+        phase="secondary",
         error=RuntimeError("checkpoint store is broken"),
     )
     result = run(_request(store, run_id="fails-after-paid"))
@@ -436,7 +438,12 @@ def test_a_partial_secondary_is_not_re_queried_on_a_same_run_resume(tmp_path: Pa
     assert not resent, f"same-run no_match answers were sent again: {sorted(resent)}"
 
 
-def test_a_partial_secondary_is_restored_even_when_the_breaker_is_open(tmp_path: Path) -> None:
+def test_a_partial_free_pass_waits_while_the_breaker_is_open_and_sends_nothing(
+    tmp_path: Path,
+) -> None:
+    """Deep's free pass is its primary now: killed part-way and resumed while the breaker is
+    open, it waits (nothing re-sent, nothing reserved) instead of discarding its answers."""
+
     work = tmp_path / "work"
     run_id = "partial-secondary-open"
     answered = _secondary_killed(work, run_id)
@@ -454,9 +461,10 @@ def test_a_partial_secondary_is_restored_even_when_the_breaker_is_open(tmp_path:
         app_config=AppConfig(shazam_breaker=config),
         shazam_breaker=breaker,
     )
-    run(_request(store, run_id=run_id))
+    waited = run(_request(store, run_id=run_id))
+    assert waited.status == "waiting"
+    assert waited.usd_e6_reserved == waited.usd_e6_spent == 0
     assert resumed.requests == 0
-    assert int(store.state(run_id, "secondary").get("resolved", 0)) >= len(answered)
 
 
 # ------------------------------------------------------------------------------ 4a-i A / P1-4

@@ -17,7 +17,7 @@ from typer.testing import CliRunner
 
 from id_detector import pipeline
 from id_detector.cli import _analyse
-from id_detector.io import native_path
+from id_detector.io import native_path, read_text
 from id_detector.present.bundles import shown_result_dir
 from id_detector.providers import audd as audd_module
 from id_detector.providers.audd import AudDAdapter, AudDCredentials
@@ -156,20 +156,22 @@ def test_paid_no_match_is_resolved_cached_and_gap_counts_accumulate(
     assert len(cached) == 7
     assert all(item == {"status": "success", "result": None} for item in cached)
     assert entry["counts"]["paid_resolved"] == 7  # type: ignore[index]
-    # Seven AudD no-matches leave the whole mix blank, so the secondary sends its whole
-    # capacity of C = ceil(1 min x 2) = 2 Shazam clips to it (plan §2.3.4 step 4; R = 0 here).
-    assert entry["counts"]["requests"] == shazam.requests == 2  # type: ignore[index]
-    assert entry["counts"]["physical_attempts"] == 2  # type: ignore[index]
-    assert entry["counts"]["secondary_allocated"] == 2  # type: ignore[index]
+    # Free-first: the free pass sent its seven Shazam clips, then the paid check its seven.
+    assert entry["counts"]["requests"] == shazam.requests == 7  # type: ignore[index]
+    assert entry["counts"]["physical_attempts"] == 7  # type: ignore[index]
+    assert entry["counts"]["paid_targets"] == 7  # type: ignore[index]
     assert audd.billed_units == 7
 
-    # The user-facing default refreshes cached no-match states, but preserves Shazam matches.
+    # A stored paid answer -- a no-match included -- is never bought again: the free-first Deep
+    # recipe reads the paid cache whatever the free engine's refresh states say (the confirmed
+    # price counted those clips as free). Only an explicit --refresh re-sends them.
     second_code, second_audd, second_shazam = _run_analysis(tmp_path, "all-no-match.json")
     _media_dir, second_entry = _entry(tmp_path / "work")
     assert second_code == 0
-    assert second_audd.calls == 7
-    assert second_entry["counts"]["paid_cache_hits"] == 0  # type: ignore[index]
-    assert second_shazam.requests == 0
+    assert second_audd.calls == 0
+    assert second_entry["counts"]["paid_cache_hits"] == 7  # type: ignore[index]
+    assert second_entry["counts"]["paid_planned"] == 0  # type: ignore[index]
+    assert second_entry["usd_e6_spent"] == 0
 
 
 def test_shazam_no_match_refresh_gets_a_fresh_allowance_after_exhausting_budget(
@@ -215,15 +217,16 @@ def test_identity_less_audd_result_is_malformed_and_never_cached(tmp_path: Path)
     media_dir, entry = _entry(tmp_path / "work")
     raw_dir = media_dir / "recognise" / "invocations" / "live-audd-clip-v1" / "raw"
     # Plan §2.3.5: ``malformed`` is billable and ambiguous, not a terminal-provider outcome, so a
-    # sweep of them is a primary that resolved 0 of 7 (< 95 %): ``partial``, exit 0, spent.
+    # paid check of them resolved 0 of 7 (< 95 %) beside a complete free pass: ``degraded``,
+    # exit 0, spent.
     assert exit_code == 0
-    assert entry["status"] == "partial"
-    assert entry["reason"] == "primary_not_achieved"
+    assert entry["status"] == "degraded"
+    assert entry["reason"] == "secondary_not_achieved"
     assert entry["counts"]["paid_resolved"] == 0  # type: ignore[index]
     assert entry["counts"]["paid_billable_units"] == 7  # type: ignore[index]
     assert entry["usd_e6_spent"] == 35_000
     assert audd.calls == audd.billed_units == 7
-    assert shazam.requests == 2  # the secondary probes the blank mix, nothing more
+    assert shazam.requests == 7  # the free pass, once
     assert not _raw_payloads(raw_dir)
 
 
@@ -245,9 +248,10 @@ def test_all_http_401_is_provider_unavailable_unspent_and_never_cached(tmp_path:
     assert entry["counts"]["paid_resolved"] == 0  # type: ignore[index]
     # A terminal-provider outcome stops the primary at once (§2.3.3): one dispatch, six not sent.
     assert audd.calls == 1 and audd.billed_units == 0
-    assert shazam.requests == 0
+    assert shazam.requests == 7  # the free pass ran first and is kept -- as a Free result
     assert not _raw_payloads(raw_dir)
-    assert not (shown_result_dir(media_dir) / "index.html").exists()
+    kept = json.loads(read_text(shown_result_dir(media_dir) / "manifest.json"))
+    assert kept["achieved"] == "free" and kept["compatibility"]["recipe_name"] == "free"
     assert any("(1 requests, 0 cached, 6 not sent)" in message for message in progress_messages)
     assert all("billable" not in message for message in progress_messages)
 

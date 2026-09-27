@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 
+from id_detector.additive import PaidPlan
 from id_detector.contracts import PcmRecord, SourceRecord
 from id_detector.ingest import canonicalize_url
 from id_detector.io import read_text
@@ -96,20 +97,102 @@ class CostEstimate:
         alternative = ((self.windows + 1) // 2) * self.unit_usd_e6
         lines = [
             f"Mix length: {length} ({self.duration_ms / 60000:.2f} minutes).",
-            f"Deep at density {self.density}: approximately {self.clips} paid clips, "
-            f"estimated ${ceil_e2(self.estimate_e6) / 100:.2f}.",
-            f"Density 2: approximately {(self.windows + 1) // 2} paid clips, "
-            f"estimated ${ceil_e2(alternative) / 100:.2f}.",
+            "Deep runs the free pass first and then pays only for the stretches the free result "
+            "leaves blank, so the real figure is known only after the free pass. The whole mix is "
+            "the ceiling:",
+            f"Ceiling at density {self.density}: {self.clips} paid clips, "
+            f"${ceil_e2(self.estimate_e6) / 100:.2f}.",
+            f"Ceiling at density 2: {(self.windows + 1) // 2} paid clips, "
+            f"${ceil_e2(alternative) / 100:.2f}.",
             f"Recipe ceiling: ${self.ceiling_e2 / 100:.2f}; configured per-run cap: {cap}; "
             f"effective cap: ${self.cap_e2 / 100:.2f}.",
-            f"Reservation including 5% headroom: ${ceil_e2(self.reservation_e6) / 100:.2f}.",
+            f"Ceiling reservation including 5% headroom: "
+            f"${ceil_e2(self.reservation_e6) / 100:.2f}.",
             scanned,
-            "Estimate only, not a promise: cached answers, duplicate clips and provider "
-            "outcomes can change the spend.",
+            "Stored paid answers are never bought again, so a mix Deep-scanned before costs less.",
         ]
         if ceil_e2(self.reservation_e6) > self.cap_e2:
             lines.append("This plan exceeds the cap and will be refused before paid dispatch.")
         return "\n".join(lines)
+
+
+def _clock(ms: int) -> str:
+    seconds = max(0, ms) // 1000
+    return f"{seconds // 3600:d}:{seconds // 60 % 60:02d}:{seconds % 60:02d}"
+
+
+def render_plan(plan: PaidPlan, config: AppConfig, scanned: str = "") -> str:
+    """The EXACT paid step of a Deep run, known once the free pass has run."""
+
+    recipe = get_recipe("deep", primary_density=config.deep_primary_density)
+    configured = config.max_usd_e2
+    effective = min(recipe.max_usd_e2, configured) if configured is not None else recipe.max_usd_e2
+    cap = "none" if configured is None else f"${configured / 100:.2f}"
+    lines = [
+        f"Deep would check {plan.spans} gaps for about ${ceil_e2(plan.estimate_e6) / 100:.2f}.",
+        f"The free pass lists nothing for {_clock(plan.target_ms)} of this "
+        f"{_clock(plan.duration_ms)} mix; Deep checks only those gaps: {plan.clips} paid clips "
+        f"at density {plan.density}, {plan.cached} already answered (free), "
+        f"{plan.to_send} to send.",
+        f"Exact price: {plan.to_send} x ${plan.unit_usd_e6 / 1e6:.4f} = "
+        f"${ceil_e2(plan.estimate_e6) / 100:.2f}; reservation including 5% headroom: "
+        f"${ceil_e2(plan.reservation_e6) / 100:.2f}.",
+        f"Recipe ceiling: ${recipe.max_usd_e2 / 100:.2f}; configured per-run cap: {cap}; "
+        f"effective cap: ${effective / 100:.2f}.",
+    ]
+    if scanned:
+        lines.append(scanned)
+    if ceil_e2(plan.reservation_e6) > effective:
+        lines.append("This plan exceeds the cap and will be refused before paid dispatch.")
+    return "\n".join(lines)
+
+
+def free_scanned_plan(mix: CachedMix, config: AppConfig) -> PaidPlan | None:
+    """The exact Deep paid plan of a mix already Free-scanned, computed offline; else ``None``.
+
+    Today's fusion of the stored Free result's own proven evidence, the Deep policy's targets over
+    it, and the paid answers already stored for those clips.  Reads files only.
+    """
+
+    from id_detector.additive import fuse_offline, plan_paid_step, proven_free_results
+    from id_detector.contracts import WindowRecord
+    from id_detector.io import path_is_file
+    from id_detector.recipes import paid_policy
+
+    if mix.duration_ms is None:
+        return None
+    windows_path = mix.directory / "windows" / "windows.gen0.jsonl"
+    if not path_is_file(windows_path):
+        return None
+    try:
+        windows = tuple(
+            WindowRecord.model_validate_json(line)
+            for line in read_text(windows_path).splitlines()
+            if line.strip()
+        )
+    except (OSError, ValueError):
+        return None
+    recipe = get_recipe("deep", primary_density=config.deep_primary_density)
+    for observations, hints, _source in proven_free_results(mix.directory, windows):
+        free = fuse_offline(
+            media_key=mix.source.media_key,
+            duration_ms=mix.duration_ms,
+            observations=observations,
+            windows=windows,
+            hints=hints,
+            config=config,
+        )
+        plan, _targets = plan_paid_step(
+            policy=paid_policy(recipe) or "gaps",
+            free_episodes=free.episodes.episodes,
+            windows=windows,
+            duration_ms=mix.duration_ms,
+            density=recipe.primary_density,
+            unit_usd_e6=config.audd_usd_e6_per_request,
+            media_dir=mix.directory,
+        )
+        return plan
+    return None
 
 
 def estimate(duration_ms: int, config: AppConfig, *, windows: int | None = None) -> CostEstimate:

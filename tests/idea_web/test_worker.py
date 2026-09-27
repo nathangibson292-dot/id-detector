@@ -1110,7 +1110,8 @@ def _child_run_until_primary(database_path: str, work_root: str, ready) -> None:
     database = Database(Path(database_path))
 
     def after_checkpoint(_run_id: str, phase: str) -> None:
-        if phase == "primary":
+        # Free-first: ``secondary`` is the paid step's durable checkpoint (after its dispatches).
+        if phase == "secondary":
             ready.set()
             threading.Event().wait()
 
@@ -1151,7 +1152,7 @@ def test_real_worker_kill_after_primary_resumes_with_zero_audd_requests(tmp_path
         args=(str(database.path), str(work), ready),
     )
     process.start()
-    assert ready.wait(180), "child did not durably checkpoint primary"
+    assert ready.wait(180), "child did not durably checkpoint its paid step"
     process.terminate()
     process.join(20)
     assert process.exitcode is not None
@@ -1186,7 +1187,7 @@ def test_real_worker_kill_after_primary_resumes_with_zero_audd_requests(tmp_path
     assert resumed is not None and resumed.id == job_id
     assert resumed.state in {"complete", "degraded"}
     assert audd.calls == 0
-    assert resumed_checkpoints[0] == "hints"
+    assert resumed_checkpoints[0] == "fuse2"  # everything up to the paid step was durable
     store = SQLiteCheckpointStore(database, work, mode="local", options=options)
     assert store.completed_phases("killed-primary") == frozenset(CHECKPOINT_PHASES)
     with database.read() as connection:
@@ -1203,8 +1204,11 @@ def test_real_worker_kill_after_primary_resumes_with_zero_audd_requests(tmp_path
             "WHERE run_id='killed-primary'"
         ).fetchone()
     assert paid == 21
-    # §2.3.5's breaker denominator: the secondary's Shazam attempts are in the hosted ledger too.
+    # §2.3.5's breaker denominator: the free pass's Shazam attempts are in the hosted ledger too.
     assert shazam > 0
-    assert (run["usd_e6_reserved"], run["usd_e6_spent"]) == tuple(original_money)
+    # The resume paid nothing more: the settled spend is exactly the killed pass's seven clips,
+    # against its original reservation.
+    assert run["usd_e6_reserved"] == original_money["usd_e6_reserved"]
+    assert run["usd_e6_spent"] == 7 * 5_000
     assert run["usd_e6_reserved"] >= run["usd_e6_spent"] > 0
     assert run["claim_token"] is None  # settled runs accept no further writes

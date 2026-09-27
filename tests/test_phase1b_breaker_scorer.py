@@ -241,7 +241,10 @@ def pipeline(tmp_path, breaker, *, free=False, shazam=None, script="gate0a-deep.
 
 
 @pytest.mark.parametrize("rule", ["a", "b", "c"])
-def test_open_secondary_is_skipped_and_degraded_with_rule_in_journal(tmp_path, rule):
+def test_an_open_breaker_makes_a_new_deep_request_wait_before_any_paid_work(tmp_path, rule):
+    """Deep is free-first: its free pass is its primary, so with no stored Free result to reuse
+    a new Deep request waits exactly like a Free one -- nothing reserved, nothing sent."""
+
     breaker = ShazamBreaker(
         BreakerConfig(
             latch_count=1 if rule == "c" else 3,
@@ -254,17 +257,18 @@ def test_open_secondary_is_skipped_and_degraded_with_rule_in_journal(tmp_path, r
         trip(breaker)
     reason = breaker.reason()
     code, entry, shazam, audd = pipeline(tmp_path, breaker)
-    assert code == 0 and entry["status"] == "degraded"
-    assert entry["reason"] == reason and entry["achieved"] == "deep"
-    assert audd.calls == 7 and shazam.requests == 0
+    assert code == 6 and entry["status"] == "waiting"
+    assert entry["reason"] == reason
+    assert audd.calls == 0 and shazam.requests == 0
+    assert entry["usd_e6_reserved"] == entry["usd_e6_spent"] == 0
 
 
-def test_mid_secondary_daily_open_skips_remaining_and_is_degraded(tmp_path):
+def test_a_started_deep_free_pass_finishes_despite_the_breaker_opening(tmp_path):
     breaker = ShazamBreaker(BreakerConfig(shazam_daily_budget_per_egress=1))
     code, entry, shazam, audd = pipeline(tmp_path, breaker)
-    assert code == 0 and entry["status"] == "degraded"
-    assert entry["reason"] == "shazam_breaker:b_daily_budget"
-    assert shazam.requests == 1 and audd.calls == 7
+    assert code == 0 and entry["status"] == "complete"
+    assert shazam.requests == 7 and audd.calls == 7
+    assert breaker.reason() == "shazam_breaker:b_daily_budget"
 
 
 def test_admitted_free_primary_finishes_despite_opening(tmp_path):
@@ -508,12 +512,9 @@ def test_open_breaker_still_serves_a_compatible_cached_result(tmp_path):
     assert shazam.requests == audd.calls == 0
 
 
-def test_degrade_restart_refusal_settles_the_deep_reservation(tmp_path):
-    """§2.3.2: a Deep run refused at its ``--allow-degrade`` restart already reserved USD.
-
-    The waiting journal must report that reservation and its release, not a run that never
-    reserved — nothing is re-billed and nothing is hidden.
-    """
+def test_a_deep_request_refused_by_the_breaker_reserves_nothing(tmp_path):
+    """§2.3.2, free-first: an open breaker refuses a new Deep request before its free pass, so
+    before any reservation -- ``--allow-degrade`` or not -- and the waiting journal says so."""
 
     breaker = ShazamBreaker(BreakerConfig(latch_count=1))
     trip(breaker)
@@ -522,9 +523,9 @@ def test_degrade_restart_refusal_settles_the_deep_reservation(tmp_path):
     )
     assert code == 6 and entry["status"] == "waiting"
     assert entry["reason"] == "shazam_breaker:c_latch"
-    assert entry["usd_e6_reserved"] == 36_750  # reserved by Deep, released in full here
+    assert entry["usd_e6_reserved"] == 0  # the price is only known after the free pass
     assert entry["usd_e6_spent"] == 0 and entry["costs"] == {"usd_e2": 0}
-    assert audd.billed_units == 0 and shazam.requests == 0
+    assert audd.calls == 0 and shazam.requests == 0
     assert not list((tmp_path / "work").rglob("tracklist.json"))
 
 

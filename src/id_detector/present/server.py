@@ -904,6 +904,7 @@ function showOutcome(j){
     var open = '<a class="btn primary big" id="open" href="' + j.result_url +
       '">Open the tracklist →</a>';
     row.innerHTML = j.result_url ? open : '';
+    if(j.paid_offer){ showOffer(j, h, p, row); return; }
     confetti();
   } else if(j.status === 'waiting'){
     var w = outcomeCopy('waiting', null);
@@ -920,6 +921,39 @@ function showOutcome(j){
     var reached = j.last_stage ? ' It got as far as ' + j.last_stage + '.' : '';
     p.textContent = copy[0] + reached + ' ' + costSentence(j) + ' ' + copy[1];
     row.innerHTML = again;
+  }
+}
+// A Max-accuracy job stops after its free pass until the owner answers the exact Deep price.
+// Approve starts the paid job (it reserves and dispatches only up to this price); Skip keeps the
+// Free result and spends nothing; closing the tab spends nothing either.
+function offerForm(action, label, cls){
+  return '<form method="post" action="/jobs/' + JOB_ID + '/' + action +
+    '" style="display:inline">' +
+    '<input type="hidden" name="csrf_token" value="' + CSRF_TOKEN + '">' +
+    '<button class="btn ' + cls + '" type="submit">' + label + '</button></form>';
+}
+function showOffer(j, h, p, row){
+  var o = j.paid_offer, dollars = '$' + (o.usd_e2 / 100).toFixed(2);
+  var free = o.cached ? ' ' + o.cached + ' of its ' + o.clips +
+    ' clips already have a stored answer and cost nothing.' : '';
+  var open = j.result_url ? '<a class="btn" href="' + j.result_url +
+    '">Open the Free result</a>' : '';
+  if(j.offer_decision === 'approved'){
+    h.textContent = 'Deep approved';
+    p.textContent = 'The paid check was approved and runs as its own job.';
+    row.innerHTML = (j.follow_up_url ? '<a class="btn primary" href="' + j.follow_up_url +
+      '">Follow the Deep job →</a>' : '') + open;
+  } else if(j.offer_decision === 'skipped'){
+    h.textContent = 'Free result kept';
+    p.textContent = 'You skipped the paid check. Nothing was reserved or spent.';
+    row.innerHTML = open;
+  } else {
+    h.textContent = 'Free pass done — Deep is waiting for your approval';
+    p.textContent = 'Deep would check ' + o.gaps + ' gaps for about ' + dollars + '.' + free +
+      ' Nothing has been reserved or spent. Approve to run the paid check, or Skip to keep the ' +
+      'Free result. Closing this page spends nothing.';
+    row.innerHTML = offerForm('approve', 'Approve ' + dollars, 'primary big') +
+      offerForm('skip', 'Skip', '') + open;
   }
 }
 function render(j){

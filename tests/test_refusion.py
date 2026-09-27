@@ -55,7 +55,7 @@ from tests.fakes.providers import FakeAudD, FakeShazamHTTP, no_backoff
 from tests.test_phase1a_compat import request, stored
 
 OLD_FREE = replace(FREE_RECIPE, algorithm_version="fusion:2")
-OLD_DEEP = replace(DEEP_RECIPE, algorithm_version="targeting:1,fusion:2")
+OLD_DEEP = replace(DEEP_RECIPE, algorithm_version="additive:1,fusion:2")
 PHANTOM, FIRST, SECOND = "Tone 440", "Tone 554", "Tone 659"
 #: Window ordinals at the 9 s hop: the phantom 0-13 and 28-30 (a 114 s hole), the real tracks in it.
 LABELS = {
@@ -158,7 +158,7 @@ def _tree(*roots: Path) -> dict[str, str]:
 def test_a_fusion_2_result_is_stale_for_serving_and_reusable_for_recognition(monkeypatch) -> None:
     assert FUSION_VERSION == 4
     assert FREE_RECIPE.algorithm_version == "fusion:4"
-    assert DEEP_RECIPE.algorithm_version == "targeting:1,fusion:4"
+    assert DEEP_RECIPE.algorithm_version == "additive:1,fusion:4"
     for name, old in (("free", OLD_FREE), ("deep", OLD_DEEP)):
         req = request(name)
         was = stored(compat.RunRequest(replace(req.inputs, recipe_id=old.recipe_id), old))
@@ -350,7 +350,18 @@ def test_a_stale_deep_result_never_becomes_a_new_paid_analysis(
     work, audio, old_bundle, (first_audd, _) = _stored_under_fusion_2(
         tmp_path, monkeypatch, OLD_DEEP
     )
-    assert first_audd.calls > 30  # paid clips, already paid for
+    # Free-first: the paid clips are exactly the free result's gap windows (2 gaps, 5 clips),
+    # none of them cached yet -- all bought once, here.
+    assert first_audd.calls == 5
+    first_entry = json.loads(
+        read_text(old_bundle.parents[2] / "invocations.jsonl").splitlines()[-1]
+    )
+    assert (
+        first_entry["counts"]["paid_targets"],
+        first_entry["counts"]["paid_target_spans"],
+        first_entry["counts"]["paid_cache_hits"],
+        first_entry["counts"]["paid_requests"],
+    ) == (5, 2, 0, 5)
     media = old_bundle.parents[2]
     _damage(media, how)
     attempts = {p: p.read_bytes() for p in media.rglob("attempts*.jsonl")}
@@ -389,7 +400,18 @@ def test_a_legacy_stale_deep_result_is_refused_before_any_paid_action(
     work, audio, old_bundle, (first_audd, _) = _stored_under_fusion_2(
         tmp_path, monkeypatch, OLD_DEEP
     )
-    assert first_audd.calls > 30
+    # Free-first: the paid clips are exactly the free result's gap windows (2 gaps, 5 clips),
+    # none of them cached yet -- all bought once, here.
+    assert first_audd.calls == 5
+    first_entry = json.loads(
+        read_text(old_bundle.parents[2] / "invocations.jsonl").splitlines()[-1]
+    )
+    assert (
+        first_entry["counts"]["paid_targets"],
+        first_entry["counts"]["paid_target_spans"],
+        first_entry["counts"]["paid_cache_hits"],
+        first_entry["counts"]["paid_requests"],
+    ) == (5, 2, 0, 5)
     media = old_bundle.parents[2]
     _make_pre_bundle(media)
     _damage(media, how)

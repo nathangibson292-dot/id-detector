@@ -175,8 +175,10 @@ def test_free_to_deep_primary_only_and_frozen_secondary(tmp_path, monkeypatch):
     assert entry["usd_e2_reserved"] == 4 and entry["usd_e2_spent"] == 4
     terminal = [item for item in entries if item["invocation_id"] == entry["invocation_id"]]
     assert len(terminal) == 1 and terminal[0]["status"] == "complete"
-    assert entry["counts"]["secondary_allocated"] == 0
-    assert entry["counts"]["secondary_reused"] == 7
+    # Free-first: the stored Free sweep answers Deep's free pass outright (no Shazam request);
+    # the paid step then checks the free result's gaps -- here the whole one-minute tone.
+    assert entry["counts"]["free_reused"] == 7
+    assert entry["counts"]["paid_targets"] == 7
     manifest = read_bundle_manifest(deep)
     assert manifest["status"] == "complete"
     assert entry["analysis_key"] == manifest["analysis_key"]
@@ -184,8 +186,8 @@ def test_free_to_deep_primary_only_and_frozen_secondary(tmp_path, monkeypatch):
     assert read_bytes(free / "manifest.json") == before
     frozen = json.loads(read_text(media / manifest["fuse_run"] / "episodes.json"))
     assert frozen
-    assert {item.provider for item in fused_inputs[-1]["observations"]} == {"audd"}
-    assert {item.provider for item in fused_inputs[-1]["extra_observations"]} == {"shazam"}
+    assert {item.provider for item in fused_inputs[-1]["observations"]} == {"shazam"}
+    assert {item.provider for item in fused_inputs[-1]["extra_observations"]} == {"audd"}
     assert len(fused_inputs[-1]["extra_observations"]) == 7
 
 

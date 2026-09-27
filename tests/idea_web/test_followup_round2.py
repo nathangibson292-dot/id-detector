@@ -25,7 +25,7 @@ from id_detector.service import LocalPath, PipelineOptions
 from idea_web.database import Database, Migration
 from idea_web.jobs.local import LocalJobs, LocalWorker, LocalWorkerSupervisor, local_database
 from idea_web.jobs.worker import JobQueue, SQLiteAttemptJournal, Worker
-from tests.fakes.providers import FakeShazamHTTP, no_backoff
+from tests.fakes.providers import APPROVED_DEEP, FakeShazamHTTP, no_backoff
 from tests.idea_web.test_followup_queue_money import _claimed_run
 from tests.idea_web.test_followup_review_fixes import (
     FAKES,
@@ -130,7 +130,7 @@ def test_three_worker_deaths_dead_letter_the_job_and_settle_its_durable_spend(
 ) -> None:
     config = _env(tmp_path, monkeypatch)
     jobs = LocalJobs(tmp_path)
-    job_id = jobs.submit(str(AUDIO), "max_accuracy")
+    job_id = jobs.submit(str(AUDIO), "max_accuracy", **APPROVED_DEEP)
     for _ in range(3):
         _child_worker_dies(tmp_path, config, kill_on=1)
         _expire(jobs, job_id)
@@ -149,7 +149,7 @@ def test_cancelling_after_a_death_before_the_first_progress_flush_settles_spend(
 ) -> None:
     config = _env(tmp_path, monkeypatch)
     jobs = LocalJobs(tmp_path)
-    job_id = jobs.submit(str(AUDIO), "max_accuracy")
+    job_id = jobs.submit(str(AUDIO), "max_accuracy", **APPROVED_DEEP)
     submitted = jobs.queue.get(job_id).progress
     _child_worker_dies(tmp_path, config, kill_on=3)
     # The worker died before its 0.5 s publisher ever flushed: the row still holds the snapshot
@@ -192,7 +192,7 @@ def test_a_paid_job_survives_a_worker_kill_through_the_real_supervisor(
         first = supervisor.pid
         assert first is not None
         pids.append(first)
-        job_id = jobs.submit(str(AUDIO), "max_accuracy")
+        job_id = jobs.submit(str(AUDIO), "max_accuracy", **APPROVED_DEEP)
         assert _until(marker.exists, timeout=240), "the worker never reached its paid sweep"
         assert _until(lambda: supervisor.pid not in (None, first), timeout=60)
         pids.append(supervisor.pid)

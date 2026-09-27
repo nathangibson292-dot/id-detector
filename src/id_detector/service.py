@@ -235,7 +235,12 @@ class PipelineOptions:
     #: dispatch-admission check and the claim fence for terminal settlement (plan §4.6).
     dispatch_admission: object | None = None
     settlement_writer: object | None = None
-    cli_paid_confirm: Callable[[int, int], bool] | None = None
+    #: The Deep price gate, asked once the free pass has run: it receives the exact
+    #: :class:`~id_detector.additive.PaidPlan` and returns whether to reserve and dispatch.
+    #: The CLI prompts (or honours ``--yes``); the browser approves only a price the owner
+    #: already accepted. ``None`` means the caller authorised the spend itself (a budgeted
+    #: experiment); it never bypasses the money authority.
+    cli_paid_confirm: Callable[[Any], bool] | None = None
 
 
 def durable_artefact_records(

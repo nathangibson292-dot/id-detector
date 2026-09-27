@@ -128,14 +128,32 @@ class _Boom(RuntimeError):
     """A crash — a power cut, an OOM kill — in the middle of the paid primary."""
 
 
+def _in_paid_step(callback):
+    """Call ``callback(done)`` only for the paid step's own ticks.
+
+    Deep is free-first: the free pass ticks ``recognise`` first; the paid check announces itself
+    ("paid check of the free result's gaps") and then ticks its clips through the same hook.
+    """
+
+    started = [False]
+
+    def progress(phase: str, done: int, _total: int, message: str) -> None:
+        if message.startswith("paid check of"):
+            started[0] = True
+        elif phase == "recognise" and started[0]:
+            callback(done)
+
+    return progress
+
+
 def _crash_after(clips: int):
     """A progress hook that dies once ``clips`` paid clips have resolved."""
 
-    def progress(phase: str, done: int, _total: int, _message: str) -> None:
-        if phase == "recognise" and done >= clips:
-            raise _Boom("the worker died mid-primary")
+    def crash(done: int) -> None:
+        if done >= clips:
+            raise _Boom("the worker died mid paid check")
 
-    return progress
+    return _in_paid_step(crash)
 
 
 def _crash_at_phase(target_phase: str):
@@ -279,10 +297,7 @@ def test_cancellation_mid_primary_leaves_a_resumable_checkpoint(tmp_path: Path) 
     work = tmp_path / "work"
     token = threading.Event()
     audd = FakeAudD(SCRIPT, latency_s=0.02)
-
-    def progress(phase: str, done: int, _total: int, _message: str) -> None:
-        if phase == "recognise" and done >= 1:
-            token.set()
+    progress = _in_paid_step(lambda done: token.set() if done >= 1 else None)
 
     store = _store(work, audd=audd)
     result = run(
@@ -295,8 +310,9 @@ def test_cancellation_mid_primary_leaves_a_resumable_checkpoint(tmp_path: Path) 
     )
     assert result.status == "cancelled"
     completed = store.completed_phases(result.run_id)
-    assert {"ingest", "decode", "windows"} <= completed
-    assert "primary" not in completed
+    # Free-first: the free pass (the primary) is durable; the paid step is not.
+    assert {"ingest", "decode", "windows", "primary", "fuse1"} <= completed
+    assert "secondary" not in completed
     assert 0 < audd.calls < 7
 
 
@@ -462,7 +478,7 @@ def _crashed_deep_run(
     crashed = run(_request(store, run_id=run_id, progress=_crash_after(4), attempt_journal=journal))
     assert crashed.status == "failed", crashed
     assert 0 < audd.calls < DEEP_CLIPS, audd.calls
-    assert "primary" not in store.completed_phases(run_id)
+    assert "secondary" not in store.completed_phases(run_id)
     return audd, store
 
 
@@ -583,10 +599,7 @@ def test_a_cancelled_primary_resumes_instead_of_colliding_with_its_own_artefacts
     run_id = "cancel-then-resume"
     token = threading.Event()
     audd = FakeAudD(SCRIPT, latency_s=0.02)
-
-    def progress(phase: str, done: int, _total: int, _message: str) -> None:
-        if phase == "recognise" and done >= 1:
-            token.set()
+    progress = _in_paid_step(lambda done: token.set() if done >= 1 else None)
 
     store = _store(work, audd=audd, refresh_states=frozenset({"no_match"}))
     cancelled = run(_request(store, run_id=run_id, cancel_token=token, progress=progress))
@@ -742,11 +755,12 @@ def test_a_degraded_free_primary_resumes_as_free_and_never_as_deep(tmp_path: Pat
     audd = FakeAudD(unavailable)
     shazam = FakeShazamHTTP(SCRIPT)
     store = _store(work, audd=audd, shazam=shazam, allow_degrade=True)
-    failed = run(_request(store, run_id=run_id, progress=_crash_at_phase("fuse")))
+    # Free-first: the paid engine's refusal is found in the paid step, after the free pass; the
+    # substitution is durable with that step's checkpoint, so crash just after it.
+    failed = run(_request(store, run_id=run_id, progress=_crash_at_phase("present")))
     assert failed.status == "failed", failed
-    state = store.state(run_id, "primary")
-    assert state["achieved"] == "free"
-    assert state["paid_first"] is False
+    assert store.state(run_id, "primary")["paid_first"] is False
+    state = store.state(run_id, "secondary")
     assert state["degrade_reason"] == "provider_unavailable"
 
     resumed_audd = FakeAudD(unavailable)

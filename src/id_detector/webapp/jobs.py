@@ -233,6 +233,18 @@ class Job:
     #: The fetched mix on disk (``ingest/original.*``) once ingest has completed and the
     #: server has resolved it — what the analysing page plays while the engines run.
     audio_path: str | None = None
+    #: A Deep ("Max accuracy") job stops after its free pass until the owner approves the price:
+    #: ``paid_offer`` is that exact price (``gaps``, ``clips``, ``cached``, ``to_send``,
+    #: ``usd_e6``, ``usd_e2``), shown with Approve / Skip. ``offer_decision`` records the answer
+    #: (``approved`` / ``skipped``) and ``follow_up_job`` the Deep job an approval started.
+    paid_offer: dict[str, int] | None = None
+    offer_decision: str | None = None
+    follow_up_job: str | None = None
+    #: What the owner approved for THIS job: its paid step runs only when its exact plan is within
+    #: both figures; otherwise it stops with a fresh offer. ``None`` on every job not started by an
+    #: approval, so no job is ever pre-authorised by default.
+    approved_usd_e6: int | None = None
+    approved_clips: int | None = None
     log: deque[str] = field(default_factory=lambda: deque(maxlen=LOG_RING))
     cancel_event: threading.Event = field(default_factory=threading.Event)
     #: Queue-aware guards the supervised local worker attaches for ONE execution: the dispatch
@@ -460,6 +472,10 @@ class Job:
             # The canonical projection's count for the finished result.
             "tracks_found": self.tracks_found,
             "crowd_tracks": self.crowd_tracks,
+            # The Deep price waiting for the owner's answer, and that answer.
+            "paid_offer": self.paid_offer,
+            "offer_decision": self.offer_decision,
+            "follow_up_url": f"/jobs/{self.follow_up_job}" if self.follow_up_job else None,
             "terminal": self.status in TERMINAL_STATES,
             "log": list(self.log),
         }
@@ -518,6 +534,24 @@ class JobContext:
         """The job's durable service run id (``None`` only for a job built without one)."""
 
         return self._job.run_id
+
+    @property
+    def approved_usd_e6(self) -> int | None:
+        return self._job.approved_usd_e6
+
+    @property
+    def approved_clips(self) -> int | None:
+        return self._job.approved_clips
+
+    def set_offer(self, offer: dict[str, int]) -> None:
+        """The Deep price this job stopped at, for the owner to approve or skip."""
+
+        with self._manager.lock:
+            self._job.paid_offer = dict(offer)
+            self._job.log.append(
+                f"{_stamp()} free pass done: Deep would check {offer.get('gaps', 0)} gaps for "
+                f"about ${offer.get('usd_e2', 0) / 100:.2f}; waiting for your approval"
+            )
 
     @property
     def dispatch_admission(self) -> Any:
@@ -713,6 +747,8 @@ class JobManager:
         acquire: bool = False,
         build_index: bool = False,
         known_tracklist: str | None = None,
+        approved_usd_e6: int | None = None,
+        approved_clips: int | None = None,
     ) -> str:
         validated = validate_target(target)
         job = Job(
@@ -724,6 +760,8 @@ class JobManager:
             build_index=build_index,
             known_tracklist=known_tracklist,
             run_id=new_run_id(),
+            approved_usd_e6=approved_usd_e6,
+            approved_clips=approved_clips,
         )
         with self.lock:
             self._jobs[job.id] = job
@@ -737,6 +775,48 @@ class JobManager:
     def get(self, job_id: str) -> Job | None:
         with self.lock:
             return self._jobs.get(job_id)
+
+    def approve_offer(self, job_id: str) -> str | None:
+        """Approve a finished Max-accuracy job's Deep price: start the job that may spend it."""
+
+        with self.lock:
+            job = self._jobs.get(job_id)
+            if (
+                job is None
+                or job.status not in TERMINAL_STATES
+                or not job.paid_offer
+                or job.offer_decision is not None
+            ):
+                return None
+            job.offer_decision = "approved"
+            offer = dict(job.paid_offer)
+        follow_up = self.submit(
+            job.target,
+            "max_accuracy",
+            acquire=job.acquire,
+            build_index=job.build_index,
+            known_tracklist=job.known_tracklist,
+            approved_usd_e6=int(offer.get("usd_e6", 0)),
+            approved_clips=int(offer.get("to_send", 0)),
+        )
+        with self.lock:
+            job.follow_up_job = follow_up
+        return follow_up
+
+    def skip_offer(self, job_id: str) -> bool:
+        """Skip a finished Max-accuracy job's Deep price: keep the Free result, spend nothing."""
+
+        with self.lock:
+            job = self._jobs.get(job_id)
+            if (
+                job is None
+                or job.status not in TERMINAL_STATES
+                or not job.paid_offer
+                or job.offer_decision is not None
+            ):
+                return False
+            job.offer_decision = "skipped"
+            return True
 
     def recent(self, limit: int = 25) -> list[Job]:
         with self.lock:

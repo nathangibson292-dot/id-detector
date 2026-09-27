@@ -29,6 +29,7 @@ from idea_web.database import Database
 from idea_web.jobs import worker as worker_module
 from idea_web.jobs.local import SUPERVISOR_LOCK, LocalJobs, LocalWorker, local_database
 from idea_web.jobs.worker import DispatchAdmission, JobQueue, SettlementLedger, Worker
+from tests.fakes.providers import APPROVED_DEEP
 from tests.idea_web.test_followup_review_fixes import UNIT, _invocations
 from tests.idea_web.test_followup_round2 import _env, _expire, _nothing_runs
 from tests.idea_web.test_followup_round5 import _claimed_local_job
@@ -124,7 +125,7 @@ def test_an_old_worker_claim_marks_the_job_unproven_so_it_never_gets_a_zero_row(
 ) -> None:
     _env(tmp_path, monkeypatch)
     jobs = LocalJobs(tmp_path)
-    job_id = jobs.submit(str(AUDIO), "max_accuracy")
+    job_id = jobs.submit(str(AUDIO), "max_accuracy", **APPROVED_DEEP)
     run_id = jobs.queue.get(job_id).run_id
     assert _stamp(jobs.database, job_id) == 3
     # A still-running worker of OLDER code claims it: it knows neither provenance column.

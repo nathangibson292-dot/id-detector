@@ -347,9 +347,9 @@ def test_novelty_is_computed_once_for_every_fuse_of_a_run_with_rescans_on(
 ) -> None:
     calls = _count_novelty(monkeypatch)
     loops = _capture_loop(monkeypatch)
-    # Deep fuses twice (the first fuse, then the secondary's re-fuse) with rescans allowed; a
-    # request budget equal to the window count keeps the loop from spending a rescan generation
-    # (which would hand the secondary nothing to probe), so both fuses see the same gen-0 picture.
+    # Deep fuses twice (the free pass, then the re-fuse with the paid check's answers) with
+    # rescans allowed; a request budget equal to the window count keeps the loop from spending a
+    # rescan generation, so both fuses see the same gen-0 picture.
     code, _audd, shazam, entry, _media = _run(
         tmp_path,
         "gate0a-deep.json",
@@ -359,7 +359,7 @@ def test_novelty_is_computed_once_for_every_fuse_of_a_run_with_rescans_on(
         max_requests=7,
     )
     assert code == 0 and entry["status"] == "complete"
-    assert entry["counts"]["secondary_allocated"] == shazam.requests == 2  # type: ignore[index]
+    assert shazam.requests == 7 and entry["counts"]["paid_targets"] == 7  # type: ignore[index]
     assert len(loops) == 2  # the re-fuse happened
     assert calls == [60_000]  # ... and novelty was computed exactly once, before the first fuse
     assert [loop["novelty_change_points_ms"] for loop in loops] == [(21_000, 42_000)] * 2
@@ -520,27 +520,37 @@ def test_deep_density_two_reports_the_windows_the_paid_sweep_skipped(
         deep_primary_density=2,
     )
     loops = _capture_loop(monkeypatch)
+    # The free pass leaves window 3 (27-39 s) unanswered; the density-2 paid check sends every
+    # other gap window (the even ones), so window 3 stays unlistened by every engine.
+    script = {
+        "shazam": {"default": "match", "windows": {"3": "malformed"}},
+        "audd": {"default": "match", "windows": {}},
+    }
     code, audd, shazam, entry, media_dir = _run(
         tmp_path,
-        "gate0a-deep.json",
+        script,
         recipe=get_recipe("deep", primary_density=2),
         app_config=config,
     )
     assert code == 0 and entry["status"] == "complete"
     assert audd.calls == 4 and entry["counts"]["paid_planned"] == 4  # type: ignore[index]
+    assert [path.name for path in audd.paths] == [
+        "0000000000-none.wav",
+        "0000018000-none.wav",
+        "0000036000-none.wav",
+        "0000048000-none.wav",
+    ]
+    assert shazam.requests == 7
     first, second = loops
-    # The first fuse sees exactly the even-indexed windows the density-2 sweep sent to AudD;
-    # every window is still handed over for the sidecars.
-    assert _scanned_starts(first) == [0, 18_000, 36_000, 48_000]
+    # The first fuse sees exactly the windows the free pass answered; every window is still
+    # handed over for the sidecars.
+    assert _scanned_starts(first) == [0, 9_000, 18_000, 36_000, 45_000, 48_000]
     assert len(first["windows"].records) == 7  # type: ignore[attr-defined]
-    # The re-fuse adds whatever the Shazam secondary probed (it may coincide with AudD windows).
-    assert entry["counts"]["secondary_allocated"] == shazam.requests == 2  # type: ignore[index]
-    probed = set(_scanned_starts(second))
-    assert {0, 18_000, 36_000, 48_000} <= probed and len(probed) <= 6
+    # The re-fuse adds what the paid check answered (here, windows the free pass also answered).
+    assert set(_scanned_starts(second)) == set(_scanned_starts(first))
     scanned = [tuple(window.support_ms) for window in second["scanned_windows"]]  # type: ignore[union-attr]
-    # Proved evidence never exceeds the time an engine actually listened to (here the two
-    # unanswered holes sit against episode edges, so the partition reports them as unresolved
-    # boundaries rather than unscanned time), and gap evidence counts only answered windows.
+    # Proved evidence never exceeds the time an engine actually listened to, and gap evidence
+    # counts only answered windows.
     episodes = _episodes(media_dir)
     listened = interval_length(scanned, 60_000)
     assert listened < 60_000

@@ -161,6 +161,12 @@ async def _notify_attempt(callback: Callable[[], Awaitable[None]] | object) -> N
         await result
 
 
+#: A browser Max-accuracy job's approval, as the Approve button records it, sized so that the
+#: fixtures' paid step is always within it: a test that needs the paid step to run passes these
+#: to ``submit`` (a job without them stops after its free pass with the offer).
+APPROVED_DEEP = {"approved_usd_e6": 10_000_000, "approved_clips": 10_000}
+
+
 async def no_backoff(_seconds: float) -> None:
     """Retry sleeper for tests: the recipe's backoff schedule costs no wall time but yields."""
 

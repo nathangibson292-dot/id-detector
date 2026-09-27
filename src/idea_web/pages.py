@@ -51,6 +51,9 @@ def activity_item_html(job: Any, csrf_token: str) -> str:
     steps = legacy._job_steps(job)
     label = html.escape(legacy._job_title(job))
     phase = html.escape(phase_label(steps, job.status, job.phase))
+    if getattr(job, "paid_offer", None) and getattr(job, "offer_decision", None) is None:
+        # A Max-accuracy job waits after its free pass until the owner answers its Deep price.
+        phase = "Free pass done &mdash; Deep is waiting for your approval"
     pct = 100 if job.status == "succeeded" else 0
     terminal = "1" if job.status in TERMINAL_STATES else "0"
     dismiss = ""

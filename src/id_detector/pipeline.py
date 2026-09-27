@@ -18,13 +18,20 @@ from __future__ import annotations
 import asyncio
 import json
 import os
-from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass, field
+from collections.abc import Callable, Mapping
+from dataclasses import dataclass, field, replace
 from hashlib import sha256
 from pathlib import Path
 
 import typer
 
+from id_detector.additive import (
+    FreeEvidence,
+    Fused,
+    additive_merge,
+    find_free_evidence,
+    plan_paid_step,
+)
 from id_detector.attempts import AttemptJournal, attempts_path
 from id_detector.compat import (
     LOCAL_OWNER_SCOPE,
@@ -34,7 +41,6 @@ from id_detector.compat import (
     find_stale_result,
     hints_snapshot,
     index_identity,
-    load_free_observations,
 )
 from id_detector.contracts import ObservationRecord, WindowRecord
 from id_detector.decode import decode, load_decode
@@ -45,11 +51,14 @@ from id_detector.fuse.episodes import (
 from id_detector.hints.pipeline import run_hints
 from id_detector.ingest import SourceChanged, _load_cached, ingest
 from id_detector.io import (
+    atomic_write_bytes,
     atomic_write_json,
+    canonical_json_bytes,
     native_path,
     path_is_file,
     read_text,
     sha256_file,
+    write_completion_sidecar,
 )
 from id_detector.jobs import JobStoreLocked, ProcessLock
 from id_detector.journal import InvocationTimer, append_invocation, has_invocation
@@ -75,8 +84,8 @@ from id_detector.paid_clip import (
 )
 from id_detector.providers.audd import DEFAULT_ANCHOR_MAX_MS, DEFAULT_ANCHOR_SLACK_MS
 from id_detector.providers.base import AppConfig
-from id_detector.recipes import Recipe, get_recipe
-from id_detector.recognise import _write_jsonl, recognise_generation, restore_run_answers
+from id_detector.recipes import Recipe, get_recipe, paid_policy
+from id_detector.recognise import _write_jsonl, recognise_generation
 from id_detector.rescan import DEFAULT_MAX_GENERATIONS
 from id_detector.run_ledger import (
     RecoveredMoney,
@@ -88,17 +97,7 @@ from id_detector.run_ledger import (
 from id_detector.scan import PAID_FILE_SCANNERS
 from id_detector.scan_targeting import select_scan_targets
 from id_detector.secondary_targeting import (
-    SecondaryPick,
-    allocate_secondary_windows,
-    distribute_secondary_windows,
-    energy_reader,
     frozen_windows,
-    listed_text_keys,
-    new_identity_discoveries,
-    secondary_capacity,
-    secondary_reserve,
-    select_secondary_candidates,
-    serve_confirmations,
 )
 from id_detector.shazam import HTTPClientInterface
 from id_detector.shazam_breaker import ShazamBreaker, shazam_off
@@ -381,47 +380,42 @@ def _primary_state(
     *,
     media_dir: Path,
     observation_path: Path | None,
-    paid_first: bool,
     achieved_recipe: Recipe,
     degrade_reason: str | None,
     primary_planned: int,
     primary_resolved: int,
-    primary_clip: PaidScanResult,
     free_failures: int,
     counts: Mapping[str, int],
-    usd_admitter: UsdAdmitter | None,
 ) -> dict[str, object]:
-    """Everything a resume needs about the completed primary.
+    """Everything a resume needs about the completed primary: the free sweep, for both recipes.
 
-    Besides the evidence and the counts this records the SUBSTITUTION (``achieved`` / ``paid_first``
-    / ``degrade_reason``) and the whole reservation, so a resumed run cannot take the paid branch
-    for Free evidence, and cannot lose or re-derive the money against a cap that has since changed.
+    The money fields stay (at zero) for readers of older checkpoints: the free-first Deep recipe
+    reserves only after this phase, and its reservation lives in the attempt journal.
     """
 
-    reservation = usd_admitter.reservation if usd_admitter is not None else None
     return {
         "observation_path": (
             _reference(media_dir, observation_path) if observation_path is not None else ""
         ),
-        "paid_first": paid_first,
+        "paid_first": False,
         "achieved": achieved_recipe.name,
         "degrade_reason": degrade_reason,
         "primary_planned": primary_planned,
         "resolved": primary_resolved,
         "requests": int(counts.get("requests", 0)),
         "physical_attempts": int(counts.get("physical_attempts", 0)),
-        "failures": primary_clip.failures if paid_first else free_failures,
-        "cache_hits": primary_clip.cache_hits if paid_first else int(counts.get("cache_hits", 0)),
-        "billable_units": primary_clip.billable_units,
-        "reservation_exhausted": primary_clip.reservation_exhausted,
-        "provider_stopped": primary_clip.provider_stopped,
-        "attempts": primary_clip.attempts,
-        "planned": reservation.planned if reservation is not None else 0,
-        "unit_usd_e6": reservation.unit_usd_e6 if reservation is not None else 0,
-        "effective_cap_e2": reservation.effective_cap_e2 if reservation is not None else 0,
-        "usd_e6_reserved": reservation.usd_e6_reserved if reservation is not None else 0,
-        "usd_e2_reserved": reservation.usd_e2_reserved if reservation is not None else 0,
-        "usd_e6_spent": usd_admitter.usd_e6_spent if usd_admitter is not None else 0,
+        "failures": free_failures,
+        "cache_hits": int(counts.get("cache_hits", 0)),
+        "billable_units": 0,
+        "reservation_exhausted": False,
+        "provider_stopped": None,
+        "attempts": 0,
+        "planned": 0,
+        "unit_usd_e6": 0,
+        "effective_cap_e2": 0,
+        "usd_e6_reserved": 0,
+        "usd_e2_reserved": 0,
+        "usd_e6_spent": 0,
     }
 
 
@@ -432,12 +426,10 @@ def _secondary_state(
     index_scan: PaidScanResult,
     secondary_allocated: int,
     secondary_resolved: int,
-    secondary_blocked: str | None,
-    supplemental_requests: int,
-    supplemental_physical_attempts: int,
+    degrade_reason: str | None,
     counts: Mapping[str, int],
 ) -> dict[str, object]:
-    """Everything a resume needs about the completed second opinion."""
+    """Everything a resume needs about the completed paid step (and the local index)."""
 
     return {
         "secondary_paths": [
@@ -448,13 +440,13 @@ def _secondary_state(
         ],
         "allocated": secondary_allocated,
         "resolved": secondary_resolved,
-        "blocked": secondary_blocked,
-        "supplemental_requests": supplemental_requests,
-        "supplemental_physical_attempts": supplemental_physical_attempts,
+        "degrade_reason": degrade_reason,
+        "provider_stopped": secondary_scan.provider_stopped,
+        "reservation_exhausted": secondary_scan.reservation_exhausted,
         "counts": {
             key: value
             for key, value in counts.items()
-            if key.startswith("secondary") or key == "local_index_matches"
+            if key.startswith("paid") or key == "local_index_matches"
         },
     }
 
@@ -862,13 +854,8 @@ async def run_analysis(
         # open — it needs no Shazam request.  Only a request that would start a new analysis waits.
         if requested_recipe.name == "free" and refuse_free():
             return 6
-        free_bundle = None if refresh else find_result(media_dir, request, free_evidence=True)
-        reused_observations, reused_path = (
-            load_free_observations(free_bundle) if free_bundle else ((), None)
-        )
+        deep = requested_recipe.name == "deep"
 
-        if free_bundle is not None:
-            max_generations = 0  # Reused Free evidence replaces all new Shazam allocation.
         if decoded is None:
             ingested = await ingest(url, work_root)
             _report(progress, "decode", 0, 1, "decoding audio")
@@ -917,106 +904,31 @@ async def run_analysis(
             (windows.record_path, *(media_dir / item.wav_path for item in windows.records)),
         )
 
-        # Plan §2.3.3: what a previous pass of THIS run already dispatched and paid for.  The
-        # authority is the journal the sweep writes to (the caller's, when one was injected):
-        # recovering it before any new paid request means resuming cannot re-bill resolved work
-        # and cannot omit earlier spend from this run's settlement.
-        restored_over_cap = False
-
         # The frozen generation-0 window set is what every recipe plans against (§2.3.1): the
-        # Deep reservation, both primaries' achieved fractions and the secondary's eligibility.
+        # primary's achieved fraction, and the Deep paid step's clip selection.
         frozen_count = len(frozen_windows(windows.records))
-        primary_planned = (
-            frozen_count + requested_recipe.primary_density - 1
-        ) // requested_recipe.primary_density
-        if requested_recipe.name == "deep":
-            planned = primary_planned
-            counts["paid_planned"] = planned
-            # Only the CLI supplies this additional gate. Refusing a fresh run creates no
-            # reservation, attempt or settlement; durable recovery and all money fences below
-            # remain the authority. A resumed reservation has already been authorised.
-            if (
-                durable_reservation is None
-                and usd_admitter is None
-                and not recovered.any
-                and cli_paid_confirm is not None
-                and not cli_paid_confirm(decoded.record.pcm.duration_ms, frozen_count)
-            ):
-                return _finish(exit_code=130, status="cancelled", reason="paid_not_confirmed")
-            if usd_admitter is not None and durable_reservation is None:
-                # The caller's admitter (or one restored from a primary checkpoint written before
-                # reservation records existed) carries the run's original reservation.
-                durable_reservation = ReservationRecord.from_reservation(
-                    run_id, usd_admitter.reservation
-                )
-            if durable_reservation is None and journal.dispatch_without_reservation():
-                # Fail closed: the SQLite authority proves this run already dispatched, yet holds
-                # no reservation. Recomputing one from today's price or cap could authorise spend
-                # the run never reserved, so no further paid request is made at all.
-                missing_settlement = _settle()
-                entry = timer.entry(
-                    status="failed",
-                    reason="reservation_missing",
-                    exit_code=1,
-                    counts=counts,
-                    costs={"usd_e2": missing_settlement.usd_e2_spent},
-                    source_ids=source_ids,
-                    ffmpeg_version=ffmpeg_version,
-                    **_money_journal_fields(missing_settlement, requested_recipe, app_config),
-                )
-                _report(progress, "recognise", 0, planned, "refused: no durable reservation")
-                _append_settlement(media_dir / "invocations.jsonl", entry)
-                return _finish(
-                    exit_code=1,
-                    status="failed",
-                    reason="reservation_missing",
-                    settlement=missing_settlement,
-                )
-            try:
-                if durable_reservation is not None:
-                    # Plan §2.3.2 on resume: the reservation this run made before its first
-                    # dispatch is restored verbatim — never recomputed from today's price or cap.
-                    reservation = durable_reservation.reservation()
-                else:
-                    reservation = reserve_usd(
-                        planned=planned,
-                        unit_usd_e6=app_config.audd_usd_e6_per_request,
-                        recipe_max_usd_e2=requested_recipe.max_usd_e2,
-                        configured_max_usd_e2=app_config.max_usd_e2,
-                    )
-            except BudgetExhausted as exc:
-                # A refusal must still report what this run already spent — the exact µUSD its own
-                # attempt events recorded, never units × today's price.
-                refused_settlement = _settle()
-                entry = timer.entry(
-                    status="budget_exhausted",
-                    reason="reservation_exceeds_cap",
-                    exit_code=4,
-                    counts=counts,
-                    costs={"usd_e2": refused_settlement.usd_e2_spent},
-                    source_ids=source_ids,
-                    ffmpeg_version=ffmpeg_version,
-                    **_money_journal_fields(refused_settlement, requested_recipe, app_config),
-                )
-                _report(progress, "recognise", 0, planned, str(exc))
-                _append_settlement(media_dir / "invocations.jsonl", entry)
-                return _finish(
-                    exit_code=4,
-                    status="budget_exhausted",
-                    reason="reservation_exceeds_cap",
-                    settlement=refused_settlement,
-                )
-            # Durable BEFORE any dispatch (§2.3.2): a crash from here on resumes against exactly
-            # this reservation, and an existing record for the run always wins.
-            durable_reservation = journal.record_reservation(reservation)
-            journal.unit_usd_e6 = durable_reservation.unit_usd_e6
-            # Charge what this run already spent — the ledger's exact µUSD — against the ORIGINAL
-            # reservation before anything new is admitted, an injected admitter included. A
-            # reservation that cannot even cover it means no further paid request may be made.
-            usd_admitter, covered = restore_admitter(
-                durable_reservation.reservation(), recovered.usd_e6_spent, usd_admitter
+        primary_planned = frozen_count
+        primary_state = (checkpoint_state or {}).get("primary", {})
+        if primary_state.get("paid_first"):
+            # A primary written by the retired paid-first Deep recipe. Its evidence is AudD's, not
+            # the free sweep this recipe fuses first; it is never resumed as if it were (and the
+            # generic failure path below settles what that run already spent).
+            raise ValueError(
+                "this run was started by the older paid-first Deep recipe and cannot be resumed; "
+                "nothing further was sent"
             )
-            restored_over_cap = not covered
+        # Deep is free-first: its first pass IS the Free sweep. A stored Free result's proven
+        # Shazam evidence answers it outright -- no Shazam request, no time -- and only without one
+        # does the free engine sweep the mix (and wait, like a Free request, while it is paused).
+        free_evidence: FreeEvidence | None = None
+        if deep and "primary" not in completed_phases and not refresh:
+            free_evidence = find_free_evidence(
+                media_dir, request, windows=windows.records, local=presentation_local
+            )
+        if deep and "primary" not in completed_phases and free_evidence is None and refuse_free():
+            return 6
+        if free_evidence is not None:
+            max_generations = 0  # Reused Free evidence replaces all new Shazam allocation.
 
         timer.start_stage("recognise_ms")
         # The latest per-window tick, so a log line in the same phase repeats the real
@@ -1057,10 +969,9 @@ async def run_analysis(
         async def recognise_windows(
             *, windows: object, generation: int, run_label: str | None = None
         ) -> object:
-            # ``run_label`` keys a further Shazam pass of the same generation (the secondary's
-            # confirmations) to its own invocation directory: the recognition artefacts are
-            # immutable per invocation and generation, so a second pass over new windows must
-            # not try to rewrite the first pass's files.
+            # ``run_label`` keys a further Shazam pass of the same generation to its own
+            # invocation directory: the recognition artefacts are immutable per invocation and
+            # generation, so a second pass over new windows must not rewrite the first pass's.
             return await recognise_generation(
                 media_key=ingested.record.media_key,
                 media_dir=media_dir,
@@ -1077,35 +988,15 @@ async def run_analysis(
                 on_window=_on_recognise_window if progress is not None else None,
                 http_client=shazam_http_client,
                 process_breaker=shazam_breaker,
-                running_free=achieved_recipe.name == "free",
+                # The free sweep is the primary of BOTH recipes now: once running it is never
+                # interrupted by the breaker opening (§2.3.5).
+                running_free=True,
                 refresh_states=recognise_refresh_states,
                 attempt_journal=shazam_journal,
             )
 
-        # Which engine identifies the WHOLE mix first (generation 0).  Free = the rate-limited free
-        # engine over every frozen window.  Deep = the paid engine, which is ~4-6x faster and has
-        # no rate limit, so it does the bulk and the free engine runs only as the bounded second
-        # opinion of plan §2.3.4 step 4.
-        paid_first = requested_recipe.primary_engine == "audd" and "audd" in enabled_engines
         achieved_recipe = requested_recipe
         degrade_reason: str | None = None
-        primary_state = (checkpoint_state or {}).get("primary", {})
-        if "primary" in completed_phases:
-            # Plan §2.3.1: the achieved recipe is part of the primary's durable state.  Without
-            # restoring the substitution a degraded Free pass would resume down the paid branch
-            # and load Free observations as AudD primary evidence.
-            restored_achieved = str(primary_state.get("achieved") or achieved_recipe.name)
-            if restored_achieved != achieved_recipe.name:
-                achieved_recipe = get_recipe(restored_achieved)
-            if primary_state.get("degrade_reason"):
-                degrade_reason = str(primary_state["degrade_reason"])
-            paid_first = bool(primary_state.get("paid_first", paid_first))
-            if not paid_first:
-                enabled_engines = tuple(
-                    engine for engine in enabled_engines if engine not in _PAID_ENGINES
-                )
-            primary_planned = int(primary_state.get("primary_planned", primary_planned))
-        primary_clip = PaidScanResult()
         primary_resolved = 0
         gen0_observations: tuple[object, ...] = ()
         gen0_observations_path: Path | None = None
@@ -1114,183 +1005,48 @@ async def run_analysis(
         free_failures = 0
         if "primary" in completed_phases:
             # A completed primary is restored from its immutable observation file and the counts
-            # checkpointed beside it -- for BOTH primaries.  The Free primary used to re-run every
-            # Shazam window here, which is the whole cost of the phase; and a restart with the
-            # breaker open would then refuse and degrade a run whose evidence is already on disk.
+            # checkpointed beside it. Re-running every Shazam window here would repeat the whole
+            # cost of the phase; and a restart with the breaker open would then refuse a run whose
+            # evidence is already on disk.
+            primary_planned = int(primary_state.get("primary_planned", primary_planned))
             observation_path = _checkpointed_path(media_dir, primary_state, "observation_path")
             gen0_observations = _read_observations(observation_path)
             gen0_observations_path = observation_path
             primary_resolved = int(primary_state.get("resolved", len(gen0_observations)))
-            counts["matches"] = sum(item.status == "match" for item in gen0_observations)
-            if paid_first:
-                primary_clip = PaidScanResult(
-                    observations=gen0_observations,
-                    observation_paths=(observation_path,),
-                    engines_run=("audd",),
-                    resolved=primary_resolved,
-                    failures=int(primary_state.get("failures", 0)),
-                    cache_hits=int(primary_state.get("cache_hits", len(gen0_observations))),
-                    billable_units=int(primary_state.get("billable_units", 0)),
-                    reservation_exhausted=bool(primary_state.get("reservation_exhausted", False)),
-                    provider_stopped=(
-                        str(primary_state["provider_stopped"])
-                        if primary_state.get("provider_stopped") is not None
-                        else None
-                    ),
-                    attempts=int(primary_state.get("attempts", 0)),
-                )
-                counts.update(
-                    {
-                        "paid_requests": 0,
-                        "paid_attempts": primary_clip.attempts,
-                        "paid_resolved": primary_clip.resolved,
-                        "paid_failures": primary_clip.failures,
-                        "paid_cache_hits": primary_clip.cache_hits,
-                        "paid_billable_units": primary_clip.billable_units,
-                        "paid_resumed_ambiguous": 0,
-                        "paid_resumed_reissued": 0,
-                    }
-                )
-            else:
-                gen0_requests = int(primary_state.get("requests", 0))
-                gen0_physical = int(primary_state.get("physical_attempts", 0))
-                free_failures = int(primary_state.get("failures", 0))
-                counts.update(
-                    {
-                        "requests": gen0_requests,
-                        "physical_attempts": gen0_physical,
-                        "failures": free_failures,
-                        "cache_hits": int(primary_state.get("cache_hits", 0)),
-                    }
-                )
-                # Reused Free evidence replaces all new Shazam allocation; a restored one likewise.
-                max_generations = 0
-        elif paid_first:
-            if restored_over_cap:
-                # The recovered spend already fills the reservation. The sweep still runs: it
-                # reuses every clip this run resolved (so the primary has its evidence file) and
-                # its exhausted admitter refuses any new dispatch, ending `partial`. Skipping it
-                # left no observation file and fusion crashed.
-                _recognise_log("audd primary resumed with its reservation already spent")
-            audd_retry = requested_recipe.retry_policy.get("audd")
-            primary_clip = await run_paid_clip_recognition(
-                media_key=ingested.record.media_key,
-                media_dir=media_dir,
-                windows=windows,
-                targets=((0, duration_ms),),
-                run_id=run_id,
-                app_config=app_config,
-                enabled_engines=enabled_engines,
-                cli_confirmation=cli_confirmation,
-                refresh=refresh,
-                refresh_states=refresh_states,
-                max_clips=len(windows.records) + 1,  # the whole mix, no per-mix cap
-                primary_density=requested_recipe.primary_density,
-                usd_admitter=usd_admitter,
-                adapters=paid_scan_adapters,
-                log=_recognise_log,
-                # Plan §2.3.1: the recipe fixes the concurrency, the bounded retry policy and
-                # the anchor validity bounds; the token-bucket ceiling is a config knob.
-                concurrency=requested_recipe.audd_concurrency or 1,
-                retry_policy=audd_retry,
-                anchor_max_ms=requested_recipe.anchor_max_ms or DEFAULT_ANCHOR_MAX_MS,
-                anchor_slack_ms=requested_recipe.anchor_slack_ms or DEFAULT_ANCHOR_SLACK_MS,
-                cancel_token=cancel_token,
-                on_window=_on_recognise_window if progress is not None else None,
-                sleep=paid_sleep,
-                attempt_journal=journal,
-            )
+            gen0_requests = int(primary_state.get("requests", 0))
+            gen0_physical = int(primary_state.get("physical_attempts", 0))
+            free_failures = int(primary_state.get("failures", 0))
             counts.update(
                 {
-                    "paid_requests": primary_clip.requests,
-                    "paid_attempts": primary_clip.attempts,
-                    "paid_resolved": primary_clip.resolved,
-                    "paid_failures": primary_clip.failures,
-                    "paid_cache_hits": primary_clip.cache_hits,
-                    "paid_billable_units": primary_clip.billable_units,
-                    "paid_resumed_ambiguous": primary_clip.resumed_ambiguous,
-                    "paid_resumed_reissued": primary_clip.resumed_reissued,
+                    "matches": sum(item.status == "match" for item in gen0_observations),
+                    "requests": gen0_requests,
+                    "physical_attempts": gen0_physical,
+                    "failures": free_failures,
+                    "cache_hits": int(primary_state.get("cache_hits", 0)),
                 }
             )
-            if primary_clip.cancelled:
-                # The cancel token fired (or the progress hook raised) inside the sweep; the
-                # clips in flight resolved first, so the journal below carries their spend.
-                raise asyncio.CancelledError("paid sweep cancelled")
-            if primary_clip.resolved == 0 and (
-                not primary_clip.ran or primary_clip.provider_stopped or primary_clip.unreachable
-            ):
-                # Plan §2.3.5 row 1: the provider refused the credential, ran out of quota, was
-                # never configured or could not be reached before a single resolved attempt.  A
-                # Deep request never silently turns into a Free one: it stops here (exit 3) unless
-                # the local caller passed --allow-degrade, which restarts it as the Free recipe
-                # before any paid work — requested stays deep, achieved becomes free.
-                reason = primary_clip.provider_stopped or next(
-                    (item for item in primary_clip.outcomes if item in UNREACHABLE_OUTCOMES),
-                    "not_configured",
-                )
-                # "Before any paid work" is literal: an ambiguous-but-billable outcome
-                # (http_5xx / malformed / timeout_post) charges a unit without resolving
-                # anything, so once one has been billed the request may no longer be restarted
-                # as the Free recipe — that would report `degraded` (settled at 100 %, servable
-                # with accept_degraded) on top of money already spent.  Stop with the true spend.
-                # Cumulative, not this pass's: a resumed run whose earlier pass was billed may
-                # not restart as Free either (4a-i retro P1).
-                already_billed = bool(primary_clip.billable_units) or (
-                    usd_admitter is not None and usd_admitter.usd_e6_spent > 0
-                )
-                if allow_degrade and already_billed:
-                    _report(
-                        progress,
-                        "recognise",
-                        0,
-                        1,
-                        f"--allow-degrade not applied: {primary_clip.billable_units} paid "
-                        f"request(s) were already billed before {reason}",
-                    )
-                if not allow_degrade or already_billed:
-                    settlement = _settle()
-                    entry = timer.entry(
-                        status="provider_unavailable",
-                        reason=reason,
-                        exit_code=3,
-                        counts=counts,
-                        costs={"usd_e2": settlement.usd_e2_spent},
-                        source_ids=source_ids,
-                        ffmpeg_version=ffmpeg_version,
-                        **_money_journal_fields(settlement, requested_recipe, app_config),
-                    )
-                    _append_settlement(media_dir / "invocations.jsonl", entry)
-                    return _finish(
-                        exit_code=3,
-                        status="provider_unavailable",
-                        reason=reason,
-                        settlement=settlement,
-                    )
-                _report(
-                    progress,
-                    "recognise",
-                    0,
-                    1,
-                    f"paid engine unavailable ({reason}); restarting as the free recipe",
-                )
-                achieved_recipe = get_recipe("free")
-                if refuse_free():
-                    return 6
-                degrade_reason = "provider_unavailable"
-                paid_first = False
-                primary_clip = PaidScanResult()
-                primary_planned = frozen_count
-                enabled_engines = tuple(
-                    engine for engine in enabled_engines if engine not in _PAID_ENGINES
-                )
-            else:
-                gen0_observations = primary_clip.observations
-                gen0_observations_path = primary_clip.observation_paths[0]
-                primary_resolved = primary_clip.resolved
-                counts["matches"] = sum(
-                    item.status == "match" for item in primary_clip.observations
-                )
-        if not paid_first and "primary" not in completed_phases:
+            # Reused Free evidence replaces all new Shazam allocation; a restored one likewise.
+            max_generations = 0
+        elif free_evidence is not None:
+            # This run's own copy of the reused evidence, so every later step (fusion's recorded
+            # inputs, a resume) names a file of THIS run rather than another result's.
+            reused_key = sha256(f"{run_id}:free-evidence".encode()).hexdigest()[:20]
+            gen0_observations_path = (
+                media_dir / "recognise" / "invocations" / reused_key / "observations.gen0.jsonl"
+            )
+            _write_jsonl(gen0_observations_path, list(free_evidence.observations))
+            gen0_observations = free_evidence.observations
+            primary_resolved = sum(
+                item.generation == 0 and item.transform.type == "none" and item.status != "error"
+                for item in free_evidence.observations
+            )
+            counts["matches"] = sum(item.status == "match" for item in gen0_observations)
+            counts["free_reused"] = len(gen0_observations)
+            _recognise_log(
+                f"reusing this mix's stored Free result: {len(gen0_observations)} free answers, "
+                "no new free requests"
+            )
+        else:
             recognised = await recognise_windows(windows=windows, generation=0)
             gen0_observations = recognised.observations
             gen0_observations_path = recognised.observations_path
@@ -1341,15 +1097,12 @@ async def run_analysis(
                 _primary_state(
                     media_dir=media_dir,
                     observation_path=gen0_observations_path,
-                    paid_first=paid_first,
                     achieved_recipe=achieved_recipe,
                     degrade_reason=degrade_reason,
                     primary_planned=primary_planned,
                     primary_resolved=primary_resolved,
-                    primary_clip=primary_clip,
                     free_failures=free_failures,
                     counts=counts,
-                    usd_admitter=usd_admitter,
                 ),
             )
         _checkpoint(
@@ -1393,10 +1146,8 @@ async def run_analysis(
                 novelty_enabled=novelty,
                 novelty_change_points_ms=novelty_points,
                 # Only the windows an engine actually answered for count as scanned (review
-                # M10): under Deep the AudD sweep may skip every other window (density 2) and
-                # the Shazam secondary probes a handful, so the coverage figures and the gap
-                # evidence must not describe a free-engine pass over the whole mix that never
-                # happened.
+                # M10): the paid step checks only its targets, so the coverage figures and the
+                # gap evidence must not describe a pass over windows that never happened.
                 scanned_windows=scanned_windows(
                     windows.records, (*gen0_observations, *extra_observations)
                 ),
@@ -1432,29 +1183,119 @@ async def run_analysis(
         timer.finish_stage("fuse_ms")
         _report(progress, "fuse", 1, 1, f"{len(fused.episodes.episodes)} episodes")
         _checkpoint("fuse1", (fused.final_path, fused.identities_path))
+        #: The free result: every free-found row the Deep result must keep (the additive
+        #: invariant), and what a declined or unavailable paid step leaves the owner.
+        free_orchestrated = orchestrated
+        free_fused = fused
 
-        # Phase 2 — the second opinion.  The first fuse just said where the primary is weak; each
-        # lever below sends only window clips (the same ~12 s clips the engines already see — no
-        # whole-file upload, no consent gate) and re-fuses, so agreement lifts confidence,
-        # disagreement lets a phantom be demoted, and a primary-blind track is recovered:
-        #   • Deep: the Shazam secondary — the ``targeting:1`` scheduler spends ``C − R`` clips
-        #     over the hint-only, not-confident, challengeable-suppressed and blank spans, keeps
-        #     the reserve ``R`` to confirm a new identity a blank probe turns up, and hands any
-        #     unused reserve back to the spans (plan §2.3.4 step 4);
+        async def _publish_free_only() -> Path | None:
+            """Publish the finished free pass as a Free result, stamped exactly as a Free request
+            would stamp it, so a later Free request is served it and a later Deep run reuses its
+            sweep.  Nothing to publish when the free evidence was itself a stored Free result."""
+
+            if free_evidence is not None:
+                return None
+            free_recipe = get_recipe("free")
+            free_request = RunRequest(
+                AnalysisInputs(
+                    request.inputs.media_key,
+                    free_recipe.recipe_id,
+                    request.inputs.source_kind,
+                    request.inputs.tenant_scope,
+                    request.inputs.hints_snapshot_id,
+                    request.inputs.manual_tracklist_sha256,
+                    request.inputs.panako_index_id,
+                ),
+                free_recipe,
+            )
+            free_status, free_reason = _run_status(
+                primary_resolved=primary_resolved,
+                primary_planned=primary_planned,
+                primary_fraction=free_recipe.primary_achieved_fraction,
+                secondary_resolved=0,
+                secondary_allocated=0,
+                secondary_fraction=None,
+                provider_stopped=None,
+                reservation_exhausted=False,
+            )
+            _write_free_evidence(free_orchestrated)
+            from id_detector.present.bundles import publish_result
+
+            zero = _settle_money(None)
+            return publish_result(
+                media_dir=media_dir,
+                source=ingested.record,
+                episodes=free_fused.episodes,
+                identities=free_fused.identities.record,
+                duration_ms=decoded.record.pcm.duration_ms,
+                metadata={
+                    "analysis_key": free_request.inputs.analysis_key,
+                    "compatibility": free_request.metadata(free_recipe),
+                    "run_id": timer.run_id,
+                    "started_at": timer.started_at,
+                    "status": free_status,
+                    "reason": free_reason,
+                    "achieved": "free",
+                    **_money_journal_fields(zero, free_recipe, app_config),
+                },
+                config=app_config,
+                local=presentation_local,
+            )
+
+        def _write_free_evidence(source: object) -> None:
+            shazam_observations = [
+                json.loads(line)
+                for generation in source.generations  # type: ignore[attr-defined]
+                for line in read_text(generation.observations_path).splitlines()
+                if line.strip()
+            ]
+            atomic_write_json(media_dir / "fuse/shazam-observations.json", shazam_observations)
+
+        def _stop(*, exit_code: int, status: str, reason: str, bundle: Path | None) -> int:
+            """End the run without paid evidence: its ONE settlement, the free result if any."""
+
+            stop_settlement = _settle()
+            stop_entry = timer.entry(
+                status=status,
+                reason=reason,
+                exit_code=exit_code,
+                counts=counts,
+                costs={"usd_e2": stop_settlement.usd_e2_spent},
+                source_ids=source_ids,
+                ffmpeg_version=ffmpeg_version,
+                **_money_journal_fields(stop_settlement, requested_recipe, app_config),
+            )
+            if bundle is not None:
+                stop_entry = stop_entry.model_copy(update={"bundle_id": bundle.name})
+                if result_paths is not None:
+                    result_paths.append(bundle)
+            _append_settlement(media_dir / "invocations.jsonl", stop_entry)
+            return _finish(
+                exit_code=exit_code,
+                status=status,
+                reason=reason,
+                bundle=bundle,
+                settlement=stop_settlement,
+            )
+
+        # Phase 2 — what the free pass cannot say on its own.  Each lever sends only window clips
+        # (the same ~12 s clips the engines already see — no whole-file upload, no consent gate)
+        # and re-fuses:
+        #   • Deep: AudD checks ONLY the windows its paid policy selects from the free result
+        #     (``gaps``: where the free result lists nothing at all), after the exact price is
+        #     shown and confirmed; its answers are added under the additive invariant;
         #   • a local Panako index — the DJ's OWN unreleased uploads, in no public catalogue —
         #     over whatever is still uncertain afterwards.
-        # The paid clip lever no longer runs here: the Deep primary already swept the whole mix
-        # and the Free recipe's cap forbids every paid call.
         index_scan = PaidScanResult()
-        secondary_scan = PaidScanResult()
-        secondary_blocked: str | None = None
-        secondary_allocated = 0
-        secondary_resolved = 0
+        paid_scan = PaidScanResult()
+        paid_allocated = 0
+        paid_resolved = 0
         supplemental_requests = 0
         supplemental_physical_attempts = 0
         want_index = local_index_label is not None
         resume_secondary = "secondary" in completed_phases
         secondary_state = (checkpoint_state or {}).get("secondary", {})
+        restored_over_cap = False
 
         async def _refuse_with(*scans: PaidScanResult) -> None:
             nonlocal fused, orchestrated
@@ -1467,7 +1308,7 @@ async def run_analysis(
             counts.update(
                 {
                     # Re-fusion recomputes the generation-loop totals from generation zero. Keep
-                    # the separately-run secondary work instead of overwriting it with zero.
+                    # the separately-run work instead of overwriting it with zero.
                     "requests": orchestrated.requests + supplemental_requests,
                     "physical_attempts": (
                         orchestrated.physical_attempts + supplemental_physical_attempts
@@ -1479,222 +1320,238 @@ async def run_analysis(
             _report(progress, "fuse", 1, 1, f"{len(fused.episodes.episodes)} episodes")
 
         if resume_secondary:
-            # The second opinion is already durable.  Re-probing it would spend the free
-            # engine's allocation twice, and a restart while the breaker is open would discard
-            # a COMPLETED secondary's evidence and report `degraded` for a run that is not.
-            secondary_paths = _checkpointed_paths(
-                media_dir, secondary_state.get("secondary_paths", ())
-            )
+            # The paid step is already durable: re-running it would send its clips twice.
+            paid_paths = _checkpointed_paths(media_dir, secondary_state.get("secondary_paths", ()))
             index_paths = _checkpointed_paths(media_dir, secondary_state.get("index_paths", ()))
-            secondary_scan = PaidScanResult(
-                observations=_read_observations(*secondary_paths),
-                observation_paths=secondary_paths,
+            paid_scan = PaidScanResult(
+                observations=_read_observations(*paid_paths),
+                observation_paths=paid_paths,
             )
             index_scan = PaidScanResult(
                 observations=_read_observations(*index_paths),
                 observation_paths=index_paths,
             )
-            secondary_allocated = int(secondary_state.get("allocated", 0))
-            secondary_resolved = int(secondary_state.get("resolved", 0))
-            secondary_blocked = (
-                str(secondary_state["blocked"]) if secondary_state.get("blocked") else None
-            )
-            supplemental_requests = int(secondary_state.get("supplemental_requests", 0))
-            supplemental_physical_attempts = int(
-                secondary_state.get("supplemental_physical_attempts", 0)
-            )
+            paid_allocated = int(secondary_state.get("allocated", 0))
+            paid_resolved = int(secondary_state.get("resolved", 0))
+            if secondary_state.get("degrade_reason"):
+                degrade_reason = str(secondary_state["degrade_reason"])
+                achieved_recipe = get_recipe("free")
+            if secondary_state.get("provider_stopped"):
+                paid_scan = replace(
+                    paid_scan, provider_stopped=str(secondary_state["provider_stopped"])
+                )
+            if secondary_state.get("reservation_exhausted"):
+                paid_scan = replace(paid_scan, reservation_exhausted=True)
             restored_counts = secondary_state.get("counts")
             if isinstance(restored_counts, dict):
                 counts.update({str(key): int(value) for key, value in restored_counts.items()})
-            if secondary_scan.observations or index_scan.observations:
-                await _refuse_with(secondary_scan, index_scan)
-        if not resume_secondary and paid_first and free_bundle is not None:
-            secondary_scan = PaidScanResult(
-                observations=reused_observations, observation_paths=(reused_path,)
+            if paid_scan.observations or index_scan.observations:
+                await _refuse_with(paid_scan, index_scan)
+        elif deep:
+            plan, targets = plan_paid_step(
+                policy=paid_policy(requested_recipe) or "gaps",
+                free_episodes=free_fused.episodes.episodes,
+                windows=windows.records,
+                duration_ms=duration_ms,
+                density=requested_recipe.primary_density,
+                unit_usd_e6=app_config.audd_usd_e6_per_request,
+                media_dir=media_dir,
+                refresh=refresh,
             )
-            counts["secondary_reused"] = len(reused_observations)
-            counts["secondary_allocated"] = 0
-            await _refuse_with(secondary_scan)
-
-        if not resume_secondary and paid_first and free_bundle is None:
-            secondary_blocked = "shazam_manual_off" if shazam_off() else shazam_breaker.reason()
-            if secondary_blocked is not None and completed_phases:
-                # The breaker is open on a same-run resume whose secondary never checkpointed.
-                # What this run's probes already received is evidence: restore it from the run's
-                # own raw answers BEFORE the refusal can discard it. No request is sent.
-                restored = restore_run_answers(
+            paid_allocated = plan.clips
+            counts["paid_planned"] = plan.to_send
+            counts["paid_targets"] = plan.clips
+            counts["paid_target_spans"] = plan.spans
+            _recognise_log(
+                f"free pass done: {plan.spans} gap(s) for the paid check, {plan.clips} clip(s), "
+                f"{plan.cached} already answered, {plan.to_send} to send"
+            )
+            authorised = (
+                durable_reservation is not None or usd_admitter is not None or recovered.any
+            )
+            credentialled = bool((paid_scan_adapters or {}).get("audd")) or bool(
+                os.environ.get("AUDD_API_TOKEN", "").strip()
+            )
+            unavailable: str | None = None
+            if plan.to_send and not authorised and not credentialled:
+                if plan.cached == 0:
+                    # Before any price is asked or money reserved: the paid engine is not
+                    # configured and no clip has a stored answer.
+                    unavailable = "not_configured"
+                else:
+                    # Without a credential nothing can be sent, so nothing can be spent: the
+                    # stored answers are read and the clips without one are counted, not sent.
+                    _recognise_log(
+                        f"no AudD credential: {plan.to_send} clip(s) without a stored paid "
+                        "answer will not be sent"
+                    )
+            elif (
+                plan.clips
+                and not authorised
+                and cli_paid_confirm is not None
+                and not cli_paid_confirm(plan)
+            ):
+                # Declined (or, in the browser, not yet approved): nothing is reserved or spent,
+                # and the finished free pass is kept as the owner's Free result.
+                free_bundle = await _publish_free_only()
+                return _stop(
+                    exit_code=130,
+                    status="cancelled",
+                    reason="paid_not_confirmed",
+                    bundle=free_bundle,
+                )
+            if plan.clips and unavailable is None:
+                # Without a credential nothing can be sent, so nothing is reserved: the sweep
+                # only reads the stored answers (a resumed run keeps the reservation it made).
+                if authorised or credentialled:
+                    if usd_admitter is not None and durable_reservation is None:
+                        # The caller's admitter carries the run's original reservation.
+                        durable_reservation = ReservationRecord.from_reservation(
+                            run_id, usd_admitter.reservation
+                        )
+                    if durable_reservation is None and journal.dispatch_without_reservation():
+                        # Fail closed: the SQLite authority proves this run already dispatched, yet
+                        # holds no reservation. Recomputing one from today's price or cap could
+                        # authorise spend the run never reserved, so no paid request is made at all.
+                        _report(progress, "recognise", 0, plan.to_send, "refused: no reservation")
+                        return _stop(
+                            exit_code=1, status="failed", reason="reservation_missing", bundle=None
+                        )
+                    try:
+                        if durable_reservation is not None:
+                            # Plan §2.3.2 on resume: the reservation this run made before its first
+                            # dispatch is restored verbatim — never recomputed from today's price.
+                            reservation = durable_reservation.reservation()
+                        else:
+                            reservation = reserve_usd(
+                                planned=plan.to_send,
+                                unit_usd_e6=app_config.audd_usd_e6_per_request,
+                                recipe_max_usd_e2=requested_recipe.max_usd_e2,
+                                configured_max_usd_e2=app_config.max_usd_e2,
+                            )
+                    except BudgetExhausted as exc:
+                        _report(progress, "recognise", 0, plan.to_send, str(exc))
+                        # Refused before any reservation or dispatch: the free pass is kept.
+                        return _stop(
+                            exit_code=4,
+                            status="budget_exhausted",
+                            reason="reservation_exceeds_cap",
+                            bundle=await _publish_free_only(),
+                        )
+                    # Durable BEFORE any dispatch (§2.3.2): a crash from here on resumes against
+                    # exactly this reservation, and an existing record for the run always wins.
+                    durable_reservation = journal.record_reservation(reservation)
+                    journal.unit_usd_e6 = durable_reservation.unit_usd_e6
+                    usd_admitter, covered = restore_admitter(
+                        durable_reservation.reservation(), recovered.usd_e6_spent, usd_admitter
+                    )
+                    restored_over_cap = not covered
+                    if restored_over_cap:
+                        # The recovered spend already fills the reservation. The sweep still
+                        # runs: it reuses every clip this run resolved and its exhausted admitter
+                        # refuses any new dispatch, ending `partial`.
+                        _recognise_log("paid check resumed with its reservation already spent")
+                timer.start_stage("paid_ms")
+                audd_retry = requested_recipe.retry_policy.get("audd")
+                paid_scan = await run_paid_clip_recognition(
                     media_key=ingested.record.media_key,
                     media_dir=media_dir,
-                    windows=WindowsResult(
-                        records=tuple(frozen_windows(windows.records)),
-                        record_path=windows.record_path,
-                        cached=windows.cached,
-                    ),
-                    project_root=pipeline_project_root,
-                    run_labels=(run_id, f"{run_id}:secondary-2"),
+                    windows=windows,
+                    targets=targets,
+                    run_id=run_id,
+                    app_config=app_config,
+                    enabled_engines=enabled_engines,
+                    cli_confirmation=cli_confirmation,
+                    refresh=refresh,
+                    # A stored paid answer -- a no-match included -- is never bought again unless
+                    # the owner explicitly passes --refresh; the confirmed price counted it free.
+                    refresh_states=frozenset(),
+                    max_clips=plan.clips + 1,
+                    primary_density=requested_recipe.primary_density,
+                    usd_admitter=usd_admitter,
+                    adapters=paid_scan_adapters,
+                    log=_recognise_log,
+                    # Plan §2.3.1: the recipe fixes the concurrency, the bounded retry policy and
+                    # the anchor validity bounds; the token-bucket ceiling is a config knob.
+                    concurrency=requested_recipe.audd_concurrency or 1,
+                    retry_policy=audd_retry,
+                    anchor_max_ms=requested_recipe.anchor_max_ms or DEFAULT_ANCHOR_MAX_MS,
+                    anchor_slack_ms=requested_recipe.anchor_slack_ms or DEFAULT_ANCHOR_SLACK_MS,
+                    cancel_token=cancel_token,
+                    on_window=_on_recognise_window if progress is not None else None,
+                    sleep=paid_sleep,
+                    attempt_journal=journal,
                 )
-                if restored:
-                    restored_key = sha256(f"{run_id}:secondary-restored".encode()).hexdigest()[:20]
-                    restored_path = (
-                        media_dir
-                        / "recognise"
-                        / "invocations"
-                        / restored_key
-                        / "observations.gen0.jsonl"
-                    )
-                    _write_jsonl(restored_path, list(restored))
-                    secondary_scan = PaidScanResult(
-                        observations=restored, observation_paths=(restored_path,)
-                    )
-                    secondary_resolved = len(restored)
-                    secondary_allocated = len(restored)
-                    counts["secondary_restored"] = len(restored)
-                    counts["secondary_resolved"] = len(restored)
-                    await _refuse_with(secondary_scan)
-        if (
-            not resume_secondary
-            and paid_first
-            and free_bundle is None
-            and secondary_blocked is None
-        ):
-            hint_ids = (
-                frozenset(hint.id for hint in hint_result.hints)
-                if hint_result is not None
-                else frozenset()
-            )
-            min_intersection_ms = requested_recipe.eligibility_min_intersection_ms or 0
-            candidates = select_secondary_candidates(
-                fused.episodes,
-                duration_ms=duration_ms,
-                suppressed_min_votes=requested_recipe.suppressed_min_votes or 0,
-                min_intersection_ms=min_intersection_ms,
-                hint_ids=hint_ids,
-            )
-            capacity = secondary_capacity(
-                duration_ms, requested_recipe.secondary_clips_per_minute or 0
-            )
-            reserve = secondary_reserve(
-                capacity, requested_recipe.secondary_reserve_fraction or 0.0
-            )
-            energy = energy_reader(media_dir)
-            picks: list[SecondaryPick] = list(
-                allocate_secondary_windows(
-                    windows.records,
-                    candidates,
-                    allocation=capacity - reserve,
-                    min_intersection_ms=min_intersection_ms,
-                    energy=energy,
-                )
-            )
-            picked_ids = {pick.window.id for pick in picks}
-            counts["secondary_capacity"] = capacity
-            counts["secondary_reserve"] = reserve
-            counts["secondary_allocated"] = len(picks)
-            secondary_passes: list[object] = []
-
-            async def _probe(batch: Sequence[SecondaryPick], label: str, run_label: str | None):
-                _report(progress, "scan", 0, len(batch), label)
-                result = await recognise_windows(
-                    windows=WindowsResult(
-                        records=[pick.window for pick in batch],
-                        record_path=windows.record_path,
-                        cached=windows.cached,
-                    ),
-                    generation=0,
-                    run_label=run_label,
-                )
-                nonlocal secondary_blocked
-                secondary_blocked = secondary_blocked or result.blocked_reason
-                secondary_passes.append(result)
-                return result
-
-            if picks:
-                timer.start_stage("secondary_ms")
-                first_pass = await _probe(picks, "second opinion (free engine)", None)
-                # The reserve: a blank probe that names a track no listed episode carries gets
-                # two confirmation clips around it (first-come until R is gone); whatever is
-                # left of R goes back to the spans proportionally.  One further Shazam pass.
-                discoveries = new_identity_discoveries(
-                    first_pass.observations,
-                    picks,
-                    listed_text_keys(fused.episodes, fused.identities.record),
-                )
-                served, unused_reserve = serve_confirmations(
-                    windows.records,
-                    [
-                        (item.observation.support_ms, item.pick.window.id, item.pick.candidate.span)
-                        for item in discoveries
-                    ],
-                    reserve=reserve,
-                    picked=picked_ids,
-                    search_ms=requested_recipe.reserve_search_ms or 0,
-                    min_separation_ms=requested_recipe.reserve_min_separation_ms or 0,
-                    min_intersection_ms=min_intersection_ms,
-                )
-                follow_up: list[SecondaryPick] = [
-                    SecondaryPick(window, item.pick.candidate, "confirmation")
-                    for item, chosen in zip(discoveries, served, strict=True)
-                    for window in chosen
-                ]
-                picked_ids.update(pick.window.id for pick in follow_up)
-                follow_up.extend(
-                    distribute_secondary_windows(
-                        windows.records,
-                        candidates,
-                        quota=unused_reserve,
-                        min_intersection_ms=min_intersection_ms,
-                        energy=energy,
-                        picked=picked_ids,
-                    )
-                )
-                counts["secondary_discoveries"] = len(discoveries)
-                counts["secondary_confirmed"] = sum(1 for chosen in served if chosen)
-                counts["secondary_uncorroborated"] = sum(1 for chosen in served if not chosen)
-                counts["secondary_confirmation_clips"] = sum(len(chosen) for chosen in served)
-                if discoveries:
-                    _recognise_log(
-                        f"{len(discoveries)} new track(s) found in blank stretches; "
-                        f"{counts['secondary_confirmed']} confirmed from the reserve, "
-                        f"{counts['secondary_uncorroborated']} listed uncorroborated"
-                    )
-                if follow_up:
-                    picks.extend(follow_up)
-                    counts["secondary_allocated"] = len(picks)
-                    await _probe(follow_up, "confirming new finds (free engine)", "secondary-2")
-                timer.finish_stage("secondary_ms")
-                secondary_allocated = len(picks)
-                secondary_failures = sum(item.failures for item in secondary_passes)
-                secondary_resolved = secondary_allocated - secondary_failures
-                counts["secondary_resolved"] = secondary_resolved
-                if secondary_failures:
-                    _recognise_log(
-                        f"{secondary_failures} of {secondary_allocated} second-opinion windows "
-                        "got no usable answer from Shazam (throttled or malformed reply)"
-                    )
-                secondary_observations = tuple(
-                    observation for item in secondary_passes for observation in item.observations
-                )
-                counts["secondary_matches"] = sum(
-                    item.status == "match" for item in secondary_observations
-                )
-                supplemental_requests += sum(item.requests for item in secondary_passes)
-                supplemental_physical_attempts += sum(
-                    item.physical_attempts for item in secondary_passes
-                )
-                counts["requests"] = orchestrated.requests + supplemental_requests
-                counts["physical_attempts"] = (
-                    orchestrated.physical_attempts + supplemental_physical_attempts
-                )
-                counts["failures"] = free_failures + secondary_failures
-                counts["cache_hits"] += sum(item.cache_hits for item in secondary_passes)
-                if secondary_observations:
-                    secondary_scan = PaidScanResult(
-                        observations=secondary_observations,
-                        observation_paths=tuple(
-                            item.observations_path for item in secondary_passes
+                timer.finish_stage("paid_ms")
+                counts.update(
+                    {
+                        "paid_requests": paid_scan.requests,
+                        "paid_attempts": paid_scan.attempts,
+                        "paid_resolved": paid_scan.resolved,
+                        "paid_failures": paid_scan.failures,
+                        "paid_cache_hits": paid_scan.cache_hits,
+                        "paid_billable_units": paid_scan.billable_units,
+                        "paid_resumed_ambiguous": paid_scan.resumed_ambiguous,
+                        "paid_resumed_reissued": paid_scan.resumed_reissued,
+                        "paid_clip_matches": sum(
+                            item.status == "match" for item in paid_scan.observations
                         ),
+                    }
+                )
+                if paid_scan.cancelled:
+                    # The cancel token fired (or the progress hook raised) inside the sweep; the
+                    # clips in flight resolved first, so the journal below carries their spend.
+                    raise asyncio.CancelledError("paid sweep cancelled")
+                if paid_scan.resolved == 0 and (
+                    not paid_scan.ran or paid_scan.provider_stopped or paid_scan.unreachable
+                ):
+                    unavailable = paid_scan.provider_stopped or next(
+                        (item for item in paid_scan.outcomes if item in UNREACHABLE_OUTCOMES),
+                        "not_configured",
                     )
-                    await _refuse_with(secondary_scan)  # re-fuse once (§2.3.4 step 5)
+                paid_resolved = paid_scan.resolved
+            if unavailable is not None:
+                # Plan §2.3.5 row 1: the paid engine refused the credential, ran out of quota, was
+                # never configured or could not be reached before a single resolved clip. A Deep
+                # request never silently turns into a Free one: it stops (exit 3) with the free
+                # result kept, unless the local caller passed --allow-degrade and nothing was
+                # billed — then it ends `degraded`, achieved Free.
+                already_billed = bool(paid_scan.billable_units) or (
+                    usd_admitter is not None and usd_admitter.usd_e6_spent > 0
+                )
+                if allow_degrade and already_billed:
+                    _report(
+                        progress,
+                        "recognise",
+                        0,
+                        1,
+                        f"--allow-degrade not applied: {paid_scan.billable_units} paid "
+                        f"request(s) were already billed before {unavailable}",
+                    )
+                if not allow_degrade or already_billed:
+                    free_bundle = await _publish_free_only()
+                    return _stop(
+                        exit_code=3,
+                        status="provider_unavailable",
+                        reason=unavailable,
+                        bundle=free_bundle,
+                    )
+                _report(
+                    progress,
+                    "recognise",
+                    0,
+                    1,
+                    f"paid engine unavailable ({unavailable}); the free result is kept",
+                )
+                achieved_recipe = get_recipe("free")
+                degrade_reason = "provider_unavailable"
+                paid_scan = PaidScanResult()
+                paid_allocated = 0
+                enabled_engines = tuple(
+                    engine for engine in enabled_engines if engine not in _PAID_ENGINES
+                )
+            elif paid_scan.observations:
+                await _refuse_with(paid_scan)  # re-fuse once (§2.3.4 step 5)
         if want_index and not resume_secondary:
             # Panako can still recover the DJ's own unreleased edits in the still-uncertain spans.
             idx_targets = select_scan_targets(fused.episodes.episodes, duration_ms)
@@ -1714,46 +1571,68 @@ async def run_analysis(
                     log=lambda message: _report(progress, "scan", 0, 1, message),
                 )
                 timer.finish_stage("index_scan_ms")
-                for name, reason in index_scan.skipped:
-                    _report(progress, "scan", 1, 1, f"{name} skipped: {reason}")
+                for name, index_reason in index_scan.skipped:
+                    _report(progress, "scan", 1, 1, f"{name} skipped: {index_reason}")
                 counts["local_index_matches"] = sum(
                     item.status == "match" for item in index_scan.observations
                 )
                 if any(item.status == "match" for item in index_scan.observations):
-                    await _refuse_with(secondary_scan, index_scan)
+                    await _refuse_with(paid_scan, index_scan)
 
         secondary_artefacts = tuple(
-            path for path in secondary_scan.observation_paths if path is not None
+            path for path in paid_scan.observation_paths if path is not None
         ) + tuple(path for path in index_scan.observation_paths if path is not None)
         _checkpoint(
             "secondary",
             secondary_artefacts,
             _secondary_state(
                 media_dir=media_dir,
-                secondary_scan=secondary_scan,
+                secondary_scan=paid_scan,
                 index_scan=index_scan,
-                secondary_allocated=secondary_allocated,
-                secondary_resolved=secondary_resolved,
-                secondary_blocked=secondary_blocked,
-                supplemental_requests=supplemental_requests,
-                supplemental_physical_attempts=supplemental_physical_attempts,
+                secondary_allocated=paid_allocated,
+                secondary_resolved=paid_resolved,
+                degrade_reason=degrade_reason,
                 counts=counts,
             ),
         )
+        final_episodes = fused.episodes
+        final_identities = fused.identities.record
+        if deep and (paid_scan.observations or index_scan.observations):
+            # The additive invariant: the Deep result is the free result plus what the paid (and
+            # index) evidence adds or confirms — never a free-found row removed.
+            merged, merge_report = additive_merge(
+                free=Fused(free_fused.episodes, free_fused.identities.record),
+                combined=Fused(fused.episodes, fused.identities.record),
+                paid_observation_ids=[
+                    item.id for item in (*paid_scan.observations, *index_scan.observations)
+                ],
+                hint_ids=[hint.id for hint in (hint_result.hints if hint_result else ())],
+                min_track_ms=app_config.present_min_track_ms,
+            )
+            counts["paid_rows_added"] = merge_report.added
+            counts["paid_rows_confirmed"] = merge_report.confirmed
+            counts["paid_rows_dropped"] = merge_report.kept_free
+            final_episodes, final_identities = merged.episodes, merged.identities
+            # The frozen run copies the flat fuse tree: its final episode file must be the merged
+            # result the page shows, recorded as derived from the fusion it was merged from.
+            atomic_write_bytes(fused.final_path, canonical_json_bytes(final_episodes))
+            write_completion_sidecar(
+                fused.final_path,
+                {fused.generation_path.relative_to(media_dir).as_posix(): fused.generation_path},
+            )
         _checkpoint("fuse2", (fused.final_path, fused.identities_path))
 
+        paid_ran = deep and achieved_recipe.name == "deep" and paid_allocated > 0
         status, reason = _run_status(
             primary_resolved=primary_resolved,
             primary_planned=primary_planned,
             primary_fraction=achieved_recipe.primary_achieved_fraction,
-            secondary_resolved=secondary_resolved,
-            secondary_allocated=secondary_allocated,
-            secondary_fraction=achieved_recipe.secondary_achieved_fraction,
-            provider_stopped=primary_clip.provider_stopped,
-            reservation_exhausted=primary_clip.reservation_exhausted,
+            secondary_resolved=paid_resolved,
+            secondary_allocated=paid_allocated,
+            secondary_fraction=achieved_recipe.secondary_achieved_fraction if paid_ran else None,
+            provider_stopped=paid_scan.provider_stopped,
+            reservation_exhausted=paid_scan.reservation_exhausted,
         )
-        if secondary_blocked is not None and status in {"complete", "degraded"}:
-            status, reason = "degraded", secondary_blocked
         if degrade_reason is not None and status == "complete":
             status, reason = "degraded", degrade_reason
         _report(progress, "present", 0, 1, "writing result page")
@@ -1762,18 +1641,12 @@ async def run_analysis(
 
         settlement = _settle()
         if achieved_recipe.name == "free":
-            shazam_observations = [
-                json.loads(line)
-                for generation in orchestrated.generations
-                for line in read_text(generation.observations_path).splitlines()
-                if line.strip()
-            ]
-            atomic_write_json(media_dir / "fuse/shazam-observations.json", shazam_observations)
+            _write_free_evidence(orchestrated)
         bundle = publish_result(
             media_dir=media_dir,
             source=ingested.record,
-            episodes=fused.episodes,
-            identities=fused.identities.record,
+            episodes=final_episodes,
+            identities=final_identities,
             duration_ms=decoded.record.pcm.duration_ms,
             metadata={
                 "analysis_key": effective_analysis_key,
@@ -1816,7 +1689,7 @@ async def run_analysis(
                 f"{counts['physical_attempts']} physical attempts; "
                 f"{orchestrated.final_generation + 1} generations "
                 f"(stop={orchestrated.stop_reason}); "
-                f"{len(fused.episodes.episodes)} episodes; tracklist={bundle / 'tracklist.json'}"
+                f"{len(final_episodes.episodes)} episodes; tracklist={bundle / 'tracklist.json'}"
             )
         entry = timer.entry(
             status=status,

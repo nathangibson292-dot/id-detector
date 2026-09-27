@@ -286,6 +286,31 @@ def make_pipeline_runner(
         )
 
         service_target = LocalPath(Path(target)) if Path(target).is_file() else PlatformUrl(target)
+        offers: list[object] = []
+
+        def paid_gate(plan: object) -> bool:
+            """The browser's Deep price gate: only a price the owner already approved passes.
+
+            A new Max-accuracy job stops after its free pass with the exact offer; approving it
+            starts a job carrying that approval, whose paid step runs only while its own exact
+            plan stays within what was approved. Nothing is pre-approved by default.
+            """
+
+            to_send = int(getattr(plan, "to_send", 0))
+            if to_send == 0:
+                return True  # every clip already has a stored answer: nothing to spend
+            approved_usd = getattr(ctx, "approved_usd_e6", None)
+            approved_clips = getattr(ctx, "approved_clips", None)
+            if (
+                approved_usd is not None
+                and approved_clips is not None
+                and to_send <= int(approved_clips)
+                and int(getattr(plan, "estimate_e6", 0)) <= int(approved_usd)
+            ):
+                return True
+            offers.append(plan)
+            return False
+
         store = LocalCheckpointStore(
             root,
             options=PipelineOptions(
@@ -307,6 +332,9 @@ def make_pipeline_runner(
                 # The supervised local worker's queue-aware guards (none outside it).
                 dispatch_admission=getattr(ctx, "dispatch_admission", None),
                 settlement_writer=getattr(ctx, "settlement_writer", None),
+                # The price gate the browser was missing: Max accuracy never reserves or
+                # dispatches a paid clip the owner has not approved.
+                cli_paid_confirm=paid_gate if selected_recipe.name == "deep" else None,
             ),
         )
         # The job's ONE durable service run: a restart after the worker process died resumes it,
@@ -355,6 +383,37 @@ def make_pipeline_runner(
                 bundle = Path(cached.media_dir) / "present" / "bundles" / service_result.bundle_id
                 if path_is_file(bundle / "manifest.json"):
                     result_paths.append(bundle)
+        if service_result.reason == "paid_not_confirmed" and offers:
+            # The free pass finished and the paid step waits for the owner: nothing was reserved
+            # or spent. The job ends with the free result open and the exact offer beside it.
+            from id_detector.money import ceil_e2 as _ceil_e2
+
+            plan = offers[-1]
+            estimate_e6 = int(getattr(plan, "estimate_e6", 0))
+            set_offer = getattr(ctx, "set_offer", None)
+            if callable(set_offer):
+                set_offer(
+                    {
+                        "gaps": int(getattr(plan, "spans", 0)),
+                        "clips": int(getattr(plan, "clips", 0)),
+                        "cached": int(getattr(plan, "cached", 0)),
+                        "to_send": int(getattr(plan, "to_send", 0)),
+                        "usd_e6": estimate_e6,
+                        "usd_e2": _ceil_e2(estimate_e6),
+                    }
+                )
+            selected = result_paths[-1] if result_paths else None
+            if selected is not None and (selected / "index.html").is_file():
+                ctx.set_result(selected / "index.html")
+                return
+            cached = cli._load_cached(root.resolve(), target)
+            if cached is not None:
+                from id_detector.present.bundles import shown_result_dir
+
+                index = shown_result_dir(cached.media_dir) / "index.html"
+                if index.is_file():
+                    ctx.set_result(index)
+            return
         if service_result.status == "cancelled":
             # The paid sweep let its in-flight clips resolve and the service journalled
             # ``cancelled``; re-raise so the manager records a cancellation, not a failure.

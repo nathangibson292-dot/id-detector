@@ -21,7 +21,7 @@ from id_detector.recipes import FREE_RECIPE
 from id_detector.service import LocalPath, PipelineOptions, PlatformUrl, RunResult
 from idea_web.jobs.local import LocalJobs, LocalWorker, local_database
 from idea_web.jobs.worker import JobQueue, Worker
-from tests.fakes.providers import FakeAudD, FakeShazamHTTP
+from tests.fakes.providers import APPROVED_DEEP, FakeAudD, FakeShazamHTTP
 from tests.idea_web.local_runner_fakes import fake_pipeline_runner
 from tests.idea_web.test_worker import AUDIO, MIX, ROOT, SCRIPT, _database, _intake, _run_row
 
@@ -62,7 +62,7 @@ def _kill_local_worker_mid_sweep(tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     monkeypatch.setenv("IDEA_FOLLOWUP_SCRIPT", str(SCRIPT))
     monkeypatch.delenv("IDEA_ENGINE_SHAZAM", raising=False)
     jobs = LocalJobs(tmp_path)
-    job_id = jobs.submit(str(AUDIO), "max_accuracy")
+    job_id = jobs.submit(str(AUDIO), "max_accuracy", **APPROVED_DEEP)
     config = _config(tmp_path)
     env = dict(os.environ, IDEA_FOLLOWUP_KILL_ON="3")
     finished = subprocess.run(

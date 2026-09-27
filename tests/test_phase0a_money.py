@@ -131,31 +131,29 @@ def test_frozen_recipes_contain_every_phase_zero_field_and_hash_canonical_json()
     assert FREE_RECIPE.algorithm_version == "fusion:4"
     assert FREE_RECIPE.requires == ("shazam_sweep",)
 
-    assert DEEP_RECIPE.primary_engine == "audd"
-    assert DEEP_RECIPE.secondary_engine == "shazam"
-    assert DEEP_RECIPE.secondary_clips_per_minute == 2
-    assert DEEP_RECIPE.secondary_reserve_fraction == 0.25
-    assert DEEP_RECIPE.secondary_priority == (
-        "hint_only",
-        "listed_not_confident",
-        "suppressed_challengeable",
-        "blank",
-    )
-    assert DEEP_RECIPE.eligibility_min_intersection_ms == 4_000
-    assert DEEP_RECIPE.suppressed_min_votes == 2
-    assert DEEP_RECIPE.reserve_search_ms == 45_000
-    assert DEEP_RECIPE.reserve_min_separation_ms == 30_000
+    # Free-first and additive: the free sweep is the primary, AudD checks only the free result's
+    # gaps (``secondary_priority`` names the paid policy), and the paid-first ``targeting:1``
+    # recipe is retired by ``additive:1``.
+    assert DEEP_RECIPE.primary_engine == "shazam"
+    assert DEEP_RECIPE.secondary_engine == "audd"
+    assert DEEP_RECIPE.secondary_clips_per_minute is None
+    assert DEEP_RECIPE.secondary_reserve_fraction is None
+    assert DEEP_RECIPE.secondary_priority == ("gaps",)
+    assert DEEP_RECIPE.eligibility_min_intersection_ms is None
+    assert DEEP_RECIPE.suppressed_min_votes is None
+    assert DEEP_RECIPE.reserve_search_ms is None
+    assert DEEP_RECIPE.reserve_min_separation_ms is None
     assert DEEP_RECIPE.overlap_min_ms == 6_000
     assert DEEP_RECIPE.separation_min_ms == 60_000
-    assert DEEP_RECIPE.primary_achieved_fraction == 0.95
-    assert DEEP_RECIPE.secondary_achieved_fraction == 0.80
+    assert DEEP_RECIPE.primary_achieved_fraction == 0.80
+    assert DEEP_RECIPE.secondary_achieved_fraction == 0.95
     assert DEEP_RECIPE.anchor_max_ms == 86_400_000
     assert DEEP_RECIPE.anchor_slack_ms == 12_000
     assert DEEP_RECIPE.audd_concurrency == 4
     assert DEEP_RECIPE.max_usd_e2 == 900
     assert dict(DEEP_RECIPE.adapter_versions) == {"audd_clip": 2, "shazam": 1}
-    assert DEEP_RECIPE.algorithm_version == "targeting:1,fusion:4"
-    assert DEEP_RECIPE.requires == ("audd_sweep", "shazam_secondary")
+    assert DEEP_RECIPE.algorithm_version == "additive:1,fusion:4"
+    assert DEEP_RECIPE.requires == ("shazam_sweep", "audd_additive")
     audd_retry = DEEP_RECIPE.retry_policy["audd"]
     assert audd_retry.retryable_outcomes == (
         "connect_error",
@@ -301,7 +299,7 @@ def test_deep_success_records_price_recipe_reservation_and_settlement(tmp_path: 
     assert entry["usd_e2_spent"] == 4
     assert entry["costs"] == {"usd_e2": 4}
     assert entry["requested_recipe_id"] == DEEP_RECIPE.recipe_id
-    assert entry["algorithm_version"] == "targeting:1,fusion:4"
+    assert entry["algorithm_version"] == "additive:1,fusion:4"
     assert entry["pricing_version"] == "v1"
     assert entry["audd_usd_e6_per_request"] == 5_000
 
@@ -353,8 +351,15 @@ def test_reservation_over_effective_cap_exits_four_without_provider_attempts(
     assert entry["reason"] == "reservation_exceeds_cap"
     assert entry["usd_e6_reserved"] == entry["usd_e6_spent"] == 0
     assert entry["usd_e2_reserved"] == entry["usd_e2_spent"] == 0
-    assert audd.calls == shazam.requests == 0
-    assert not (media_dir / "present" / "index.html").exists()
+    # Free-first: the free pass ran (the price is only known after it) and is kept as a Free
+    # result; the refusal came before any reservation or paid dispatch.
+    assert audd.calls == 0 and shazam.requests == 7
+    manifest = media_dir / "present" / "bundles" / str(entry["bundle_id"]) / "manifest.json"
+    from id_detector.io import read_text
+
+    kept = json.loads(read_text(manifest))
+    assert kept["achieved"] == "free" and kept["compatibility"]["recipe_name"] == "free"
+    assert kept["status"] == "complete"
 
 
 def test_paid_outcome_costs_refund_zero_cost_units_and_bill_ambiguous(tmp_path: Path) -> None:
@@ -428,7 +433,7 @@ def test_primary_stops_and_journals_partial_when_admission_cannot_dispatch(
     code, audd, shazam, entry, _media_dir = _run_deep(tmp_path, "gate0a-deep.json")
     assert code == 0
     assert audd.calls == 1
-    assert shazam.requests == 2  # the Deep secondary still probes the blank remainder
+    assert shazam.requests == 7  # the free sweep ran first, over the whole mix
     assert entry["status"] == "partial"
     assert entry["reason"] == "reservation_exhausted"
     assert entry["usd_e6_reserved"] == 5_250
@@ -449,7 +454,7 @@ def test_recipe_cli_selects_deep_and_retires_max_paid_clips(monkeypatch) -> None
     selected = runner.invoke(cli.app, ["analyse", "http://example/set", "--recipe", "deep"])
     assert selected.exit_code == 0, selected.output
     assert captured["recipe"] == DEEP_RECIPE
-    assert captured["primary_engine"] == "audd"
+    assert captured["primary_engine"] == "shazam"  # free-first: the free sweep is Deep's primary
 
     free_selected = runner.invoke(cli.app, ["analyse", "http://example/set", "--recipe", "free"])
     assert free_selected.exit_code == 0, free_selected.output
@@ -498,19 +503,19 @@ def test_pricing_loader_refuses_unknown_or_malformed_fields(tmp_path: Path) -> N
 
 
 def test_throttled_run_refunds_every_unit_and_bills_nothing(tmp_path: Path) -> None:
-    """A 429 storm resolves nothing and bills nothing: plan §2.3.5 makes it a ``partial`` Deep run
-    (AudD 0 of 7 < 95 %), not a silent Free one."""
+    """A 429 storm resolves nothing and bills nothing: the free pass stands and the Deep run is
+    ``degraded`` (the paid check resolved 0 of 7 < 95 %), never a silent Free one."""
 
     code, audd, shazam, entry, media_dir = _run_deep(tmp_path, "all-http-429.json")
     assert code == 0
-    assert entry["status"] == "partial"
-    assert entry["reason"] == "primary_not_achieved"
+    assert entry["status"] == "degraded"
+    assert entry["reason"] == "secondary_not_achieved"
     assert entry["achieved"] == "deep"
-    assert entry["algorithm_version"] == "targeting:1,fusion:4"
+    assert entry["algorithm_version"] == "additive:1,fusion:4"
     # Every planned dispatch and each of its three bounded retries was admitted; none was refused.
     assert audd.calls == 28
     assert audd.billed_units == 0
-    assert shazam.requests == 2  # only the Deep recipe's own bounded secondary, never a free sweep
+    assert shazam.requests == 7  # the free sweep, once; nothing re-sent after the 429s
     assert entry["usd_e6_reserved"] == 36_750
     assert entry["usd_e2_reserved"] == 4
     assert entry["usd_e6_spent"] == entry["usd_e2_spent"] == 0

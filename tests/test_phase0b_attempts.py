@@ -227,7 +227,7 @@ def test_timeout_post_is_ambiguous_spent_and_never_retried(tmp_path: Path) -> No
     audd = FakeAudD(SCRIPTS / "timeout-post-once.json")
     assert _run(tmp_path, "timeout-post-once.json", audd=audd) == 0
     media_dir, entry = _entry(tmp_path / "work")
-    assert (entry["status"], entry["reason"]) == ("partial", "primary_not_achieved")
+    assert (entry["status"], entry["reason"]) == ("degraded", "secondary_not_achieved")
     # One attempt per window — the lost response is not retried — and it is billed.
     assert audd.calls == 7 and audd.billed_units == 7
     counts = entry["counts"]
@@ -286,8 +286,9 @@ def test_a_raising_progress_hook_stops_dispatch_and_lets_in_flight_clips_resolve
     at_raise: dict[str, int] = {}
 
     def progress(phase: str, done: int, total: int, message: str) -> None:
-        # The web app's hook raises from a tick once the user clicked cancel.
-        if phase == "recognise" and done == 3 and "dispatched" not in at_raise:
+        # The web app's hook raises from a tick once the user clicked cancel -- here during the
+        # paid check, which runs after the free pass.
+        if phase == "recognise" and done == 3 and inner.calls and "dispatched" not in at_raise:
             at_raise["dispatched"] = _count(tmp_path / "work", "dispatched")
             raise asyncio.CancelledError("browser cancel")
 
@@ -515,12 +516,15 @@ def test_progress_is_reported_per_clip_with_the_real_total(tmp_path: Path) -> No
             ticks.append((done, total, message))
 
     assert _run(tmp_path, "gate0a-deep.json", progress=progress) == 0
-    # The paid primary's ticks end at its summary line; the Shazam secondary ticks its own
-    # (done, 2) afterwards through the same hook.
+    # The free pass ticks first; the paid check's ticks run from its opening line to its
+    # summary line through the same hook.
     summary = next(
         i for i, (_d, _t, message) in enumerate(ticks) if message.startswith("audd clips:")
     )
-    primary = ticks[: summary + 1]
+    opening = next(
+        i for i, (_d, _t, message) in enumerate(ticks) if message.startswith("paid check of")
+    )
+    primary = ticks[opening : summary + 1]
     windows = [
         (done, total) for done, total, message in primary if message == "recognising windows"
     ]
@@ -528,8 +532,8 @@ def test_progress_is_reported_per_clip_with_the_real_total(tmp_path: Path) -> No
     assert [done for done, _ in windows] == list(range(8))
     # Log lines inside the phase repeat the current done/total instead of resetting the web
     # app's ETA to "1 window" (review H4); only the opening line precedes the first tick.
-    assert primary[summary][:2] == (7, 7)
-    assert all(total == 7 for _done, total, message in primary if "identifying" not in message)
+    assert primary[-1][:2] == (7, 7)
+    assert all(total == 7 for _done, total, message in primary if "paid check of" not in message)
 
 
 def test_web_runner_passes_the_jobs_cancel_event_as_the_cancel_token(

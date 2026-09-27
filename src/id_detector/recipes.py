@@ -54,7 +54,7 @@ class Recipe:
     name: RecipeName
     primary_engine: Literal["shazam", "audd"]
     primary_density: int
-    secondary_engine: Literal["shazam"] | None
+    secondary_engine: Literal["shazam", "audd"] | None
     secondary_clips_per_minute: int | None
     secondary_reserve_fraction: float | None
     secondary_priority: tuple[str, ...]
@@ -123,27 +123,31 @@ FREE_RECIPE = Recipe(
     requires=("shazam_sweep",),
 )
 
+#: Deep is FREE-FIRST and ADDITIVE (restoring the original "free-first, paid fills gaps" design of
+#: commit e0f1d81): the full free Shazam sweep runs first -- reused from a stored Free result when
+#: one exists -- and is fused; the paid engine then checks only the windows the recipe's paid policy
+#: selects from that free result (``secondary_priority``: ``gaps`` = where the free result lists
+#: nothing at all); one final fusion adds what paid found under the invariant of
+#: :func:`id_detector.additive.additive_merge` (paid may confirm or add a row, never remove one the
+#: free evidence supports on its own).  ``primary_density`` is the paid clip density over those
+#: targets (1 = every window, 2 = every other).  ``additive:1`` in ``algorithm_version`` retires the
+#: paid-first ``targeting:1`` recipe: an old-style Deep result is never served as this recipe.
 DEEP_RECIPE = Recipe(
     name="deep",
-    primary_engine="audd",
+    primary_engine="shazam",
     primary_density=1,
-    secondary_engine="shazam",
-    secondary_clips_per_minute=2,
-    secondary_reserve_fraction=0.25,
-    secondary_priority=(
-        "hint_only",
-        "listed_not_confident",
-        "suppressed_challengeable",
-        "blank",
-    ),
-    eligibility_min_intersection_ms=4_000,
-    suppressed_min_votes=2,
-    reserve_search_ms=45_000,
-    reserve_min_separation_ms=30_000,
+    secondary_engine="audd",
+    secondary_clips_per_minute=None,
+    secondary_reserve_fraction=None,
+    secondary_priority=("gaps",),
+    eligibility_min_intersection_ms=None,
+    suppressed_min_votes=None,
+    reserve_search_ms=None,
+    reserve_min_separation_ms=None,
     overlap_min_ms=6_000,
     separation_min_ms=60_000,
-    primary_achieved_fraction=0.95,
-    secondary_achieved_fraction=0.80,
+    primary_achieved_fraction=0.80,
+    secondary_achieved_fraction=0.95,
     anchor_max_ms=86_400_000,
     anchor_slack_ms=12_000,
     audd_concurrency=4,
@@ -159,14 +163,24 @@ DEEP_RECIPE = Recipe(
                 ),
                 max_retries=3,
                 backoff_seconds=(1, 2, 4),
-            )
+            ),
+            "shazam": RetryPolicy(mode="existing_limiter"),
         }
     ),
     max_usd_e2=900,
     adapter_versions=MappingProxyType({"audd_clip": 2, "shazam": 1}),
-    algorithm_version=f"targeting:1,{_FUSION}",
-    requires=("audd_sweep", "shazam_secondary"),
+    algorithm_version=f"additive:1,{_FUSION}",
+    requires=("shazam_sweep", "audd_additive"),
 )
+
+
+def paid_policy(recipe: Recipe) -> str | None:
+    """The paid policy of an additive recipe (``gaps`` for Deep); ``None`` for a free recipe."""
+
+    if recipe.secondary_engine != "audd" or not recipe.secondary_priority:
+        return None
+    return recipe.secondary_priority[0]
+
 
 FREE = FREE_RECIPE
 DEEP = DEEP_RECIPE

@@ -1,7 +1,8 @@
 """Phase 0a-iv gate: the plan §2.3.5 status matrix, ``--allow-degrade`` and the secondary
 scheduler's candidate classes.  Every run is offline: the fakes script both providers over the
-60 s fixture (seven frozen windows, so the Deep secondary capacity is ``C = ceil(1 min x 2) = 2``
-and the reserve ``R = floor(0.25 x 2) = 0``)."""
+60 s fixture (seven frozen windows).  Deep is free-first: the free sweep is its primary (80 %),
+and the paid check of the free result's gaps -- here the whole one-minute tone -- must resolve
+95 % of its clips or the run is ``degraded``."""
 
 from __future__ import annotations
 
@@ -42,6 +43,20 @@ def _entry(work_root: Path) -> tuple[Path, dict[str, object]]:
 
 def _tracklist(media_dir: Path) -> dict[str, object]:
     return json.loads((shown_result_dir(media_dir) / "tracklist.json").read_text(encoding="utf-8"))
+
+
+def _kept_free_result(media_dir: Path, entry: dict[str, object]) -> None:
+    """A Deep run that stopped before any paid evidence kept its free pass as a FREE result:
+    stamped as the Free recipe (so it is served to a Free request and reused by a later Deep run),
+    never as a Deep one."""
+
+    from id_detector.io import read_text
+
+    bundle = media_dir / "present" / "bundles" / str(entry["bundle_id"])
+    manifest = json.loads(read_text(bundle / "manifest.json"))
+    assert manifest["achieved"] == "free"
+    assert manifest["compatibility"]["recipe_name"] == "free"
+    assert manifest["compatibility"]["analysis_inputs"]["recipe_id"] == FREE_RECIPE.recipe_id
 
 
 def _run(
@@ -117,8 +132,10 @@ def test_provider_unavailable_before_any_resolved_attempt_is_exit_3_unspent_and_
     assert audd.calls == audd_calls and audd.billed_units == 0
     assert entry["usd_e6_reserved"] == 36_750 and entry["usd_e6_spent"] == 0
     assert entry["costs"] == {"usd_e2": 0}
-    assert shazam.requests == 0  # never a silent Free run
-    assert not (media_dir / "present").exists()  # no result stored, nothing served later
+    # Free-first: the free pass ran before the paid check, and it is kept -- as a Free result.
+    # The run itself is never reported as a silent Free one: its status is provider_unavailable.
+    assert shazam.requests == 7
+    _kept_free_result(media_dir, entry)
 
 
 # --------------------------------------------------------------------------------------------------
@@ -135,8 +152,7 @@ def test_quota_error_after_two_matches_is_partial_provider_unavailable_midrun(
     assert audd.calls == 3  # two matches, then the quota refusal stops the primary
     assert entry["counts"]["paid_resolved"] == 2  # type: ignore[index]
     assert entry["usd_e6_spent"] == 10_000 and entry["usd_e2_spent"] == 1
-    # The Deep secondary still runs over the two-track hull and the blank remainder.
-    assert entry["counts"]["secondary_allocated"] == shazam.requests == 2  # type: ignore[index]
+    assert shazam.requests == 7  # the free pass, before the paid check
     assert (shown_result_dir(media_dir) / "index.html").is_file()
     tracklist = _tracklist(media_dir)
     assert (tracklist["status"], tracklist["reason"], tracklist["achieved"]) == (
@@ -147,28 +163,28 @@ def test_quota_error_after_two_matches_is_partial_provider_unavailable_midrun(
 
 
 # --------------------------------------------------------------------------------------------------
-# Row 3 — primary achieved fraction not met
+# Row 3 — the paid check's achieved fraction not met (the free pass stands: degraded)
 # --------------------------------------------------------------------------------------------------
-def test_deep_primary_below_95_percent_is_partial_and_billed(tmp_path: Path) -> None:
+def test_deep_paid_check_below_95_percent_is_degraded_and_billed(tmp_path: Path) -> None:
     code, audd, _shazam, entry, _media_dir = _run(tmp_path, "primary-thin.json")
     assert code == 0
-    assert entry["status"] == "partial"
-    assert entry["reason"] == "primary_not_achieved"
+    assert entry["status"] == "degraded"
+    assert entry["reason"] == "secondary_not_achieved"
     assert entry["counts"]["paid_resolved"] == 6  # type: ignore[index]  # 6/7 < 95 %
     assert audd.calls == 7 and audd.billed_units == 7  # an http_5xx unit is spent (§2.3.2)
     assert entry["usd_e6_spent"] == 35_000
 
 
-def test_deep_primary_resolving_nothing_without_a_terminal_outcome_is_partial_unspent(
+def test_deep_paid_check_resolving_nothing_without_a_terminal_outcome_is_degraded_unspent(
     tmp_path: Path,
 ) -> None:
     code, audd, shazam, entry, _media_dir = _run(tmp_path, "all-http-429.json")
     assert code == 0
-    assert (entry["status"], entry["reason"]) == ("partial", "primary_not_achieved")
+    assert (entry["status"], entry["reason"]) == ("degraded", "secondary_not_achieved")
     # Every window is retried to the recipe's bound (1 + 3) and refunded each time.
     assert audd.calls == 28 and audd.billed_units == 0
     assert entry["usd_e6_spent"] == 0
-    assert shazam.requests == 2  # the whole mix is blank: the secondary probes its capacity
+    assert shazam.requests == 7  # the free pass, once
 
 
 def test_free_primary_below_80_percent_is_partial(tmp_path: Path) -> None:
@@ -192,20 +208,21 @@ def test_free_primary_meeting_80_percent_is_complete(tmp_path: Path) -> None:
 
 
 # --------------------------------------------------------------------------------------------------
-# Row 4 — primary met, secondary < 80 %
+# Row 4 — the free pass (Deep's primary) below 80 %: partial, whatever the paid check did
 # --------------------------------------------------------------------------------------------------
-def test_secondary_below_80_percent_is_degraded(tmp_path: Path) -> None:
+def test_deep_free_pass_below_80_percent_is_partial(tmp_path: Path) -> None:
     code, audd, shazam, entry, media_dir = _run(tmp_path, "secondary-thin.json")
     assert code == 0
-    assert entry["status"] == "degraded"
-    assert entry["reason"] == "secondary_not_achieved"
+    assert entry["status"] == "partial"
+    assert entry["reason"] == "primary_not_achieved"
     assert entry["achieved"] == "deep"
-    assert audd.calls == audd.billed_units == 7  # the primary was complete and is paid for
+    # Every free answer was malformed, so the whole mix is a gap and the paid check covers it.
+    assert shazam.requests == 7
+    assert audd.calls == audd.billed_units == 7
     assert entry["usd_e6_spent"] == 35_000
-    assert shazam.requests == entry["counts"]["secondary_allocated"] == 2  # type: ignore[index]
-    assert entry["counts"]["secondary_resolved"] == 0  # type: ignore[index]
+    assert entry["counts"]["paid_resolved"] == 7  # type: ignore[index]
     assert (shown_result_dir(media_dir) / "index.html").is_file()  # shown, with a banner
-    assert _tracklist(media_dir)["status"] == "degraded"
+    assert _tracklist(media_dir)["status"] == "partial"
 
 
 # --------------------------------------------------------------------------------------------------
@@ -215,14 +232,14 @@ def test_all_requirements_met_is_complete_with_the_gate_money_figures(tmp_path: 
     code, audd, shazam, entry, media_dir = _run(tmp_path, "gate0a-deep.json")
     assert code == 0
     assert (entry["status"], entry["reason"], entry["achieved"]) == ("complete", None, "deep")
-    assert entry["algorithm_version"] == "targeting:1,fusion:4"
+    assert entry["algorithm_version"] == "additive:1,fusion:4"
     assert entry["usd_e6_reserved"] == 36_750
     assert entry["usd_e6_spent"] == 35_000 and entry["usd_e2_spent"] == 4
     assert audd.calls == 7
     counts = entry["counts"]
-    assert counts["secondary_capacity"] == 2  # type: ignore[index]
-    assert counts["secondary_allocated"] == counts["secondary_resolved"] == 2  # type: ignore[index]
-    assert shazam.requests == 2
+    assert counts["paid_targets"] == counts["paid_resolved"] == 7  # type: ignore[index]
+    assert "secondary_capacity" not in counts  # type: ignore[operator]
+    assert shazam.requests == 7
     tracklist = _tracklist(media_dir)
     assert (tracklist["status"], tracklist["reason"], tracklist["achieved"]) == (
         "complete",
@@ -245,9 +262,9 @@ def test_budget_exhausted_is_exit_4_with_nothing_spent_and_no_result(tmp_path: P
     assert code == 4
     assert (entry["status"], entry["achieved"]) == ("budget_exhausted", None)
     assert entry["reason"] == "reservation_exceeds_cap"
-    assert audd.calls == 0 and shazam.requests == 0
+    assert audd.calls == 0 and shazam.requests == 7  # refused after the free pass
     assert entry["usd_e6_reserved"] == entry["usd_e6_spent"] == 0
-    assert not (media_dir / "present").exists()
+    _kept_free_result(media_dir, entry)
 
 
 # --------------------------------------------------------------------------------------------------
@@ -274,7 +291,7 @@ def test_allow_degrade_restarts_as_the_free_recipe_before_any_paid_work(
     assert entry["counts"]["paid_attempts"] == audd.calls  # type: ignore[index]
     assert entry["usd_e6_spent"] == 0 and entry["costs"] == {"usd_e2": 0}
     assert entry["usd_e6_reserved"] == 36_750  # reserved, then released in full
-    assert any("restarting as the free recipe" in message for message in messages)
+    assert any("the free result is kept" in message for message in messages)
     assert (shown_result_dir(media_dir) / "index.html").is_file()
     tracklist = _tracklist(media_dir)
     assert (tracklist["status"], tracklist["reason"], tracklist["achieved"]) == (
@@ -307,9 +324,9 @@ def test_allow_degrade_never_restarts_after_a_billable_outcome_was_already_spent
         None,
     )
     assert entry["usd_e6_spent"] == 5_000 and entry["usd_e2_spent"] == 1
-    assert shazam.requests == 0  # never a second, free sweep on top of the spend
-    assert not (media_dir / "present").exists()
-    assert not any("restarting as the free recipe" in message for message in messages)
+    assert shazam.requests == 7  # the free pass ran first, once; never a second sweep
+    _kept_free_result(media_dir, entry)
+    assert not any("the free result is kept" in message for message in messages)
     assert any("--allow-degrade not applied" in message for message in messages)
 
 

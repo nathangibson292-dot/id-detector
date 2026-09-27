@@ -210,9 +210,18 @@ def _active_jobs(state: _State) -> list[Any]:
     """The home's activity list: running first, then queued, then what stopped (U-F18)."""
 
     assert state.jobs is not None
-    active = [job for job in state.jobs.recent() if job.status != "succeeded"]
+
+    def awaiting_approval(job: Any) -> bool:
+        # A finished free pass whose Deep price the owner has not answered yet stays in view.
+        return bool(getattr(job, "paid_offer", None)) and getattr(job, "offer_decision", 1) is None
+
+    active = [
+        job for job in state.jobs.recent() if job.status != "succeeded" or awaiting_approval(job)
+    ]
     rank = {"running": 0, "queued": 1, "waiting": 2, "failed": 3, "cancelled": 4}
-    active.sort(key=lambda job: (rank.get(job.status, 5), -job.created_at))
+    active.sort(
+        key=lambda job: (2 if awaiting_approval(job) else rank.get(job.status, 5), -job.created_at)
+    )
     return active
 
 
@@ -701,6 +710,38 @@ def _dismiss(
     return redirect("/")
 
 
+def _offer(
+    state: _State, request: Request, route: str, raw: bytes | None, viewer: _Viewer
+) -> Response:
+    """Answer a finished Max-accuracy job's Deep price: ``approve`` starts the paid job, ``skip``
+    keeps the Free result. Local only; the same loopback and synchroniser-token guards as dismiss.
+    """
+
+    assert state.jobs is not None
+    parts = route.strip("/").split("/")
+    try:
+        form = _parse_form(raw) if raw is not None else {}
+    except (ValueError, UnicodeDecodeError):
+        form = {}
+    if (
+        len(parts) != 3
+        or not _JOB_ID.fullmatch(parts[1])
+        or parts[2] not in {"approve", "skip"}
+        or not csrf_matches(request, form.get(_CSRF_FIELD), viewer.request_csrf)
+    ):
+        return bytes_response(HTTPStatus.BAD_REQUEST, b"bad request", TEXT)
+    if parts[2] == "approve":
+        approve = getattr(state.jobs, "approve_offer", None)
+        follow_up = approve(parts[1]) if callable(approve) else None
+        if follow_up is None:
+            return bytes_response(HTTPStatus.CONFLICT, b"nothing to approve", TEXT)
+        return redirect(f"/jobs/{follow_up}")
+    skip = getattr(state.jobs, "skip_offer", None)
+    if not (callable(skip) and skip(parts[1])):
+        return bytes_response(HTTPStatus.CONFLICT, b"nothing to skip", TEXT)
+    return redirect(f"/jobs/{parts[1]}")
+
+
 def _cancel(state: _State, request: Request, route: str, viewer: _Viewer) -> Response:
     assert state.jobs is not None
     segments = route.strip("/").split("/")
@@ -894,6 +935,14 @@ def create_app(
         if state.active and route.startswith("/jobs/") and route.endswith("/dismiss"):
             raw = await read_bounded(request)
             return await run_in_threadpool(_dismiss, state, request, route, raw, viewer)
+        if (
+            state.active
+            and route.startswith("/jobs/")
+            and (route.endswith("/approve") or route.endswith("/skip"))
+        ):
+            # Local only: a hosted server never starts paid work, so it has no such route.
+            raw = await read_bounded(request)
+            return await run_in_threadpool(_offer, state, request, route, raw, viewer)
         if state.active and route.startswith("/jobs/") and route.endswith("/cancel"):
             # Cancel carries no body, but a client's is never left on the socket.
             await drain_request(request)

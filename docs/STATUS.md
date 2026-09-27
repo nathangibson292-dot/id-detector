@@ -138,6 +138,23 @@ His 14 cached mixes are 15.5 hours — about **$31 for all of them**, about **$1
 have hand-written tracklists**, which are the only ones where the free-versus-paid question can
 actually be answered. **A $20 top-up covers that experiment with headroom.**
 
+**Paid measured, 2026-09-27: on the owner's music AudD adds nothing** ([build notes](reviews/build-local-additive-deep.md)).
+$9.04 of real AudD credit over the three mixes where Free struggles most, compared like-for-like from the
+cached answers: **Free today finds 56 of 107 tracks, and so does every paid policy** (paid everywhere, gaps
+only, gaps plus unsure rows). AudD recognised 139 of 1,806 clips against Shazam's 1,122, and everything it
+recognised Shazam already had. An earlier reading that credited AudD with five of Mall Grab's unreleased dubs
+was wrong — it compared a stale fusion:1 Free result against a fusion:4 Deep run — so the lesson is recorded:
+**compare recipes at the same fusion version**, checking each run's `algorithm_version`, because offline
+re-fusion publishes new bundles and leaves `fuse/episodes.json` as it was. The gains are on the free side:
+current Free finds 56 where the 10 September version found 49.
+
+Deep is rebuilt so that it can never do harm when it is used: free first, AudD only on the gaps, paid may
+confirm or add a row but never remove, demote or rename one Free lists, cached answers are never bought twice,
+and the price is approved after the free pass — on the command line, and in the browser, where "Max accuracy"
+now stops and offers Approve / Skip instead of spending unseen. **Recommendation to the owner: cancel the AudD
+plan.** The paid answers already bought are kept in `id-detector-deepscan` and backed up outside the repo.
+The next accuracy work is free-side: abbreviated and misspelled tracklist entries that match nothing.
+
 **When the hosted build resumes, next in plan order:** 4d-i (tenancy schema, lots,
 worker-side reservations), then 4d-ii and 4d-iii + 4d-iv. **Not started:** 6a–6b (ingest policy,
 container, launch checklist), then M2 (billing, Stripe sandbox) — see PLAN-v2 §5.

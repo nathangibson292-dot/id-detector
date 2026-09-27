@@ -190,9 +190,10 @@ def test_retries_are_bounded_by_the_recipe_and_sleep_its_backoff(tmp_path: Path)
         tmp_path, "retry-503-exhausted.json", sleep=recording_sleep
     )
     # Window 0 never stops answering 503: one attempt plus the recipe's three retries, each
-    # refunded, then the window is given up; the six others match.  6/7 < 95 % -> partial.
+    # refunded, then the window is given up; the six others match.  The paid check resolved
+    # 6/7 < 95 % of its clips while the free pass stands -> degraded.
     assert code == 0
-    assert (entry["status"], entry["reason"]) == ("partial", "primary_not_achieved")
+    assert (entry["status"], entry["reason"]) == ("degraded", "secondary_not_achieved")
     assert audd.calls == 10 and audd.billed_units == 6
     assert entry["usd_e6_spent"] == 30_000
     assert entry["counts"]["paid_attempts"] == 10  # type: ignore[index]
@@ -237,7 +238,7 @@ def test_http_403_is_auth_error_cost_zero_and_stops_the_sweep(tmp_path: Path) ->
     assert audd.calls == 1 and audd.billed_units == 0
     assert entry["usd_e6_spent"] == 0 and entry["costs"] == {"usd_e2": 0}
     assert entry["counts"]["paid_attempts"] == 1  # type: ignore[index]
-    assert shazam.requests == 0
+    assert shazam.requests == 7  # the free pass ran first; it is kept, nothing else is sent
     ((attempt,),) = _chains(media_dir).values()
     assert attempt.outcome == "auth_error" and attempt.unit_usd_e6 == 5_000
 

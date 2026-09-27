@@ -67,7 +67,7 @@ def test_a_part_cent_price_is_never_shown_lower_than_it_is():
     preview = estimate(0, config, windows=271)
     assert preview.estimate_e6 == 1_355_000
     shown = preview.render()
-    assert "estimated $1.36." in shown
+    assert "271 paid clips, $1.36." in shown
     assert "$1.35." not in shown
 
 
@@ -78,9 +78,12 @@ def test_cost_cached_key_and_url_read_only(cached):
     for target in (key, mix.source.input_url):
         result = CliRunner().invoke(cli.app, ["cost", target, "--work-root", str(work)])
         assert result.exit_code == 0, result.output
+        # Already Free-scanned: the EXACT paid step, computed offline from the stored result.
+        assert "Deep would check 1 gaps for about $0.04." in result.output
         assert "0:01:00" in result.output and "7 paid clips" in result.output
+        assert "0 already answered (free), 7 to send" in result.output
         assert "Stored scan: free" in result.output
-        assert "Density 2: approximately 4" in result.output
+        assert "Nothing was fetched or spent." in result.output
     assert before == stamps(work)
 
 
@@ -128,14 +131,33 @@ def test_cli_confirmation_before_reservation(tmp_path, monkeypatch, interactive,
     ]
     result = CliRunner().invoke(cli.app, [*args, *(["--yes"] if yes else [])], input=answer)
     assert result.exit_code == (0 if paid else 130), (result.output, result.exception)
-    assert "estimated $" in result.output
+    # Asked AFTER the free pass, with the exact count and price of the gaps.
+    assert "Deep would check 1 gaps for about $0.04." in result.output
+    assert "7 to send" in result.output
+    (journal,) = work.rglob("invocations.jsonl")
+    entry = json.loads(read_text(journal).splitlines()[-1])
+    audd_events = [
+        event
+        for path in work.rglob("*attempts*.jsonl")
+        for event in (json.loads(line) for line in read_text(path).splitlines() if line)
+        if event.get("provider") == "audd"
+    ]
     if paid:
-        assert list(work.rglob("invocations.jsonl"))
+        assert entry["status"] == "complete" and entry["usd_e6_spent"] > 0
+        assert audd_events
     else:
         assert "cancelled:" in result.output
-        assert not list(work.rglob("invocations.jsonl"))
+        assert "Deep stopped after the free pass" in result.output
+        assert "Nothing was reserved or spent." in result.output
+        assert "Your Free result is saved" in result.output
+        assert (entry["status"], entry["reason"]) == ("cancelled", "paid_not_confirmed")
+        assert entry["usd_e6_reserved"] == entry["usd_e6_spent"] == 0
         assert not list(work.rglob("*reservations*"))
-        assert not list(work.rglob("*attempts*.jsonl"))
+        assert not audd_events
+        kept = json.loads(
+            read_text(journal.parent / "present" / "bundles" / entry["bundle_id"] / "manifest.json")
+        )
+        assert kept["achieved"] == "free"
 
 
 def test_gate_is_cli_only_and_free_never_prompts(tmp_path, monkeypatch):
@@ -344,7 +366,7 @@ def test_comparison_table_and_named_gains(tmp_path):
         runs.append(entry.model_copy(update={"episodes": path, "identities": identities}))
     output = compare_deep.comparison(RunList(recipe="free", runs=runs), deep)
     assert "Pooled | Deep | 66.7% | 57.1% | 80.0%" in output
-    assert "Pooled | Free | 33.3% | 40.0% | 66.7%" in output
+    assert "Pooled | Free (stored) | 33.3% | 40.0% | 66.7%" in output
     assert "Mini Artist - Alpha" in output
     assert "Mini Artist - Theta" in output
 

@@ -16,6 +16,7 @@ from typing import Annotated
 
 import typer
 
+from id_detector.additive import PaidPlan
 from id_detector.benchmark.ablations import engine_status_rows, run_ablations
 from id_detector.benchmark.controlled import render_controlled
 from id_detector.benchmark.corpus import run_corpus
@@ -547,8 +548,13 @@ def cost(
     profile: str | None = typer.Option(None, "--profile"),
     density: int | None = typer.Option(None, "--density", min=1, max=2),
 ) -> None:
-    """Estimate Deep spending without downloading, decoding or changing the work tree."""
-    from id_detector.cost import cached_mix, estimate
+    """Estimate Deep spending without downloading, decoding or changing the work tree.
+
+    For a mix already Free-scanned the exact figure is computed offline: Deep's paid step checks
+    only the gaps the free result leaves, and stored paid answers cost nothing.  Otherwise the real
+    figure is known only after the free pass, and the whole mix is shown as the ceiling.
+    """
+    from id_detector.cost import cached_mix, estimate, free_scanned_plan, render_plan
 
     loaded = _load_app_config(config)
     selected = profile if profile is not None else loaded.default_profile
@@ -567,15 +573,30 @@ def cost(
     if duration is None or duration <= 0:
         typer.echo("Length unknown. Supply --minutes to estimate; nothing was fetched or spent.")
         raise typer.Exit(2)
+    if cached is not None and minutes is None:
+        plan = free_scanned_plan(cached, loaded)
+        if plan is not None:
+            typer.echo(render_plan(plan, loaded, cached.scanned))
+            typer.echo(
+                "Exact for today's stored free result; a fresh run re-reads its tracklist hints, "
+                "which can move a gap. Nothing was fetched or spent."
+            )
+            return
     typer.echo(
         estimate(duration, loaded).render(cached.scanned if cached else "No cached mix found.")
     )
 
 
-def _confirm_paid(duration: int, windows: int, config: AppConfig, history: str, yes: bool) -> bool:
-    from id_detector.cost import estimate
+def _confirm_paid(plan: PaidPlan, config: AppConfig, history: str, yes: bool) -> bool:
+    """The Deep price gate, asked once the free pass has run and the exact count is known."""
 
-    typer.echo(estimate(duration, config, windows=windows).render(history))
+    from id_detector.cost import render_plan
+    from id_detector.money import ceil_e2
+
+    typer.echo(render_plan(plan, config, history))
+    if plan.to_send == 0:
+        typer.echo("Nothing to spend: every clip Deep checks already has a stored paid answer.")
+        return True
     if yes:
         return True
     if not sys.stdin.isatty():
@@ -586,7 +607,11 @@ def _confirm_paid(duration: int, windows: int, config: AppConfig, history: str, 
         )
         return False
     try:
-        accepted = typer.confirm("Spend AudD credit on this Deep scan?", default=False)
+        accepted = typer.confirm(
+            f"Spend about ${ceil_e2(plan.estimate_e6) / 100:.2f} of AudD credit on these "
+            f"{plan.to_send} clips?",
+            default=False,
+        )
     except (EOFError, typer.Abort):
         accepted = False
     if not accepted:
@@ -866,10 +891,9 @@ def analyse(
         paid_confirm = None
         if requested_recipe.name == "deep":
 
-            def paid_confirm(duration: int, windows: int) -> bool:
+            def paid_confirm(plan: PaidPlan) -> bool:
                 return _confirm_paid(
-                    duration,
-                    windows,
+                    plan,
                     loaded_config,
                     cached.scanned if cached else "No stored scan found.",
                     yes,
@@ -927,10 +951,35 @@ def analyse(
         exit_code = exit_code_for(result)
         if result.status == "failed" and result.reason:
             typer.echo(f"failed: {result.reason}", err=True)
+        if requested_recipe.name == "deep" and (
+            result.reason == "paid_not_confirmed" or result.status == "provider_unavailable"
+        ):
+            stopped = (
+                "you did not confirm the paid check"
+                if result.reason == "paid_not_confirmed"
+                else f"the paid engine is unavailable ({result.reason})"
+            )
+            typer.echo(
+                f"Deep stopped after the free pass: {stopped}. Nothing was reserved or spent. "
+                + _free_result_line(work_root, url, result.bundle_id),
+                err=True,
+            )
     except KeyboardInterrupt:
         typer.echo("cancelled; safe job states were restored", err=True)
         raise typer.Exit(130) from None
     raise typer.Exit(exit_code)
+
+
+def _free_result_line(work_root: Path, url: str, bundle_id: str | None) -> str:
+    """Where the Free result a stopped Deep run left the owner can be opened."""
+
+    cached = _load_cached(work_root.resolve(), url)
+    if cached is None:
+        return "The free pass result was not saved."
+    if bundle_id is not None:
+        path = Path(cached.media_dir) / "present" / "bundles" / bundle_id / "tracklist.json"
+        return f"Your Free result is saved: tracklist={path}"
+    return "Your stored Free result is unchanged (open it from the library or `idea show`)."
 
 
 async def _acquire(

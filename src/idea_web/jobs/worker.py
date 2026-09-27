@@ -1621,34 +1621,63 @@ class JobQueue:
         progress: Mapping[str, object] | None = None,
         user_id: str | None = None,
     ) -> str:
-        document = _target_document(target, local_mode=self.local_mode)
+        _target_document(target, local_mode=self.local_mode)  # refuses a bad target up front
         scope = tenant_scope or (
             LOCAL_OWNER_SCOPE if isinstance(target, (UploadId, LocalPath)) else "public"
         )
         if scope != "public" and not scope.startswith("user:"):
             raise ValueError("invalid tenant scope")
         identifier = job_id or uuid.uuid4().hex
-        now = self.clock()
         with self.database.write() as connection:
-            connection.execute(
-                "INSERT INTO jobs(id, run_id, target, recipe_id, state, log_path, tenant_scope, "
-                "progress, created_at, updated_at, money_authority, user_id) "
-                "VALUES (?, ?, ?, ?, 'intake', ?, ?, ?, ?, ?, ?, ?)",
-                (
-                    identifier,
-                    run_id,
-                    _json(document),
-                    recipe.recipe_id,
-                    str(Path(log_path).resolve()) if log_path is not None else None,
-                    scope,
-                    _json(dict(progress or {})),
-                    now,
-                    now,
-                    MONEY_AUTHORITY,
-                    user_id,
-                ),
+            self.insert_job(
+                connection,
+                target,
+                recipe,
+                job_id=identifier,
+                run_id=run_id,
+                tenant_scope=scope,
+                log_path=log_path,
+                progress=progress,
+                user_id=user_id,
             )
         return identifier
+
+    def insert_job(
+        self,
+        connection: Any,
+        target: PlatformUrl | UploadId | LocalPath,
+        recipe: Recipe,
+        *,
+        job_id: str,
+        run_id: str | None,
+        tenant_scope: str,
+        log_path: Path | None = None,
+        progress: Mapping[str, object] | None = None,
+        user_id: str | None = None,
+    ) -> None:
+        """Insert one queued job inside the caller's write transaction (see :meth:`enqueue`)."""
+
+        document = _target_document(target, local_mode=self.local_mode)
+        identifier, scope = job_id, tenant_scope
+        now = self.clock()
+        connection.execute(
+            "INSERT INTO jobs(id, run_id, target, recipe_id, state, log_path, tenant_scope, "
+            "progress, created_at, updated_at, money_authority, user_id) "
+            "VALUES (?, ?, ?, ?, 'intake', ?, ?, ?, ?, ?, ?, ?)",
+            (
+                identifier,
+                run_id,
+                _json(document),
+                recipe.recipe_id,
+                str(Path(log_path).resolve()) if log_path is not None else None,
+                scope,
+                _json(dict(progress or {})),
+                now,
+                now,
+                MONEY_AUTHORITY,
+                user_id,
+            ),
+        )
 
     def get(self, job_id: str) -> Job:
         with self.database.read() as connection:

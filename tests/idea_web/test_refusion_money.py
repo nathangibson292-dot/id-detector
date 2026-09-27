@@ -27,7 +27,7 @@ from id_detector.retention import collect
 from id_detector.service import PlatformUrl
 from idea_web.jobs.local import LocalJobs, LocalWorker, local_database
 from idea_web.jobs.worker import Worker
-from tests.fakes.providers import FakeAudD, FakeShazamHTTP
+from tests.fakes.providers import APPROVED_DEEP, FakeAudD, FakeShazamHTTP
 from tests.idea_web.local_runner_fakes import fake_pipeline_runner
 from tests.idea_web.test_followup_review_fixes import _invocations
 from tests.idea_web.test_followup_round2 import _env
@@ -124,7 +124,7 @@ def test_a_stale_deep_result_stops_the_job_without_a_reservation_or_a_dispatch(
     config = _env(tmp_path, monkeypatch)
     jobs = LocalJobs(tmp_path)
     paid = FakeAudD(SCRIPT)
-    first = jobs.submit(str(AUDIO), "max_accuracy")
+    first = jobs.submit(str(AUDIO), "max_accuracy", **APPROVED_DEEP)
     if legacy and evidence == "intact":
         from id_detector.present import page as page_module
 
@@ -171,7 +171,7 @@ def test_a_stale_deep_result_stops_the_job_without_a_reservation_or_a_dispatch(
         assert result_dir(media) == shown
 
     again = FakeAudD(SCRIPT)
-    second = jobs.submit(str(AUDIO), "max_accuracy")
+    second = jobs.submit(str(AUDIO), "max_accuracy", **APPROVED_DEEP)
     _run_one(tmp_path, config, again)
     job = jobs.get(second)
     run_id = jobs.queue.get(second).run_id
@@ -224,7 +224,7 @@ def test_unreadable_legacy_metadata_stops_the_real_worker_before_money(
     config = _env(tmp_path, monkeypatch)
     jobs = LocalJobs(tmp_path)
     paid = FakeAudD(SCRIPT)
-    first = jobs.submit(str(AUDIO), "max_accuracy")
+    first = jobs.submit(str(AUDIO), "max_accuracy", **APPROVED_DEEP)
     _run_one(tmp_path, config, paid)
     assert jobs.get(first).status == "succeeded"
     (media,) = [path.parent for path in Path(native_path(tmp_path)).glob("*/*/present")]
@@ -240,7 +240,7 @@ def test_unreadable_legacy_metadata_stops_the_real_worker_before_money(
     reservations = _count(jobs.database, "run_reservations")
 
     blocked = FakeAudD(SCRIPT)
-    second = jobs.submit(str(AUDIO), "max_accuracy")
+    second = jobs.submit(str(AUDIO), "max_accuracy", **APPROVED_DEEP)
     _run_one(tmp_path, config, blocked)
     job = jobs.get(second)
     run_id = jobs.queue.get(second).run_id

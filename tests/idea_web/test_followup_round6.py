@@ -29,7 +29,7 @@ from id_detector.service import PipelineOptions, UploadId
 from idea_web.database import Database
 from idea_web.jobs.local import LocalJobs, LocalWorker, local_database
 from idea_web.jobs.worker import JobQueue, StaleClaim, Worker
-from tests.fakes.providers import FakeAudD, FakeShazamHTTP, no_backoff
+from tests.fakes.providers import APPROVED_DEEP, FakeAudD, FakeShazamHTTP, no_backoff
 from tests.idea_web.local_runner_fakes import fake_pipeline_runner
 from tests.idea_web.test_followup_queue_money import _claimed_run
 from tests.idea_web.test_followup_review_fixes import UNIT, _invocations
@@ -236,7 +236,7 @@ def test_a_stale_worker_writes_no_reservation_and_a_price_change_never_alters_it
     )
 
     # (1) Worker A reserves while it holds the claim; its lease lapses and B reclaims the job.
-    job_id = jobs.submit(str(AUDIO), "max_accuracy")
+    job_id = jobs.submit(str(AUDIO), "max_accuracy", **APPROVED_DEEP)
     a = jobs.queue.claim("worker-a", lease_seconds=600)
     assert a is not None and a.id == job_id
     journal_a = _local_journal(tmp_path, jobs.database, a)
@@ -264,7 +264,7 @@ def test_a_stale_worker_writes_no_reservation_and_a_price_change_never_alters_it
     # (2) A worker whose lease lapsed BEFORE it ever reserved writes no row and no sidecar.
     other_root = tmp_path / "second"
     jobs2 = LocalJobs(other_root)
-    job2 = jobs2.submit(str(AUDIO), "max_accuracy")
+    job2 = jobs2.submit(str(AUDIO), "max_accuracy", **APPROVED_DEEP)
     stale = jobs2.queue.claim("worker-a", lease_seconds=600)
     assert stale is not None and stale.id == job2
     _expire(jobs2, job2)
@@ -278,7 +278,7 @@ def test_a_stale_worker_writes_no_reservation_and_a_price_change_never_alters_it
 def _killed_deep_job(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     config = _env(tmp_path, monkeypatch)
     jobs = LocalJobs(tmp_path)
-    job_id = jobs.submit(str(AUDIO), "max_accuracy")
+    job_id = jobs.submit(str(AUDIO), "max_accuracy", **APPROVED_DEEP)
     _child_worker_dies(tmp_path, config, kill_on=3)
     run_id, dispatched = _dispatched_queries(tmp_path)
     _expire(jobs, job_id)
