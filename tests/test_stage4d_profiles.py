@@ -162,15 +162,27 @@ def test_profile_app_config_maps_the_frozen_geometry() -> None:
     assert config.transform_rates_e4 == (9_200, 9_600, 10_400, 10_800)
 
 
-def test_analyse_rejects_a_profile_that_is_not_a_frozen_artefact() -> None:
+def test_analyse_rejects_a_profile_that_is_not_a_frozen_artefact(tmp_path: Path) -> None:
     result = CliRunner().invoke(
-        cli_module.app, ["analyse", "http://example/set", "--profile", "turbo"]
+        cli_module.app,
+        [
+            "analyse",
+            "http://example/set",
+            "--profile",
+            "turbo",
+            "--work-root",
+            str(tmp_path / "work"),
+            "--config",
+            str(tmp_path / "idea.toml"),
+        ],
     )
     assert result.exit_code == 2
     assert "unknown profile" in result.output
 
 
-def test_analyse_accepts_a_frozen_profile_and_derives_its_config(monkeypatch) -> None:
+def test_analyse_accepts_a_frozen_profile_and_derives_its_config(
+    tmp_path: Path, monkeypatch
+) -> None:
     captured: dict[str, object] = {}
 
     async def fake_analyse(url: str, **kwargs: object) -> int:
@@ -180,7 +192,17 @@ def test_analyse_accepts_a_frozen_profile_and_derives_its_config(monkeypatch) ->
 
     monkeypatch.setattr(pipeline_module, "run_analysis", fake_analyse)
     result = CliRunner().invoke(
-        cli_module.app, ["analyse", "http://example/set", "--profile", "max_accuracy"]
+        cli_module.app,
+        [
+            "analyse",
+            "http://example/set",
+            "--profile",
+            "max_accuracy",
+            "--work-root",
+            str(tmp_path / "work"),
+            "--config",
+            str(tmp_path / "idea.toml"),
+        ],
     )
     assert result.exit_code == 0, result.output
     config = captured["app_config"]

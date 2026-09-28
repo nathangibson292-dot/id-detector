@@ -107,7 +107,10 @@ def test_snapshot_commands_run_end_to_end_through_the_idea_cli(tmp_path: Path) -
         "verify-artefacts": ("Verify hashes", "without changing", "snapshot"),
     }
     for command, words in help_expectations.items():
-        shown = runner.invoke(cli.app, [command, "--help"])
+        args = [command]
+        if command in {"backup", "restore"}:
+            args.extend(("--work-root", str(tmp_path / f"{command}-help-work")))
+        shown = runner.invoke(cli.app, [*args, "--help"])
         assert shown.exit_code == 0, shown.output
         plain = " ".join(shown.output.split())
         assert all(word in plain for word in words)

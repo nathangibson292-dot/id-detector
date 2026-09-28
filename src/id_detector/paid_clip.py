@@ -120,6 +120,8 @@ class PaidScanResult:
     outcomes: tuple[str, ...] = ()
     #: The terminal-provider outcome (``auth_error`` / ``quota_error``) that stopped the sweep.
     provider_stopped: str | None = None
+    #: AudD's own error code for that refusal, when its body carried one (900, 902, 904, ...).
+    refusal_code: int | None = None
     #: Live dispatches including retries; ``attempts - requests`` is the retry count.
     attempts: int = 0
     #: The cancel token fired or the progress hook raised: nothing further was dispatched and the
@@ -164,10 +166,143 @@ def _cache_state(response: Mapping[str, Any]) -> str | None:
     return None
 
 
-#: AudD's own error codes inside an HTTP 200 body: 900 = wrong token, 901 = the token's request
-#: limit is reached (https://docs.audd.io/#common-errors).  Both are terminal for the sweep.
+#: AudD's account and token error codes inside an HTTP 200 body, split by what is KNOWN about
+#: billing.
+#:
+#: ``_AUDD_AUTH_CODES`` / ``_AUDD_QUOTA_CODES`` are the classification this code base already had
+#: before this build (HTTP 401/403/402 and AudD 900/901, https://docs.audd.io/#common-errors): the
+#: zero-cost ``auth_error`` / ``quota_error`` of the money authority, left exactly as it was.
+#:
+#: ``AUDD_BILLED_REFUSAL_CODES`` are the codes AudD's official SDKs name -- 902 quota exceeded;
+#: 903 a token problem; 904 / 905 subscription; 19 / 31337 request blocked (blocking, abuse or a
+#: test-scope restriction); 611 rate limit (github.com/AudDMusic/audd-java "AudDApiError"
+#: hierarchy; audd-go / audd-c sentinels). AudD's own documentation says nothing about whether a
+#: request answered with one of them is billed ("some number of requests is included with your
+#: monthly bill, but you can send requests on top ... and will be charged for those separately",
+#: docs.audd.io), and its written answer on billing covers only HTTP 429/503
+#: (docs/legal/audd-commercial-answers-2026-09-11.md). So a request answered with one of these is
+#: COUNTED AS SPENT (recorded as the billable ``malformed`` outcome, never retried), and the paid
+#: sweep stops at once: the next clip would be refused the same way. 611 arrives as a body code,
+#: not an HTTP 429, so the 429/503 answer does not cover it either.
 _AUDD_AUTH_CODES = frozenset({401, 403, 900})
 _AUDD_QUOTA_CODES = frozenset({402, 901})
+AUDD_BILLED_REFUSAL_CODES: dict[int, str] = {
+    902: "quota_error",
+    903: "auth_error",
+    904: "auth_error",
+    905: "auth_error",
+    19: "blocked",
+    31337: "blocked",
+    611: "rate_limited",
+}
+#: The stop reasons a refusal can end a Deep run with (the run's journalled ``reason``).
+PAID_REFUSAL_REASONS = frozenset({"auth_error", "quota_error", "blocked", "rate_limited"})
+#: Plain words for each refusal code, for the owner (the log line and the stop message).
+AUDD_REFUSAL_WORDS: dict[int, str] = {
+    900: "AudD says the API token is invalid",
+    901: "AudD received no API token and its free limit is reached",
+    902: "AudD says this token's request quota is used up",
+    903: "AudD refused the API token",
+    904: "AudD says the subscription does not cover this request (an expired or cancelled plan)",
+    905: "AudD says the subscription does not cover this request (an expired or cancelled plan)",
+    19: "AudD blocked the request (blocking, abuse or a test-only restriction)",
+    31337: "AudD blocked the request",
+    611: "AudD says the request rate limit was reached",
+    401: "AudD refused the API token",
+    403: "AudD refused the API token",
+    402: "AudD says the account has no credit left",
+}
+
+
+def refusal_words(outcome: str | None, code: int | None = None) -> str:
+    """Why AudD refused, in plain words (the specific code when known, else the reason)."""
+
+    if code is not None and code in AUDD_REFUSAL_WORDS:
+        return f"{AUDD_REFUSAL_WORDS[code]} (AudD error {code})"
+    if outcome == "quota_error":
+        return "AudD says this token has no requests or credit left"
+    if outcome == "auth_error":
+        return "AudD refused the API token (a cancelled plan or a wrong token)"
+    if outcome == "blocked":
+        return "AudD blocked the request"
+    if outcome == "rate_limited":
+        return "AudD says the request rate limit was reached"
+    return "AudD refused the request"
+
+
+def paid_recognition_configured() -> bool:
+    """Whether a paid-recognition credential is set up in this process (``AUDD_API_TOKEN``)."""
+
+    import os
+
+    return bool(os.environ.get("AUDD_API_TOKEN", "").strip())
+
+
+NOT_CONFIGURED_WORDS = (
+    "Paid recognition is not set up (no AudD token is configured), so the Free result is the "
+    "final one."
+)
+
+
+def spent_words(usd_e6_spent: int) -> str:
+    """The run's settled AudD spend, stated from the frozen figure -- never inferred."""
+
+    from id_detector.money import ceil_e2
+
+    if usd_e6_spent > 0:
+        return (
+            f"${ceil_e2(usd_e6_spent) / 100:.2f} of AudD credit was counted as spent (every "
+            "request AudD answered, or may have answered, is counted)."
+        )
+    return "Nothing was spent."
+
+
+def paid_stop_words(
+    reason: str | None, refusal_code: int | None = None, usd_e6_spent: int = 0
+) -> str | None:
+    """Why a Deep run ended on its Free result, in plain words; ``None`` for any other reason.
+
+    The spend sentence comes from ``usd_e6_spent`` -- the run's frozen settlement -- because a
+    refusal can arrive while sibling requests already in flight resolve and are charged.
+    """
+
+    spent = spent_words(usd_e6_spent)
+    if reason == "not_configured":
+        return f"{NOT_CONFIGURED_WORDS} {spent}"
+    if reason in PAID_REFUSAL_REASONS:
+        return (
+            f"Paid recognition stopped at once: {refusal_words(reason, refusal_code)}. No further "
+            f"clip was sent. {spent} The Free result is the final one."
+        )
+    if reason in UNREACHABLE_OUTCOMES:
+        return (
+            f"AudD could not be reached, so the paid check did not run. {spent} "
+            "The Free result is kept."
+        )
+    return None
+
+
+def not_set_up_cached_words(not_sent: int, usd_e6_spent: int = 0) -> str:
+    """No token, but some clips had a stored paid answer: say what was and was not checked."""
+
+    return (
+        "Paid recognition is not set up (no AudD token is configured): "
+        f"{not_sent} clip(s) Deep would check were not sent, and only paid answers already stored "
+        f"were used, so this result is the final one. {spent_words(usd_e6_spent)}"
+    )
+
+
+def audd_error_code(response: Mapping[str, Any]) -> int | None:
+    """The numeric code in an AudD error body, or ``None`` when it carries none."""
+
+    error = response.get("error")
+    code = error.get("error_code", error.get("code")) if isinstance(error, Mapping) else None
+    if code is None:
+        code = response.get("status_code")
+    try:
+        return int(code)
+    except (TypeError, ValueError):
+        return None
 
 
 def _error_body_outcome(response: Mapping[str, Any]) -> str:
@@ -192,6 +327,10 @@ def _error_body_outcome(response: Mapping[str, Any]) -> str:
         return "auth_error"
     if status_code in _AUDD_QUOTA_CODES:
         return "quota_error"
+    if status_code in AUDD_BILLED_REFUSAL_CODES:
+        # Billing unknown: counted as spent, never retried (see AUDD_BILLED_REFUSAL_CODES); the
+        # sweep stops on it separately.
+        return "malformed"
     if status_code == 429:
         return "http_429"
     if status_code == 503:
@@ -352,6 +491,7 @@ class _Sweep:
     done: int = 0
     reservation_exhausted: bool = False
     provider_stopped: str | None = None
+    refusal_code: int | None = None
     resumed_ambiguous: int = 0
     resumed_reissued: int = 0
     recovered_resolved: int = 0
@@ -516,6 +656,9 @@ async def run_paid_clip_recognition(
             sweep.cancel()
         return sweep.halted
 
+    #: attempt id -> the reason a refusal answered on it stops the sweep.
+    stop_reasons: dict[str, str] = {}
+
     async def _attempt(
         wav: Path, attempt_id: str, start_s: int
     ) -> tuple[str | None, dict[str, Any] | None, bool]:
@@ -589,7 +732,17 @@ async def run_paid_clip_recognition(
             raise RuntimeError("AudD adapter returned without invoking its on_attempt callback")
         state = _cache_state(response)
         if state is None:
-            return _error_body_outcome(response), None, admitted
+            outcome = _error_body_outcome(response)
+            code = audd_error_code(response)
+            if outcome in TERMINAL_PROVIDER_OUTCOMES:
+                stop_reasons[attempt_id] = outcome
+            elif code in AUDD_BILLED_REFUSAL_CODES:
+                # A refusal whose billing AudD does not document: the attempt is settled as the
+                # billable `malformed` (counted as spent, never retried) and the sweep stops.
+                stop_reasons[attempt_id] = AUDD_BILLED_REFUSAL_CODES[code]
+            if attempt_id in stop_reasons and sweep.refusal_code is None:
+                sweep.refusal_code = code
+            return outcome, None, admitted
         return state, response, admitted
 
     async def _process(window: WindowRecord) -> None:
@@ -685,12 +838,18 @@ async def run_paid_clip_recognition(
                 if response is not None:
                     limiter.recover()
                     break
-                if outcome in TERMINAL_PROVIDER_OUTCOMES:
-                    # Plan §2.3.3: a refused credential or an exhausted quota will not change for
-                    # the next window, so the primary stops at once rather than burning the sweep.
-                    sweep.provider_stopped = outcome
+                if attempt_id in stop_reasons:
+                    # Plan §2.3.3: a refused credential, an exhausted quota or a blocked request
+                    # will not change for the next window, so the primary stops at once rather
+                    # than burning the sweep. What it cost is the settled outcome above.
+                    reason = stop_reasons[attempt_id]
+                    if sweep.provider_stopped is None:
+                        sweep.provider_stopped = reason
                     sweep.stop()
-                    emit(f"audd primary stopped: {outcome}")
+                    emit(
+                        f"audd primary stopped: {reason}: "
+                        f"{refusal_words(reason, sweep.refusal_code)}; no further clip is sent"
+                    )
                     break
                 if outcome in THROTTLE_OUTCOMES:
                     limiter.penalize()
@@ -796,6 +955,7 @@ async def run_paid_clip_recognition(
         reservation_exhausted=sweep.reservation_exhausted,
         outcomes=tuple(sweep.outcomes),
         provider_stopped=sweep.provider_stopped,
+        refusal_code=sweep.refusal_code,
         attempts=sweep.attempts,
         cancelled=sweep.cancelled,
         resumed_ambiguous=sweep.resumed_ambiguous,

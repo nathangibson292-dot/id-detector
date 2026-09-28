@@ -18,6 +18,32 @@ from id_detector.io import url_has_credentials
 API_URL = "https://www.mixesdb.com/w/api.php"
 _PLAYER = re.compile(r"\{\{Player\b(.*?)\}\}", re.IGNORECASE | re.DOTALL)
 _HTTPS_URL = re.compile(r"https://[^\s|}\]]+", re.IGNORECASE)
+#: MediaWiki emphasis: a run of two or more apostrophes is markup, not text. MixesDB sets an
+#: unidentified or unconfirmed entry in italics (``''Artist - ID''``), and the markup is not part
+#: of the artist or the title.
+_WIKI_EMPHASIS = re.compile(r"'{2,}")
+
+
+def _emphasis_text(match: re.Match[str]) -> str:
+    """What a run of apostrophes leaves as text, by MediaWiki's own rule.
+
+    Two (italic), three (bold) and five (both) are pure markup. Four is one literal apostrophe
+    followed by bold; more than five keeps the extras as literal apostrophes. A single apostrophe
+    is never matched, so ``Don't``, ``Lady B's`` and ``Rockin' Steady`` are untouched.
+    """
+
+    run = len(match.group(0))
+    if run == 4:
+        return "'"
+    if run > 5:
+        return "'" * (run - 5)
+    return ""
+
+
+def strip_wiki_emphasis(value: str) -> str:
+    """``value`` without MediaWiki italic/bold markup; apostrophes inside names are kept."""
+
+    return re.sub(r"\s{2,}", " ", _WIKI_EMPHASIS.sub(_emphasis_text, value)).strip()
 
 
 def parse_search(payload: dict[str, object]) -> tuple[str, ...]:
@@ -73,6 +99,7 @@ def parse_wikitext(text: str, *, page_id: str, mirror_of: str | None = None) -> 
         if in_tracklist and stripped.startswith("#"):
             value = re.sub(r"^#+\s*", "", stripped)
             value = re.sub(r"<!--.*?-->", "", value).strip()
+            value = strip_wiki_emphasis(value)
             if value:
                 tracklist.append(value)
     mirrors = sorted(

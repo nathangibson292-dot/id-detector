@@ -244,6 +244,8 @@ def test_altered_local_source_exit_5_preserves_results(tmp_path, monkeypatch):
             str(audio),
             "--work-root",
             str(work),
+            "--config",
+            str(tmp_path / "idea.toml"),
             "--recipe",
             "free",
             "--no-hints",

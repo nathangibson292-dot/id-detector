@@ -442,7 +442,7 @@ def test_primary_stops_and_journals_partial_when_admission_cannot_dispatch(
     assert entry["counts"]["paid_failures"] == 0  # type: ignore[index]
 
 
-def test_recipe_cli_selects_deep_and_retires_max_paid_clips(monkeypatch) -> None:
+def test_recipe_cli_selects_deep_and_retires_max_paid_clips(tmp_path: Path, monkeypatch) -> None:
     captured: dict[str, object] = {}
 
     async def fake_analyse(_url: str, **kwargs: object) -> int:
@@ -451,20 +451,34 @@ def test_recipe_cli_selects_deep_and_retires_max_paid_clips(monkeypatch) -> None
 
     monkeypatch.setattr(pipeline, "run_analysis", fake_analyse)
     runner = CliRunner()
-    selected = runner.invoke(cli.app, ["analyse", "http://example/set", "--recipe", "deep"])
+    safe_options = [
+        "--work-root",
+        str(tmp_path / "work"),
+        "--config",
+        str(tmp_path / "idea.toml"),
+    ]
+    selected = runner.invoke(
+        cli.app, ["analyse", "http://example/set", "--recipe", "deep", *safe_options]
+    )
     assert selected.exit_code == 0, selected.output
     assert captured["recipe"] == DEEP_RECIPE
     assert captured["primary_engine"] == "shazam"  # free-first: the free sweep is Deep's primary
 
-    free_selected = runner.invoke(cli.app, ["analyse", "http://example/set", "--recipe", "free"])
+    free_selected = runner.invoke(
+        cli.app, ["analyse", "http://example/set", "--recipe", "free", *safe_options]
+    )
     assert free_selected.exit_code == 0, free_selected.output
     assert captured["recipe"] == FREE_RECIPE
     assert captured["primary_engine"] == "shazam"
 
-    invalid = runner.invoke(cli.app, ["analyse", "http://example/set", "--recipe", "turbo"])
+    invalid = runner.invoke(
+        cli.app, ["analyse", "http://example/set", "--recipe", "turbo", *safe_options]
+    )
     assert invalid.exit_code == 2
     assert "choose free or deep" in invalid.output
-    retired = runner.invoke(cli.app, ["analyse", "http://example/set", "--max-paid-clips", "10"])
+    retired = runner.invoke(
+        cli.app, ["analyse", "http://example/set", "--max-paid-clips", "10", *safe_options]
+    )
     assert retired.exit_code == 2
 
 
@@ -545,6 +559,7 @@ def test_pricing_authority_falls_back_to_the_packaged_copy_without_a_checkout(
 
 
 def test_legacy_max_accuracy_profile_never_starts_paid_work_without_an_explicit_recipe(
+    tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """A bare `--profile max_accuracy` spent nothing before recipes; it must still spend nothing."""
@@ -557,7 +572,16 @@ def test_legacy_max_accuracy_profile_never_starts_paid_work_without_an_explicit_
 
     monkeypatch.setattr(pipeline, "run_analysis", fake_analyse)
     runner = CliRunner()
-    bare = runner.invoke(cli.app, ["analyse", "http://example/set", "--profile", "max_accuracy"])
+    safe_options = [
+        "--work-root",
+        str(tmp_path / "work"),
+        "--config",
+        str(tmp_path / "idea.toml"),
+    ]
+    bare = runner.invoke(
+        cli.app,
+        ["analyse", "http://example/set", "--profile", "max_accuracy", *safe_options],
+    )
     assert bare.exit_code == 0, bare.output
     assert captured["recipe"] == FREE_RECIPE
     assert captured["primary_engine"] == "shazam"
@@ -565,13 +589,23 @@ def test_legacy_max_accuracy_profile_never_starts_paid_work_without_an_explicit_
     # The pre-v2 paid invocation (profile + an explicit paid engine) keeps its paid-first behaviour.
     opted_in = runner.invoke(
         cli.app,
-        ["analyse", "http://example/set", "--profile", "max_accuracy", "--engine", "audd"],
+        [
+            "analyse",
+            "http://example/set",
+            "--profile",
+            "max_accuracy",
+            "--engine",
+            "audd",
+            *safe_options,
+        ],
     )
     assert opted_in.exit_code == 0, opted_in.output
     assert captured["recipe"] == DEEP_RECIPE
 
     # --engine on a free-recipe run is dropped, and says so rather than pretending it ran.
-    dropped = runner.invoke(cli.app, ["analyse", "http://example/set", "--engine", "audd"])
+    dropped = runner.invoke(
+        cli.app, ["analyse", "http://example/set", "--engine", "audd", *safe_options]
+    )
     assert dropped.exit_code == 0, dropped.output
     assert captured["recipe"] == FREE_RECIPE
     assert "--engine is ignored by the free recipe" in dropped.output

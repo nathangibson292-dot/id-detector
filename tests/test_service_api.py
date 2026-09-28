@@ -228,6 +228,8 @@ def test_full_local_service_run_matches_the_cli_bundle_and_honours_run_id(
             str(AUDIO),
             "--work-root",
             str(work),
+            "--config",
+            str(tmp_path / "idea.toml"),
             "--recipe",
             "free",
             "--no-hints",

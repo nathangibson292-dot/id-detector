@@ -347,7 +347,9 @@ def test_whole_file_scanner_call_site_is_gone_from_analyse(tmp_path: Path, monke
     assert entry["usd_e6_spent"] == 35_000
 
 
-def test_engine_acrcloud_is_refused_and_the_consent_flag_is_inert(monkeypatch) -> None:
+def test_engine_acrcloud_is_refused_and_the_consent_flag_is_inert(
+    tmp_path: Path, monkeypatch
+) -> None:
     captured: dict[str, object] = {}
 
     async def fake_analyse(_url: str, **kwargs: object) -> int:
@@ -356,23 +358,46 @@ def test_engine_acrcloud_is_refused_and_the_consent_flag_is_inert(monkeypatch) -
 
     monkeypatch.setattr(pipeline, "run_analysis", fake_analyse)
     runner = CliRunner()
-    refused = runner.invoke(cli.app, ["analyse", "http://example/set", "--engine", "acrcloud"])
+    safe_options = [
+        "--work-root",
+        str(tmp_path / "work"),
+        "--config",
+        str(tmp_path / "idea.toml"),
+    ]
+    refused = runner.invoke(
+        cli.app, ["analyse", "http://example/set", "--engine", "acrcloud", *safe_options]
+    )
     assert refused.exit_code == 2
     assert "acrcloud is refused" in refused.output
     assert not captured
-    unknown = runner.invoke(cli.app, ["analyse", "http://example/set", "--engine", "other"])
+    unknown = runner.invoke(
+        cli.app, ["analyse", "http://example/set", "--engine", "other", *safe_options]
+    )
     assert unknown.exit_code == 2 and "choose audd" in unknown.output
     accepted = runner.invoke(
-        cli.app, ["analyse", "http://example/set", "--recipe", "deep", "--engine", "audd"]
+        cli.app,
+        [
+            "analyse",
+            "http://example/set",
+            "--recipe",
+            "deep",
+            "--engine",
+            "audd",
+            *safe_options,
+        ],
     )
     assert accepted.exit_code == 0, accepted.output
     assert "audd" in captured["enabled_engines"]  # type: ignore[operator]
     consent = runner.invoke(
-        cli.app, ["analyse", "http://example/set", "--i-own-this-audio-or-have-permission"]
+        cli.app,
+        ["analyse", "http://example/set", "--i-own-this-audio-or-have-permission", *safe_options],
     )
     assert consent.exit_code == 0, consent.output
     assert "has no effect" in consent.output
-    assert "--i-own-this-audio" not in runner.invoke(cli.app, ["analyse", "--help"]).output
+    assert (
+        "--i-own-this-audio"
+        not in runner.invoke(cli.app, ["analyse", *safe_options, "--help"]).output
+    )
 
 
 # --------------------------------------------------------------------------------------------------

@@ -800,6 +800,10 @@ function outcomeCopy(status, reason){
   return OUTCOME_COPY[status + ':' + reason] || OUTCOME_COPY[status] || OUTCOME_COPY.failed;
 }
 function costSentence(j){
+  // A settled, non-zero spend is always stated, whatever the status (a refusal can arrive while
+  // sibling requests already in flight are charged).
+  if(j.spend_known && typeof j.usd_e2_spent === 'number' && j.usd_e2_spent > 0)
+    return '$' + (j.usd_e2_spent / 100).toFixed(2) + ' of paid checks was spent before it stopped.';
   if(j.run_status === 'budget_exhausted' || j.run_status === 'provider_unavailable' ||
     j.status === 'waiting')
     return 'Nothing was spent — it stopped before any paid check ran.';
@@ -905,6 +909,17 @@ function showOutcome(j){
       '">Open the tracklist →</a>';
     row.innerHTML = j.result_url ? open : '';
     if(j.paid_offer){ showOffer(j, h, p, row); return; }
+    // Deep ended on its Free result: paid recognition is not set up, or AudD refused the token.
+    // Say so plainly; there is no Approve button, because there is nothing it could buy.
+    if(j.paid_notice){
+      h.textContent = j.paid_notice.reason === 'not_configured'
+        ? 'Free result ready — paid recognition is not set up'
+        : j.paid_notice.reason === 'not_configured_cached'
+        ? 'Tracklist ready — paid recognition is not set up'
+        : 'Free result ready — the paid check was refused';
+      p.textContent = p.textContent + ' ' + j.paid_notice.words;
+      return;
+    }
     confetti();
   } else if(j.status === 'waiting'){
     var w = outcomeCopy('waiting', null);
@@ -1157,6 +1172,10 @@ def _cost_sentence(
     scan can never spend; and only an unreadable cost record is admitted as unknown.
     """
 
+    if spend_known and usd_e2_spent is not None and usd_e2_spent > 0:
+        # A settled, non-zero spend is always stated, whatever the status: a refusal can stop the
+        # paid sweep while sibling requests already in flight are charged.
+        return f"${usd_e2_spent / 100:.2f} of paid checks was spent before it stopped."
     if status in {"budget_exhausted", "provider_unavailable"}:
         return "Nothing was spent — it stopped before any paid check ran."
     if spend_known and usd_e2_spent is not None:

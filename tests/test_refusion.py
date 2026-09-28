@@ -726,6 +726,8 @@ def test_owner_visible_upkeep_skips(tmp_path: Path, monkeypatch: pytest.MonkeyPa
             "serve",
             "--work-root",
             str(tmp_path / "browser"),
+            "--config",
+            str(tmp_path / "idea.toml"),
             "--port",
             "0",
             "--no-analyse",

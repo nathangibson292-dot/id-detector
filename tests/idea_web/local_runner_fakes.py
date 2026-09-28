@@ -96,6 +96,25 @@ def fake_pipeline_runner(
     )
 
 
+def browser_check_runner(work_root: Path, config: Path):
+    """The real pipeline runner for the browser progress check: no paid adapter, and a fake
+    Shazam that answers after 4.5 s, so a long synthetic mix takes a few minutes."""
+
+    from id_detector.webapp.runner import make_pipeline_runner
+    from tests.fakes.providers import FakeShazamHTTP, no_backoff
+
+    assert not os.environ.get("AUDD_API_TOKEN", "").strip(), "no paid credential in this runner"
+    script = {"shazam": {"default": "match", "latency_ms": 4500, "windows": {}}}
+    return make_pipeline_runner(
+        work_root,
+        project_root=ROOT,
+        config_path=config,
+        paid_scan_adapters=None,
+        shazam_http_client=FakeShazamHTTP(script),
+        paid_sleep=no_backoff,
+    )
+
+
 def deep_runner(work_root: Path, config: Path):
     """The real runner; ``IDEA_FOLLOWUP_KILL_ON`` makes the worker process die mid-sweep."""
 

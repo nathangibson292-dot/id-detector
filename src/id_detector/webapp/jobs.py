@@ -240,6 +240,10 @@ class Job:
     paid_offer: dict[str, int] | None = None
     offer_decision: str | None = None
     follow_up_job: str | None = None
+    #: A Deep job that ended on its Free result because paid recognition is not set up, or AudD
+    #: refused the token: ``reason`` and the plain ``words`` the page shows instead of an Approve
+    #: button that could not work.
+    paid_notice: dict[str, str] | None = None
     #: What the owner approved for THIS job: its paid step runs only when its exact plan is within
     #: both figures; otherwise it stops with a fresh offer. ``None`` on every job not started by an
     #: approval, so no job is ever pre-authorised by default.
@@ -475,6 +479,7 @@ class Job:
             # The Deep price waiting for the owner's answer, and that answer.
             "paid_offer": self.paid_offer,
             "offer_decision": self.offer_decision,
+            "paid_notice": self.paid_notice,
             "follow_up_url": f"/jobs/{self.follow_up_job}" if self.follow_up_job else None,
             "terminal": self.status in TERMINAL_STATES,
             "log": list(self.log),
@@ -552,6 +557,13 @@ class JobContext:
                 f"{_stamp()} free pass done: Deep would check {offer.get('gaps', 0)} gaps for "
                 f"about ${offer.get('usd_e2', 0) / 100:.2f}; waiting for your approval"
             )
+
+    def set_paid_notice(self, notice: dict[str, str]) -> None:
+        """Why this Deep job ended on its Free result (no token, or a refused one)."""
+
+        with self._manager.lock:
+            self._job.paid_notice = dict(notice)
+            self._job.log.append(f"{_stamp()} {notice.get('words', '')}")
 
     @property
     def dispatch_admission(self) -> Any:
@@ -904,9 +916,13 @@ class JobManager:
         with self.lock:
             job = self._jobs[job_id]
             job.status = RUNNING
-            job.started_at = time.time()
+            now = time.time()
+            # A job the local worker restarted keeps the time it first started, so the page's
+            # "elapsed" tile carries on with the bar instead of dropping back to a few seconds.
+            if job.started_at is None:
+                job.started_at = now
             job.phase = "starting"
-            job.phase_started_at = job.started_at
+            job.phase_started_at = now
             job.log.append(f"{_stamp()} started")
         ctx = JobContext(self, job)
         outcome = SUCCEEDED

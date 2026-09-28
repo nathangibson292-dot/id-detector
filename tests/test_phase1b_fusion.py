@@ -739,7 +739,7 @@ def test_a_lone_audd_phantom_is_probed_as_a_listed_candidate_not_treated_as_cove
 # --------------------------------------------------------------------------------------------------
 # E-M6: ``--profile max_accuracy`` alone is the free recipe
 # --------------------------------------------------------------------------------------------------
-def test_profile_max_accuracy_alone_selects_the_free_recipe(monkeypatch) -> None:
+def test_profile_max_accuracy_alone_selects_the_free_recipe(tmp_path: Path, monkeypatch) -> None:
     captured: dict[str, object] = {}
 
     async def fake_analyse(url: str, **kwargs: object) -> int:
@@ -748,13 +748,21 @@ def test_profile_max_accuracy_alone_selects_the_free_recipe(monkeypatch) -> None
 
     monkeypatch.setattr(pipeline, "run_analysis", fake_analyse)
     runner = CliRunner()
+    safe_options = [
+        "--work-root",
+        str(tmp_path / "work"),
+        "--config",
+        str(tmp_path / "idea.toml"),
+    ]
     for arguments, expected in (
         (["--profile", "max_accuracy"], "free"),
         (["--profile", "max_accuracy", "--recipe", "deep"], "deep"),
         (["--profile", "max_accuracy", "--engine", "audd"], "deep"),
         (["--profile", "free"], "free"),
     ):
-        result = runner.invoke(cli.app, ["analyse", "http://example/set", *arguments])
+        result = runner.invoke(
+            cli.app, ["analyse", "http://example/set", *arguments, *safe_options]
+        )
         assert result.exit_code == 0, result.output
         assert captured["recipe"].name == expected, arguments  # type: ignore[attr-defined]
     # The option's help says so; the stale "defaults to deep for max_accuracy" line is gone.

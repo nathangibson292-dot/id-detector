@@ -435,13 +435,25 @@ def test_run_certify_is_refused_before_it_opens_any_corpus(
 
 
 def test_idea_benchmark_certify_refuses_with_the_disabled_message(
+    tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(truth_module, "CERTIFICATION_ENABLED", False)  # the moratorium
     monkeypatch.setenv("IDEA_TEST_MODE", "1")
     result = CliRunner().invoke(
         cli.app,
-        ["benchmark", "certify", "--corpus", "fx-v1", "--profile", "free", "--test-version", "v1"],
+        [
+            "benchmark",
+            "certify",
+            "--corpus",
+            "fx-v1",
+            "--profile",
+            "free",
+            "--test-version",
+            "v1",
+            "--work-root",
+            str(tmp_path / "work"),
+        ],
     )
     assert result.exit_code == 2, result.output
     assert CERTIFICATION_DISABLED in result.output

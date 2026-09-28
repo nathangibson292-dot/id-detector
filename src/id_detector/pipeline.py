@@ -1385,6 +1385,7 @@ async def run_analysis(
                         f"no AudD credential: {plan.to_send} clip(s) without a stored paid "
                         "answer will not be sent"
                     )
+                    counts["paid_not_sent_no_credential"] = plan.to_send
             elif (
                 plan.clips
                 and not authorised
@@ -1498,6 +1499,9 @@ async def run_analysis(
                         ),
                     }
                 )
+                if paid_scan.refusal_code is not None:
+                    # AudD's own code for the refusal that stopped the sweep (900, 902, 904, ...).
+                    counts["paid_refusal_code"] = paid_scan.refusal_code
                 if paid_scan.cancelled:
                     # The cancel token fired (or the progress hook raised) inside the sweep; the
                     # clips in flight resolved first, so the journal below carries their spend.

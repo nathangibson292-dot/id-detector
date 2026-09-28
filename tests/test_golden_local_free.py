@@ -77,32 +77,42 @@ def test_the_golden_is_canonical_json_with_lf_endings() -> None:
     assert raw.decode("utf-8") == expected
 
 
-def _identity_from(produced: object, golden: object) -> object:
-    """``produced`` with ONLY its run identity and timestamps taken from ``golden`` (an identity
-    field the committed golden predates is left out, as the semantic comparison ignores it).
+def _golden_with_identity_of(golden: object, produced: object) -> object:
+    """The committed golden, with ONLY the run identity and timestamps taken from ``produced``.
 
-    Every other byte must then match the golden exactly -- including value types, which the
-    semantic comparison cannot see (``True == 1 == 1.0`` in Python)."""
+    Every other value comes from the golden itself -- including value types, which a semantic
+    comparison cannot see (``True == 1 == 1.0`` in Python) -- so rendering it gives exactly the
+    bytes the writer must have produced.  An identity field the golden predates is taken from the
+    produced document (the semantic comparison ignores it too); any other key the golden lacks is
+    left out, so a new result field fails the comparison."""
 
-    if isinstance(produced, dict) and isinstance(golden, dict):
-        grafted = {}
-        for key, value in produced.items():
+    if isinstance(golden, dict) and isinstance(produced, dict):
+        expected = {}
+        for key in set(golden) | set(produced):
             if key in IGNORED_KEYS or is_timestamp_key(str(key)):
-                if key in golden:  # an identity field the golden predates stays ignored
-                    grafted[key] = golden[key]
-            else:
-                grafted[key] = _identity_from(value, golden.get(key))
-        return grafted
-    if isinstance(produced, list) and isinstance(golden, list) and len(produced) == len(golden):
-        return [_identity_from(a, b) for a, b in zip(produced, golden, strict=True)]
-    return produced
+                if key in produced:
+                    expected[key] = produced[key]
+            elif key in golden:
+                expected[key] = _golden_with_identity_of(golden[key], produced.get(key))
+        return expected
+    if isinstance(golden, list) and isinstance(produced, list) and len(produced) == len(golden):
+        return [_golden_with_identity_of(a, b) for a, b in zip(golden, produced, strict=True)]
+    return golden
+
+
+def _canonical_bytes(document: object) -> bytes:
+    """The result writer's documented format, spelled out here independently of the writer:
+    UTF-8, keys sorted, compact separators, no ASCII escaping, no trailing newline."""
+
+    return json.dumps(
+        document, ensure_ascii=False, allow_nan=False, separators=(",", ":"), sort_keys=True
+    ).encode("utf-8")
 
 
 def test_local_free_run_reproduces_the_golden_bytes(tmp_path: Path) -> None:
-    produced = json.loads(run_local_free(tmp_path / "work").read_text(encoding="utf-8"))
-    raw = GOLDEN.read_bytes()
-    golden = json.loads(raw.decode("utf-8"))
-    rendered = json.dumps(
-        _identity_from(produced, golden), indent=2, ensure_ascii=False, sort_keys=True
-    )
-    assert (rendered + "\n").encode("utf-8") == raw
+    # The bytes the Free run actually wrote -- never parsed and re-serialised before comparing.
+    produced_raw = run_local_free(tmp_path / "work").read_bytes()
+    golden = json.loads(GOLDEN.read_bytes().decode("utf-8"))
+    produced = json.loads(produced_raw.decode("utf-8"))
+    assert b"\r" not in produced_raw  # the same bytes on every platform: no CRLF on Windows
+    assert produced_raw == _canonical_bytes(_golden_with_identity_of(golden, produced))

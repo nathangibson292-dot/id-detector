@@ -215,7 +215,14 @@ def test_cli_analyse_and_the_web_runner_carry_the_five_knobs_and_agree(
         return 0
 
     monkeypatch.setattr(pipeline, "run_analysis", fake_analyse)
-    args = ["analyse", "http://example/set", "--config", str(config)]
+    args = [
+        "analyse",
+        "http://example/set",
+        "--config",
+        str(config),
+        "--work-root",
+        str(tmp_path / "work"),
+    ]
     if via == "--profile":
         args += ["--profile", "free"]
     result = runner.invoke(cli.app, args)
@@ -449,7 +456,9 @@ def test_free_run_with_malformed_replies_is_partial_and_says_so(
     code, audd, shazam, entry, media_dir = _run(
         tmp_path, "free-thin.json", progress_messages=messages
     )
-    assert code == 0 and audd.calls == 0 and shazam.requests == 7
+    # The sweep's 7 requests, then the two errored windows asked once more at its end (the
+    # script keeps them malformed, so they stay errors).
+    assert code == 0 and audd.calls == 0 and shazam.requests == 7 + 2
     assert (entry["status"], entry["reason"]) == ("partial", "primary_not_achieved")
     assert entry["counts"]["failures"] == 2  # type: ignore[index]  # 5/7 resolved < 80 %
     assert any(
@@ -540,7 +549,7 @@ def test_deep_density_two_reports_the_windows_the_paid_sweep_skipped(
         "0000036000-none.wav",
         "0000048000-none.wav",
     ]
-    assert shazam.requests == 7
+    assert shazam.requests == 7 + 1  # window 3 asked once more at the end of the sweep
     first, second = loops
     # The first fuse sees exactly the windows the free pass answered; every window is still
     # handed over for the sidecars.

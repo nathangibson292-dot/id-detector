@@ -229,7 +229,18 @@ def test_no_emitter_claims_certification_while_the_gate_is_closed(
     )
     certify = runner.invoke(
         cli.app,
-        ["benchmark", "certify", "--corpus", "fx", "--profile", "free", "--test-version", "v1"],
+        [
+            "benchmark",
+            "certify",
+            "--corpus",
+            "fx",
+            "--profile",
+            "free",
+            "--test-version",
+            "v1",
+            "--work-root",
+            str(tmp_path / "certify-work"),
+        ],
     )
     everything = "\n".join([text, freeze.output, certify.output])
     assert _claims(everything) == []

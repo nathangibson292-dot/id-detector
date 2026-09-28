@@ -76,7 +76,17 @@ def test_cost_cached_key_and_url_read_only(cached):
     before = stamps(work)
     mix = cached_mix(work, key)
     for target in (key, mix.source.input_url):
-        result = CliRunner().invoke(cli.app, ["cost", target, "--work-root", str(work)])
+        result = CliRunner().invoke(
+            cli.app,
+            [
+                "cost",
+                target,
+                "--work-root",
+                str(work),
+                "--config",
+                str(work / "idea.toml"),
+            ],
+        )
         assert result.exit_code == 0, result.output
         # Already Free-scanned: the EXACT paid step, computed offline from the stored result.
         assert "Deep would check 1 gaps for about $0.04." in result.output
@@ -89,7 +99,14 @@ def test_cost_cached_key_and_url_read_only(cached):
 
 def test_unknown_length_requires_minutes_without_creating_work(tmp_path):
     root = tmp_path / "absent"
-    args = ["cost", "unknown-key", "--work-root", str(root)]
+    args = [
+        "cost",
+        "unknown-key",
+        "--work-root",
+        str(root),
+        "--config",
+        str(tmp_path / "idea.toml"),
+    ]
     missing = CliRunner().invoke(cli.app, args)
     assert missing.exit_code == 2 and "Length unknown" in missing.output
     supplied = CliRunner().invoke(cli.app, [*args, "--minutes", "60"])
@@ -125,6 +142,8 @@ def test_cli_confirmation_before_reservation(tmp_path, monkeypatch, interactive,
         "deep",
         "--work-root",
         str(work),
+        "--config",
+        str(tmp_path / "idea.toml"),
         "--no-hints",
         "--fake-providers",
         "audd,shazam",
@@ -169,9 +188,15 @@ def test_gate_is_cli_only_and_free_never_prompts(tmp_path, monkeypatch):
         return 0
 
     monkeypatch.setattr(pipeline, "run_analysis", capture)
-    CliRunner().invoke(cli.app, ["analyse", str(AUDIO), "--recipe", "free"])
+    safe_options = [
+        "--work-root",
+        str(tmp_path / "cli-work"),
+        "--config",
+        str(tmp_path / "idea.toml"),
+    ]
+    CliRunner().invoke(cli.app, ["analyse", str(AUDIO), "--recipe", "free", *safe_options])
     assert "cli_paid_confirm" not in seen[-1]
-    CliRunner().invoke(cli.app, ["analyse", str(AUDIO), "--recipe", "deep"])
+    CliRunner().invoke(cli.app, ["analyse", str(AUDIO), "--recipe", "deep", *safe_options])
     assert callable(seen[-1]["cli_paid_confirm"])
     store = _store(tmp_path, audd=FakeAudD(SCRIPT), shazam=FakeShazamHTTP(SCRIPT))
     run(_request(store, run_id="service"))

@@ -155,6 +155,14 @@ now stops and offers Approve / Skip instead of spending unseen. **Recommendation
 plan.** The paid answers already bought are kept in `id-detector-deepscan` and backed up outside the repo.
 The next accuracy work is free-side: abbreviated and misspelled tracklist entries that match nothing.
 
+**Final polish LANDED (2026-09-28)** ([build notes](reviews/build-local-final-polish.md)). Errored Shazam clips (about
+2.8% of windows) are retried once at the end of a scan, capped so one bad mix cannot spend the day's allowance.
+MixesDB italics no longer leave stray quote marks. With AudD cancelled, "Max accuracy", `--recipe deep` and
+`idea cost` say plainly that paid recognition is not set up and the Free result is final. A token AudD refuses
+stops the paid sweep at once and is counted conservatively: only 900/901 and HTTP 401/402/403 are no-charge, and
+every spend statement comes from the settled spend. The wall-clock progress bar has now been watched working in a
+real browser, including across a worker restart; screenshots are in `reviews/final-polish-shots/`.
+
 **When the hosted build resumes, next in plan order:** 4d-i (tenancy schema, lots,
 worker-side reservations), then 4d-ii and 4d-iii + 4d-iv. **Not started:** 6a–6b (ingest policy,
 container, launch checklist), then M2 (billing, Stripe sandbox) — see PLAN-v2 §5.

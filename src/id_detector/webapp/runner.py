@@ -383,6 +383,31 @@ def make_pipeline_runner(
                 bundle = Path(cached.media_dir) / "present" / "bundles" / service_result.bundle_id
                 if path_is_file(bundle / "manifest.json"):
                     result_paths.append(bundle)
+        if selected_recipe.name == "deep" and service_result.status == "provider_unavailable":
+            # Deep ended on its Free result because paid recognition is not set up, or AudD
+            # refused the token: say so plainly and show the Free result -- no Approve button
+            # that could not work. What it cost is the run's frozen settled spend.
+            from id_detector.paid_clip import PAID_REFUSAL_REASONS, paid_stop_words
+
+            refused = service_result.reason in PAID_REFUSAL_REASONS
+            code = cli.last_paid_refusal_code(root, target) if refused else None
+            words = paid_stop_words(service_result.reason, code, service_result.usd_e6_spent)
+            if words is not None:
+                set_notice = getattr(ctx, "set_paid_notice", None)
+                if callable(set_notice):
+                    set_notice({"reason": str(service_result.reason), "words": words})
+                selected = result_paths[-1] if result_paths else None
+                if selected is not None and (selected / "index.html").is_file():
+                    ctx.set_result(selected / "index.html")
+                    return
+                cached = cli._load_cached(root.resolve(), target)
+                if cached is not None:
+                    from id_detector.present.bundles import shown_result_dir
+
+                    index = shown_result_dir(cached.media_dir) / "index.html"
+                    if index.is_file():
+                        ctx.set_result(index)
+                        return
         if service_result.reason == "paid_not_confirmed" and offers:
             # The free pass finished and the paid step waits for the owner: nothing was reserved
             # or spent. The job ends with the free result open and the exact offer beside it.
@@ -431,6 +456,23 @@ def make_pipeline_runner(
             meaning = _EXIT_STATUS.get(exit_code, "error")
             raise RuntimeError(f"analysis failed: {meaning} (exit code {exit_code})")
 
+        if selected_recipe.name == "deep" and service_result.status in {
+            "complete",
+            "degraded",
+            "partial",
+        }:
+            not_sent = cli.last_run_counts(root, target).get("paid_not_sent_no_credential", 0)
+            set_notice = getattr(ctx, "set_paid_notice", None)
+            if not_sent and callable(set_notice):
+                # No token: only stored paid answers were used. Say so beside the result.
+                from id_detector.paid_clip import not_set_up_cached_words
+
+                set_notice(
+                    {
+                        "reason": "not_configured_cached",
+                        "words": not_set_up_cached_words(not_sent, service_result.usd_e6_spent),
+                    }
+                )
         selected = result_paths[-1] if result_paths else None
         if ctx.acquire:
             ctx.check_cancel()

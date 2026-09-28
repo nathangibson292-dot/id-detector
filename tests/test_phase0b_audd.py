@@ -502,7 +502,16 @@ def test_audd_requests_per_minute_is_a_deep_config_knob_carried_under_a_profile(
     monkeypatch.setattr(pipeline, "run_analysis", fake_analyse)
     result = CliRunner().invoke(
         cli.app,
-        ["analyse", "http://example/set", "--profile", "free", "--config", str(config)],
+        [
+            "analyse",
+            "http://example/set",
+            "--profile",
+            "free",
+            "--config",
+            str(config),
+            "--work-root",
+            str(tmp_path / "work"),
+        ],
     )
     assert result.exit_code == 0, result.output
     assert captured["app_config"].audd_requests_per_minute == 7  # type: ignore[attr-defined]

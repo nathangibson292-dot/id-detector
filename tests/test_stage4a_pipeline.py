@@ -290,16 +290,37 @@ def test_retryable_connector_failure_is_recorded_for_later_retry(tmp_path: Path)
     asyncio.run(scenario())
 
 
-def test_cli_exposes_required_stage4a_options() -> None:
+def test_cli_exposes_required_stage4a_options(tmp_path: Path) -> None:
     runner = CliRunner()
-    analyse_help = runner.invoke(app, ["analyse", "--help"])
+    analyse_help = runner.invoke(
+        app,
+        [
+            "analyse",
+            "--work-root",
+            str(tmp_path / "analyse-work"),
+            "--config",
+            str(tmp_path / "idea.toml"),
+            "--help",
+        ],
+    )
     assert analyse_help.exit_code == 0
     assert "--tracklist" in analyse_help.stdout and "--no-hints" in analyse_help.stdout
-    hints_help = runner.invoke(app, ["hints", "--help"])
+    hints_help = runner.invoke(
+        app, ["hints", "--work-root", str(tmp_path / "hints-work"), "--help"]
+    )
     assert hints_help.exit_code == 0
     assert "Fetch and parse hints" in hints_help.stdout
     assert "--confirm-mirror" in hints_help.stdout
-    gate_help = runner.invoke(app, ["benchmark", "hints", "--help"])
+    gate_help = runner.invoke(
+        app,
+        [
+            "benchmark",
+            "hints",
+            "--work-root",
+            str(tmp_path / "gate-work"),
+            "--help",
+        ],
+    )
     assert gate_help.exit_code == 0
     assert "--corpus" in gate_help.stdout
 

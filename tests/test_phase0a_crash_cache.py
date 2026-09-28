@@ -322,14 +322,22 @@ def test_fake_provider_cli_is_hidden_guarded_and_injects_both_boundaries(
     from id_detector import cli
 
     runner = CliRunner()
+    safe_options = [
+        "--work-root",
+        str(tmp_path / "work"),
+        "--config",
+        str(tmp_path / "idea.toml"),
+    ]
     monkeypatch.delenv("IDEA_TEST_MODE", raising=False)
     refused = runner.invoke(
         cli.app,
-        ["analyse", str(AUDIO), "--fake-providers", "audd,shazam"],
+        ["analyse", str(AUDIO), "--fake-providers", "audd,shazam", *safe_options],
     )
     assert refused.exit_code == 2
     assert "IDEA_TEST_MODE=1" in refused.output
-    assert "fake-providers" not in runner.invoke(cli.app, ["analyse", "--help"]).output
+    assert (
+        "fake-providers" not in runner.invoke(cli.app, ["analyse", *safe_options, "--help"]).output
+    )
 
     captured: dict[str, object] = {}
 
@@ -347,8 +355,7 @@ def test_fake_provider_cli_is_hidden_guarded_and_injects_both_boundaries(
             str(AUDIO),
             "--fake-providers",
             "audd,shazam",
-            "--work-root",
-            str(tmp_path / "work"),
+            *safe_options,
         ],
     )
     assert accepted.exit_code == 0

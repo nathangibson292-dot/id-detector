@@ -51,6 +51,19 @@ _MASHUP = re.compile(r"(?i)(?:(?<!\w)w/(?!\w)|\bvs\.?\b|\s+x\s+)")
 _EDIT = re.compile(r"(?i)\b(edit|rework|vip|dub)\b")
 _BOOTLEG = re.compile(r"(?i)\bbootleg\b")
 _UNKNOWN = re.compile(r"(?i)^\s*(?:id\s*-\s*id|id|\?)\s*(?:\([^)]*\))?\s*$")
+#: A title that only stands in for a track nobody has named: "ID", "?", "??" -- optionally with the
+#: version or label brackets a tracklist keeps on it ("ID (Benwal Remix)", "ID [Armada]").
+_PLACEHOLDER_TITLE = re.compile(r"(?i)^\s*(?:id|\?+)\s*(?:[(\[][^()\[\]]*[)\]]\s*)*$")
+#: Quote pairs that may wrap a whole field. Only a pair at BOTH ends is removed, so an apostrophe
+#: inside a name ("Don't Stop", "Lady B's Lullaby", "'Round Midnight") is never touched.
+_WRAPPING_QUOTES = (
+    ('"', '"'),
+    ("“", "”"),
+    ("„", "“"),
+    ("‘", "’"),
+    ("«", "»"),
+    ("'", "'"),
+)
 _REACTION = re.compile(r"(?i)^\s*(?:this is|so good|fire\b|what a set|love this)\b")
 # A reply may open with several mentions ("@a @b  Artist - Title"): every prefix that tolerates
 # one tolerates any number, and nothing downstream may ever emit an ``@handle`` in a label.
@@ -298,28 +311,57 @@ def _scrub_mentions(value: str | None) -> str | None:
     return cleaned or None
 
 
+def _unquote(value: str) -> str:
+    """``value`` without quote marks that wrap all of it (repeatedly: ``"'ID'"`` is ``ID``).
+
+    A single-apostrophe pair is removed only when neither end of the inside is another apostrophe,
+    so a name that merely starts or ends with one keeps it.
+    """
+
+    text = value.strip()
+    changed = True
+    while changed and len(text) >= 2:
+        changed = False
+        for opening, closing in _WRAPPING_QUOTES:
+            if text.startswith(opening) and text.endswith(closing):
+                inner = text[len(opening) : len(text) - len(closing)].strip()
+                if not inner:
+                    break
+                if opening == "'" and (inner.startswith("'") or inner.endswith("'")):
+                    break
+                text, changed = inner, True
+                break
+    return text
+
+
 def _artist_title(text: str, *, split_no_space: bool) -> tuple[str | None, str | None, int]:
-    clean = _scrub_mentions(_MENTION_PREFIX.sub("", text)) or ""
+    clean = _unquote(_scrub_mentions(_MENTION_PREFIX.sub("", text)) or "")
     by_match = re.fullmatch(r"(.+?)\s+by\s+(.+)", clean, re.IGNORECASE)
     if by_match:
-        return by_match.group(2).strip(), by_match.group(1).strip(), 8_500
+        return _unquote(by_match.group(2)), _unquote(by_match.group(1)), 8_500
     for separator in _SPACED_SEPARATORS:
         if separator in clean:
             artist, title = clean.split(separator, 1)
             if artist.strip() and title.strip():
-                return artist.strip(), title.strip(), 9_000
+                return _unquote(artist), _unquote(title), 9_000
     if split_no_space and "-" in clean:
         artist, title = clean.split("-", 1)
         if artist.strip() and title.strip():
-            return artist.strip(), title.strip(), 5_000
+            return _unquote(artist), _unquote(title), 5_000
     return None, clean or None, 3_000
 
 
 def _flags_and_qualifiers(
     text: str, artist: str | None, title: str | None
 ) -> tuple[str | None, str | None, HintFlags, int]:
-    unknown = bool(_UNKNOWN.fullmatch(text)) or bool(
-        artist and title and artist.casefold() == "id" and title.casefold().startswith("id")
+    unknown = (
+        bool(_UNKNOWN.fullmatch(_unquote(text)))
+        or bool(
+            artist and title and artist.casefold() == "id" and title.casefold().startswith("id")
+        )
+        # "Artist - ID" / "Artist - ?": the artist is known, the track is not. The line is a
+        # placeholder, never a track called "ID".
+        or bool(title and _PLACEHOLDER_TITLE.fullmatch(title))
     )
     version_match = _VERSION.search(text)
     qualifier = None

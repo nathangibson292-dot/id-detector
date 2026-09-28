@@ -54,7 +54,7 @@ from id_detector.shazam import (
     response_to_observation,
     retry_delay,
 )
-from id_detector.shazam_breaker import ShazamBreaker
+from id_detector.shazam_breaker import ShazamBreaker, shazam_off
 from id_detector.windows import WindowsResult
 
 POSITIVE_MAX_AGE_SECONDS = 180 * 24 * 60 * 60
@@ -186,6 +186,56 @@ def _write_immutable_json(path: Path, value: Any) -> None:
     _write_immutable_bytes(path, canonical_json_bytes(value))
 
 
+def _is_error_payload(path: Path) -> bool:
+    """True when ``path`` holds the error payload a failed query leaves, never an answer."""
+
+    try:
+        stored = json.loads(read_text(path))
+    except (OSError, ValueError):
+        return False
+    return isinstance(stored, dict) and "error" in stored and "matches" not in stored
+
+
+def _write_raw_json(path: Path, value: Any, *, replace_error: bool) -> None:
+    """Write a query's raw body; a retry may replace ONLY the error payload its failure left.
+
+    Answers stay immutable: a stored match or no-match is never overwritten, whatever the caller.
+    """
+
+    if replace_error and path_is_file(path) and _is_error_payload(path):
+        atomic_write_bytes(path, canonical_json_bytes(value))
+        return
+    _write_immutable_json(path, value)
+
+
+#: The provider outcomes an end-of-sweep retry may re-ask: the request reached Shazam and came
+#: back as an error rather than an answer (a throttle, a server error, a body that was not a
+#: recognition, a lost or refused connection). A refused credential or quota never changes on a
+#: second ask, so it is never retried; a window that was never dispatched was not a provider error.
+END_OF_SWEEP_RETRY_OUTCOMES = frozenset(
+    {
+        "malformed",
+        "http_5xx",
+        "http_429",
+        "http_503",
+        "timeout_post",
+        "timeout_pre",
+        "connect_error",
+    }
+)
+#: The end-of-sweep retry pass is bounded: at most one retry per errored window, and at most
+#: ``max(RETRY_PASS_MIN, 10 % of the mix's windows)`` retries in all -- about 2.8 % of windows
+#: error on the owner's mixes, so the cap never binds on an ordinary mix, while a mix where Shazam
+#: kept failing cannot spend the rest of the day's request allowance on second asks.
+RETRY_PASS_MIN = 10
+RETRY_PASS_FRACTION_E2 = 10
+#: Connection failures do not count toward the breaker's failure-rate sample, so the retry pass
+#: judges them itself: this many retries in a row that could not reach Shazam at all end the pass
+#: (the network or the service is down; asking again now only burns requests).
+RETRY_PASS_UNREACHABLE_STREAK = 3
+_UNREACHABLE = frozenset({"connect_error", "timeout_pre"})
+
+
 def _write_immutable_sidecar(path: Path, upstream: dict[str, Path]) -> None:
     sidecar = completion_sidecar_path(path)
     if path_is_file(sidecar):
@@ -301,7 +351,15 @@ async def _run_job(
     owner: str,
     journal: Any = None,
     resume: Any = None,
+    max_retries: int = MAX_RETRIES,
+    retry_of: str | None = None,
 ) -> None:
+    """Run one leased query: the request, its in-job retries, and its raw body and job state.
+
+    ``retry_of`` is the end-of-sweep retry of a window that already failed in this run: its
+    first attempt is parented on the failed one, and it may replace that failure's error payload.
+    """
+
     raw_path = raw_dir / f"{query.cache_key}.json"
     relative_path = raw_path.relative_to(media_dir).as_posix()
     from id_detector.shazam_breaker import SHAZAM_QUERY_ID
@@ -322,7 +380,9 @@ async def _run_job(
             if resume is not None and resume.action in {"retry", "reissue"}
             else None
         )
-        for retry_index in range(MAX_RETRIES + 1):
+        if retry_of is not None:
+            parent = retry_of
+        for retry_index in range(max_retries + 1):
             attempt_id = (
                 journal.prepare(
                     query_id=query.cache_key,
@@ -356,7 +416,7 @@ async def _run_job(
                 settle(shazam_outcome(exc))
                 last_error = exc
                 retryable = exc.status_code == 0 or exc.status_code == 429 or exc.status_code >= 500
-                if not retryable or retry_index == MAX_RETRIES:
+                if not retryable or retry_index == max_retries:
                     break
                 await asyncio.sleep(retry_delay(retry_index, exc.retry_after))
             except DispatchRefused:
@@ -378,7 +438,7 @@ async def _run_job(
                 "error": type(last_error).__name__ if last_error else "unknown",
                 "message": str(last_error)[:1000] if last_error else "recognition failed",
             }
-            _write_immutable_json(raw_path, error_payload)
+            _write_raw_json(raw_path, error_payload, replace_error=retry_of is not None)
             await store.finish(
                 job.id,
                 "permanent_failure",
@@ -390,7 +450,9 @@ async def _run_job(
         # The synchronous Shazam response is its acknowledgement. Commit that fact before any
         # downstream artifact work so a crash cannot silently submit the same job again.
         await store.submitted(job.id)
-        _write_immutable_json(raw_path, canonicalize_provider_json(response))
+        _write_raw_json(
+            raw_path, canonicalize_provider_json(response), replace_error=retry_of is not None
+        )
         status = "succeeded" if response.get("matches") and response.get("track") else "no_match"
         await store.finish(job.id, status, result_path=relative_path)
     finally:
@@ -610,9 +672,78 @@ async def recognise_generation(
                     window_done = min(window_done + 1, window_total)
                     on_window(window_done, window_total)
 
+        async def _retry_errors_once() -> None:
+            """Ask Shazam once more, at the end of the sweep, for each window that came back as
+            a provider error in THIS run.
+
+            Every retry goes through the same adapter (its rate limiter and the Shazam breaker),
+            the same per-media request budget and the same attempt journal as the sweep: it stops
+            the moment the breaker or the daily budget refuses new work, and never extends either.
+            A window whose retry also fails stays an error.
+            """
+
+            ledger = shazam_journal.run_ledger()
+            candidates: list[tuple[Any, QueryRecord, Any]] = []
+            for stored_job in await store.list_jobs():
+                if stored_job.state != "permanent_failure" or stored_job.query_id not in leasable:
+                    continue
+                query = query_by_id[stored_job.query_id]
+                latest = ledger.resume(query.cache_key).latest
+                if (
+                    latest is None
+                    or not latest.dispatched
+                    or latest.outcome not in END_OF_SWEEP_RETRY_OUTCOMES
+                ):
+                    continue
+                candidates.append((stored_job, query, latest))
+            # Window order, so the retry pass is deterministic whatever order the pool finished in.
+            candidates.sort(key=lambda item: window_by_id[item[1].target.window_id].support_ms[0])
+            cap = max(RETRY_PASS_MIN, -(-len(queries) * RETRY_PASS_FRACTION_E2 // 100))
+            unreachable_streak = 0
+            for stored_job, query, latest in candidates[:cap]:
+                breaker = getattr(adapter, "process_breaker", None)
+                if shazam_off() or (breaker is not None and breaker.reason() is not None):
+                    return  # the breaker (or the kill-switch) refuses new work: never around it
+                budget = await store.budget(media_key, "shazam")
+                if budget is not None and (
+                    budget["used_requests"] + budget["reserved_requests"] >= budget["max_requests"]
+                ):
+                    return  # the request budget is spent: a retry never extends it
+                await store.reset_for_refresh(stored_job.id)
+                leased = await store.lease_next(
+                    run_id,
+                    media_key=media_key,
+                    provider="shazam",
+                    query_ids=frozenset({query.id}),
+                )
+                if leased is None:
+                    continue
+                await _run_job(
+                    store=store,
+                    job=leased,
+                    query=query,
+                    window=window_by_id[query.target.window_id],
+                    adapter=adapter,
+                    media_dir=media_dir,
+                    raw_dir=raw_dir,
+                    owner=run_id,
+                    journal=shazam_journal,
+                    resume=shazam_journal.run_ledger().resume(query.cache_key),
+                    max_retries=0,
+                    retry_of=latest.attempt_id,
+                )
+                retried = shazam_journal.run_ledger().resume(query.cache_key).latest
+                if retried is not None and retried.outcome in _UNREACHABLE:
+                    unreachable_streak += 1
+                    if unreachable_streak >= RETRY_PASS_UNREACHABLE_STREAK:
+                        return  # Shazam cannot be reached at all: stop asking again
+                else:
+                    unreachable_streak = 0
+
         workers = [asyncio.create_task(_drain()) for _ in range(worker_count)]
         try:
             await asyncio.gather(*workers)
+            await _retry_errors_once()
         except BaseException:
             # Ctrl-C (CancelledError) or an unexpected worker error: cancel the siblings, let them
             # unwind, release every lease this run holds, then re-raise. Prevents an orphaned worker

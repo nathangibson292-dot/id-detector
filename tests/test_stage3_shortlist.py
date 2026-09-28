@@ -69,6 +69,10 @@ def test_shortlist_cli_contract_uses_requested_corpus_and_output(
             "controlled-synth-1",
             "--out",
             str(destination),
+            "--work-root",
+            str(tmp_path / "work"),
+            "--config",
+            str(tmp_path / "idea.toml"),
         ],
     )
     assert result.exit_code == 0, result.output
@@ -124,6 +128,10 @@ def test_shortlist_cli_passes_refresh_and_redacts_failures(tmp_path: Path, monke
             "controlled-synth-1",
             "--out",
             str(tmp_path / "out.json"),
+            "--work-root",
+            str(tmp_path / "work"),
+            "--config",
+            str(tmp_path / "idea.toml"),
             "--refresh",
         ],
     )

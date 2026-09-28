@@ -192,7 +192,9 @@ def test_free_primary_below_80_percent_is_partial(tmp_path: Path) -> None:
     assert code == 0
     assert (entry["status"], entry["reason"]) == ("partial", "primary_not_achieved")
     assert entry["achieved"] == "free"
-    assert shazam.requests == 7 and audd.calls == 0  # 5/7 resolved < 80 %
+    # 5/7 resolved < 80 %: the sweep's 7 requests, then the two errored windows are asked once
+    # more at the end of the sweep (the script keeps them malformed, so they stay errors).
+    assert shazam.requests == 7 + 2 and audd.calls == 0
     assert entry["counts"]["failures"] == 2  # type: ignore[index]
     assert entry["usd_e6_reserved"] == entry["usd_e6_spent"] == 0
     assert _tracklist(media_dir)["status"] == "partial"
@@ -217,7 +219,8 @@ def test_deep_free_pass_below_80_percent_is_partial(tmp_path: Path) -> None:
     assert entry["reason"] == "primary_not_achieved"
     assert entry["achieved"] == "deep"
     # Every free answer was malformed, so the whole mix is a gap and the paid check covers it.
-    assert shazam.requests == 7
+    # Each errored window is asked once more at the end of the free sweep, and fails again.
+    assert shazam.requests == 7 + 7
     assert audd.calls == audd.billed_units == 7
     assert entry["usd_e6_spent"] == 35_000
     assert entry["counts"]["paid_resolved"] == 7  # type: ignore[index]
@@ -348,7 +351,7 @@ def test_allow_degrade_never_applies_after_paid_work_or_to_a_free_request(tmp_pa
     assert code == 0 and entry["status"] == "complete" and entry["achieved"] == "free"
 
 
-def test_allow_degrade_cli_flag_is_threaded_and_off_by_default(monkeypatch) -> None:
+def test_allow_degrade_cli_flag_is_threaded_and_off_by_default(tmp_path: Path, monkeypatch) -> None:
     captured: dict[str, object] = {}
 
     async def fake_analyse(_url: str, **kwargs: object) -> int:
@@ -357,15 +360,31 @@ def test_allow_degrade_cli_flag_is_threaded_and_off_by_default(monkeypatch) -> N
 
     monkeypatch.setattr(pipeline, "run_analysis", fake_analyse)
     runner = CliRunner()
-    default = runner.invoke(cli.app, ["analyse", "http://example/set", "--recipe", "deep"])
+    safe_options = [
+        "--work-root",
+        str(tmp_path / "work"),
+        "--config",
+        str(tmp_path / "idea.toml"),
+    ]
+    default = runner.invoke(
+        cli.app, ["analyse", "http://example/set", "--recipe", "deep", *safe_options]
+    )
     assert default.exit_code == 0, default.output
     assert captured["allow_degrade"] is False
     flagged = runner.invoke(
-        cli.app, ["analyse", "http://example/set", "--recipe", "deep", "--allow-degrade"]
+        cli.app,
+        [
+            "analyse",
+            "http://example/set",
+            "--recipe",
+            "deep",
+            "--allow-degrade",
+            *safe_options,
+        ],
     )
     assert flagged.exit_code == 0, flagged.output
     assert captured["allow_degrade"] is True
-    assert "--allow-degrade" in runner.invoke(cli.app, ["analyse", "--help"]).output
+    assert "--allow-degrade" in runner.invoke(cli.app, ["analyse", *safe_options, "--help"]).output
 
 
 # --------------------------------------------------------------------------------------------------

@@ -1248,12 +1248,48 @@ class LocalWorkerSupervisor:
         print(message, file=sys.stderr, flush=True)
 
 
+#: The ONLY substitute runners the local worker will load: the repository's offline fakes, which
+#: inject scripted providers (or run no provider at all). Any other ``module:factory`` is refused,
+#: even under ``IDEA_TEST_MODE=1`` -- an arbitrary factory would bypass the provider-override
+#: guard of :func:`id_detector.webapp.runner.make_pipeline_runner` entirely.
+TEST_RUNNER_MODULE = "tests.idea_web.local_runner_fakes"
+TEST_RUNNERS = frozenset(
+    f"{TEST_RUNNER_MODULE}:{name}"
+    for name in ("slow_runner", "forever_runner", "deep_runner", "browser_check_runner")
+)
+
+
+def runner_spec_refusal(spec: str) -> str | None:
+    """Why ``spec`` may not run as the worker's runner, or ``None`` when it may.
+
+    Allowed only with ``IDEA_TEST_MODE=1``, an empty ``AUDD_API_TOKEN`` (no paid credential can
+    reach a substitute runner) and a name on :data:`TEST_RUNNERS`.
+    """
+
+    if os.environ.get("IDEA_TEST_MODE") != "1":
+        return "--runner is available only when IDEA_TEST_MODE=1"
+    if os.environ.get("AUDD_API_TOKEN", "").strip():
+        return "--runner refuses to start while AUDD_API_TOKEN is set; clear it for offline tests"
+    if spec not in TEST_RUNNERS:
+        return (
+            f"--runner accepts only the built-in offline runners: {', '.join(sorted(TEST_RUNNERS))}"
+        )
+    return None
+
+
 def _load_runner(work_root: Path, config: Path, spec: str | None) -> Runner:
     if spec:
-        if os.environ.get("IDEA_TEST_MODE") != "1":
-            raise SystemExit("--runner is available only when IDEA_TEST_MODE=1")
+        refusal = runner_spec_refusal(spec)
+        if refusal is not None:
+            raise SystemExit(refusal)
+        from id_detector.cli import PROJECT_ROOT
+
         module_name, _, attribute = spec.partition(":")
-        factory = getattr(importlib.import_module(module_name), attribute)
+        module = importlib.import_module(module_name)
+        origin = Path(getattr(module, "__file__", "") or "").resolve()
+        if not origin.is_relative_to((PROJECT_ROOT / "tests").resolve()):
+            raise SystemExit(f"--runner module {module_name} is not this checkout's offline fake")
+        factory = getattr(module, attribute)
         return factory(work_root, config)
     from id_detector.cli import PROJECT_ROOT
     from id_detector.webapp.runner import make_pipeline_runner

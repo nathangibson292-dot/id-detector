@@ -622,7 +622,18 @@ def test_idea_benchmark_certify_says_certified_only_when_something_was(
     monkeypatch.setattr(cli, "run_certify", fake_run_certify)
     result = CliRunner().invoke(
         cli.app,
-        ["benchmark", "certify", "--corpus", "fx-v1", "--profile", "free", "--test-version", "t1"],
+        [
+            "benchmark",
+            "certify",
+            "--corpus",
+            "fx-v1",
+            "--profile",
+            "free",
+            "--test-version",
+            "t1",
+            "--work-root",
+            str(tmp_path / "work"),
+        ],
     )
     assert result.exit_code == 0, result.output
     assert result.output.startswith(f"{verb} corpus=fx-v1 profile=free test_version=t1; ")

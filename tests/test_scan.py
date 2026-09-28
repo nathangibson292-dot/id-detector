@@ -150,13 +150,23 @@ def test_a_second_run_reconstructs_from_cache_without_the_adapter(tmp_path: Path
     ]
 
 
-def test_analyse_rejects_an_unknown_engine_before_running() -> None:
+def test_analyse_rejects_an_unknown_engine_before_running(tmp_path: Path) -> None:
     from typer.testing import CliRunner
 
     from id_detector.cli import app
 
     result = CliRunner().invoke(
-        app, ["analyse", "https://soundcloud.com/example/mix", "--engine", "bogus"]
+        app,
+        [
+            "analyse",
+            "https://soundcloud.com/example/mix",
+            "--engine",
+            "bogus",
+            "--work-root",
+            str(tmp_path / "work"),
+            "--config",
+            str(tmp_path / "idea.toml"),
+        ],
     )
     assert result.exit_code == 2
     assert "unknown --engine" in result.output

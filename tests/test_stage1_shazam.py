@@ -472,4 +472,12 @@ def test_job_executor_enforces_retry_limit(tmp_path: Path, monkeypatch: object) 
             assert final
         return calls, final.physical_attempts, final.state, final.attempts
 
-    assert asyncio.run(scenario()) == (MAX_RETRIES + 1, MAX_RETRIES + 1, "permanent_failure", 1)
+    # The job executor stops after MAX_RETRIES in-job retries (MAX_RETRIES + 1 requests); the
+    # sweep then asks an errored window exactly once more at its end (a second lease), and a
+    # window whose retry also fails stays a permanent failure.
+    assert asyncio.run(scenario()) == (
+        MAX_RETRIES + 1 + 1,
+        MAX_RETRIES + 1 + 1,
+        "permanent_failure",
+        2,
+    )

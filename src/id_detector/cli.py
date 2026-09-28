@@ -572,6 +572,7 @@ def cost(
         duration = round(minutes * 60_000)
     if duration is None or duration <= 0:
         typer.echo("Length unknown. Supply --minutes to estimate; nothing was fetched or spent.")
+        _echo_paid_not_set_up()
         raise typer.Exit(2)
     if cached is not None and minutes is None:
         plan = free_scanned_plan(cached, loaded)
@@ -581,10 +582,25 @@ def cost(
                 "Exact for today's stored free result; a fresh run re-reads its tracklist hints, "
                 "which can move a gap. Nothing was fetched or spent."
             )
+            _echo_paid_not_set_up()
             return
     typer.echo(
         estimate(duration, loaded).render(cached.scanned if cached else "No cached mix found.")
     )
+    _echo_paid_not_set_up()
+
+
+def _echo_paid_not_set_up() -> None:
+    """``idea cost`` says so plainly when paid recognition has no credential at all."""
+
+    from id_detector.paid_clip import paid_recognition_configured
+
+    if not paid_recognition_configured():
+        typer.echo(
+            "Paid recognition is not set up (no AudD token is configured): a Deep run would stop "
+            "after its free pass, and the Free result is the final one. The figures above are "
+            "what Deep would cost only once a token is set up."
+        )
 
 
 def _confirm_paid(plan: PaidPlan, config: AppConfig, history: str, yes: bool) -> bool:
@@ -954,20 +970,71 @@ def analyse(
         if requested_recipe.name == "deep" and (
             result.reason == "paid_not_confirmed" or result.status == "provider_unavailable"
         ):
-            stopped = (
-                "you did not confirm the paid check"
+            from id_detector.paid_clip import paid_stop_words, spent_words
+
+            # Every spend statement comes from the run's frozen settlement (usd_e6_spent).
+            words = (
+                None
                 if result.reason == "paid_not_confirmed"
-                else f"the paid engine is unavailable ({result.reason})"
+                else paid_stop_words(
+                    result.reason,
+                    last_paid_refusal_code(work_root, url),
+                    result.usd_e6_spent,
+                )
             )
+            if words is None:
+                stopped = (
+                    "you did not confirm the paid check"
+                    if result.reason == "paid_not_confirmed"
+                    else f"the paid engine is unavailable ({result.reason})"
+                )
+                spent = spent_words(result.usd_e6_spent)
+                if result.reason == "paid_not_confirmed" and not result.usd_e6_spent:
+                    # Declined before any reservation: the owner's own answer, stated as before.
+                    spent = "Nothing was reserved or spent."
+                words = f"{stopped}. {spent}"
             typer.echo(
-                f"Deep stopped after the free pass: {stopped}. Nothing was reserved or spent. "
+                f"Deep stopped after the free pass: {words} "
                 + _free_result_line(work_root, url, result.bundle_id),
                 err=True,
             )
+        elif requested_recipe.name == "deep" and result.status in {
+            "complete",
+            "degraded",
+            "partial",
+        }:
+            not_sent = last_run_counts(work_root, url).get("paid_not_sent_no_credential", 0)
+            if not_sent:
+                from id_detector.paid_clip import not_set_up_cached_words
+
+                typer.echo(not_set_up_cached_words(not_sent, result.usd_e6_spent), err=True)
     except KeyboardInterrupt:
         typer.echo("cancelled; safe job states were restored", err=True)
         raise typer.Exit(130) from None
     raise typer.Exit(exit_code)
+
+
+def last_run_counts(work_root: Path, url: str) -> dict[str, int]:
+    """The ``counts`` of this mix's latest journalled run (empty when there is none)."""
+
+    cached = _load_cached(work_root.resolve(), url)
+    if cached is None:
+        return {}
+    try:
+        lines = read_text(Path(cached.media_dir) / "invocations.jsonl").splitlines()
+        entry = json.loads(next(line for line in reversed(lines) if line.strip()))
+        counts = entry.get("counts") or {}
+    except (OSError, ValueError, StopIteration, AttributeError):
+        return {}
+    if not isinstance(counts, dict):
+        return {}
+    return {str(key): value for key, value in counts.items() if isinstance(value, int)}
+
+
+def last_paid_refusal_code(work_root: Path, url: str) -> int | None:
+    """AudD's own code for the refusal that stopped this mix's latest run, when it gave one."""
+
+    return last_run_counts(work_root, url).get("paid_refusal_code")
 
 
 def _free_result_line(work_root: Path, url: str, bundle_id: str | None) -> str:
@@ -1093,6 +1160,12 @@ def serve(
     config: Path = typer.Option(  # noqa: B008
         Path("idea.toml"), "--config", help="Non-secret schedule/transform TOML config."
     ),
+    runner: str | None = typer.Option(
+        None,
+        "--runner",
+        hidden=True,
+        help="A built-in offline test runner for the local worker (IDEA_TEST_MODE=1 only).",
+    ),
 ) -> None:
     """Serve analysed sets on 127.0.0.1; by default also run analyses started from the browser."""
 
@@ -1111,6 +1184,15 @@ def serve(
     except ValueError as exc:
         typer.echo(str(exc), err=True)
         raise typer.Exit(2) from None
+    if runner is not None:
+        # A substitute runner (fake providers, a slowed clock) must never serve a real analysis:
+        # only the built-in offline fakes, only in test mode, and never beside a paid credential.
+        from idea_web.jobs.local import runner_spec_refusal
+
+        refusal = runner_spec_refusal(runner)
+        if refusal is not None:
+            typer.echo(refusal, err=True)
+            raise typer.Exit(2)
     # The web process never runs a pipeline (plan §4.2): it enqueues into the durable local queue,
     # and a worker process that this command starts, restarts and stops runs the analyses.
     jobs = supervisor = None
@@ -1122,7 +1204,9 @@ def serve(
         except MigrationRefused as exc:
             typer.echo(str(exc), err=True)
             raise typer.Exit(2) from None
-        supervisor = LocalWorkerSupervisor(work_root, config_path=config, jobs=jobs)
+        supervisor = LocalWorkerSupervisor(
+            work_root, config_path=config, jobs=jobs, runner_spec=runner
+        )
 
     def _show_upkeep(report: object) -> None:
         for line in report.owner_status_lines():  # type: ignore[attr-defined]
