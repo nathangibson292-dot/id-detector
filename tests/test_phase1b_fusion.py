@@ -67,7 +67,7 @@ from id_detector.hints.relations import apply_relations
 from id_detector.io import atomic_write_json
 from id_detector.present.bundles import shown_result_dir
 from id_detector.present.exports import (
-    _candidate_label,
+    _identity_candidate_label,
     export_tracklist,
     flatten_tracklist,
     hidden_reason,
@@ -949,7 +949,7 @@ def test_a_comment_lead_in_is_not_a_track_label_and_never_names_a_crowd_row() ->
             "works": [{**stamp, "work_id": "b" * 40, "member_nodes": [clean, lead_in]}],
         }
     )
-    assert _candidate_label(identities, "a" * 40) == ("Fishmans", "Long Season")
+    assert _identity_candidate_label(identities, "a" * 40) == ("Fishmans", "Long Season")
     # With no plausible label at all the row still gets its name (never "Unknown").
     only_lead_in = identities.model_copy(
         update={
@@ -957,7 +957,7 @@ def test_a_comment_lead_in_is_not_a_track_label_and_never_names_a_crowd_row() ->
             "works": [identities.works[0].model_copy(update={"member_nodes": [lead_in]})],
         }
     )
-    assert _candidate_label(only_lead_in, "a" * 40) == (
+    assert _identity_candidate_label(only_lead_in, "a" * 40) == (
         "FULL TRACK LIST:",
         "Fishmans - Long Season",
     )

@@ -26,6 +26,8 @@
       "truth_matched": 4
     }
   },
+  "fusion_versions": [],
+  "fusion_warning": null,
   "generated_by": "id-detector/0.1.0 scripts/score_corpus.py",
   "l3": {
     "certifiable": false,
@@ -72,6 +74,7 @@
       "episodes": "mini-a/fuse/episodes.json",
       "episodes_listed": 5,
       "episodes_total": 7,
+      "fusion_version": null,
       "hidden_by_reason": {
         "buried": 1,
         "short": 1
@@ -149,6 +152,7 @@
       "episodes": "mini-b/fuse/episodes.json",
       "episodes_listed": 2,
       "episodes_total": 3,
+      "fusion_version": null,
       "hidden_by_reason": {
         "short": 1
       },

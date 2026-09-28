@@ -31,6 +31,23 @@ def stamps(root):
     }
 
 
+def tree_fingerprint(root):
+    listing = tuple(
+        sorted(
+            f"{'d' if path.is_dir() else 'f'}:{path.relative_to(root).as_posix()}"
+            for path in root.rglob("*")
+        )
+    )
+    files = tuple(
+        sorted(
+            (str(path.relative_to(root)), path.stat().st_size, path.stat().st_mtime_ns)
+            for path in root.rglob("*")
+            if path.is_file()
+        )
+    )
+    return listing, files
+
+
 @pytest.fixture
 def cached(tmp_path, monkeypatch):
     monkeypatch.setenv("IDEA_TEST_MODE", "1")
@@ -399,10 +416,12 @@ def test_comparison_table_and_named_gains(tmp_path):
 def test_refusion_measurement_read_only(cached, tmp_path):
     work, _ = cached
     args = experiment(cached, tmp_path)
-    before = stamps(work)
+    # An unusable index exercises the in-memory rebuild rather than the easy current-index case.
+    (work / "index.json").write_text("{}\n", encoding="utf-8")
+    before = tree_fingerprint(work)
     output = measure_refusion.measure(work, args.run_list, AppConfig.load(None))
     assert "SKIPPED" not in output
     assert "Total |" in output and "Supported episodes" in output
     assert "->" in output
     assert "Before: 1 truth mixes" in output and "After: 1 truth mixes" in output
-    assert before == stamps(work)
+    assert before == tree_fingerprint(work)

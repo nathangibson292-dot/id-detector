@@ -394,6 +394,10 @@ class IdentitiesRecord(Record):
     assertions: list[IdentityAssertion]
     works: list[IdentityWork]
     candidates: list[IdentityCandidate]
+    # Verified placeholder lines retained only so presentation can choose their fuller wording for
+    # an independently identified row.  They deliberately have no node id and can therefore
+    # belong to no work or candidate and support no assertion.  Empty on older records.
+    display_only_labels: list[str] = Field(default_factory=list, exclude_if=lambda value: not value)
 
 
 class PredictionInterval(ContractModel):

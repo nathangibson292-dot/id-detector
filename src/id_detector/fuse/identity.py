@@ -50,6 +50,12 @@ def normalise_text(value: str | None) -> str:
     return re.sub(r"\s+", " ", normalised)
 
 
+def display_label_of(fields: tuple[str | None, str | None]) -> str:
+    """``Artist - Title`` of a stored (artist, title) pair, as :func:`display_label` shows it."""
+
+    return f"{fields[0] or 'Unknown artist'} - {fields[1] or 'Unknown title'}"
+
+
 def work_text_key(observation: ObservationRecord) -> str | None:
     artist = normalise_text(observation.raw_label.artist)
     title = normalise_text(observation.raw_label.title)
@@ -161,6 +167,12 @@ class IdentityBuildResult:
     hint_work_ids: dict[str, str]
     candidate_labels: dict[str, tuple[str, str]]
     recording_supported: frozenset[str]
+    #: Every link a TOLERANCE made (fusion:5): ``(kind, left label, right label, tolerances)``,
+    #: ``kind`` being ``"hint_to_audio"`` or ``"hint_to_hint"`` — the audit trail of the one rule.
+    tolerant_links: tuple[tuple[str, str, str, tuple[str, ...]], ...] = ()
+    #: The names solid in this mix (credited on two or more recognised works): what initials may
+    #: stand for.
+    solid: frozenset[tuple[str, ...]] = frozenset()
 
 
 class _UnionFind:
@@ -540,6 +552,435 @@ def hint_label_corroborates(
     return False
 
 
+# --- fusion:5 — the tolerant half of the one identity rule ------------------------------------
+#
+# Real tracklists name a track correctly and still fail the rule above: words joined or split
+# ("4raws" / "4 Raws"), letters typed apart ("t e s t p r e s s"), a phonetic respelling ("rock
+# the house" / "Rok da House"), an inflected word ("Feel Emotion" / "Feeling Emotions"), a
+# descriptor kept on one side only ("Long season MG Edit" / "Long Season (MG Edit)"), a bracket
+# offering alternative titles ("ID (LET ME SEE U / ROK DA HOUSE!)"), one dropped letter in a name
+# ("Tomlison"), a comment's lead-in ("FULL TRACK LIST: - …"), or initials ("MG" for Mall Grab).
+# Each is one named TOLERANCE.  Tolerance is where wrong tracks get in, so each is guarded:
+#
+# * the other field must agree EXACTLY — a tolerant title needs the artist, a tolerant artist the
+#   title (the both-parts rule is never relaxed on both sides at once);
+# * initials resolve only to a name SOLID in this mix (credited on two or more recognised works),
+#   and only when no other solid name has the same initials;
+# * a tolerant match is used only when it is UNIQUE — the caller (identity fusion, the corpus
+#   scorer) refuses one that fits two different works;
+# * titles are compared whole: two titles that merely share words never match.
+#
+# The established rule (:func:`hint_label_corroborates`) is tried first and is unchanged; a
+# tolerance is only consulted where it found nothing.  The corpus scorer calls the same
+# :func:`same_work_labels`, so the score measures what the tool does.
+
+#: Letters typed apart: "t e s t p r e s s" is "testpress" (three or more single characters).
+_SPACED_LETTERS = re.compile(r"(?<![a-z0-9])(?:[a-z0-9] ){2,}[a-z0-9](?![a-z0-9])")
+#: A trailing "<word> Edit" outside brackets is the bracketed "(<word> Edit)": a descriptor.
+_DESCRIPTOR_VERSION_WORDS = frozenset(
+    {"edit", "remix", "rework", "bootleg", "refix", "flip", "dub"}
+)
+#: Words of a descriptor that describe the cut, never who made it ("Intro Edit", "Club Dub").
+_DESCRIPTOR_NOT_NAMES = frozenset(
+    {
+        "intro", "outro", "radio", "club", "extended", "original", "vocal", "instrumental",
+        "short", "long", "full", "main", "alt", "alternative", "vip", "dub", "mix", "remix",
+        "edit", "special", "new", "old", "my", "the", "a", "an", "live",
+    }
+)  # fmt: skip
+#: Phonetic spellings of one word ("da" for "the", "u" for "you").
+_PHONETIC_ALIASES = {
+    "da": "the", "tha": "the", "teh": "the",
+    "u": "you", "ya": "you", "yu": "you",
+    "ur": "your", "yor": "your",
+    "n": "and",
+    "luv": "love",
+    "nite": "night",
+    "tonite": "tonight",
+}  # fmt: skip
+#: A stem is only trusted when this much of the word is left: "feeling" / "feel", never "is" / "i".
+_STEM_MIN_CHARS = 3
+_INITIALS_MIN, _INITIALS_MAX = 2, 4
+#: A changed word (stem, phonetic) is only tolerated in a title of at least this many words, and a
+#: misspelt name only beside one (fix pass 1: "Dream" / "Dreams", "Nite" / "Night").
+_TOLERANT_TITLE_MIN_WORDS = 2
+
+TOLERANCES = (
+    "lead_in",
+    "spaced",
+    "joined",
+    "descriptor",
+    "alt_title",
+    "stem",
+    "phonetic",
+    "artist_slip",
+    "initials",
+)
+
+
+@dataclass(frozen=True)
+class LabelMatch:
+    """How two labels were found to name one work: ``tolerances`` is empty for the established
+    rule, otherwise the named tolerances that one accepted reading needed."""
+
+    tolerances: tuple[str, ...] = ()
+
+    @property
+    def tolerant(self) -> bool:
+        return bool(self.tolerances)
+
+
+def _unspaced(text: str) -> str:
+    return _SPACED_LETTERS.sub(lambda match: match.group(0).replace(" ", ""), text)
+
+
+def _descriptor_split(title: str) -> tuple[str, tuple[tuple[str, ...], ...]] | None:
+    """``"long season mg edit"`` -> (``"long season"``, ``("mg",)``): a trailing, unbracketed
+    ``<word> <edit|remix|dub|…>`` read as the bracket it stands for.  The core keeps at least two
+    words, so "Tokyo Dub" or "Home T Dub" are never cut down to a single word."""
+
+    tokens = _label_tokens(title)
+    if len(tokens) < 4 or tokens[-1] not in _DESCRIPTOR_VERSION_WORDS:
+        return None
+    word = tokens[-2]
+    if word in _VERSION_WORDS and word not in _DESCRIPTOR_NOT_NAMES:
+        return None
+    core = tokens[:-2]
+    while len(core) > 2 and core[-1] in _VERSION_WORDS:
+        core = core[:-1]
+    if len(core) < 2:
+        return None
+    names = () if word in _DESCRIPTOR_NOT_NAMES or word.isdigit() else ((word,),)
+    return " ".join(core), names
+
+
+@dataclass(frozen=True)
+class _TolerantSide:
+    """One label as the tolerant reading sees it: the established reading of the unspaced text
+    plus the extra title forms and names each tolerance may use."""
+
+    base: _LabelSide
+    #: title forms the descriptor or an alternative-title bracket adds, with their tolerance
+    extra_titles: tuple[tuple[tuple[str, ...], str], ...]
+    #: credited names a trailing descriptor adds ("mg" of "… MG Edit")
+    descriptor_names: tuple[tuple[str, ...], ...]
+    spaced: bool
+
+
+def _read_tolerant(artist: str, title: str) -> _TolerantSide:
+    unspaced_artist, unspaced_title = _unspaced(artist), _unspaced(title)
+    spaced = (unspaced_artist, unspaced_title) != (artist, title)
+    base = _read_label(unspaced_artist, unspaced_title)
+    extra: list[tuple[tuple[str, ...], str]] = []
+    names: list[tuple[str, ...]] = []
+    core = _FEATURING_BRACKET.sub(" ", _VERSION_BRACKET.sub(" ", unspaced_title))
+    split = _descriptor_split(_ANY_BRACKET.sub(" ", core))
+    if split is not None:
+        extra.append((tuple(_label_tokens(split[0])), "descriptor"))
+        names.extend(split[1])
+    for match in _ANY_BRACKET.finditer(core):
+        parts = [part for part in match.group(1).split("/") if part.strip()]
+        if len(parts) < 2:
+            continue
+        for part in parts:
+            tokens = tuple(_without_trailing_version(_label_tokens(part)))
+            if tokens and not is_placeholder(part):
+                extra.append((tokens, "alt_title"))
+    return _TolerantSide(
+        base=base,
+        extra_titles=tuple(dict.fromkeys(extra)),
+        descriptor_names=tuple(dict.fromkeys(names)),
+        spaced=spaced,
+    )
+
+
+def _stem(word: str) -> str:
+    for suffix in ("ings", "ing", "es", "s", "ed"):
+        if word.endswith(suffix) and len(word) - len(suffix) >= _STEM_MIN_CHARS:
+            return word[: -len(suffix)]
+    return word
+
+
+def _phonetic(word: str) -> str:
+    word = _PHONETIC_ALIASES.get(word, word)
+    word = word.replace("ck", "k").replace("ph", "f")
+    return word[:-1] + "s" if word.endswith("z") and len(word) > 2 else word
+
+
+def _title_tolerance(left: tuple[str, ...], right: tuple[str, ...]) -> str | None:
+    """``None`` when two title forms are not one title; ``"exact"`` when the established rule
+    already equates them; else the one tolerance (joined, stem, phonetic) that does.  Titles are
+    compared whole and in order: the same number of words, each pair one word."""
+
+    if not left or not right:
+        return None
+    if _titles_equivalent(left, right):
+        return "exact"
+    joined_left = _fold_joined(list(left), frozenset(right))
+    joined_right = _fold_joined(list(right), frozenset(left))
+    if joined_left == joined_right:
+        return "joined"
+    if len(left) != len(right) or len(left) < _TOLERANT_TITLE_MIN_WORDS:
+        # A ONE-word title carries too little to tolerate a changed word: "Dream" / "Dreams" and
+        # "Nite" / "Night" are as likely two tracks as one.  Only an exact, joined or spaced-letter
+        # spelling of a one-word title counts (fix pass 1).
+        return None
+    kinds: set[str] = set()
+    for x, y in zip(left, right, strict=True):
+        if x == y:
+            continue
+        if _stem(x) == _stem(y):
+            kinds.add("stem")
+        elif _phonetic(x) == _phonetic(y) or _stem(_phonetic(x)) == _stem(_phonetic(y)):
+            kinds.add("phonetic")
+        else:
+            return None
+    if not kinds:
+        return "exact"
+    return "phonetic" if "phonetic" in kinds else "stem"
+
+
+def _title_readings(hint: _TolerantSide, audio: _TolerantSide) -> list[tuple[str, int]]:
+    """Every way the two titles agree: ``(kind, words)`` — ``"exact"`` or the tolerance used, and
+    how many words the shorter matched title form has."""
+
+    forms_left = [(form, None) for form in hint.base.titles] + list(hint.extra_titles)
+    forms_right = [(form, None) for form in audio.base.titles] + list(audio.extra_titles)
+    found: list[tuple[str, int]] = []
+    for left, left_kind in forms_left:
+        for right, right_kind in forms_right:
+            kind = _title_tolerance(left, right)
+            if kind is None:
+                continue
+            via = [item for item in (left_kind, right_kind) if item]
+            words = min(len(left), len(right))
+            if kind == "exact":
+                kind = via[0] if via else "exact"
+            found.append((kind, words))
+    return found
+
+
+def _best_title(hint: _TolerantSide, audio: _TolerantSide) -> str | None:
+    """The least tolerant way the two titles agree, or ``None``."""
+
+    order = {"exact": -1, **{name: index for index, name in enumerate(TOLERANCES)}}
+    found = [kind for kind, _ in _title_readings(hint, audio)]
+    return min(found, key=order.__getitem__) if found else None
+
+
+SolidName = tuple[str, ...]
+
+
+def _distinctive(name: tuple[str, ...]) -> tuple[str, ...]:
+    """A credited name's identifying words, in order ("DJ Alice" is ``("alice",)``)."""
+
+    return tuple(word for word in name if word not in _COMMON_NAME_WORDS) or name
+
+
+def _initials(name: SolidName) -> str:
+    """ "mg" for Mall Grab; a one-word name has no initials."""
+
+    return "".join(word[0] for word in name) if len(name) >= 2 else ""
+
+
+def _as_initials(name: tuple[str, ...]) -> str | None:
+    """The name when it is written as initials: one short all-letter word ("MG", "CRTB")."""
+
+    if len(name) == 1 and name[0].isalpha() and _INITIALS_MIN <= len(name[0]) <= _INITIALS_MAX:
+        return name[0]
+    return None
+
+
+def _initials_owner(initials: str, solid: frozenset[SolidName]) -> SolidName | None:
+    """The ONE solid name these initials stand for; ``None`` for none, or for two."""
+
+    owners = sorted(name for name in solid if _initials(name) == initials)
+    return owners[0] if len(owners) == 1 else None
+
+
+def _credited_names(artist: str | None, title: str | None) -> list[tuple[str, ...]]:
+    """The artist and featured names a recogniser label credits (not its remixers)."""
+
+    artist_text, title_text = normalise_text(artist), normalise_text(title)
+    featured = [match.group(0) for match in _FEATURING_BRACKET.finditer(title_text)]
+    tail = _FEATURING_TAIL.search(f" {artist_text}")
+    if tail is not None:
+        featured.append(tail.group(1))
+        artist_text = f" {artist_text}"[: tail.start()]
+    return [*_split_names(artist_text), *(name for text in featured for name in _split_names(text))]
+
+
+def solid_names(
+    recognised_labels: Iterable[Iterable[tuple[str | None, str | None]]],
+) -> frozenset[SolidName]:
+    """The names SOLID in a mix: credited (as the artist or a featured guest) on two or more
+    different recognised works.  ``recognised_labels`` holds, per recognised work, the recogniser's
+    labels of it.  A DJ playing their own music is solid; a famous track "heard" once is not, and
+    nothing a comment says can make a name solid."""
+
+    works_by_name: dict[SolidName, set[int]] = {}
+    for index, labels in enumerate(recognised_labels):
+        for artist, title in labels:
+            for name in _credited_names(artist, title):
+                works_by_name.setdefault(_distinctive(name), set()).add(index)
+    return frozenset(name for name, works in works_by_name.items() if len(works) >= 2)
+
+
+def _artist_tolerance(
+    hint_artist_text: str, audio: _TolerantSide, solid: frozenset[SolidName]
+) -> str | None:
+    """``"exact"`` when the hint's artist field holds one whole credited name of the audio label
+    (the established reading, a descriptor's name included); else the one tolerance that finds
+    one — joined, artist_slip, initials — else ``None``."""
+
+    names = [*audio.base.names, *audio.descriptor_names]
+    tokens = _label_tokens(hint_artist_text)
+    words = frozenset(tokens)
+    if any(all(word in words for word in _distinctive(name)) for name in names):
+        return "exact"
+    folded = frozenset(_fold_joined(tokens, frozenset(word for name in names for word in name)))
+    for name in names:
+        if all(word in folded for word in _distinctive(tuple(_fold_joined(list(name), folded)))):
+            return "joined"
+    for name in names:
+        distinctive = _distinctive(name)
+        missing = [word for word in distinctive if word not in words]
+        if (
+            len(distinctive) >= 2
+            and len(missing) == 1
+            and any(
+                abs(len(missing[0]) - len(word)) == 1
+                and min(len(missing[0]), len(word)) >= _SLIP_MIN_CHARS
+                and _within_one_edit(missing[0], word)
+                for word in words - set(distinctive)
+            )
+        ):
+            return "artist_slip"
+    # Initials, either way round — "MG" typed for a solid "Mall Grab" on the label, or a solid
+    # "Mall Grab" typed for an "MG" the label credits — only ever to a SOLID name, and only when
+    # it is the one solid name with those initials.
+    hint_names = _split_names(hint_artist_text)
+    if len(hint_names) == 1 and (initials := _as_initials(hint_names[0])):
+        owner = _initials_owner(initials, solid)
+        if owner is not None and any(_distinctive(name) == owner for name in names):
+            return "initials"
+    for name in names:
+        if (initials := _as_initials(name)) is None:
+            continue
+        owner = _initials_owner(initials, solid)
+        if owner is not None and any(_distinctive(item) == owner for item in hint_names):
+            return "initials"
+    return None
+
+
+def _tolerant_orientation(
+    hint_artist: str, hint_title: str, audio: _TolerantSide, solid: frozenset[SolidName]
+) -> tuple[str, ...] | None:
+    if is_placeholder(hint_artist) or is_placeholder(hint_title):
+        return None
+    hint = _read_tolerant(hint_artist, hint_title)
+    if hint.base.featured and audio.base.featured and not hint.base.featured & audio.base.featured:
+        return None  # "… (feat. Somebody Else)" is another work, tolerance or not
+    artist = _artist_tolerance(_unspaced(hint_artist), audio, solid)
+    if artist is None:
+        return None
+    readings = _title_readings(hint, audio)
+    if artist == "artist_slip":
+        # A misspelt name is only trusted against a title of two or more words, matched exactly: a
+        # one-word title plus a nearly-right name is two weak signals, not one strong one.
+        readings = [item for item in readings if item[1] >= _TOLERANT_TITLE_MIN_WORDS]
+    order = {"exact": -1, **{name: index for index, name in enumerate(TOLERANCES)}}
+    title = min((kind for kind, _ in readings), key=order.__getitem__, default=None)
+    if title is None:
+        return None
+    if artist != "exact" and title != "exact":
+        return None  # both parts loose: never
+    used = [kind for kind in (artist, title) if kind != "exact"]
+    if (hint.spaced or audio.spaced) and "spaced" not in used:
+        used.insert(0, "spaced")
+    return tuple(used)
+
+
+def label_match(
+    hint_artist: str | None,
+    hint_title: str | None,
+    audio_artist: str | None,
+    audio_title: str | None,
+    *,
+    solid: frozenset[SolidName] = frozenset(),
+) -> LabelMatch | None:
+    """THE identity rule: whether a (crowd or truth) label names the work of a recogniser label.
+
+    The established rule (:func:`hint_label_corroborates`) first; failing that, the tolerances of
+    ``TOLERANCES``, each guarded as the section above says.  Returns ``None`` for no match, a
+    :class:`LabelMatch` saying which tolerances were needed otherwise.  Uniqueness within the mix
+    is the caller's to enforce (it knows the other works).
+    """
+
+    if hint_label_corroborates(hint_artist, hint_title, audio_artist, audio_title):
+        return LabelMatch()
+    (hint_artist, hint_title), hint_lead = _without_lead_in(hint_artist, hint_title)
+    (audio_artist, audio_title), audio_lead = _without_lead_in(audio_artist, audio_title)
+    lead_in: tuple[str, ...] = ("lead_in",) if hint_lead or audio_lead else ()
+    if lead_in and hint_label_corroborates(hint_artist, hint_title, audio_artist, audio_title):
+        return LabelMatch(lead_in)
+    if is_placeholder(audio_artist) or is_placeholder(audio_title):
+        return None
+    if not hint_artist and hint_title:
+        pair = _BARE_HYPHEN_PAIR.match(normalise_text(hint_title))
+        if pair is None:
+            return None
+        hint_artist, hint_title = pair.group(1), pair.group(2)
+    if not hint_artist or not hint_title:
+        return None
+    audio = _read_tolerant(normalise_text(audio_artist), normalise_text(audio_title))
+    found: list[tuple[str, ...]] = []
+    for hedges in (True, False):
+        first = _hint_field(hint_artist, hedges=hedges)
+        second = _hint_field(hint_title, hedges=hedges)
+        for artist, title in ((first, second), (second, first)):
+            used = _tolerant_orientation(artist, title, audio, solid)
+            if used is not None:
+                found.append(used)
+    if not found:
+        return None
+    return LabelMatch(lead_in + min(found, key=lambda item: (len(item), item)))
+
+
+def _without_lead_in(
+    artist: str | None, title: str | None
+) -> tuple[tuple[str | None, str | None], bool]:
+    """ "FULL TRACK LIST: - Fishmans - Long Season" is "Fishmans - Long Season": a field that ends
+    in a colon is a comment's lead-in, never a name, and the label is in the other field."""
+
+    if artist and title and artist.strip().endswith(":") and " - " in title:
+        left, right = title.split(" - ", 1)
+        return (left, right), True
+    return (artist, title), False
+
+
+def same_work_labels(
+    left: tuple[str | None, str | None],
+    right: tuple[str | None, str | None],
+    *,
+    solid: frozenset[SolidName] = frozenset(),
+) -> LabelMatch | None:
+    """:func:`label_match` read both ways round (neither label is privileged): the rule for two
+    crowd labels, or a listed label against a truth row."""
+
+    matches = [
+        match
+        for match in (
+            label_match(*left, *right, solid=solid),
+            label_match(*right, *left, solid=solid),
+        )
+        if match is not None
+    ]
+    if not matches:
+        return None
+    return min(matches, key=lambda item: (len(item.tolerances), item.tolerances))
+
+
 AudioWorkKey = tuple[frozenset[frozenset[str]], tuple[str, ...]]
 
 
@@ -583,6 +1024,20 @@ def build_identity_graph(
     hint_text: dict[str, str] = {}
     audio_fields: dict[str, tuple[str | None, str | None]] = {}
     hint_fields: dict[str, tuple[str | None, str | None]] = {}
+    # Placeholder lines name no work, but their exact parsed wording can still be useful when
+    # presentation labels a row whose identity came from independent evidence.  Keep that wording
+    # outside the identity graph: no node, assertion, work, candidate or hint mapping can be made
+    # from this collection.
+    display_only_labels = sorted(
+        {
+            f"{hint.artist} - {hint.title}"
+            for hint in hints
+            if hint.mirror_status == "verified"
+            and hint.flags.id_unknown
+            and hint.artist
+            and hint.title
+        }
+    )
 
     for observation in final_matches:
         label = display_label(observation)
@@ -687,6 +1142,40 @@ def build_identity_graph(
             ]
         return named_by_label[(artist, title)]
 
+    # What initials may stand for: the names credited on two or more recognised works.
+    recognised_groups: dict[str, list[tuple[str | None, str | None]]] = {}
+    for node in sorted(audio_text_nodes):
+        recognised_groups.setdefault(recognised.find(node), []).append(audio_fields[node])
+    solid = solid_names(recognised_groups[root] for root in sorted(recognised_groups))
+    tolerant_links: list[tuple[str, str, str, tuple[str, ...]]] = []
+    tolerant_by_label: dict[tuple[str, str], tuple[list[str], tuple[str, ...], bool]] = {}
+
+    def _tolerantly_named(artist: str, title: str) -> tuple[list[str], tuple[str, ...], bool]:
+        """Only where the established rule named nothing: the recognised labels a TOLERANCE
+        names, kept only when they are all one recognised work (unique within the mix); the flag
+        says the tolerance fitted two or more recognised works (ambiguous)."""
+
+        if (artist, title) not in tolerant_by_label:
+            found = {
+                node: match
+                for node in sorted(audio_text_nodes)
+                if (match := label_match(artist, title, *audio_fields[node], solid=solid))
+                is not None
+            }
+            works = len({recognised.find(node) for node in found})
+            unique = works == 1
+            tolerances = min(
+                (match.tolerances for match in found.values()),
+                key=lambda item: (len(item), item),
+                default=(),
+            )
+            tolerant_by_label[(artist, title)] = (
+                sorted(found) if unique else [],
+                tolerances,
+                works > 1,
+            )
+        return tolerant_by_label[(artist, title)]
+
     audio_matched_nodes: set[str] = set()
     for hint in sorted(hints, key=lambda item: item.id):
         if hint.mirror_status != "verified" or hint.flags.id_unknown or not hint.title:
@@ -713,6 +1202,21 @@ def build_identity_graph(
         named = _named(hint.artist, hint.title)
         if len({recognised.find(node) for node in named}) > 1:
             continue  # ambiguous: no identity, no assertion — backs nothing, contradicts nothing
+        confidence = 7_000
+        if not named:
+            named, tolerances, ambiguous = _tolerantly_named(hint.artist, hint.title)
+            if ambiguous:
+                continue  # a tolerance fits two recognised works: as the veto above, no identity
+            if named:
+                confidence = 6_500  # a tolerance joined it: a notch below the established rule
+                tolerant_links.append(
+                    (
+                        "hint_to_audio",
+                        f"{hint.artist} - {hint.title}",
+                        display_label_of(audio_fields[named[0]]),
+                        tolerances,
+                    )
+                )
         node_labels.setdefault(text_node, f"{hint.artist} - {hint.title}")
         hint_text[hint.id] = text_node
         hint_fields.setdefault(text_node, (hint.artist, hint.title))
@@ -728,30 +1232,73 @@ def build_identity_graph(
                 source_kind="hint_text_match",
                 source_record_id=hint.id,
                 independent_of="hint:comment_answer",
-                confidence=7_000,
+                confidence=confidence,
             )
             assertion_by_id[item.id] = item
 
-    def _words(node: str) -> frozenset[str]:
-        artist, title = hint_fields[node]
-        return frozenset([*_label_tokens(_hint_field(artist)), *_label_tokens(_hint_field(title))])
-
     # Two crowd IDs of the SAME track — "Entasia - Satalite" and "Entasia - Satalite (unreleased)",
-    # "…Pump It" and "…Pump It (Club Royalty 3)" — otherwise land in separate works and the track is
-    # listed twice.  Union hint text nodes with each OTHER on the same conservative word-set rule
-    # (subset with >=2 words, or a near-spelled long token), so a track named more than once in the
-    # comments is one identity.  Audio-matched hints are excluded — they already joined the audio
-    # work above — so this looser rule can never carry a hint INTO a recognised work through a
-    # better-spelled neighbour: only the field-level test above does that.
+    # "MG - 1ofthozedaze" and "1ofthozedaze - Mall Grab" — otherwise land in separate works and the
+    # track is listed twice.  They are joined by THE rule (:func:`same_work_labels`, read both ways
+    # round): the established reading first, then a tolerance — and a tolerant link only when it is
+    # unique, i.e. every crowd work it would join this label to is one work.  Titles are compared
+    # whole, so two works whose titles merely share words are never merged.  Audio-matched hints
+    # are excluded — they already joined the audio work above — so nothing here can carry a hint
+    # INTO a recognised work through a better-spelled neighbour: only the test above does that.
     unmatched = sorted(
-        (hint_id, node)
-        for hint_id, node in hint_text.items()
-        if node not in audio_text_nodes and node not in audio_matched_nodes
+        {
+            node
+            for node in hint_text.values()
+            if node not in audio_text_nodes and node not in audio_matched_nodes
+        }
     )
-    for index, (hint_a, node_a) in enumerate(unmatched):
-        words_a = _words(node_a)
-        for _hint_b, node_b in unmatched[index + 1 :]:
-            if node_a == node_b or not _word_sets_corroborate(words_a, _words(node_b)):
+    source_of = {node: hint_id for hint_id, node in sorted(hint_text.items(), reverse=True)}
+    crowd = _UnionFind(unmatched)
+    tolerant_pairs: dict[str, list[tuple[str, tuple[str, ...]]]] = {node: [] for node in unmatched}
+    for index, node_a in enumerate(unmatched):
+        for node_b in unmatched[index + 1 :]:
+            match = same_work_labels(hint_fields[node_a], hint_fields[node_b], solid=solid)
+            if match is None:
+                continue
+            if match.tolerant:
+                tolerant_pairs[node_a].append((node_b, match.tolerances))
+                tolerant_pairs[node_b].append((node_a, match.tolerances))
+                continue
+            crowd.union(node_a, node_b)
+            item = _assertion(
+                media_key,
+                a=node_a,
+                b=node_b,
+                relation="same_work",
+                source_kind="hint_text_match",
+                source_record_id=source_of[node_a],
+                independent_of="hint:comment_answer",
+                confidence=6_000,
+            )
+            assertion_by_id[item.id] = item
+
+    # A tolerant link counts only when it resolves to exactly ONE work, on both sides, and it never
+    # chains: the components the established rule built are fixed first; component A is joined to
+    # component B only when every tolerant partner of A's labels lies in B and every tolerant
+    # partner of B's labels lies in A.  "Alex Anderson" fitting both "Alex Andersson" and "Alex
+    # Anderon" (which do not fit each other) is therefore joined to neither (fix pass 1).
+    partner_components: dict[str, set[str]] = {}
+    for node in unmatched:
+        own = crowd.find(node)
+        partner_components.setdefault(own, set()).update(
+            crowd.find(other) for other, _ in tolerant_pairs[node] if crowd.find(other) != own
+        )
+
+    def _mutual(node_a: str, node_b: str) -> bool:
+        left, right = crowd.find(node_a), crowd.find(node_b)
+        return (
+            left != right
+            and partner_components.get(left) == {right}
+            and partner_components.get(right) == {left}
+        )
+
+    for node_a in unmatched:
+        for node_b, tolerances in tolerant_pairs[node_a]:
+            if node_b < node_a or not _mutual(node_a, node_b):
                 continue
             item = _assertion(
                 media_key,
@@ -759,11 +1306,14 @@ def build_identity_graph(
                 b=node_b,
                 relation="same_work",
                 source_kind="hint_text_match",
-                source_record_id=hint_a,
+                source_record_id=source_of[node_a],
                 independent_of="hint:comment_answer",
-                confidence=6_000,
+                confidence=5_500,
             )
             assertion_by_id[item.id] = item
+            tolerant_links.append(
+                ("hint_to_hint", node_labels[node_a], node_labels[node_b], tolerances)
+            )
 
     assertions = sorted(assertion_by_id.values(), key=lambda item: item.id)
     # Reuse the Stage 0 helper; this call is intentionally not duplicated below.
@@ -933,6 +1483,7 @@ def build_identity_graph(
         assertions=assertions,
         works=sorted(works, key=lambda item: item.work_id),
         candidates=sorted(candidates, key=lambda item: item.canonical_id),
+        display_only_labels=display_only_labels,
     )
     return IdentityBuildResult(
         record=record,
@@ -941,6 +1492,8 @@ def build_identity_graph(
         hint_work_ids=hint_work_ids,
         candidate_labels=candidate_labels,
         recording_supported=recording_supported,
+        tolerant_links=tuple(tolerant_links),
+        solid=solid,
     )
 
 

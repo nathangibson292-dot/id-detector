@@ -117,6 +117,52 @@ def media_dir_for_key_read_only(work_root: Path, media_key: str) -> Path | None:
     return candidate
 
 
+def media_map_read_only(work_root: Path) -> tuple[list[Path], dict[str, Path]]:
+    """Enumerate and key cached media without refreshing or mutating ``work_root``.
+
+    The derived index contains results that can be opened from the library.  Measurement also
+    needs older pre-bundle caches (and damaged/incomplete results so it can report them), so retain
+    the index's validated aliases and complete that map from source records in memory.  This gives
+    callers the same set as the historical direct scan while making the non-persisting index path
+    explicit at the boundary where an owner's cache becomes measurement input.
+    """
+
+    # Keep the caller's path spelling in the returned paths (notably, do not introduce a Windows
+    # ``\\?\`` prefix); the loader itself applies native long-path handling while it reads.
+    root = Path(work_root)
+    resolved_root = root.resolve()
+    directories: set[Path] = set()
+    indexed: dict[str, Path] = {}
+    document = load_index_read_only(root)
+    for media_key, entry in document.get("media", {}).items():
+        if not isinstance(entry, dict):
+            continue
+        for alias in entry.get("aliases") or [entry]:
+            if not isinstance(alias, dict) or not isinstance(alias.get("media_dir"), str):
+                continue
+            candidate = root / alias["media_dir"]
+            resolved = candidate.resolve()
+            if resolved != resolved_root and resolved.is_relative_to(resolved_root):
+                directories.add(candidate)
+                if alias is entry or media_key not in indexed:
+                    indexed[media_key] = candidate
+    directories.update(
+        source.parents[1]
+        for source in root.glob("*/*/ingest/source.json")
+        if source.parents[1].name != ".trash" and source.resolve().is_relative_to(resolved_root)
+    )
+    ordered = sorted(directories)
+    by_key = {path.name: path for path in ordered}
+    by_key.update(indexed)  # the index's selected alias is the result the product currently opens
+    return ordered, by_key
+
+
+def media_dirs_read_only(work_root: Path) -> list[Path]:
+    """Enumerate cached media without refreshing or otherwise mutating ``work_root``."""
+
+    return media_map_read_only(work_root)[0]
+
+
 def _usable(root: Path, document: Any, stamp: list[list[Any]]) -> bool:
     """The stamp already covers every source record, pointer, legacy page and bundle manifest, so
     entries are only re-checked structurally: verifying each bundle's hashes again would make every

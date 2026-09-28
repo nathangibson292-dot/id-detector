@@ -18,7 +18,10 @@ RecipeName = Literal["free", "deep"]
 #: 3 = hint corroboration by reach and field-level labels; smeared ``likely`` rows are scatter and
 #: bury only under proved audio; edge answers; short rows by an artist solidly in the mix.
 #: 4 = an unambiguous untimed hint may support a recognised work without changing its timing.
-FUSION_VERSION = 4
+#: 5 = one tolerant identity rule (joined/spaced/descriptor/alternative titles, inflection, phonetic
+#: respelling, a dropped letter in a name, initials of a solid name) for hints and crowd labels;
+#: an episode of mostly ambiguous windows is listed only when a comment or a second engine says so.
+FUSION_VERSION = 5
 _FUSION = f"fusion:{FUSION_VERSION}"
 
 

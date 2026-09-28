@@ -152,10 +152,10 @@ def test_deep_algorithm_version_is_bumped_and_a_targeting_1_result_is_incompatib
     """The free-first additive recipe retired the paid-first ``targeting:1`` one: a Deep result
     that scheduler produced is never served as today's Deep (its raw answers stay reusable)."""
 
-    assert DEEP_RECIPE.algorithm_version == "additive:1,fusion:4"
-    assert get_recipe("deep", primary_density=2).algorithm_version == "additive:1,fusion:4"
-    assert FREE_RECIPE.algorithm_version == "fusion:4"
-    previous = replace(DEEP_RECIPE, algorithm_version="targeting:1,fusion:4")
+    assert DEEP_RECIPE.algorithm_version == "additive:1,fusion:5"
+    assert get_recipe("deep", primary_density=2).algorithm_version == "additive:1,fusion:5"
+    assert FREE_RECIPE.algorithm_version == "fusion:5"
+    previous = replace(DEEP_RECIPE, algorithm_version="targeting:1,fusion:5")
     assert previous.recipe_id != DEEP_RECIPE.recipe_id  # a bump changes the recipe identity
     from id_detector.compat import fusion_stale_only, versions_current
 

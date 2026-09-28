@@ -24,7 +24,7 @@ from id_detector.contracts import (
     TruthWork,
 )
 from id_detector.io import canonical_json_bytes, path_is_file, read_text, sha256_file
-from id_detector.present.exports import _candidate_label
+from id_detector.present.exports import _identity_candidate_label
 from id_detector.present.index import media_dir_for_key_read_only
 from id_detector.present.theme import head_html, topbar_html
 from id_detector.truth import (
@@ -384,7 +384,7 @@ def _predictions(media_dir: Path | None) -> list[dict[str, Any]]:
         )
         result = []
         for episode in episodes.episodes:
-            artist, title = _candidate_label(identities, episode.candidate_id)
+            artist, title = _identity_candidate_label(identities, episode.candidate_id)
             result.append(
                 {
                     "artist": artist,

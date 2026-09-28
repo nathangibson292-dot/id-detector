@@ -128,7 +128,7 @@ def test_frozen_recipes_contain_every_phase_zero_field_and_hash_canonical_json()
     assert FREE_RECIPE.primary_achieved_fraction == 0.80
     assert FREE_RECIPE.max_usd_e2 == 0
     assert dict(FREE_RECIPE.adapter_versions) == {"shazam": 1}
-    assert FREE_RECIPE.algorithm_version == "fusion:4"
+    assert FREE_RECIPE.algorithm_version == "fusion:5"
     assert FREE_RECIPE.requires == ("shazam_sweep",)
 
     # Free-first and additive: the free sweep is the primary, AudD checks only the free result's
@@ -152,7 +152,7 @@ def test_frozen_recipes_contain_every_phase_zero_field_and_hash_canonical_json()
     assert DEEP_RECIPE.audd_concurrency == 4
     assert DEEP_RECIPE.max_usd_e2 == 900
     assert dict(DEEP_RECIPE.adapter_versions) == {"audd_clip": 2, "shazam": 1}
-    assert DEEP_RECIPE.algorithm_version == "additive:1,fusion:4"
+    assert DEEP_RECIPE.algorithm_version == "additive:1,fusion:5"
     assert DEEP_RECIPE.requires == ("shazam_sweep", "audd_additive")
     audd_retry = DEEP_RECIPE.retry_policy["audd"]
     assert audd_retry.retryable_outcomes == (
@@ -299,7 +299,7 @@ def test_deep_success_records_price_recipe_reservation_and_settlement(tmp_path: 
     assert entry["usd_e2_spent"] == 4
     assert entry["costs"] == {"usd_e2": 4}
     assert entry["requested_recipe_id"] == DEEP_RECIPE.recipe_id
-    assert entry["algorithm_version"] == "additive:1,fusion:4"
+    assert entry["algorithm_version"] == "additive:1,fusion:5"
     assert entry["pricing_version"] == "v1"
     assert entry["audd_usd_e6_per_request"] == 5_000
 
@@ -328,7 +328,7 @@ def test_free_recipe_forbids_paid_calls_and_journals_zero_money(tmp_path: Path) 
     assert audd.calls == 0
     assert shazam.requests == 7
     assert entry["requested_recipe_id"] == FREE_RECIPE.recipe_id
-    assert entry["algorithm_version"] == "fusion:4"
+    assert entry["algorithm_version"] == "fusion:5"
     assert entry["usd_e6_reserved"] == entry["usd_e6_spent"] == 0
     assert entry["usd_e2_reserved"] == entry["usd_e2_spent"] == 0
 
@@ -525,7 +525,7 @@ def test_throttled_run_refunds_every_unit_and_bills_nothing(tmp_path: Path) -> N
     assert entry["status"] == "degraded"
     assert entry["reason"] == "secondary_not_achieved"
     assert entry["achieved"] == "deep"
-    assert entry["algorithm_version"] == "additive:1,fusion:4"
+    assert entry["algorithm_version"] == "additive:1,fusion:5"
     # Every planned dispatch and each of its three bounded retries was admitted; none was refused.
     assert audd.calls == 28
     assert audd.billed_units == 0

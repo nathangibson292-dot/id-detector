@@ -156,9 +156,9 @@ def _tree(*roots: Path) -> dict[str, str]:
 # The compatibility contract
 # --------------------------------------------------------------------------------------------------
 def test_a_fusion_2_result_is_stale_for_serving_and_reusable_for_recognition(monkeypatch) -> None:
-    assert FUSION_VERSION == 4
-    assert FREE_RECIPE.algorithm_version == "fusion:4"
-    assert DEEP_RECIPE.algorithm_version == "additive:1,fusion:4"
+    assert FUSION_VERSION == 5
+    assert FREE_RECIPE.algorithm_version == "fusion:5"
+    assert DEEP_RECIPE.algorithm_version == "additive:1,fusion:5"
     for name, old in (("free", OLD_FREE), ("deep", OLD_DEEP)):
         req = request(name)
         was = stored(compat.RunRequest(replace(req.inputs, recipe_id=old.recipe_id), old))
@@ -207,11 +207,11 @@ def test_analyse_re_fuses_a_fusion_2_result_without_a_single_provider_request(
     assert new_bundle != old_bundle
     assert _titles(new_bundle) == {PHANTOM, FIRST, SECOND}  # what the three fixes list
     manifest = read_bundle_manifest(new_bundle)
-    assert manifest["compatibility"]["algorithm_version"] == "fusion:4"
+    assert manifest["compatibility"]["algorithm_version"] == "fusion:5"
     assert manifest["refusion"] == {
         "source_run_id": read_bundle_manifest(old_bundle)["run_id"],
         "source_bundle": old_bundle.name,
-        "fusion_version": 4,
+        "fusion_version": 5,
     }
     # Superseded, not corrupted or orphaned: every old byte is where it was (the recognition
     # evidence and the mutable fuse tree included) and the pointer has moved on.
@@ -220,7 +220,7 @@ def test_analyse_re_fuses_a_fusion_2_result_without_a_single_provider_request(
     assert result_dir(media) == new_bundle
     assert read_text(media / "present" / "current").strip() == new_bundle.name
     provenance = json.loads(read_text(media / manifest["fuse_run"] / "refusion.json"))
-    assert provenance["source_fusion_version"] == 2 and provenance["fusion_version"] == 4
+    assert provenance["source_fusion_version"] == 2 and provenance["fusion_version"] == 5
     assert any(key.startswith("recognise/") for key in provenance["inputs"])
     # The next identical request is an ordinary cache hit on the re-fused bundle — the stale
     # bundle still lying beside it is no longer what the offline lookup names.
@@ -574,9 +574,9 @@ def test_the_upkeep_pass_re_fuses_stored_results_offline(
     assert refresh_stale_pages(work, CONFIG) == 1
     new_bundle = result_dir(media)
     manifest = read_bundle_manifest(new_bundle)
-    assert manifest is not None and manifest["refusion"]["fusion_version"] == 4
+    assert manifest is not None and manifest["refusion"]["fusion_version"] == 5
     assert new_bundle != old_bundle and _titles(new_bundle) == {PHANTOM, FIRST, SECOND}
-    assert stored_fusion_version(manifest) == 4
+    assert stored_fusion_version(manifest) == 5
     assert 'content="25"' in read_text(new_bundle / "index.html")[:4096]
     assert _tree(media / "fuse" / "episodes.json", media / "recognise") == flat
     # Idempotent: the next start-up has nothing left to do.
@@ -1102,7 +1102,7 @@ def test_spawned_process_refusion_crash_and_alias_lock_harness(
     assert first.returncode == second.returncode == 0, (one_err, two_err)
     assert {one_out.strip(), two_out.strip()} <= {"refused", "busy", "current"}
     assert "refused" in {one_out.strip(), two_out.strip()}
-    assert read_bundle_manifest(result_dir(media))["refusion"]["fusion_version"] == 4
+    assert read_bundle_manifest(result_dir(media))["refusion"]["fusion_version"] == 5
     assert len(list((media / "present/bundles").glob("*"))) == 2
 
     # The first process dies after the frozen run is sealed but before publish_result can create or

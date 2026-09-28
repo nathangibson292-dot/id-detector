@@ -218,6 +218,56 @@ COVER_RUN_GAP_MS = 12_000
 #: An explicit CORRECTION is a listener saying "this is not that": it contradicts wherever it sits.
 EDGE_ANSWER_MS = 15_000
 EDGE_ANSWER_MIN_ON_AIR_MS = 60_000
+#: fusion:5 — the recurring phantom.  A handful of famous tracks (Sandstorm, Adagio for Strings,
+#: Airwave, Kernkraft 400 …) are "heard" in mixes where they were never played.  On the owner's
+#: seven hand-transcribed mixes every such listed row has the same fingerprint in its OWN evidence:
+#: the recogniser's reply for most of its windows offered several different recordings for the same
+#: 12 s of audio and they did not agree where in a track that audio sits (no reliable offset anchor)
+#: — a generic sound resembling many records, not one record playing.  Every correct listed row has
+#: the opposite: nearly every window is one recording at one consistent offset.  So a window is
+#: AMBIGUOUS when its reply lists at least ``AMBIGUOUS_REPLY_MIN_MATCHES`` recordings and carries no
+#: reliable anchor, and an episode most of whose windows are ambiguous is not listed ("ambiguous")
+#: unless the evidence says the track really played: an unbroken run of UNAMBIGUOUS windows of at
+#: least ``LIKELY_CORE_RUN_MS``, a tracklist or comment naming it (``hint_supported``), or a second
+#: engine agreeing (``engine_corroborated``).  No track name is involved, so a DJ who genuinely
+#: drops Sandstorm (clean, anchored windows) is listed like any other track, and the verdict
+#: depends only on this result's own recorded observations — never on other mixes in the library.
+AMBIGUOUS_REPLY_MIN_MATCHES = 2
+
+
+def ambiguous_vote(observation: ObservationRecord) -> bool:
+    """A window whose reply named several recordings — none of them the one it reported — that
+    disagree where this audio sits."""
+
+    if observation.anchor is not None and observation.anchor.reliable:
+        return False
+    matches = observation.native.get("matches") if isinstance(observation.native, dict) else None
+    if not isinstance(matches, list) or len(matches) < AMBIGUOUS_REPLY_MIN_MATCHES:
+        return False
+    reported = {str(value) for value in observation.provider_ids.values()}
+    return not any(
+        isinstance(match, dict) and str(match.get("id")) in reported for match in matches
+    )
+
+
+def mostly_ambiguous(votes: list[ObservationRecord], duration_ms: int) -> bool:
+    """Most of an episode's windows are ambiguous and no clean core stands among them: no
+    unbroken run of unambiguous windows (adjacent under ``COVER_RUN_GAP_MS``) of
+    ``LIKELY_CORE_RUN_MS``."""
+
+    ambiguous = [vote for vote in votes if ambiguous_vote(vote)]
+    if not votes or len(ambiguous) * 2 <= len(votes):
+        return False
+    clean = normalise_intervals(
+        [vote.support_ms for vote in votes if not ambiguous_vote(vote)], duration_ms
+    )
+    runs: list[tuple[int, int]] = []
+    for start, end in clean:
+        if runs and start - runs[-1][1] < COVER_RUN_GAP_MS:
+            runs[-1] = (runs[-1][0], max(runs[-1][1], end))
+        else:
+            runs.append((start, end))
+    return not any(end - start >= LIKELY_CORE_RUN_MS for start, end in runs)
 
 
 def trust_family(provider: str) -> str:
@@ -432,6 +482,31 @@ def plausible_crowd_label(artist: str | None, title: str | None) -> bool:
 CrowdAnswer = tuple[HintRecord, str, str]
 #: One work named at one timestamp: ``(work_id, candidate_id, its answers in position order)``.
 CrowdWork = tuple[str, str, list[HintRecord]]
+
+
+_BADGE_RANK = {"unclear": 0, "possible": 1, "likely": 2, "verified": 3}
+
+
+def separate_playing(
+    position: tuple[int, int], spans: list[tuple[int, int]], separators: list[tuple[int, int]]
+) -> bool:
+    """Whether a crowd answer at ``position`` is a play of its work SEPARATE from every earlier or
+    later appearance of that work (``spans``): a listed, confident track of another work
+    (``separators``) lies wholly between it and each of them.  That track IS the evidence the first
+    play stopped; no time floor is added — DJs bring a track back within a couple of minutes around
+    another one (fix pass 2).  With nothing between them, mentions however far apart stay one
+    playing.  A work with no appearance yet is trivially separate."""
+
+    for start, end in spans:
+        if start >= position[1]:
+            between = (position[1], start)
+        elif position[0] >= end:
+            between = (end, position[0])
+        else:
+            return False  # overlapping: the same playing
+        if not any(between[0] <= lo and hi <= between[1] for lo, hi in separators):
+            return False
+    return True
 
 
 def crowd_answer_clusters(
@@ -906,6 +981,9 @@ def build_episodes(
                 flags.append("engine_corroborated")
             if separated_agreements(agreements, separation_min_ms=separation_min_ms):
                 flags.append("engine_corroborated_separated")
+            if mostly_ambiguous(votes, duration_ms):
+                # Recorded with the result: the input of the "ambiguous" verdict below.
+                flags.append("ambiguous_evidence")
             provisional.append(
                 {
                     "id": episode_id,
@@ -1138,6 +1216,17 @@ def build_episodes(
             return "scatter"
         return "contradicted" if _contradicted(episode) else None
 
+    def _ambiguous(episode: EpisodeRecord) -> bool:
+        """Mostly ambiguous windows, and nothing else says the track really played: no comment or
+        tracklist naming it, no second engine agreeing.  Overrides every badge — a ``likely``
+        counted up from ambiguous windows is exactly how the recurring phantom was listed."""
+
+        return (
+            "ambiguous_evidence" in episode.flags
+            and "hint_supported" not in episode.flags
+            and "engine_corroborated" not in episode.flags
+        )
+
     def _immune(episode: EpisodeRecord) -> bool:
         """A strong badge, separated engine agreement, or a hint ON one of the matched windows.
 
@@ -1179,10 +1268,12 @@ def build_episodes(
     confident_cover = [
         ((episode.evidence_support_ms[0][0], episode.evidence_support_ms[-1][1]), _runs(episode))
         for episode in episode_records
-        if _immune(episode)
+        if _immune(episode) and not _ambiguous(episode)
     ]
 
     def _suppressed_reason(episode: EpisodeRecord) -> str | None:
+        if _ambiguous(episode):
+            return "ambiguous"
         if _immune(episode):
             return None
         fault = _own_fault(episode)
@@ -1209,11 +1300,25 @@ def build_episodes(
     # plausible ``Artist - Title`` qualifies (U-F13), the answers are read in position order, and
     # contradictory answers at one timestamp become ONE row — the best-supported work listed, the
     # others as its alternatives — instead of a track per answer (review M4).
-    known_work_ids = {
-        candidate_by_id[episode.candidate_id].work_id
+    # Where each work is already on the tracklist (every episode of it, listed or not): a crowd
+    # answer names it again only as a SEPARATE playing (:func:`separate_playing`) — one work under
+    # two spellings at 1:40 and 10:00, with another track between, is two plays, not one row.
+    work_spans: dict[str, list[tuple[int, int]]] = defaultdict(list)
+    for episode in episode_records:
+        if episode.candidate_id in candidate_by_id:
+            work_spans[candidate_by_id[episode.candidate_id].work_id].append(
+                (episode.evidence_support_ms[0][0], episode.evidence_support_ms[-1][1])
+            )
+    separators = [
+        (
+            candidate_by_id[episode.candidate_id].work_id,
+            (episode.evidence_support_ms[0][0], episode.evidence_support_ms[-1][1]),
+        )
         for episode in episode_records
-        if episode.candidate_id in candidate_by_id
-    }
+        if not episode.suppressed
+        and episode.candidate_id in candidate_by_id
+        and _BADGE_RANK[episode.badge] >= _BADGE_RANK["possible"]
+    ]
     listed_spans = [
         (episode.evidence_support_ms[0][0], episode.evidence_support_ms[-1][1])
         for episode in episode_records
@@ -1221,15 +1326,26 @@ def build_episodes(
     ]
     hint_only_episodes: list[EpisodeRecord] = []
     for cluster in crowd_answer_clusters(hints, identity, listed_spans):
-        # A work already listed — by an engine, or from an earlier timestamp — is not named again.
-        ranked = rank_crowd_works([item for item in cluster if item[1] not in known_work_ids])
+        # A work already on the tracklist — by an engine, or from an earlier timestamp — is not
+        # named again in the same playing; a separate playing of it is.
+        ranked = rank_crowd_works(
+            [
+                item
+                for item in cluster
+                if separate_playing(
+                    item[0].position_range_ms,  # type: ignore[arg-type]
+                    work_spans.get(item[1], []),
+                    [span for work, span in separators if work != item[1]],
+                )
+            ]
+        )
         if not ranked:
             continue
         winner, *others = ranked
         work_id, candidate_id, winning_hints = winner
-        known_work_ids.add(work_id)
         lo = min(hint.position_range_ms[0] for hint in winning_hints)  # type: ignore[index]
         hi = max(hint.position_range_ms[1] for hint in winning_hints)  # type: ignore[index]
+        work_spans[work_id].append((lo, hi))
         # Defensive only: the clusters are disjoint and each yields at most one row, so no crowd
         # row can land under another (review M4's duplicate is prevented by the clustering, not by
         # this list, which :func:`crowd_answer_clusters` has already read).

@@ -131,8 +131,9 @@ from id_detector.contracts import (
 )
 
 # The work-only matcher must be fusion's own notion of "the same track", not a second normaliser:
-# these two private helpers are exactly what attaches a crowd hint to an audio match.
-from id_detector.fuse.identity import _word_sets_corroborate
+# ``same_work_labels`` is THE identity rule fusion uses to attach a crowd label to a recognised one
+# and to join two crowd labels (fusion:5), tolerances and their guards included.
+from id_detector.fuse.identity import same_work_labels, solid_names
 from id_detector.hints.relations import _normalise
 from id_detector.io import (
     atomic_write_json,
@@ -140,7 +141,12 @@ from id_detector.io import (
     completion_sidecar_path,
     read_text,
 )
-from id_detector.present.exports import flatten_tracklist, hidden_reason
+from id_detector.present.exports import (
+    _flatten_identity_tracklist,
+    _identity_candidate_label,
+    hidden_reason,
+)
+from id_detector.recipes import fusion_component
 from id_detector.truth import (
     CERTIFICATION_DISABLED,
     CERTIFICATION_DISABLED_NEXT_STEP,
@@ -195,6 +201,10 @@ class RunEntry(BaseModel):
     #: :func:`run_media_key`); it must still equal the truth's ``source.media_key``.
     media_key: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
     min_track_ms: int = Field(default=DEFAULT_MIN_TRACK_MS, ge=0)
+    #: The ``fusion:N`` the run's episodes were decided by, when the run list states it
+    #: (``scripts/make_run_list.py`` does); otherwise read from the run's own artefacts
+    #: (:func:`run_fusion_version`).
+    fusion_version: int | None = Field(default=None, ge=0)
 
     def resolved(self, base: Path) -> RunEntry:
         """Relative paths resolve against the run list's directory, absolute ones stand."""
@@ -281,6 +291,8 @@ class WorkMatch:
     #: Listed index -> truth row index.  A prediction matches at most one row; a row may be named
     #: by any number of predictions (a track the tool lists twice is not a wrong ID).
     assignments: dict[int, int]
+    #: Listed index -> the tolerances of the identity rule that assignment needed (absent: none).
+    tolerances: dict[int, tuple[str, ...]]
     counts: WorkCounts
     #: Distinct truth works no prediction named (what was missed), in truth order.
     unmatched_truth: list[dict[str, Any]]
@@ -291,6 +303,8 @@ class WorkMatch:
 @dataclass(frozen=True)
 class MixScore:
     entry: RunEntry
+    #: The fusion version the scored episodes were decided by; ``None`` when nothing says.
+    fusion_version: int | None
     truth: GroundTruthRecord
     truth_status: TruthStatus
     #: ``False`` when predictions were visible during the truth's review (see `truth_independent`).
@@ -390,7 +404,7 @@ def assert_identities_cover(
     """Every episode must name a candidate the identity graph describes.
 
     Without this the mismatch surfaces deep inside the presentation layer as a bare
-    ``StopIteration`` from ``_candidate_label``; here it names the file that is wrong.
+    ``StopIteration`` from ``_identity_candidate_label``; here it names the file that is wrong.
     """
 
     known = {item.canonical_id for item in identities.candidates}
@@ -418,6 +432,153 @@ def run_media_key(episodes: Path) -> str | None:
         if isinstance(stated, str) and _SHA256.match(stated):
             return stated
     return media_dir.name if _SHA256.match(media_dir.name) else None
+
+
+def identity_label(identities: IdentitiesRecord, candidate_id: str) -> tuple[str, str]:
+    """The (artist, title) a row identifies as, excluding display-only wording."""
+
+    return _identity_candidate_label(identities, candidate_id)
+
+
+def listed_works_from_episodes(
+    episodes: EpisodesFile, identities: IdentitiesRecord
+) -> list[ListedWork]:
+    """Build the scorer's rows from identity labels; display-only wording is unreachable."""
+
+    candidates = {item.canonical_id: item for item in identities.candidates}
+    return [
+        ListedWork(
+            episode_id=episode.id,
+            artist=label[0],
+            title=label[1],
+            tier=episode.tiers.work,
+            work_id=candidates[episode.candidate_id].work_id,
+        )
+        for episode in episodes.episodes
+        if (label := identity_label(identities, episode.candidate_id))
+    ]
+
+
+def recognised_solid_names(identities: IdentitiesRecord) -> frozenset[tuple[str, ...]]:
+    """The mix's solid names (what initials may stand for), read from the run's identity graph
+    exactly as fusion reads them: names credited on two or more works an ENGINE recognised (a
+    work with a catalogue node), from those engine labels only — never from a comment."""
+
+    labels = {node.id: node.label for node in identities.nodes}
+    groups = []
+    for work in sorted(identities.works, key=lambda item: item.work_id):
+        engine = sorted(labels[node] for node in work.member_nodes if not node.startswith("text:"))
+        if engine:
+            groups.append(
+                [
+                    tuple(label.split(" - ", 1)) if " - " in label else (None, label)
+                    for label in engine
+                ]
+            )
+    return solid_names(groups)
+
+
+def _fusion_of(stored: object) -> int | None:
+    """The ``fusion:N`` a bundle manifest or a journal entry records, if any."""
+
+    if not isinstance(stored, dict):
+        return None
+    refusion = stored.get("refusion")
+    if isinstance(refusion, dict) and isinstance(refusion.get("fusion_version"), int):
+        return int(refusion["fusion_version"])
+    compatibility = stored.get("compatibility")
+    for value in (
+        compatibility.get("algorithm_version") if isinstance(compatibility, dict) else None,
+        stored.get("algorithm_version"),
+    ):
+        if isinstance(value, str) and (version := fusion_component(value)) is not None:
+            return version
+    return None
+
+
+def run_fusion_version(episodes: Path) -> int | None:
+    """The fusion version a run's ``episodes.json`` was decided by, read from its own artefacts.
+
+    A frozen run (``fuse/runs/<run>/``) says so itself when it is an offline re-fusion
+    (``refusion.json``), else through the sealed bundle that names it; the flat
+    ``fuse/episodes.json`` of a pre-bundle result is the journal's last finished run.  ``None``
+    when nothing says — the flat file is NOT the published result once a re-fusion has happened,
+    which is exactly how a stale ``fusion:1`` file got compared with a ``fusion:4`` run.
+    """
+
+    fuse_dir = episodes.parent
+    try:
+        if fuse_dir.parent.name == "runs" and fuse_dir.parent.parent.name == "fuse":
+            provenance = fuse_dir / "refusion.json"
+            if provenance.is_file():
+                version = json.loads(read_text(provenance)).get("fusion_version")
+                if isinstance(version, int):
+                    return version
+            media_dir = fuse_dir.parent.parent.parent
+            name = f"fuse/runs/{fuse_dir.name}"
+            for manifest_path in sorted(
+                (media_dir / "present" / "bundles").glob("*/manifest.json")
+            ):
+                manifest = json.loads(read_text(manifest_path))
+                if manifest.get("fuse_run") == name and (version := _fusion_of(manifest)):
+                    return version
+            return None
+        if fuse_dir.name == "fuse" and episodes.name == "episodes.json":
+            journal = fuse_dir.parent / "invocations.jsonl"
+            if journal.is_file():
+                for line in reversed(read_text(journal).splitlines()):
+                    entry = json.loads(line) if line.strip() else {}
+                    if entry.get("status") in {"complete", "succeeded", "degraded", "partial"}:
+                        return _fusion_of(entry)
+    except (OSError, ValueError, TypeError, AttributeError):
+        return None
+    return None
+
+
+def stated_fusion_version(entry: RunEntry) -> int | None:
+    """The run's fusion version: what its own artefacts record, and a run-list ``fusion_version``
+    only where they record nothing.  A run-list value that CONTRADICTS the artefacts is refused, so
+    a wrong hand-typed number can never hide a stale result."""
+
+    recorded = run_fusion_version(entry.episodes)
+    stated = entry.fusion_version
+    if stated is not None and recorded is not None and stated != recorded:
+        raise ValueError(
+            f"{entry.mix_id}: the run list says fusion:{stated} but the result's own provenance "
+            f"says fusion:{recorded}; fix the run list (scripts/make_run_list.py writes it from "
+            "the provenance)"
+        )
+    return recorded if recorded is not None else entry.fusion_version
+
+
+def fusion_versions_problem(versions: dict[str, int | None]) -> str | None:
+    """Why the runs of one comparison cannot be compared as they are, or ``None``.
+
+    ``versions`` maps each run (mix) to the fusion version it was decided by.  Two different known
+    versions: the numbers mix two different tools.  An unknown one: nothing proves they match.
+    """
+
+    known = {version for version in versions.values() if version is not None}
+    unknown = sorted(name for name, version in versions.items() if version is None)
+    if len(known) > 1:
+        runs_of = {
+            version: ", ".join(sorted(name for name, of in versions.items() if of == version))
+            for version in known
+        }
+        by_version = ", ".join(
+            f"fusion:{version} ({runs_of[version]})" for version in sorted(known)
+        )
+        return (
+            f"these runs were decided by DIFFERENT fusion versions — {by_version}; re-fuse the "
+            "stored evidence offline so every run is at one version (scripts/measure_refusion.py, "
+            "or open the library so start-up brings every result up to date), then compare"
+        )
+    if unknown and known:
+        return (
+            f"the fusion version of {', '.join(unknown)} is unknown while the others are "
+            f"fusion:{min(known)}; nothing proves they were decided by the same rules"
+        )
+    return None
 
 
 def assert_media_matches(entry: RunEntry, truth: GroundTruthRecord) -> None:
@@ -525,20 +686,28 @@ def work_identity(artist: str, title: str) -> tuple[tuple[str, str], frozenset[s
     return (artist_key, title_key), frozenset(f"{artist_key} {title_key}".split()) - _FEATURING
 
 
-def match_works(truth_works: list[TruthWork], listed: list[ListedWork]) -> WorkMatch:
-    """Match each listed prediction to at most one truth row by normalised work identity.
+def match_works(
+    truth_works: list[TruthWork],
+    listed: list[ListedWork],
+    *,
+    solid: frozenset[tuple[str, ...]] = frozenset(),
+) -> WorkMatch:
+    """Match each listed prediction to at most one truth row by work identity alone.
 
     Exact first (the normalised artist and title are both equal *and* both non-empty, as fusion's
     own ``hints.relations._identity_key`` requires — two labels that normalise away to nothing, an
     unnamed "ID" row against a prediction whose whole title was a mix descriptor, name no work and
-    must not count as an identification), else fusion's word-set rule
-    (:func:`~id_detector.fuse.identity._word_sets_corroborate`: one word set contains the other
-    with at least two words, or they differ by a single near-spelled long token); among several
-    candidate rows the closest word set wins, ties to the earlier row.  Time is never consulted.
+    must not count as an identification).  Otherwise THE identity rule fusion uses
+    (:func:`~id_detector.fuse.identity.same_work_labels`, read both ways round): its established
+    reading, and among several candidate rows the closest word set wins, ties to the earlier row;
+    failing that, one of its TOLERANCES — used only when it names ONE truth work (the rule's
+    uniqueness guard; ``solid`` is the mix's solid names, what initials may stand for).  Time is
+    never consulted.
     """
 
     truth_rows = [work_identity(work.artist, work.title) for work in truth_works]
     assignments: dict[int, int] = {}
+    tolerances: dict[int, tuple[str, ...]] = {}
     for index, item in enumerate(listed):
         key, words = work_identity(item.artist, item.title)
         exact = (
@@ -546,11 +715,23 @@ def match_works(truth_works: list[TruthWork], listed: list[ListedWork]) -> WorkM
             if all(key)
             else []
         )
-        candidates = exact or [
-            row
-            for row, (_, truth_words) in enumerate(truth_rows)
-            if _word_sets_corroborate(words, truth_words)
-        ]
+        ruled = {
+            row: match
+            for row, work in enumerate(truth_works)
+            if not exact
+            and (
+                match := same_work_labels(
+                    (item.artist, item.title), (work.artist, work.title), solid=solid
+                )
+            )
+            is not None
+        }
+        established = [row for row, match in ruled.items() if not match.tolerant]
+        tolerant = [row for row, match in ruled.items() if match.tolerant]
+        candidates = exact or established
+        if not candidates and len({truth_rows[row][0] for row in tolerant}) == 1:
+            candidates = tolerant
+            tolerances[index] = min(ruled[row].tolerances for row in tolerant)
         if candidates:
             assignments[index] = min(
                 candidates, key=lambda row: (len(words ^ truth_rows[row][1]), row)
@@ -577,6 +758,7 @@ def match_works(truth_works: list[TruthWork], listed: list[ListedWork]) -> WorkM
             label["tier"] = item.tier
     return WorkMatch(
         assignments=assignments,
+        tolerances=tolerances,
         counts=WorkCounts(
             rows_correct=len(assignments),
             rows=len(listed),
@@ -605,7 +787,7 @@ def listed_episodes(
     scored prediction; :func:`hidden_reason` then decides exactly as the page and exports do.
     """
 
-    entries = flatten_tracklist(
+    entries = _flatten_identity_tracklist(
         episodes, identities, collapse=False, min_track_ms=min_track_ms, include_hidden=True
     )
     hidden: dict[str, str] = {}
@@ -809,6 +991,7 @@ def _work_match_document(
                 "tier": item.tier,
                 "work_id": item.work_id,
                 "truth_index": work_match.assignments.get(index),
+                "tolerances": list(work_match.tolerances.get(index, ())),
             }
             for index, item in enumerate(listed)
         ],
@@ -842,18 +1025,12 @@ def score_mix(
         index for index, episode in enumerate(prediction_set["episodes"]) if is_range_claim(episode)
     }
     prediction_set["episodes"], range_claims = proved_bounds(prediction_set["episodes"])
-    candidates = {item.canonical_id: item for item in identities.candidates}
-    listed_works = [
-        ListedWork(
-            episode_id=episode.id,
-            artist=prediction["work"]["artist"],
-            title=prediction["work"]["title"],
-            tier=prediction["tiers"].work,
-            work_id=candidates[prediction["candidate_id"]].work_id,
-        )
-        for episode, prediction in zip(listed.episodes, prediction_set["episodes"], strict=True)
-    ]
-    work_match = match_works([episode.work for episode in truth.episodes], listed_works)
+    listed_works = listed_works_from_episodes(listed, identities)
+    work_match = match_works(
+        [episode.work for episode in truth.episodes],
+        listed_works,
+        solid=recognised_solid_names(identities),
+    )
     parity_keys = 0
     if mode == "time":
         # The certified scorer compares strings; hand it a graph in which the works it must
@@ -914,6 +1091,7 @@ def score_mix(
         metrics = report.overall
     return MixScore(
         entry=entry,
+        fusion_version=stated_fusion_version(entry),
         truth=truth,
         truth_status=status,
         independent=independent,
@@ -1005,6 +1183,10 @@ def _relative(path: Path, base: Path) -> str:
         return path.as_posix()
 
 
+class MixedFusionVersions(ValueError):
+    """The runs of one score were decided by different fusion versions."""
+
+
 def score_run_list(
     run_list: RunList,
     *,
@@ -1012,8 +1194,14 @@ def score_run_list(
     artefact_dir: Path,
     out_dir: Path,
     match: MatchChoice = "auto",
+    allow_mixed_fusion: bool = False,
 ) -> dict[str, Any]:
-    """Score every mix, pool the counts, and build the output document."""
+    """Score every mix, pool the counts, and build the output document.
+
+    Every run's fusion version is stated in the output.  Runs decided by two different KNOWN
+    fusion versions are refused (:class:`MixedFusionVersions`) unless ``allow_mixed_fusion``, in
+    which case the document carries ``fusion_warning`` and ``--print`` leads with it.
+    """
 
     refuse_generated_output(artefact_dir)
 
@@ -1029,6 +1217,11 @@ def score_run_list(
                 "one mix may appear in a run list once"
             )
         mixes.append(mix)
+    versions = {mix.entry.mix_id: mix.fusion_version for mix in mixes}
+    fusion_warning = fusion_versions_problem(versions)
+    known = {version for version in versions.values() if version is not None}
+    if fusion_warning is not None and len(known) > 1 and not allow_mixed_fusion:
+        raise MixedFusionVersions(f"refusing to pool one score: {fusion_warning}")
     # One order-only mix has no time numbers to pool, so the run pools the work-only numbers —
     # the only ones every mix has; a timed mix keeps its own time numbers on its row.
     mode: MatchMode = "work" if any(mix.match_mode == "work" for mix in mixes) else "time"
@@ -1071,6 +1264,8 @@ def score_run_list(
         "schema_version": "1.0.0",
         "generated_by": GENERATED_BY,
         "recipe": run_list.recipe,
+        "fusion_versions": sorted(known),
+        "fusion_warning": fusion_warning,
         "truth_status": status,
         "match_requested": match,
         "match_mode": mode,
@@ -1116,6 +1311,7 @@ def score_run_list(
             {
                 "mix_id": mix.entry.mix_id,
                 "set_id": mix.truth.set_id,
+                "fusion_version": mix.fusion_version,
                 "truth_status": mix.truth_status,
                 "independent": mix.independent,
                 "timing": mix.timing,
@@ -1325,7 +1521,21 @@ def summary(document: dict[str, Any], out: Path | None) -> str:
     scope_reasons = document["l3"].get("scope", {}).get("reasons", [])
     if status == "verified":
         gated += "".join(f" NOT CERTIFIABLE: {reason}." for reason in scope_reasons)
+    versions = document.get("fusion_versions") or []
+    fusion_note = (
+        f"Every run was decided by fusion:{versions[0]}. "
+        if len(versions) == 1 and not document.get("fusion_warning")
+        else "No run records the fusion version it was decided by. "
+        if not versions
+        else ""
+    )
+    warning = (
+        f"WARNING — NOT COMPARABLE: {document['fusion_warning']}. "
+        if document.get("fusion_warning")
+        else ""
+    )
     return (
+        f"{warning}{fusion_note}"
         f"The {document['recipe']} recipe was scored over {counts['mixes']} mix(es) ({mix_ids}) "
         f"against {truth_note}. {_matching_note(document)}. Of the "
         f"{counts['episodes']['total']} tracks the tool found, {hidden_note}, leaving "
@@ -1394,10 +1604,50 @@ def mix_line(mix: dict[str, Any]) -> str:
         )
         or "nothing"
     )
+    version = mix.get("fusion_version")
+    fusion = f"fusion:{version}; " if version is not None else ""
     return (
-        f"- {mix['mix_id']} [{mix['timing']}; matched by {mix['match_mode']}]: {by_time}{by_work}"
+        f"- {mix['mix_id']} [{fusion}{mix['timing']}; matched by {mix['match_mode']}]: "
+        f"{by_time}{by_work}"
         f"{offset}. Missed: {missed}. Wrong: {wrong}."
     )
+
+
+def compare_scores(earlier: dict[str, Any], later: dict[str, Any]) -> dict[str, Any]:
+    """Two scores side by side — and whether they may be compared at all.
+
+    They may only when both were decided by ONE and the same known fusion version: a score of a
+    stale ``fusion:1`` result against a ``fusion:4`` one credits whatever changed in between to
+    the wrong thing (it happened: a Free-versus-Deep comparison credited the paid engine with the
+    free side's own improvements).
+    """
+
+    before = earlier.get("fusion_versions") or []
+    after = later.get("fusion_versions") or []
+    warning = None
+    if earlier.get("fusion_warning") or later.get("fusion_warning"):
+        warning = "one of the two scores already mixes fusion versions"
+    elif not before or not after:
+        warning = "the fusion version of one of the two scores is unknown"
+    elif before != after:
+        warning = (
+            f"the earlier score was decided by fusion:{', fusion:'.join(map(str, before))} and "
+            f"this one by fusion:{', fusion:'.join(map(str, after))}"
+        )
+
+    def numbers(document: dict[str, Any]) -> str:
+        counts = document["work_only"]["counts"]
+        return (
+            f"recall {counts['truth_works']['matched']}/{counts['truth_works']['total']}, "
+            f"precision {counts['works']['correct']}/{counts['works']['predicted']}, "
+            f"likely {counts['likely']['correct']}/{counts['likely']['predicted']}, "
+            f"listed {document['counts']['episodes']['listed']}"
+        )
+
+    line = (
+        "WARNING — NOT COMPARABLE (" + warning + "): " if warning else "Compared (same fusion): "
+    ) + f"earlier {numbers(earlier)}; now {numbers(later)} (work-only)."
+    return {"fusion_warning": warning, "line": line}
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -1425,6 +1675,22 @@ def main(argv: list[str] | None = None) -> int:
             "otherwise."
         ),
     )
+    parser.add_argument(
+        "--allow-mixed-fusion",
+        action="store_true",
+        help=(
+            "Score (or compare) runs decided by different fusion versions anyway, with a loud "
+            "warning.  Without it such a score is refused: its numbers would mix two tools."
+        ),
+    )
+    parser.add_argument(
+        "--compare-with",
+        type=Path,
+        help=(
+            "An earlier score (an --out JSON) to compare this one with.  Refused when the two were "
+            "decided by different (or unknown) fusion versions, unless --allow-mixed-fusion."
+        ),
+    )
     args = parser.parse_args(argv)
     if args.out is None and not args.print:
         parser.error("give --out, --print, or both")
@@ -1445,6 +1711,7 @@ def main(argv: list[str] | None = None) -> int:
                 artefact_dir=artefact_dir,
                 out_dir=out.parent,
                 match=args.match,
+                allow_mixed_fusion=args.allow_mixed_fusion,
             )
             refuse_generated_output(out)  # revalidated immediately before the write
             atomic_write_json(out, document)
@@ -1456,6 +1723,7 @@ def main(argv: list[str] | None = None) -> int:
                     artefact_dir=Path(scratch),
                     out_dir=Path(scratch),
                     match=args.match,
+                    allow_mixed_fusion=args.allow_mixed_fusion,
                 )
             out = None
     # KeyError/StopIteration: a fuse artefact whose identity graph is inconsistent beyond the
@@ -1463,6 +1731,21 @@ def main(argv: list[str] | None = None) -> int:
     except (OSError, ValueError, ValidationError, KeyError, StopIteration) as exc:
         print(f"scoring failed: {exc if str(exc) else exc!r}", file=sys.stderr)
         return 1
+    comparison = None
+    if args.compare_with is not None:
+        try:
+            earlier = json.loads(read_text(args.compare_with))
+        except (OSError, ValueError) as exc:
+            print(f"cannot read the earlier score {args.compare_with}: {exc}", file=sys.stderr)
+            return 2
+        comparison = compare_scores(earlier, document)
+        if comparison["fusion_warning"] and not args.allow_mixed_fusion:
+            print(
+                "refusing to compare: " + comparison["fusion_warning"] + " (pass "
+                "--allow-mixed-fusion to see the numbers anyway, with this warning)",
+                file=sys.stderr,
+            )
+            return 3
     if args.print:
         # The per-mix lines carry arbitrary track titles; a narrow console encoding must not turn
         # a finished score into a UnicodeEncodeError.
@@ -1496,6 +1779,10 @@ def main(argv: list[str] | None = None) -> int:
         if document["truth_status"] == "verified":
             for reason in document["l3"]["scope"]["reasons"]:
                 print(f"NOT CERTIFIABLE: {reason}")
+        if document.get("fusion_warning"):
+            print(f"WARNING — NOT COMPARABLE: {document['fusion_warning']}")
+    if comparison is not None:
+        print(comparison["line"])
     return 0
 
 

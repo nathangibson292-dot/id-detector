@@ -163,6 +163,16 @@ stops the paid sweep at once and is counted conservatively: only 900/901 and HTT
 every spend statement comes from the settled spend. The wall-clock progress bar has now been watched working in a
 real browser, including across a worker restart; screenshots are in `reviews/final-polish-shots/`.
 
+**Free-side accuracy LANDED, and the personal product is finished (2026-09-28)** ([build notes](reviews/build-local-free-accuracy.md)).
+Names are matched the way tracklists are really written ("4raws", "t e s t p r e s s", "MG" for Mall Grab on a Mall
+Grab set), duplicate rows for one playing merge while genuine replays stay, and the famous-track phantoms (Sandstorm,
+Kernkraft, Adagio, Airwave and more) are demoted on the evidence with no list of names. On the owner's seven
+hand-transcribed mixes, same evidence and one fusion version per side: **164 of 218 tracks found; precision 83.8%;
+every "likely" row right (63/63); 217 rows, down from 228.** The scorer had been undercounting, which it no longer
+does, and it now refuses to compare results made by different fusion versions. The measuring tools never write to
+the owner's cache, and the test suite now fails if anything does. **What is left is the owner's, not code:** re-check
+the differently spelled truth rows and the tracklist clock offsets while verifying, and cancel the AudD plan.
+
 **When the hosted build resumes, next in plan order:** 4d-i (tenancy schema, lots,
 worker-side reservations), then 4d-ii and 4d-iii + 4d-iv. **Not started:** 6a–6b (ingest policy,
 container, launch checklist), then M2 (billing, Stripe sandbox) — see PLAN-v2 §5.

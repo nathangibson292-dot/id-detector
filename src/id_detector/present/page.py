@@ -31,7 +31,6 @@ from id_detector.io import atomic_write_bytes, write_completion_sidecar
 from id_detector.playlists import PLAYLIST_CSS, PLAYLIST_JS, row_actions_html
 from id_detector.present.exports import (
     CanonicalProjection,
-    _candidate_label,
     _format_time,
     build_projection,
 )
@@ -1284,10 +1283,15 @@ def render_page(
         for entry in track_entries
     ]
 
+    label_by_episode = {
+        str(entry["episode_id"]): str(entry["display_label"])
+        for entry in track_entries
+        if entry["episode_id"] is not None
+    }
     lanes = [
         _timeline_lane(
             episode,
-            " — ".join(_candidate_label(identities, episode.candidate_id)),
+            label_by_episode[episode.id],
             boundaries,
             duration_ms,
         )

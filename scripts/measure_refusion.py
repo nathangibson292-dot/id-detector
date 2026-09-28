@@ -16,13 +16,32 @@ from id_detector.fuse.identity import build_identity_graph
 from id_detector.io import atomic_write_json
 from id_detector.present.bundles import load_run_snapshot
 from id_detector.present.exports import flatten_tracklist
+from id_detector.present.index import media_dirs_read_only
 from id_detector.providers.base import AppConfig
-from id_detector.refusion import NotRebuildable, _source_fuse_dir, _thresholds, load_fusion_inputs
+from id_detector.recipes import FUSION_VERSION
+from id_detector.refusion import (
+    NotRebuildable,
+    _source_fuse_dir,
+    _thresholds,
+    load_fusion_inputs,
+)
 
 try:
-    from scripts.score_corpus import RunList, assert_identities_cover, load_run_list, score_run_list
+    from scripts.score_corpus import (
+        RunList,
+        _fusion_of,
+        assert_identities_cover,
+        load_run_list,
+        score_run_list,
+    )
 except ModuleNotFoundError:
-    from score_corpus import RunList, assert_identities_cover, load_run_list, score_run_list
+    from score_corpus import (
+        RunList,
+        _fusion_of,
+        assert_identities_cover,
+        load_run_list,
+        score_run_list,
+    )
 
 
 def counts(episodes, identities, hints, duration_ms: int, config: AppConfig) -> tuple[int, ...]:
@@ -54,8 +73,7 @@ def measure(work_root: Path, run_list: Path | None, config: AppConfig) -> str:
     seen = set()
     with tempfile.TemporaryDirectory(prefix="idea-refusion-measure-") as temporary:
         scratch = Path(temporary)
-        for source in sorted(work_root.glob("*/*/ingest/source.json")):
-            media = source.parents[1]
+        for media in media_dirs_read_only(work_root):
             try:
                 snapshot = load_run_snapshot(media)
                 if snapshot.source.media_key in seen:
@@ -115,9 +133,18 @@ def measure(work_root: Path, run_list: Path | None, config: AppConfig) -> str:
                     truth = GroundTruthRecord.model_validate_json(read_text(entry.truth))
                     if truth.source.media_key != snapshot.source.media_key:
                         continue
-                    for label, episodes, identities, runs in (
-                        ("before", snapshot.episodes, snapshot.identities, before_runs),
-                        ("after", after, identity.record, after_runs),
+                    # Each side states the fusion version it was decided by: the stored result's own
+                    # (a pre-bundle result's journal says ``fusion:1``), and today's.
+                    stored_version = _fusion_of(snapshot.manifest or snapshot.metadata)
+                    for label, episodes, identities, runs, version in (
+                        (
+                            "before",
+                            snapshot.episodes,
+                            snapshot.identities,
+                            before_runs,
+                            stored_version,
+                        ),
+                        ("after", after, identity.record, after_runs, FUSION_VERSION),
                     ):
                         folder = scratch / label / entry.mix_id
                         atomic_write_json(folder / "episodes.json", episodes)
@@ -128,6 +155,7 @@ def measure(work_root: Path, run_list: Path | None, config: AppConfig) -> str:
                                     "episodes": folder / "episodes.json",
                                     "identities": folder / "identities.json",
                                     "media_key": snapshot.source.media_key,
+                                    "fusion_version": version,
                                 }
                             )
                         )
@@ -143,12 +171,23 @@ def measure(work_root: Path, run_list: Path | None, config: AppConfig) -> str:
                     run_list_dir=scratch,
                     artefact_dir=scratch / f"score-{label}",
                     out_dir=scratch,
+                    # The stored side is whatever each result was last decided by; say so below
+                    # rather than refuse to show it.
+                    allow_mixed_fusion=True,
                 )
+                versions = ", ".join(f"fusion:{v}" for v in document["fusion_versions"])
                 lines.append(
-                    f"{label}: {len(runs)} truth mixes, {document['match_mode']} matching; "
+                    f"{label}: {len(runs)} truth mixes, {document['match_mode']} matching, "
+                    f"decided by {versions or 'an unrecorded fusion version'}; "
                     f"recall {document['work_recall_e4'] / 100:.1f}%; "
                     f"precision {document['work_precision_e4'] / 100:.1f}%; "
                     f"likely precision {document['likely_precision_e4'] / 100:.1f}%."
+                )
+            if before_runs and {run.fusion_version for run in before_runs} != {FUSION_VERSION}:
+                lines.append(
+                    "WARNING — the Before side is the STORED results, decided by an older fusion "
+                    "version than After: the difference is today's fusion over the same evidence, "
+                    "not a like-for-like comparison of two recipes."
                 )
         lines.append(
             "Deep re-fusion measures its stored evidence only; "

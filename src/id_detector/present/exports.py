@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal, NotRequired, TypedDict
@@ -15,7 +16,7 @@ from id_detector.contracts import (
     IdentitiesRecord,
 )
 from id_detector.fuse.episodes import plausible_crowd_label
-from id_detector.fuse.identity import audio_work_key
+from id_detector.fuse.identity import _label_tokens, audio_work_key
 from id_detector.io import atomic_write_bytes, atomic_write_json, write_completion_sidecar
 from id_detector.semantics import interval_length, subtract_intervals
 
@@ -139,7 +140,9 @@ def _split_label(label: str) -> tuple[str, str]:
     return artist, title
 
 
-def _candidate_label(identities: IdentitiesRecord, candidate_id: str) -> tuple[str, str]:
+def _identity_candidate_label(identities: IdentitiesRecord, candidate_id: str) -> tuple[str, str]:
+    """A candidate's identity label, safe for every decision, grouping and count."""
+
     candidate = next(item for item in identities.candidates if item.canonical_id == candidate_id)
     labels = [
         node.label
@@ -155,6 +158,57 @@ def _candidate_label(identities: IdentitiesRecord, candidate_id: str) -> tuple[s
         labels = [node.label for node in identities.nodes if node.id in work.member_nodes]
         labels = [item for item in labels if plausible_crowd_label(*_split_label(item))] or labels
     return _split_label(min(labels) if labels else "Unknown artist - Unknown title")
+
+
+def _display_candidate_label(identities: IdentitiesRecord, candidate_id: str) -> tuple[str, str]:
+    """A candidate's final display label; never use this for a decision or count."""
+
+    identity_label = _identity_candidate_label(identities, candidate_id)
+    candidate = next(item for item in identities.candidates if item.canonical_id == candidate_id)
+    if any(node.id in candidate.member_nodes and node.ns != "text" for node in identities.nodes):
+        return identity_label
+    work = next(item for item in identities.works if item.work_id == candidate.work_id)
+    fuller = _fuller_crowd_label(identities, work.member_nodes, " - ".join(identity_label))
+    return _split_label(fuller) if fuller is not None else identity_label
+
+
+_ALTERNATIVES_BRACKET = re.compile(r"[(\[]([^()\[\]]*/[^()\[\]]*)[)\]]")
+
+
+def _fuller_crowd_label(identities: IdentitiesRecord, members: list[str], label: str) -> str | None:
+    """The fuller spelling a tracklist gives of a crowd row's shortened label (display only).
+
+    "kettama - let me see" is how a listener typed what the tracklist line "KETTAMA - ID (LET ME
+    SEE U / ROK DA HOUSE!)" names in full.  When exactly ONE other text label of the mix has the
+    same artist and offers, in a bracket of "/"-separated alternatives, either this exact one-word
+    title or a longer title beginning with this label's whole multi-word title, the row is SHOWN
+    under that line.  Identity is untouched: nothing is merged, backed or counted.
+    """
+
+    artist, title = _split_label(label)
+    artist_words, title_words = _label_tokens(artist), _label_tokens(title)
+    if not artist_words or not title_words:
+        return None
+    found: set[str] = set()
+    identity_labels = [
+        node.label for node in identities.nodes if node.ns == "text" and node.id not in members
+    ]
+    for other_label in [*identity_labels, *identities.display_only_labels]:
+        other_artist, other_title = _split_label(other_label)
+        if _label_tokens(other_artist) != artist_words:
+            continue
+        for bracket in _ALTERNATIVES_BRACKET.finditer(other_title):
+            for alternative in bracket.group(1).split("/"):
+                words = _label_tokens(alternative)
+                exact_one_word = len(title_words) == 1 and words == title_words
+                longer_multi_word = (
+                    len(title_words) >= 2
+                    and len(words) > len(title_words)
+                    and words[: len(title_words)] == title_words
+                )
+                if exact_one_word or longer_multi_word:
+                    found.add(other_label)
+    return found.pop() if len(found) == 1 else None
 
 
 def _display_bounds(episode: EpisodeRecord) -> tuple[int, int]:
@@ -374,7 +428,7 @@ def _track_entry(
 ) -> dict[str, Any]:
     """The one-episode tracklist row shared by the collapsed and ungrouped views."""
 
-    artist, title = _candidate_label(identities, episode.candidate_id)
+    artist, title = _identity_candidate_label(identities, episode.candidate_id)
     overlap_labels = sorted(
         {label_by_episode[other] for other in episode.overlaps if other in label_by_episode}
     )
@@ -434,7 +488,7 @@ def _track_entry(
 
 
 def _alternative_summary(episode: EpisodeRecord, identities: IdentitiesRecord) -> dict[str, Any]:
-    artist, title = _candidate_label(identities, episode.candidate_id)
+    artist, title = _identity_candidate_label(identities, episode.candidate_id)
     return {
         "badge": episode.badge,
         "version_status": episode.version_status,
@@ -453,7 +507,7 @@ def _crowd_alternative_summary(
     """A contradicting comment answer at the listed crowd row's timestamp: the same row shape as
     a folded-in version, carrying the crowd row's own (comment-only) confidence."""
 
-    artist, title = _candidate_label(identities, candidate_id)
+    artist, title = _identity_candidate_label(identities, candidate_id)
     return {
         "badge": episode.badge,
         "version_status": "unverified",
@@ -474,6 +528,7 @@ def _derive_projection_entries(
     collapse: bool = True,
     same_track_bridge_ms: int | None = None,
     min_track_ms: int = 0,
+    final_display: bool = True,
 ) -> tuple[tuple[ProjectionEntry, ...], dict[str, list[tuple[int, int]]]]:
     """Derive all presentation rows and apply suppression exactly once.
 
@@ -510,7 +565,7 @@ def _derive_projection_entries(
     ]
     # Overlap notes name other episodes by label and reach the CUE: only live identities may.
     label_by_episode = {
-        episode.id: " - ".join(_candidate_label(identities, episode.candidate_id))
+        episode.id: " - ".join(_identity_candidate_label(identities, episode.candidate_id))
         for episode in live_episodes
     }
     entries: list[dict[str, Any]] = []
@@ -626,6 +681,24 @@ def _derive_projection_entries(
             entry["overlap_labels"] = [
                 label for label in entry["overlap_labels"] if label not in hidden_labels
             ]
+    if final_display:
+        # The placeholder-derived wording is applied only now: grouping, de-duplication,
+        # suppression, overlap filtering and every count above saw identity labels exclusively.
+        for entry in judged:
+            candidate_id = entry.get("candidate_id")
+            if entry["kind"] != "track" or not candidate_id:
+                continue
+            artist, title = _display_candidate_label(identities, candidate_id)
+            entry["artist"] = artist
+            entry["title"] = title
+            entry["display_label"] = f"{artist} — {title}"
+            for alternative in entry.get("alternatives", ()):
+                alt_artist, alt_title = _display_candidate_label(
+                    identities, alternative["candidate_id"]
+                )
+                alternative["artist"] = alt_artist
+                alternative["title"] = alt_title
+                alternative["track"] = f"{alt_artist} — {alt_title}"
     return tuple(ProjectionEntry(entry) for entry in judged), spans  # type: ignore[typeddict-item]
 
 
@@ -647,6 +720,7 @@ def build_projection(
         collapse=collapse,
         same_track_bridge_ms=same_track_bridge_ms,
         min_track_ms=min_track_ms,
+        final_display=True,
     )
     return CanonicalProjection(entries, _covered_ms(episodes, entries, spans))
 
@@ -712,6 +786,31 @@ def flatten_tracklist(
     )
     entries = projection.entries if include_hidden else projection.shown_entries
     return tuple(dict(entry) for entry in entries)
+
+
+def _flatten_identity_tracklist(
+    episodes: EpisodesFile,
+    identities: IdentitiesRecord,
+    *,
+    collapse: bool,
+    min_track_ms: int,
+    include_hidden: bool,
+) -> tuple[dict[str, Any], ...]:
+    """Decision-only projection whose rows never receive optional display wording."""
+
+    entries, _ = _derive_projection_entries(
+        episodes,
+        identities,
+        collapse=collapse,
+        min_track_ms=min_track_ms,
+        final_display=False,
+    )
+    chosen = (
+        entries
+        if include_hidden
+        else tuple(entry for entry in entries if entry["hidden_reason"] is None)
+    )
+    return tuple(dict(entry) for entry in chosen)
 
 
 def _acquire_cell(entry: dict[str, Any], key: str) -> str:

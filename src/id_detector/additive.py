@@ -199,9 +199,9 @@ _SUPPORT_FLAGS = frozenset({"hint_supported", "hint_only"})
 def listed_episode_ids(fused: Fused, min_track_ms: int) -> frozenset[str]:
     """The rows the page and every export LIST (not hidden) -- the presentation floor itself."""
 
-    from id_detector.present.exports import flatten_tracklist, hidden_reason
+    from id_detector.present.exports import _flatten_identity_tracklist, hidden_reason
 
-    entries = flatten_tracklist(
+    entries = _flatten_identity_tracklist(
         fused.episodes,
         fused.identities,
         collapse=False,
@@ -223,12 +223,12 @@ class _Graph:
     """Read-only lookups over one fusion's identity record."""
 
     def __init__(self, identities: IdentitiesRecord) -> None:
-        from id_detector.present.exports import _candidate_label
+        from id_detector.present.exports import _identity_candidate_label
 
         self.identities = identities
         self.candidates = {item.canonical_id: item for item in identities.candidates}
         self.works = {item.work_id: item for item in identities.works}
-        self._label = _candidate_label
+        self._label = _identity_candidate_label
 
     def provider_nodes(self, candidate_id: str) -> frozenset[str]:
         candidate = self.candidates.get(candidate_id)

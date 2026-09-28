@@ -897,9 +897,16 @@ def test_labels_that_normalise_away_to_nothing_never_match() -> None:
     assert match.unmatched_predictions == [
         {"artist": "!!!", "title": "(Extended Mix)", "tier": "likely", "rows": 1}
     ]
-    # An empty artist with a real multi-word title still matches, through the word-set rule.
+    # fusion:5 — the scorer now uses fusion's one identity rule, which needs BOTH parts: a label
+    # with no artist names no work (fusion never lets one back or merge a track either), so an
+    # artistless pair no longer matches however alike the titles are.  (It used to, through the
+    # pooled word-set rule the scorer had of its own; no release-1 truth row lacks an artist.)
     titled = [TruthWork(artist="", title="Long Season Intro Edit")]
     match = match_works(titled, [ListedWork("e1", "", "long season intro", "likely", "w1")])
+    assert match.assignments == {}
+    # With both parts, the whole-title rule still pairs the descriptor-free spelling.
+    titled = [TruthWork(artist="Fishmans", title="Long Season (MG Edit)")]
+    match = match_works(titled, [ListedWork("e1", "Fishmans", "long season", "likely", "w1")])
     assert match.assignments == {0: 0}
 
 

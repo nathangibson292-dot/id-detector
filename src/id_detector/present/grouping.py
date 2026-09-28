@@ -17,7 +17,7 @@ import re
 from dataclasses import dataclass
 
 from id_detector.contracts import EpisodeRecord, IdentitiesRecord
-from id_detector.present.exports import _ROLE_PRECEDENCE, _candidate_label
+from id_detector.present.exports import _ROLE_PRECEDENCE, _identity_candidate_label
 from id_detector.semantics import interval_length, normalise_intervals
 
 #: Two episodes join the same display track only when their time spans overlap or sit within this
@@ -309,7 +309,7 @@ def group_display_tracks(
 
     meta: dict[str, _Meta] = {}
     for episode in episodes:
-        artist, title = _candidate_label(identities, episode.candidate_id)
+        artist, title = _identity_candidate_label(identities, episode.candidate_id)
         meta[episode.id] = _Meta(
             title_key=normalise_title(title),
             work_key=work_key(artist, title),
