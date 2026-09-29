@@ -15,10 +15,22 @@ from id_detector.contracts import AcquireFile, EpisodesFile, IdentitiesRecord
 from id_detector.io import atomic_write_json, read_bytes, read_text
 from id_detector.playlists import PLAYLIST_CSS, PLAYLIST_JS
 from id_detector.present import bundles, page, refresh
-from id_detector.present.exports import CanonicalProjection, _format_time, build_projection
-from id_detector.present.server import AnalysedSet, _fresh_sets, _mix_card_html, _set_summary
+from id_detector.present.exports import (
+    CanonicalProjection,
+    _format_time,
+    build_projection,
+    read_projected_summary,
+)
+from id_detector.present.server import (
+    AnalysedSet,
+    _conf_mini_html,
+    _fresh_sets,
+    _mix_card_html,
+    _set_summary,
+)
 from id_detector.providers.base import AppConfig
 from id_detector.semantics import interval_length, normalise_intervals
+from idea_web import pages as web_pages
 from tests.test_stage7_page import _source
 
 FIXTURES = Path(__file__).parent / "fixtures" / "present"
@@ -30,6 +42,37 @@ FIXTURE_NAMES = ("garage", "boiler", "crowd", "cluster")
 #: ``collapse=True`` is the production default (``providers.base.AppConfig.collapse``); the gate has
 #: to run the code the product actually ships, not only the historical flat view.
 COLLAPSE_MODES = (("collapsed", True), ("flat", False))
+
+
+def test_comment_credit_counts_distinct_works_not_rows(tmp_path: Path) -> None:
+    entries = [
+        {
+            "kind": "track",
+            "artist": artist,
+            "title": title,
+            "badge": "possible",
+            "hint_supported": True,
+            "hint_only": hint_only,
+        }
+        for artist, title, hint_only in (
+            ("Backed Artist", "Backed Track", False),
+            ("Backed Artist", "Backed Track (Club Mix)", False),
+            ("Crowd Artist", "Crowd Track", True),
+            ("Crowd Artist", "Crowd Track", True),
+        )
+    ]
+    path = tmp_path / "tracklist.json"
+    atomic_write_json(path, {"duration_ms": 60_000, "entries": entries})
+
+    summary = read_projected_summary(path)
+    assert summary is not None
+    assert (
+        summary.tracks,
+        summary.crowd,
+        summary.comment_named,
+        summary.comment_only,
+    ) == (4, 2, 2, 1)
+    assert "2 named in comments · 1 only there" in _conf_mini_html(summary)
 
 
 def _load_fixture(name: str) -> dict:
@@ -395,7 +438,11 @@ def _assert_surfaces(
 
     # --- three hero tiles, with the confidence mix moved under the Tracklist heading ---
     assert f'<span class="big">{expected["tracks"]}</span><small>track' in html
-    crowd_note = f" · {expected['crowd']} from comments" if expected["crowd"] else ""
+    comment_named = expected.get("comment_named", expected["crowd"])
+    if comment_named == expected["crowd"]:
+        crowd_note = f" · {comment_named} from comments only" if comment_named else ""
+    else:
+        crowd_note = f" · {comment_named} named in comments · {expected['crowd']} only there"
     assert f"found{crowd_note}</small>" in html
     # The percentage the hero prints, held to a figure computed by hand from the SHOWN rows only.
     assert f"<b>{expected['pct']}%</b></div><div><b>of the set identified</b>" in html
@@ -428,6 +475,8 @@ def _assert_surfaces(
     assert summary is not None
     assert summary.tracks == expected["tracks"]
     assert summary.crowd == expected["crowd"]
+    assert summary.comment_named == comment_named
+    assert summary.comment_only == expected["crowd"]
     assert summary.badges == page_badges
     assert summary.suppressed_count == expected["suppressed"]
     assert summary.duration_ms == fixture["duration_ms"]
@@ -445,8 +494,11 @@ def _assert_surfaces(
         assert f"mostly {majority[0]}" in card and majority[1] * 2 > card_total
     else:
         assert "mostly" not in card and "mixed &mdash;" not in card
-    if expected["crowd"]:
-        assert f"+{expected['crowd']} from comments" in card
+    if comment_named:
+        credit = crowd_note.removeprefix(" · ")
+        assert credit in card
+        # ``idea serve`` uses the FastAPI wrapper, whose card must carry the identical wording.
+        assert credit in web_pages.mixes_block([item])
     else:
         assert "from comments" not in card
     assert f"/{item.source_key}/{item.media_key}/present/index.html" in card

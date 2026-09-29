@@ -264,6 +264,91 @@ def test_an_artist_that_looks_like_list_furniture_is_never_stripped(
     assert _labels(parse_text_units(text, media_duration_ms=DURATION_MS)) == expected
 
 
+def test_a_one_sided_dash_needs_a_genuine_question_parent() -> None:
+    reactions = (
+        "@user nice one -mate",
+        "@user appreciate it -legend",
+        "@user awesome -bro",
+        "@user cheers -legend",
+    )
+    for parent_text in (None, "Love this ID"):
+        for index, text in enumerate(reactions):
+            inputs = [
+                HintInput(
+                    connector="yt_comments",
+                    source_record_id=f"reply-{index}",
+                    parent_source_id="parent" if parent_text is not None else None,
+                    text=text,
+                    position_ms=60_000,
+                    author_pseudo_id="answerer",
+                )
+            ]
+            if parent_text is not None:
+                inputs.append(
+                    HintInput(
+                        connector="yt_comments",
+                        source_record_id="parent",
+                        text=parent_text,
+                        position_ms=60_000,
+                        author_pseudo_id="listener",
+                    )
+                )
+
+            assert not any(
+                hint.raw_text == text for hint in parse_hint_inputs("a" * 64, DURATION_MS, inputs)
+            )
+
+
+def test_real_id_questions_use_the_shared_detector() -> None:
+    for text in (
+        "ID?",
+        "Id??????",
+        "ID on this?",
+        "What's the ID here?",
+        "Track id?",
+        "Song id??",
+        "what's this tune",
+        "Tuuuuune !!! Id???",
+        "I need the id",
+    ):
+        assert is_track_question(text)
+    assert not is_track_question("Love this ID")
+
+
+def test_a_one_sided_dash_answer_is_accepted_under_an_id_question() -> None:
+    hints = parse_hint_inputs(
+        "a" * 64,
+        DURATION_MS,
+        [
+            HintInput(
+                connector="yt_comments",
+                source_record_id="question",
+                text="ID?",
+                position_ms=60_000,
+                author_pseudo_id="listener",
+            ),
+            HintInput(
+                connector="yt_comments",
+                source_record_id="answer",
+                parent_source_id="question",
+                text="Example Artist -Signal Path",
+                position_ms=60_000,
+                author_pseudo_id="answerer",
+            ),
+        ],
+    )
+
+    answer = next(hint for hint in hints if hint.raw_text == "Example Artist -Signal Path")
+    assert (answer.kind, answer.artist, answer.title, answer.parse_confidence) == (
+        "answer",
+        "Example Artist",
+        "Signal Path",
+        9_000,
+    )
+    question = next(hint for hint in hints if hint.raw_text == "ID?")
+    assert question.kind == "question"
+
+
 @pytest.mark.parametrize(
     "text",
     [

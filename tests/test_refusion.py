@@ -577,7 +577,7 @@ def test_the_upkeep_pass_re_fuses_stored_results_offline(
     assert manifest is not None and manifest["refusion"]["fusion_version"] == 5
     assert new_bundle != old_bundle and _titles(new_bundle) == {PHANTOM, FIRST, SECOND}
     assert stored_fusion_version(manifest) == 5
-    assert 'content="25"' in read_text(new_bundle / "index.html")[:4096]
+    assert 'content="26"' in read_text(new_bundle / "index.html")[:4096]
     assert _tree(media / "fuse" / "episodes.json", media / "recognise") == flat
     # Idempotent: the next start-up has nothing left to do.
     assert refresh_stale_pages(work, CONFIG) == 0 and result_dir(media) == new_bundle

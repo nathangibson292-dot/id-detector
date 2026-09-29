@@ -588,6 +588,11 @@ def _derive_projection_entries(
             live_episodes, identities, duration_ms, same_track_bridge_ms=bridge_ms
         ):
             entry = _track_entry(track.primary, identities, acquire_by_episode, label_by_episode)
+            # Keep the primary's flags through visibility judging: ``hint_supported`` exempts a
+            # short row from the floor, and folded-member provenance is display-only. The public
+            # values are replaced after that decision below.
+            entry["_display_hint_supported"] = track.hint_supported
+            entry["_display_hint_only"] = track.hint_only
             entry["start_ms"] = track.start_ms
             entry["end_ms"] = track.end_ms
             member_spans = [
@@ -669,6 +674,10 @@ def _derive_projection_entries(
         min_track_ms,
     )
     judged = [dict(entry, hidden_reason=hidden_reason(entry, min_track_ms)) for entry in ordered]
+    for entry in judged:
+        if "_display_hint_supported" in entry:
+            entry["hint_supported"] = entry.pop("_display_hint_supported")
+            entry["hint_only"] = entry.pop("_display_hint_only")
     # A hidden identity must not survive as a shown row's overlap note either — that note is what
     # the CUE prints as its ``REM`` lines, and it would be the fourth tracklist all over again.
     hidden_labels = {
@@ -898,7 +907,7 @@ def export_tracklist(
             if entry.get("hint_only"):
                 badge += " FROM COMMENTS"
             elif entry["hint_supported"]:
-                badge += " +HINT"
+                badge += " · COMMENT CONFIRMED"
             if entry.get("engine_corroborated"):
                 badge += " +CONFIRMED TWICE"
             label = f"{entry['artist']} — {entry['title']}"
@@ -950,6 +959,8 @@ def render_cue(entries: tuple[dict[str, Any], ...], *, title: str | None = None)
         body.append(f"  TRACK {number:02d} AUDIO")
         body.append(f"    TITLE {_cue_quote(track_title)}")
         body.append(f"    PERFORMER {_cue_quote(performer)}")
+        if entry.get("hint_supported") and not entry.get("hint_only"):
+            body.append("    REM COMMENT_CONFIRMED")
         # Overlapping episodes (loops, layers, mixes-in-progress) are noted on REM lines: a flat CUE
         # sheet can hold only one track per instant, so the co-sounding tracks are recorded here for
         # honesty rather than silently dropped.
@@ -1004,12 +1015,16 @@ class ProjectedSummary:
     ever mean one number.
 
     ``badges`` counts **audio-supported** rows only: a crowd row (``hint_only``) is somebody's
-    comment, never evidence, so it must not move a confidence bar.  It is reported separately as
-    ``crowd`` so the surface can still say it is there.
+    comment, never evidence, so it must not move a confidence bar.  ``crowd`` retains the number
+    of comment-only rows for the completion API.  The library-facing comment credit is distinct
+    works: ``comment_named`` includes both comment-only and comment-backed rows, while
+    ``comment_only`` is the distinct subset represented by comment-only rows.
     """
 
     tracks: int
     crowd: int
+    comment_named: int
+    comment_only: int
     duration_ms: int
     badges: dict[str, int]
     suppressed_count: int
@@ -1040,6 +1055,19 @@ class ProjectedSummary:
         return (strongest, count) if count * 2 > total else None
 
 
+def comment_credit_text(comment_named: int, comment_only: int) -> str:
+    """Return the compact listener-facing credit for tracks named in comments."""
+
+    if comment_named <= 0:
+        return ""
+    if comment_only == comment_named:
+        return f"{comment_named} from comments only"
+    text = f"{comment_named} named in comments"
+    if comment_only:
+        text += f" · {comment_only} only there"
+    return text
+
+
 def read_projected_summary(path: Path) -> ProjectedSummary | None:
     """Read one published ``tracklist.json`` as a :class:`ProjectedSummary` (``None`` if absent)."""
 
@@ -1054,15 +1082,23 @@ def read_projected_summary(path: Path) -> ProjectedSummary | None:
         return None
     badges: dict[str, int] = {}
     crowd = 0
+    comment_named: set[tuple[frozenset[frozenset[str]], tuple[str, ...]]] = set()
+    comment_only: set[tuple[frozenset[frozenset[str]], tuple[str, ...]]] = set()
     for entry in entries:
+        work = audio_work_key(entry.get("artist"), entry.get("title"))
+        if entry.get("hint_supported") or entry.get("hint_only"):
+            comment_named.add(work)
         if entry.get("hint_only"):
             crowd += 1
+            comment_only.add(work)
             continue
         badge = str(entry.get("badge", "unclear"))
         badges[badge] = badges.get(badge, 0) + 1
     return ProjectedSummary(
         tracks=len(entries),
         crowd=crowd,
+        comment_named=len(comment_named),
+        comment_only=len(comment_only),
         duration_ms=int(document.get("duration_ms") or 0),
         badges=badges,
         suppressed_count=int(document.get("suppressed_count") or 0),

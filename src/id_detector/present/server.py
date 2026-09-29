@@ -46,6 +46,7 @@ from id_detector.present.exports import (
     BADGE_ORDER,
     ProjectedSummary,
     _format_time,
+    comment_credit_text,
     read_projected_summary,
 )
 from id_detector.present.page import EmbedPlan, plan_embed_from_url
@@ -375,13 +376,10 @@ def _conf_mini_html(summary: ProjectedSummary) -> str:
 
     badges = summary.badges
     total = summary.audio_tracks
-    crowd_note = ""
-    if summary.crowd:
-        crowd_note = (
-            f'<span class="conf-text">+{summary.crowd} from comments</span>'
-            if total
-            else f'<span class="conf-text">{summary.crowd} from comments only</span>'
-        )
+    comment_credit = comment_credit_text(summary.comment_named, summary.comment_only)
+    crowd_note = (
+        f'<span class="conf-text">{html.escape(comment_credit)}</span>' if comment_credit else ""
+    )
     if not total:
         return crowd_note
     bars = "".join(

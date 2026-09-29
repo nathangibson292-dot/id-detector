@@ -417,6 +417,103 @@ def test_embedding_disabled_falls_back_to_plain_link() -> None:
     assert 'href="https://soundcloud.com/example/mix"' in page
 
 
+def test_comment_backing_is_marked_on_the_track_row_and_timeline() -> None:
+    episodes = _episodes_file()
+    supported = next(episode for episode in episodes.episodes if "hint_supported" in episode.flags)
+    page = render_page(
+        source=_source("soundcloud"),
+        episodes=episodes,
+        identities=_identities(),
+        duration_ms=DURATION_MS,
+        collapse=False,
+    )
+
+    row = re.search(rf'<tr class="track" data-episode-id="{supported.id}".*?</tr>', page, re.DOTALL)
+    assert row is not None and "confirmed in comments" in row.group(0)
+    assert (
+        f'data-episode-id="{supported.id}" data-badge="likely" data-comment-confirmed="1"'
+    ) in page
+    assert '<span class="tl-comment"' in page and ">comment ✓</span>" in page
+
+
+def test_collapsed_row_preserves_comment_confirmation_from_any_member(tmp_path: Path) -> None:
+    """A stronger unbacked primary must not erase a folded member's display-only credit."""
+
+    from id_detector.present.exports import (
+        build_projection,
+        export_tracklist,
+        flatten_tracklist,
+        read_projected_summary,
+    )
+
+    document = _episodes_file().model_dump(mode="json")
+    document["episodes"][1]["flags"] = ["hint_supported"]
+    document["episodes"][2]["flags"] = []
+    episodes = EpisodesFile.model_validate(document)
+    identities = _identities()
+
+    page = render_page(
+        source=_source("soundcloud"),
+        episodes=episodes,
+        identities=identities,
+        duration_ms=DURATION_MS,
+    )
+    primary_id = document["episodes"][0]["id"]
+    row = re.search(rf'<tr class="track" data-episode-id="{primary_id}".*?</tr>', page, re.DOTALL)
+    assert row is not None and "confirmed in comments" in row.group(0)
+    assert f'data-episode-id="{primary_id}" data-badge="likely" data-comment-confirmed="1"' in page
+    assert "found · 1 named in comments</small>" in page
+
+    media_dir = tmp_path / "media"
+    (media_dir / "fuse").mkdir(parents=True)
+    episodes_path = media_dir / "fuse" / "episodes.json"
+    identities_path = media_dir / "fuse" / "identities.gen0.json"
+    episodes_path.write_bytes(episodes.model_dump_json().encode("utf-8"))
+    identities_path.write_bytes(identities.model_dump_json().encode("utf-8"))
+    result = export_tracklist(
+        media_dir=media_dir,
+        media_key="a" * 64,
+        duration_ms=DURATION_MS,
+        episodes=episodes,
+        identities=identities,
+        episodes_path=episodes_path,
+        identities_path=identities_path,
+    )
+    collapsed = next(entry for entry in result.entries if entry.get("episode_id") == primary_id)
+    assert collapsed["hint_supported"] is True
+    assert collapsed["hint_only"] is False
+    assert result.markdown_path.read_text("utf-8").count("COMMENT CONFIRMED") == 1
+    assert result.cue_path is not None
+    assert result.cue_path.read_text("utf-8").count("REM COMMENT_CONFIRMED") == 1
+    summary = read_projected_summary(result.json_path)
+    assert summary is not None and (summary.comment_named, summary.comment_only) == (1, 0)
+
+    only_document = _episodes_file().model_dump(mode="json")
+    only_document["episodes"][0]["flags"] = ["hint_supported", "hint_only"]
+    only_document["episodes"][2]["flags"] = []
+    mixed = flatten_tracklist(EpisodesFile.model_validate(only_document), identities, collapse=True)
+    mixed_collapsed = next(entry for entry in mixed if entry.get("episode_id") == primary_id)
+    assert mixed_collapsed["hint_supported"] is True
+    assert mixed_collapsed["hint_only"] is False
+
+    visibility_document = _episodes_file().model_dump(mode="json")
+    visibility_document["episodes"][0]["badge"] = "unclear"
+    visibility_document["episodes"][1]["badge"] = "unclear"
+    visibility_document["episodes"][1]["flags"] = ["hint_supported"]
+    visibility_document["episodes"][2]["flags"] = []
+    visibility = build_projection(
+        EpisodesFile.model_validate(visibility_document),
+        identities,
+        collapse=True,
+        min_track_ms=30_000,
+    )
+    hidden_collapsed = next(
+        entry for entry in visibility.entries if entry.get("episode_id") == primary_id
+    )
+    assert hidden_collapsed["hint_supported"] is True
+    assert hidden_collapsed["hidden_reason"] == "short"
+
+
 def test_cue_export_flattens_with_role_precedence(tmp_path: Path) -> None:
     from id_detector.present.exports import flatten_tracklist
 
@@ -608,7 +705,7 @@ def test_hint_only_crowd_ids_render_distinctly_and_are_never_proved_evidence() -
     assert f'<tr class="track crowd" data-episode-id="{crowd["id"]}" data-crowd="1"' in page
     assert ">from comments</span>" in page
     assert f'data-episode-id="{crowd["id"]}" data-badge="possible" data-crowd="1"' in page
-    assert "found · 1 from comments</small>" in page
+    assert "found · 1 from comments only</small>" in page
     assert page.count('<div class="legend">') == 1
     assert page.count('<span class="lg-') == 2
     validator = _Validator()
@@ -643,3 +740,32 @@ def test_hint_only_marker_reaches_the_markdown_export(tmp_path: Path) -> None:
     )
     assert "FROM COMMENTS" in result.markdown_path.read_text("utf-8")
     assert any(e.get("hint_only") for e in result.entries)
+
+
+def test_comment_confirmation_reaches_json_markdown_and_cue_exports(tmp_path: Path) -> None:
+    from id_detector.present.exports import export_tracklist
+
+    episodes = _episodes_file()
+    media_dir = tmp_path / "media"
+    (media_dir / "fuse").mkdir(parents=True)
+    episodes_path = media_dir / "fuse" / "episodes.json"
+    identities_path = media_dir / "fuse" / "identities.gen0.json"
+    episodes_path.write_bytes(episodes.model_dump_json().encode("utf-8"))
+    identities_path.write_bytes(_identities().model_dump_json().encode("utf-8"))
+    result = export_tracklist(
+        media_dir=media_dir,
+        media_key="a" * 64,
+        duration_ms=DURATION_MS,
+        episodes=episodes,
+        identities=_identities(),
+        episodes_path=episodes_path,
+        identities_path=identities_path,
+        collapse=False,
+    )
+
+    assert any(
+        entry.get("hint_supported") and not entry.get("hint_only") for entry in result.entries
+    )
+    assert "COMMENT CONFIRMED" in result.markdown_path.read_text("utf-8")
+    assert result.cue_path is not None
+    assert "REM COMMENT_CONFIRMED" in result.cue_path.read_text("utf-8")

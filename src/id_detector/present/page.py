@@ -27,12 +27,14 @@ from id_detector.contracts import (
     IdentitiesRecord,
     SourceRecord,
 )
+from id_detector.fuse.identity import audio_work_key
 from id_detector.io import atomic_write_bytes, write_completion_sidecar
 from id_detector.playlists import PLAYLIST_CSS, PLAYLIST_JS, row_actions_html
 from id_detector.present.exports import (
     CanonicalProjection,
     _format_time,
     build_projection,
+    comment_credit_text,
 )
 from id_detector.present.theme import PLATFORM_NAMES, head_html, topbar_html
 
@@ -46,7 +48,7 @@ UNRESOLVED_CAP_MS = 120_000
 #: Bump when the page's look or behaviour changes: ``present.refresh.ensure_fresh_page`` re-renders
 #: any written page whose ``<meta name="id-detector-page">`` stamp is older, so already-analysed
 #: mixes pick up the new page the next time they are opened (no re-analysis).
-PAGE_VERSION = 25
+PAGE_VERSION = 26
 
 
 # --------------------------------------------------------------------------------------------------
@@ -449,6 +451,11 @@ def _tags_html(entry: dict[str, Any]) -> str:
         tag = f'<span class="tag ver-{_esc(version)}">{_esc(version)}</span>'
     else:
         tag = ""
+    if entry.get("hint_supported") and not entry.get("hint_only"):
+        tag += (
+            '<span class="hint comment" title="a listener named this track in the comments">'
+            "confirmed in comments</span>"
+        )
     return f'<span class="tags">{tag}</span>' if tag else ""
 
 
@@ -535,11 +542,21 @@ def _timeline_html(lanes: list[dict[str, Any]], gaps: list[dict[str, Any]]) -> s
             flags += ' data-short="1"'
         if lane.get("crowd"):
             flags += ' data-crowd="1"'
+        if lane.get("comment_confirmed"):
+            flags += ' data-comment-confirmed="1"'
+        title = str(lane["label"])
+        if lane.get("comment_confirmed"):
+            title += " — confirmed in comments"
         parts.append(
             f'<div class="tl-lane" data-episode-id="{_esc(lane["episode_id"])}" '
             f'data-badge="{_esc(lane["badge"])}"{flags} '
-            f'title="{_esc(lane["label"])}">'
+            f'title="{_esc(title)}">'
         )
+        if lane.get("comment_confirmed"):
+            parts.append(
+                f'<span class="tl-comment" style="left:{lane["comment_left"]:.3f}%">'
+                "comment ✓</span>"
+            )
         parts.append(
             f'<div class="tl-extent" '
             f'style="left:{ext["left"]:.3f}%;width:{ext["width"]:.3f}%"></div>'
@@ -667,8 +684,18 @@ def _stats_html(projection: CanonicalProjection, duration_ms: int) -> str:
     entries = projection.shown_entries
     tracks = [entry for entry in entries if entry["kind"] == "track"]
     n = len(tracks)
-    crowd = sum(1 for entry in tracks if entry.get("hint_only"))
-    crowd_note = f" · {crowd} from comments" if crowd else ""
+    comment_named = {
+        audio_work_key(entry.get("artist"), entry.get("title"))
+        for entry in tracks
+        if entry.get("hint_supported") or entry.get("hint_only")
+    }
+    comment_only = {
+        audio_work_key(entry.get("artist"), entry.get("title"))
+        for entry in tracks
+        if entry.get("hint_only")
+    }
+    credit = comment_credit_text(len(comment_named), len(comment_only))
+    crowd_note = f" · {_esc(credit)}" if credit else ""
     covered = projection.covered_ms
     pct = int(round(max(0.0, min(100.0, covered * 100.0 / duration_ms)))) if duration_ms else 0
     return (
@@ -852,6 +879,9 @@ background-image:repeating-linear-gradient(90deg,transparent 0 calc(10% - 1px),
 border-radius:5px;transition:opacity .15s}
 .tl-solid{position:absolute;top:24px;height:26px;background:var(--lc);border-radius:4px;
 box-shadow:0 0 12px -3px var(--lc);transition:filter .15s;pointer-events:auto}
+.tl-comment{position:absolute;top:4px;transform:translateX(-2px);z-index:3;white-space:nowrap;
+font:700 8px/1 var(--display);letter-spacing:.04em;text-transform:uppercase;color:var(--accent);
+border:1px solid var(--accent);border-radius:4px;padding:2px 4px;background:#0c0c13}
 .tl-pi{position:absolute;top:22px;height:30px;background:var(--pi);opacity:.4;border-radius:5px}
 .tl-unresolved{position:absolute;top:22px;height:30px;border-radius:5px;opacity:.75;
 background:repeating-linear-gradient(45deg,var(--unresolved),var(--unresolved) 3px,
@@ -962,6 +992,7 @@ tr.gap .tt{color:var(--gap)}
 /* crowd IDs (named in the comments, no audio match): dashed, never drawn as proved evidence */
 .hint.crowd{background:none;border:1px dashed var(--accent);color:var(--accent)}
 .hint.engine{background:none;border:1px solid var(--verified);color:var(--verified)}
+.hint.comment{background:none;border:1px solid var(--accent);color:var(--accent)}
 tr.track.crowd td:first-child{box-shadow:inset 3px 0 0 transparent;
 border-left:3px dashed rgba(167,139,250,.6)}
 .tl-lane[data-crowd="1"] .tl-extent{display:none}
@@ -1297,9 +1328,14 @@ def render_page(
         )
         for episode in lane_episodes
     ]
-    crowd_ids = {episode.id for episode in lane_episodes if "hint_only" in episode.flags}
+    entry_by_episode = {str(entry["episode_id"]): entry for entry in track_entries}
     for lane in lanes:
-        lane["crowd"] = lane["episode_id"] in crowd_ids
+        entry = entry_by_episode[lane["episode_id"]]
+        lane["crowd"] = bool(entry.get("hint_only"))
+        lane["comment_confirmed"] = bool(entry.get("hint_supported") and not entry.get("hint_only"))
+        lane["comment_left"] = (
+            lane["solids"][0]["left"] if lane["solids"] else lane["extent"]["left"]
+        )
     shown_gap_ids = {
         entry.get("gap_id") for entry in projection.shown_entries if entry["kind"] == "id"
     }

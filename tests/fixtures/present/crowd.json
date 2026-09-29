@@ -4,7 +4,7 @@
   "min_track_ms": 30000,
   "_why": "A crowd ID (named by comments, no engine match) is kept past the on-air floor by its hint support, and its provenance has to survive into the hero note, the row and the copied text.",
   "tracks": [
-    {"artist": "Engine", "title": "Known Tune", "start_ms": 0, "end_ms": 70000, "badge": "likely"},
+    {"artist": "Engine", "title": "Known Tune", "start_ms": 0, "end_ms": 70000, "badge": "likely", "flags": ["hint_supported"]},
     {"artist": "Listener", "title": "Named Tune", "start_ms": 70000, "end_ms": 82000, "badge": "possible", "flags": ["hint_only", "hint_supported"], "alternatives": [{"artist": "Other Listener", "title": "Contradicting Tune"}]},
     {"artist": "Engine", "title": "Final Tune", "start_ms": 82000, "end_ms": 165000, "badge": "possible", "version_status": "contested"}
   ],
@@ -19,6 +19,7 @@
       "gaps": 1,
       "pct": 92,
       "crowd": 1,
+      "comment_named": 2,
       "badges": {"likely": 1, "possible": 2},
       "note": "",
       "copy": [
@@ -35,6 +36,7 @@
       "gaps": 1,
       "pct": 92,
       "crowd": 1,
+      "comment_named": 2,
       "badges": {"likely": 1, "possible": 2},
       "note": "",
       "copy": [

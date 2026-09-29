@@ -128,10 +128,10 @@ def test_a_stale_deep_result_stops_the_job_without_a_reservation_or_a_dispatch(
     if legacy and evidence == "intact":
         from id_detector.present import page as page_module
 
-        monkeypatch.setattr(page_module, "PAGE_VERSION", 24)
+        monkeypatch.setattr(page_module, "PAGE_VERSION", 25)
     _run_one(tmp_path, config, paid)
     if legacy and evidence == "intact":
-        monkeypatch.setattr(page_module, "PAGE_VERSION", 25)
+        monkeypatch.setattr(page_module, "PAGE_VERSION", 26)
     assert jobs.get(first).status == "succeeded", jobs.get(first).error
     first_run = jobs.queue.get(first).run_id
     assert paid.calls > 0 and _paid_dispatches(jobs.database, first_run) == paid.calls

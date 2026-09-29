@@ -173,6 +173,12 @@ does, and it now refuses to compare results made by different fusion versions. T
 the owner's cache, and the test suite now fails if anything does. **What is left is the owner's, not code:** re-check
 the differently spelled truth rows and the tracklist clock offsets while verifying, and cancel the AudD plan.
 
+**Comment credit LANDED (2026-09-29)** ([build notes](reviews/build-local-comment-credit.md)). The library card now
+says how many tracks the comments named — "10 named in comments · 2 only there" — instead of counting only the
+comment-only rows, which had made the owner think comment IDs were being lost; an audit showed every comment
+SoundCloud had was fetched and every ID answer reached his tracklists. Comment-confirmed rows are marked on the
+page and in exports. Replies typed "artist -title" are read when they answer an ID question.
+
 **When the hosted build resumes, next in plan order:** 4d-i (tenancy schema, lots,
 worker-side reservations), then 4d-ii and 4d-iii + 4d-iv. **Not started:** 6a–6b (ingest policy,
 container, launch checklist), then M2 (billing, Stripe sandbox) — see PLAN-v2 §5.

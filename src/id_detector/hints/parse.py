@@ -22,8 +22,13 @@ from id_detector.io import redact_text, url_has_credentials
 _COLON_TIMESTAMP = re.compile(r"(?<![\d:])(\d+):(\d{1,2})(?::(\d{1,2}))?(?![\d:])")
 _DOTTED_TIMESTAMP = re.compile(r"(?i)(?:\bat\b|\baround\b|@|\btrack\b)\s*(\d+)\.(\d{2})(?!\d)")
 _MINUTE_CUE = re.compile(r"^\s*[\[(](\d+)[\])]\s*(.+?)\s*$")
-_TRACK_WORD = re.compile(r"(?i)\b(track|tune|song)\b")
+_TRACK_WORD = re.compile(r"(?i)\b(track|tu+ne|song)\b")
 _ID_WORD = re.compile(r"(?i)\bid\b")
+_BARE_ID_QUESTION = re.compile(
+    r"(?ix)^\s*id(?:\s+(?:please|pl[sz]|here|(?:on|for)\s+(?:this|that)))?\s*\?+[^\w]*$"
+)
+_ID_REQUEST = re.compile(r"(?i)\b(?:what(?:'s|\s+is)\s+(?:the\s+)?|need\s+(?:the\s+)?)id\b")
+_WHAT_TRACK = re.compile(r"(?i)\bwhat(?:'s|\s+is)\s+(?:this|that)\s+(?:track|tune|song)\b")
 _POINTER = re.compile(r"https://[^\s<>\]\[\)\(]+", re.IGNORECASE)
 _ALLOWED_POINTER_HOSTS = {
     "www.1001tracklists.com",
@@ -41,6 +46,9 @@ _ALLOWED_POINTER_HOSTS = {
     "www.mixcloud.com",
 }
 _SPACED_SEPARATORS = (" - ", " – ", " — ", " ~ ", " : ", " | ")
+# Casual reply answers also arrive as ``Artist -Title`` or ``Artist- Title``. Requiring whitespace
+# on one side keeps ``Jay-Z`` whole; requiring a single dash keeps prose punctuation out.
+_ONE_SIDED_DASH = re.compile(r"(?<![-–—])(?:(?<=\s)[-–—](?=\S)|(?<=\S)[-–—](?=\s))(?![-–—])")
 _VERSION = re.compile(
     r"(?i)(?:\(([^()]*(?:remix|edit|rework|bootleg|mix|vip|dub|version)[^()]*)\)"
     r"|\[([^\[\]]*(?:remix|edit|rework|bootleg|mix|vip|dub|version)[^\[\]]*)\])"
@@ -84,6 +92,7 @@ _CORRECTION_CLEAN = re.compile(
 )
 _MENTION_PREFIX = re.compile(rf"^\s*{_MENTIONS}", re.IGNORECASE)
 _MENTION_ANYWHERE = re.compile(r"(?<!\w)@[\w.-]+:?")
+_LEADING_MENTION_NAME = re.compile(r"^\s*@([\w.-]+):?", re.IGNORECASE)
 # "TRACKLIST:", "Full track list -", "TL so far:" ... a header, whether it opens the comment or
 # one of its lines, is never part of the first track's artist.  The header word must END there
 # (``(?![\w'])``): an artist whose name merely STARTS with it ("TLC - No Scrubs", "Tracklisting")
@@ -183,11 +192,17 @@ def parse_hint_timestamp(text: str, *, media_duration_ms: int | None = None) -> 
 
 
 def is_track_question(text: str) -> bool:
-    """A question needs a track/tune/song word and either ``?`` or standalone ``id``."""
+    """Whether text asks for a track identity rather than merely mentioning an ID."""
 
     if re.match(r"(?i)^\s*(?:track\s+)?id\s*[:=-]\s*\S", text):
         return False
-    return bool(_TRACK_WORD.search(text)) and ("?" in text or bool(_ID_WORD.search(text)))
+    track_word = bool(_TRACK_WORD.search(text))
+    return (
+        (track_word and ("?" in text or bool(_ID_WORD.search(text))))
+        or bool(_BARE_ID_QUESTION.search(text))
+        or bool(_ID_REQUEST.search(text))
+        or bool(_WHAT_TRACK.search(text))
+    )
 
 
 def _clip_range(start: int, end: int, duration_ms: int) -> tuple[int, int] | None:
@@ -334,7 +349,9 @@ def _unquote(value: str) -> str:
     return text
 
 
-def _artist_title(text: str, *, split_no_space: bool) -> tuple[str | None, str | None, int]:
+def _artist_title(
+    text: str, *, split_no_space: bool, allow_one_sided_dash: bool
+) -> tuple[str | None, str | None, int]:
     clean = _unquote(_scrub_mentions(_MENTION_PREFIX.sub("", text)) or "")
     by_match = re.fullmatch(r"(.+?)\s+by\s+(.+)", clean, re.IGNORECASE)
     if by_match:
@@ -344,6 +361,11 @@ def _artist_title(text: str, *, split_no_space: bool) -> tuple[str | None, str |
             artist, title = clean.split(separator, 1)
             if artist.strip() and title.strip():
                 return _unquote(artist), _unquote(title), 9_000
+    one_sided = _ONE_SIDED_DASH.search(clean) if allow_one_sided_dash else None
+    if one_sided is not None:
+        artist, title = clean[: one_sided.start()], clean[one_sided.end() :]
+        if artist.strip() and title.strip():
+            return _unquote(artist), _unquote(title), 9_000
     if split_no_space and "-" in clean:
         artist, title = clean.split("-", 1)
         if artist.strip() and title.strip():
@@ -445,6 +467,7 @@ def parse_text_units(
     comment_position_kind: PositionKind = "comment_timestamp",
     structured_tracklist: bool = False,
     enforce_block_acceptance: bool = False,
+    one_sided_parent_is_track_question: bool | None = None,
 ) -> list[ParsedUnit]:
     """Classify units and expose cue parsing before source-record materialisation.
 
@@ -502,7 +525,11 @@ def parse_text_units(
         # title while the qualifier reads "Remix", and `_clean_identity_field` then cannot cut the
         # bracket back out of the title.
         body = _scrub_mentions(body) or ""
-        artist, title, confidence = _artist_title(body, split_no_space=split_no_space)
+        artist, title, confidence = _artist_title(
+            body,
+            split_no_space=split_no_space,
+            allow_one_sided_dash=one_sided_parent_is_track_question is True and not question,
+        )
         qualifier, label, flags, specificity = _flags_and_qualifiers(body, artist, title)
         artist = _clean_identity_field(artist, qualifier, label)
         title = _clean_identity_field(title, qualifier, label)
@@ -605,8 +632,40 @@ def parse_hint_inputs(
 ) -> list[HintRecord]:
     """Parse connector inputs into deterministic contract records."""
 
+    by_source: dict[tuple[str, str], list[HintInput]] = {}
+    soundcloud_at: dict[tuple[int, str], list[HintInput]] = {}
+    for source in inputs:
+        by_source.setdefault((source.connector, source.source_record_id), []).append(source)
+        if (
+            source.connector == "sc_comments"
+            and source.position_ms is not None
+            and source.author_permalink
+        ):
+            soundcloud_at.setdefault(
+                (source.position_ms, source.author_permalink.casefold()), []
+            ).append(source)
+
     records: list[HintRecord] = []
     for source in sorted(inputs, key=lambda item: (item.connector, item.source_record_id)):
+        parent_is_track_question: bool | None = None
+        if source.parent_source_id is not None:
+            parents = by_source.get((source.connector, source.parent_source_id), [])
+            parent_is_track_question = len(parents) == 1 and is_track_question(parents[0].text)
+            if (
+                parent_is_track_question
+                and source.position_ms is not None
+                and parents[0].position_ms is not None
+            ):
+                parent_is_track_question = source.position_ms == parents[0].position_ms
+        elif source.connector == "sc_comments" and source.position_ms is not None:
+            mention = _LEADING_MENTION_NAME.match(unicodedata.normalize("NFKC", source.text))
+            if mention is not None:
+                parents = soundcloud_at.get((source.position_ms, mention.group(1).casefold()), [])
+                if parents:
+                    parent_is_track_question = len(parents) == 1 and is_track_question(
+                        parents[0].text
+                    )
+
         parsed = parse_text_units(
             source.text,
             media_duration_ms=media_duration_ms,
@@ -614,6 +673,7 @@ def parse_hint_inputs(
             comment_position_kind=source.position_kind,
             structured_tracklist=source.structured_tracklist,
             enforce_block_acceptance=True,
+            one_sided_parent_is_track_question=parent_is_track_question,
         )
         for index, unit in enumerate(parsed):
             if source.structured_tracklist and source.position_ms is not None:

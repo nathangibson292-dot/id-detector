@@ -134,6 +134,10 @@ class DisplayTrack:
     alternatives: tuple[EpisodeRecord, ...]
     start_ms: int
     end_ms: int
+    # Display-only provenance from every member, including repeated episodes de-duplicated out of
+    # ``alternatives``. It must not participate in grouping or primary selection.
+    hint_supported: bool
+    hint_only: bool
 
 
 @dataclass(frozen=True)
@@ -389,6 +393,8 @@ def group_display_tracks(
                 alternatives=tuple(alternatives),
                 start_ms=start_ms,
                 end_ms=end_ms,
+                hint_supported=any("hint_supported" in ep.flags for ep in members),
+                hint_only=all("hint_only" in ep.flags for ep in members),
             )
         )
     tracks.sort(key=lambda track: (track.start_ms, track.primary.id))
