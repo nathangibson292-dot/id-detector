@@ -76,6 +76,7 @@ async def _run_posix(
         *args,
         cwd=str(cwd) if cwd else None,
         env=dict(env) if env else None,
+        stdin=subprocess.DEVNULL,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
         start_new_session=True,
@@ -135,6 +136,7 @@ async def _run_windows(
     # assigned to the kill-on-close Job Object. No descendant can escape between spawn and assign.
     import win32api
     import win32con
+    import win32file
     import win32job
     import win32pipe
     import win32process
@@ -144,6 +146,15 @@ async def _run_windows(
     security.bInheritHandle = True
     stdout_read, stdout_write = win32pipe.CreatePipe(security, 0)
     stderr_read, stderr_write = win32pipe.CreatePipe(security, 0)
+    stdin_handle = win32file.CreateFile(
+        "NUL",
+        win32con.GENERIC_READ,
+        win32con.FILE_SHARE_READ | win32con.FILE_SHARE_WRITE,
+        security,
+        win32con.OPEN_EXISTING,
+        win32con.FILE_ATTRIBUTE_NORMAL,
+        None,
+    )
     win32api.SetHandleInformation(stdout_read, win32con.HANDLE_FLAG_INHERIT, 0)
     win32api.SetHandleInformation(stderr_read, win32con.HANDLE_FLAG_INHERIT, 0)
 
@@ -151,7 +162,7 @@ async def _run_windows(
     startup.dwFlags |= win32process.STARTF_USESTDHANDLES
     startup.hStdOutput = stdout_write
     startup.hStdError = stderr_write
-    startup.hStdInput = win32api.GetStdHandle(win32api.STD_INPUT_HANDLE)
+    startup.hStdInput = stdin_handle
 
     job = win32job.CreateJobObject(None, "")
     info = win32job.QueryInformationJobObject(job, win32job.JobObjectExtendedLimitInformation)
@@ -173,6 +184,8 @@ async def _run_windows(
             str(cwd) if cwd else None,
             startup,
         )
+        stdin_handle.Close()
+        stdin_handle = None
         win32job.AssignProcessToJobObject(job, process_handle)
         win32process.ResumeThread(thread_handle)
         thread_handle.Close()
@@ -210,7 +223,14 @@ async def _run_windows(
     finally:
         for task in read_tasks:
             task.cancel()
-        for handle in (stdout_write, stderr_write, stdout_read, stderr_read, thread_handle):
+        for handle in (
+            stdin_handle,
+            stdout_write,
+            stderr_write,
+            stdout_read,
+            stderr_read,
+            thread_handle,
+        ):
             with contextlib.suppress(AttributeError, OSError):
                 handle.Close()
         if process_handle is not None:

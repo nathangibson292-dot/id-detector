@@ -48,7 +48,7 @@ UNRESOLVED_CAP_MS = 120_000
 #: Bump when the page's look or behaviour changes: ``present.refresh.ensure_fresh_page`` re-renders
 #: any written page whose ``<meta name="id-detector-page">`` stamp is older, so already-analysed
 #: mixes pick up the new page the next time they are opened (no re-analysis).
-PAGE_VERSION = 26
+PAGE_VERSION = 27
 
 
 # --------------------------------------------------------------------------------------------------
@@ -930,7 +930,7 @@ white-space:nowrap;padding:12px 12px 10px;text-align:left;border-bottom:1px soli
 background:#ffffff04}
 td{padding:11px 12px;border-bottom:1px solid var(--line);vertical-align:middle}
 tbody tr:last-child td{border-bottom:none}
-tr.track{transition:background .12s;animation:rise .45s ease both;
+tr.track{transition:background .12s;animation:rise .45s ease both;cursor:pointer;
 animation-delay:calc(min(var(--i,0),40)*14ms)}
 tr.track:hover td,tr.track:focus-within td{background:#ffffff07}
 button:focus-visible,a:focus-visible,summary:focus-visible,input:focus-visible,textarea:focus-visible{
@@ -1227,6 +1227,13 @@ ready(function(){
     }
     const seek = row.querySelector('button.seek');
     if(seek) seek.addEventListener('click', go);
+    // Preserve the original whole-row shortcut without hijacking links, playlist buttons,
+    // disclosures, or form controls. The real time-cell button remains the keyboard-accessible
+    // seek control; this listener is the larger mouse/touch target users expect.
+    row.addEventListener('click', function(e){
+      if(e.target.closest('a,button,input,select,textarea,summary,details')) return;
+      go();
+    });
     const lane = document.querySelector('.tl-lane[data-episode-id="'+id+'"]');
     if(lane){
       row.addEventListener('mouseenter', function(){ lane.classList.add('hover'); });

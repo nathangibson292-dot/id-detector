@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import json
 import os
 import subprocess
 import sys
@@ -39,6 +40,8 @@ ROOT = Path(__file__).resolve().parents[2]
 BASE = "http://127.0.0.1:8765"
 MIX = "https://soundcloud.com/example/live-mix"
 FAKES = "tests.idea_web.local_runner_fakes"
+AUDIO = ROOT / "tests/fixtures/audio/tone-60s.wav"
+SCRIPT = ROOT / "tests/fakes/scripts/gate0a-deep.json"
 
 
 def _request(app, method: str, path: str, **kwargs) -> httpx.Response:
@@ -363,6 +366,42 @@ def test_idea_serve_supervises_a_separate_worker_process(
         supervisor.stop()
     assert _until(lambda: not any(_alive(pid) for pid in pids), timeout=20)
     assert supervisor.owner is False
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows inherited-pipe regression test")
+def test_supervised_worker_decodes_local_audio_with_real_ffmpeg(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("IDEA_TEST_MODE", "1")
+    monkeypatch.setenv("IDEA_FOLLOWUP_SCRIPT", str(SCRIPT))
+    monkeypatch.setenv("AUDD_API_TOKEN", "")
+    monkeypatch.delenv("IDEA_ENGINE_SHAZAM", raising=False)
+    config = tmp_path / "idea.toml"
+    config.write_text("[hints]\nenabled = false\n", encoding="utf-8")
+    jobs = LocalJobs(tmp_path)
+    supervisor = LocalWorkerSupervisor(
+        tmp_path,
+        config_path=config,
+        jobs=jobs,
+        runner_spec=f"{FAKES}:deep_runner",
+    )
+    assert supervisor.start() is True
+    try:
+        job_id = jobs.submit(str(AUDIO), "free")
+        assert _until(
+            lambda: (job := jobs.get(job_id)) is not None and job.status in {"succeeded", "failed"},
+            timeout=120,
+        )
+        job = jobs.get(job_id)
+        assert job is not None and job.status == "succeeded", job.error if job else None
+    finally:
+        supervisor.stop()
+
+    records = list(tmp_path.glob("*/*/decode/pcm.json"))
+    assert len(records) == 1
+    record = json.loads(records[0].read_text(encoding="utf-8"))
+    assert record["pcm"]["duration_ms"] == 60_000
+    assert record["decoder"]["ffmpeg_version"].startswith("ffmpeg version")
 
 
 def test_the_worker_never_outlives_a_server_that_is_killed(

@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+import os
+import subprocess
 import sys
 import time
 from pathlib import Path
@@ -9,6 +11,70 @@ import psutil
 import pytest
 
 from id_detector.process import ProcessTimeout, run_process
+
+ROOT = Path(__file__).resolve().parents[1]
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows inherited-pipe regression test")
+def test_child_starts_while_another_thread_blocks_on_parent_stdin() -> None:
+    """Model the supervised worker: its watcher owns a pending read on the parent pipe."""
+
+    harness = r"""
+import asyncio
+import os
+import sys
+import threading
+import time
+
+from id_detector.process import run_process
+
+reading = threading.Event()
+
+def watch_parent_pipe():
+    reading.set()
+    sys.stdin.buffer.read(4096)
+
+threading.Thread(target=watch_parent_pipe, daemon=True).start()
+assert reading.wait(1)
+time.sleep(0.25)
+result = asyncio.run(run_process([sys.executable, "-c", "print('ok')"], timeout=30))
+print(result.stdout.strip(), flush=True)
+os._exit(0)
+"""
+    env = os.environ.copy()
+    env["PYTHONPATH"] = os.pathsep.join(
+        [str(ROOT / "src"), value] if (value := env.get("PYTHONPATH")) else [str(ROOT / "src")]
+    )
+    process = subprocess.Popen(
+        [sys.executable, "-c", harness],
+        cwd=ROOT,
+        env=env,
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        try:
+            returncode = process.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait(timeout=5)
+            pytest.fail("run_process child timed out while the worker-like stdin read was pending")
+        stdout = process.stdout.read() if process.stdout is not None else ""
+        stderr = process.stderr.read() if process.stderr is not None else ""
+        assert returncode == 0, stderr
+        assert stdout.strip() == "ok"
+    finally:
+        if process.poll() is None:
+            process.kill()
+            process.wait(timeout=5)
+        if process.stdin is not None:
+            process.stdin.close()
+        if process.stdout is not None:
+            process.stdout.close()
+        if process.stderr is not None:
+            process.stderr.close()
 
 
 @pytest.mark.skipif(sys.platform != "win32", reason="Windows Job Object acceptance test")

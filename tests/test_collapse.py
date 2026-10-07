@@ -457,9 +457,12 @@ def test_page_disclosure_and_playhead_present_against_collapsed_rows() -> None:
     assert page.count('"id": "') == 1  # one display-track span (the primary's id)
     assert f'"id": "{episodes.episodes[3].id}"' in page  # the primary (ViP)
     assert "tr.track.current" in page
-    # A real time-cell button seeks; the disclosure retains its native, non-seeking behaviour.
+    # A real time-cell button seeks, and the rest of the row keeps the established mouse/touch
+    # shortcut without taking clicks from links, playlist buttons, or the native disclosure.
     assert "button.seek" in page
     assert "if(seek) seek.addEventListener('click', go)" in page
+    assert "row.addEventListener('click'" in page
+    assert "e.target.closest('a,button,input,select,textarea,summary,details')" in page
     validator = _Validator()
     validator.feed(page)
     assert validator.errors == []
