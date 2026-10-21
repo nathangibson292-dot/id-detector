@@ -77,6 +77,7 @@ _NOT_RESUMED = frozenset(
         "error",
         "failed_phase",
         "phase_started_at",
+        "advanced_at",
         "known_tracklist",
         "rate_samples",
         "progress_at",

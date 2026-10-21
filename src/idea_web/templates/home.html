@@ -1,4 +1,5 @@
 {{ head | safe }}<body>{{ topbar | safe }}<main class="home"><header class="hero-home">
+{{ hero_wave | safe }}
 <p class="eyebrow">DJ-set track identifier · runs on this machine</p>
 <h1>Drop a mix.<br><span class="grad">Get the tracklist.</span></h1>
 <p class="lede">Paste a SoundCloud, YouTube or Mixcloud link. It listens to the set in short windows,
@@ -9,6 +10,6 @@ confidence for every track.</p>
 </header>
 {{ upkeep | safe }}
 {% if activity %}<h2 class="sec">Recent analyses</h2>{{ activity | safe }}{% endif %}
-<h2 class="sec">Your mixes</h2>
-{{ stats | safe }}{{ mixes | safe }}{{ footer | safe }}</main>
+<section class="library"><h2 class="sec">Your mixes</h2>
+{{ stats | safe }}{{ mixes | safe }}</section>{{ footer | safe }}</main>
 <script src="{{ script_src }}"></script></body></html>

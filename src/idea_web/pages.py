@@ -91,18 +91,24 @@ def upkeep_status_html(report: Any) -> str:
     finished = report.finished.is_set()
     lines = report.owner_status_lines()
     if not finished:
-        body = "<p>Checking saved results in the background.</p>"
+        body = (
+            '<p class="upkeep-note"><i class="upkeep-dot"></i>'
+            "Checking saved results in the background.</p>"
+        )
     elif not lines:
         body = ""
     else:
+        # One calm line, with the per-mix detail (and what a re-run would cost) a click away.
         details = "".join(f"<li>{html.escape(line)}</li>" for line in lines[1:-1])
         body = (
-            f'<h2 class="sec">{html.escape(lines[0])}</h2>'
-            f'<ul class="acts">{details}</ul>'
-            f'<p class="lede reassurance">{html.escape(lines[-1])}</p>'
+            '<details class="upkeep-box"><summary><i class="upkeep-dot done"></i>'
+            f"<b>{html.escape(lines[0])}</b>"
+            '<span class="upkeep-more">Details</span></summary>'
+            f'<ul class="upkeep-list">{details}</ul>'
+            f'<p class="upkeep-foot">{html.escape(lines[-1])}</p></details>'
         )
     return (
-        '<section id="upkeep-status" aria-live="polite" '
+        '<section id="upkeep-status" class="upkeep" aria-live="polite" '
         f'data-finished="{1 if finished else 0}">{body}</section>'
     )
 
@@ -307,6 +313,7 @@ STATIC_JS = (
     + NEW_MIX_JS
     + CONFIRM_JS
     + HOME_JS
+    + legacy._LIBRARY_JS
     + UPKEEP_JS
     + legacy._PLAYER_JS
     + "(function(){\nif(typeof JOB_ID === 'undefined') return;\n"
@@ -320,6 +327,11 @@ SCRIPT_SRC = f"/static/app.{ASSET_VERSION}.js"
 HOSTED_CSS = ACCOUNT_CSS.encode("utf-8")
 HOSTED_ASSET_VERSION = hashlib.sha256(HOSTED_CSS).hexdigest()[:12]
 HOSTED_STYLESHEET_HREF = f"/static/hosted.{HOSTED_ASSET_VERSION}.css"
+#: The tiny theme script (remembered light/dark choice, applied before first paint, and the top
+#: bar's toggle).  It is the one script a live page loads in its head; it is static, so the
+#: page policy still names no inline script.
+THEME_JS = theme.THEME_JS.encode("utf-8")
+THEME_SRC = theme.THEME_SRC
 
 
 def brand_bar_html() -> str:
@@ -355,6 +367,8 @@ def head_html(title: str, *, hosted: bool = False) -> str:
         '<!doctype html>\n<html lang="en"><head><meta charset="utf-8">'
         '<meta name="viewport" content="width=device-width, initial-scale=1">'
         f"<title>{html.escape(title)}</title>"
+        '<meta name="color-scheme" content="dark light">'
         f'<link rel="icon" href="{theme.FAVICON}">'
-        f'<link rel="stylesheet" href="{STYLESHEET_HREF}">{hosted_link}</head>'
+        f'<link rel="stylesheet" href="{STYLESHEET_HREF}">{hosted_link}'
+        f'<script src="{THEME_SRC}"></script></head>'
     )

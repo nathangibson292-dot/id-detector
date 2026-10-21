@@ -63,6 +63,19 @@ _MAX_CATCH_UP = 3.0
 #: behind hands over to the finished state directly: done is done, and the page swaps the
 #: percentage for the result at that moment rather than animating a number that is already known.
 _SMOOTHING_FLOOR_SECONDS = 120.0
+#: A phase that runs past its expected time must not keep the bar creeping on: with nothing
+#: happening, ``elapsed / (elapsed + remaining)`` still rises with the clock (observed 47 % -> 58 %
+#: during a stall).  So the bar counts time inside the current phase only up to that phase's
+#: *ceiling* -- its expected duration, or for listening the last window heard plus a stall
+#: allowance -- and then holds there, calmly, until the phase moves.  The page says "taking longer
+#: than usual" once the overrun is real: past the allowance by this much, or by half the phase's
+#: own expected time when that is longer.
+_OVERRUN_NOTICE_SECONDS = 20.0
+#: Listening with no new window for this long (or three of the recent window gaps, if longer) is a
+#: stall: the bar holds where the last window left it.
+_STALL_SECONDS = 45.0
+#: A phase the tracker does not list (the start-up, or an auxiliary scan) is allowed this long.
+_AUXILIARY_PHASE_SECONDS = 30.0
 #: Expected wall-clock **seconds** for each phase of a cold 60-minute run — the denominator behind
 #: the progress bar (U-F9: "10 % of the bar ≈ a tenth of the expected wall time").  Recognise
 #: dominates by an order of magnitude and is replaced by the *observed*-rate estimate the moment
@@ -202,6 +215,9 @@ class Job:
     carried_seconds: float = 0.0
     #: When the phase named by :attr:`phase` began, so time *inside* it is measured too.
     phase_started_at: float | None = None
+    #: When this job last visibly moved: a phase entered, or its done count went up.  Listening
+    #: that has heard no new window since then is stalled, and the bar holds instead of creeping.
+    advanced_at: float | None = None
     #: Highest percentage this job has ever reported: the bar must never move backwards, even if a
     #: growing ETA would otherwise pull the computed value down.
     progress_max: int = 0
@@ -393,6 +409,77 @@ class Job:
             index, rest = (max(measured) if measured else -1), 0.0
         return rest + sum(self._expected_seconds(phase, now) for phase in phases[index + 1 :])
 
+    def _phase_allowance(self, now: float) -> float | None:
+        """Seconds into the current phase the bar may count before it holds at the ceiling.
+
+        A listed phase is allowed its expected duration (measured-speed scaled, as the estimate
+        itself uses).  Listening is allowed up to the last window it heard plus a stall allowance,
+        so a pass that stops hearing anything -- even one still on the cautious prior rate, whose
+        remaining time never grows -- holds instead of climbing.  ``None`` when the job is not in
+        a timed phase.
+        """
+
+        started = self.phase_started_at
+        if started is None or self.status != RUNNING:
+            return None
+        if self.phase == "recognise":
+            last = self.advanced_at if self.advanced_at is not None else started
+            gap = 60.0 / self.rate_per_minute(last)
+            return max(0.0, last - started) + max(_STALL_SECONDS, 3.0 * gap)
+        if self.phase in PHASE_EXPECTED_SECONDS and self._phase_runs(self.phase):
+            return self._expected_seconds(self.phase, now)
+        return _AUXILIARY_PHASE_SECONDS
+
+    def _counted_seconds(self, now: float) -> float:
+        """Time inside the current phase, as far as the bar counts it (capped at the ceiling).
+
+        Listening is not capped by time: its remaining estimate already stretches while nothing is
+        heard, and a stalled pass is held by :meth:`_listening_held` instead.
+        """
+
+        started = self.phase_started_at
+        current = max(0.0, now - started) if started is not None else 0.0
+        if self.phase == "recognise":
+            return current
+        allowance = self._phase_allowance(now)
+        return current if allowance is None else min(current, allowance)
+
+    def _listening_held(self, now: float) -> bool:
+        """Whether a listening pass is holding the bar where it is.
+
+        Two cases.  A pass that has not heard a single window of its own yet (an engine restart
+        reports "0 of 1" before its real total is known) has no estimate worth moving for -- its
+        placeholder total would otherwise collapse the time left and fling the bar forward.  And a
+        pass that has heard nothing for longer than its stall allowance is stalled.
+        """
+
+        if self.phase != "recognise" or self.status != RUNNING:
+            return False
+        if 0 < self.windows_total <= self.windows_done:
+            return False
+        samples = self.rate_samples
+        if samples and samples[-1][1] <= samples[0][1]:
+            return True
+        if self.advanced_at is None:  # rebuilt from a document that never recorded it
+            return False
+        allowance = self._phase_allowance(now)
+        started = self.phase_started_at
+        return allowance is not None and started is not None and now - started > allowance
+
+    def overrun(self, now: float | None = None) -> bool:
+        """True when the current phase is clearly taking longer than usual (the page says so)."""
+
+        now = time.time() if now is None else now
+        allowance = self._phase_allowance(now)
+        if allowance is None or self.phase_started_at is None:
+            return False
+        current = max(0.0, now - self.phase_started_at)
+        if self.phase == "recognise":
+            if 0 < self.windows_total <= self.windows_done or self.advanced_at is None:
+                return False
+            return current > allowance
+        return current > allowance + max(_OVERRUN_NOTICE_SECONDS, 0.5 * allowance)
+
     def progress_percent(self, now: float | None = None) -> int:
         """Percent of the job's expected **wall-clock** time that has elapsed (U-F9).
 
@@ -412,14 +499,17 @@ class Job:
         if self.status == QUEUED:
             return self.progress_max
         now = time.time() if now is None else now
-        started = self.phase_started_at
-        current = max(0.0, now - started) if started is not None else 0.0
+        # Time in the current phase counts only up to its ceiling: an overrunning or stalled phase
+        # holds the bar there instead of letting the clock push it on (see _OVERRUN_NOTICE_SECONDS).
+        current = self._counted_seconds(now)
         elapsed = self.carried_seconds + sum(self.phase_seconds.values()) + current
         if self.status in TERMINAL_STATES:
             return self.progress_max  # failed/cancelled/waiting: freeze where it stopped
         total = elapsed + self._remaining_seconds(current, now)
         value = elapsed * 100.0 / total if total > 0 else 0.0
         floor = max(self.progress_value, float(self.progress_max))
+        if self._listening_held(now):
+            value = min(value, floor)
         # Rate-limit the climb from the last evaluation — or, the first time, from the moment the
         # job started, so a first poll cannot leap either.  Only a job with neither (one rebuilt
         # from a document older than these fields) takes the computed value as it is.
@@ -452,6 +542,8 @@ class Job:
             # a guess: the page words a guess as "Estimating…", never as a number.
             "eta_seconds": self.eta_seconds(),
             "eta_estimating": self.estimating(),
+            # The current phase is past its expected time: the bar holds and the page says so.
+            "overrun": self.overrun(),
             "rate_per_minute": round(self.rate_per_minute(), 1),
             "message": self.message,
             "error": self.error,
@@ -620,6 +712,8 @@ class JobContext:
                         previous: self._job.phase_seconds.get(previous, 0.0) + spent,
                     }
                 self._job.phase_started_at = now
+            if entered or done > self._job.phase_done or total != self._job.phase_total:
+                self._job.advanced_at = now
             self._job.phase = phase
             self._job.phase_done = done
             self._job.phase_total = total

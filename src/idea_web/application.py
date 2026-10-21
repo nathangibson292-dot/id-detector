@@ -96,6 +96,7 @@ _CSRF_REFUSAL = {"error": f"missing or invalid CSRF token (GET /csrf, then send 
 _STATIC = {
     pages.STYLESHEET_HREF: (STATIC_CSS, CSS),
     pages.SCRIPT_SRC: (STATIC_JS, JAVASCRIPT),
+    pages.THEME_SRC: (pages.THEME_JS, JAVASCRIPT),
 }
 #: Hosted routes that answer a script, so a missing session is a 401 rather than a redirect to the
 #: sign-in page: the JSON and fragment reads, and every POST a page script makes.
@@ -244,6 +245,7 @@ def _home_document(state: _State, form_state: legacy._FormState, viewer: _Viewer
         "home.html",
         head=pages.head_html("ID'er — your mixes", hosted=state.hosted is not None),
         topbar=_topbar(viewer, back=False, new=True),
+        hero_wave=legacy.HERO_WAVE,
         form=legacy._form_html(csrf_token=csrf, state=form_state),
         upkeep=_upkeep_html(state),
         activity=_activity_html(state, viewer),
@@ -291,6 +293,8 @@ def _job_document(state: _State, job: Any, viewer: _Viewer) -> bytes:
         title=legacy._job_title(job),
         platform_chip=legacy.platform_chip(platform),
         player=legacy._job_player_html(plan, job),
+        scan=legacy._scan_html(),
+        outcome=legacy._outcome_html(),
         steps=steps,
         footer=legacy._footer_html(),
         config=config,

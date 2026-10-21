@@ -809,7 +809,8 @@ def _page(session: TruthReviewSession, csrf_token: str) -> bytes:
         f"const TRUTH_ROWS={data};" + _JS
     )
     return (
-        head_html(f"Truth review — {truth.set_id}", _CSS)
+        # Its own server serves no static theme script; the page follows the system theme.
+        head_html(f"Truth review — {truth.set_id}", _CSS, theme_script="none")
         + f"<body>{body}<script>{script}</script></body></html>"
     ).encode("utf-8")
 

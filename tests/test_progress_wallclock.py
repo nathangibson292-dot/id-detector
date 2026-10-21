@@ -405,3 +405,123 @@ def test_the_page_words_the_time_left_plainly() -> None:
         "…",
         "—",
     ]
+
+
+# --------------------------------------------------------------------------------------------------
+# Overrun and stall: the bar holds at the phase's ceiling instead of creeping on (redesign brief).
+# --------------------------------------------------------------------------------------------------
+def _job_at(tmp_path: Path, clock: _Clock) -> tuple[Job, JobContext]:
+    job = Job(
+        id="e" * 32,
+        target="https://soundcloud.com/example/mix",
+        display="https://soundcloud.com/example/mix",
+        profile="free",
+        acquire=False,
+        build_index=False,
+        status="running",
+        phase="starting",
+        started_at=clock.now,
+        phase_started_at=clock.now,
+    )
+    return job, JobContext(JobManager(tmp_path, lambda ctx: None), job, clock=clock)
+
+
+def _poll_for(job: Job, clock: _Clock, seconds: float) -> list[tuple[float, int, bool]]:
+    """Poll the bar every POLL_SECONDS for ``seconds`` with nothing happening in between."""
+
+    polls: list[tuple[float, int, bool]] = []
+    end = clock.now + seconds
+    while clock.now + POLL_SECONDS <= end:
+        clock.now += POLL_SECONDS
+        polls.append((clock.now, job.progress_percent(clock.now), job.overrun(clock.now)))
+    clock.now = end
+    return polls
+
+
+def test_an_overrunning_phase_holds_the_bar_at_its_ceiling_and_says_so(tmp_path: Path) -> None:
+    """Preparing the audio stalls for five minutes.  Wall-clock arithmetic alone kept the bar
+    climbing the whole time (nothing was happening; the clock was).  Now the bar reaches the
+    phase's ceiling -- where the phase was expected to end -- and holds there, the status says the
+    phase is taking longer than usual, and when the work moves on the bar does too, smoothly."""
+
+    clock = _Clock()
+    job, context = _job_at(tmp_path, clock)
+    context.progress("ingest", 0, 1, "")
+    _poll_for(job, clock, 20.0)
+    context.progress("ingest", 1, 1, "")
+    context.progress("decode", 0, 1, "")
+    stalled = _poll_for(job, clock, 300.0)
+    percents = [percent for _, percent, _ in stalled]
+    assert percents == sorted(percents)
+    # The decode ceiling is a few points in (20 s of fetching and ~10 s of preparing against a
+    # cold run's ~21 minutes of listening): the bar gets there and stays there.
+    held = [percent for at, percent, _ in stalled if at - stalled[0][0] >= 30.0]
+    assert held and max(held) == min(held) and max(held) <= 4, percents
+    # Calm wording, only once the overrun is real (not the instant the expected time passes).
+    assert not any(slow for at, _, slow in stalled if at - stalled[0][0] < 20.0)
+    assert all(slow for at, _, slow in stalled if at - stalled[0][0] >= 60.0)
+    assert job.status_dict()["overrun"] is True
+    # The phase ends: the note goes, and the bar moves on without leaping.
+    context.progress("decode", 1, 1, "")
+    context.progress("windows", 0, 1, "")
+    assert job.overrun(clock.now) is False
+    resumed = _poll_for(job, clock, 10.0)
+    assert resumed[0][1] >= held[-1]
+    steps = [
+        b - a
+        for a, b in zip(
+            [held[-1]] + [p for _, p, _ in resumed], [p for _, p, _ in resumed], strict=False
+        )
+    ]
+    assert max(steps) <= MAX_POLL_STEP
+
+
+def test_a_listening_stall_on_the_cautious_prior_does_not_creep(tmp_path: Path) -> None:
+    """The case behind the observed 47 % -> 58 %: listening restarts its pass (the engine switch
+    reports 0 of 1, so there is no measured rate and the prior says almost nothing is left) and
+    then hears nothing for five minutes.  The remaining time never grows, so elapsed/total climbed
+    with the clock.  Now the bar holds where the last heard window left it."""
+
+    clock = _Clock()
+    job, context = _job_at(tmp_path, clock)
+    for phase, seconds in (("ingest", 20.0), ("decode", 5.0), ("windows", 2.0)):
+        context.progress(phase, 0, 1, "")
+        _poll_for(job, clock, seconds)
+        context.progress(phase, 1, 1, "")
+    for done in range(0, 201):  # 200 windows at 45/min, polled as the page polls
+        context.progress("recognise", done, 400, "")
+        _poll_for(job, clock, 60.0 / 45)
+    before = job.progress_percent(clock.now)
+    context.progress("recognise", 0, 1, "restarting as the free recipe")
+    stalled = _poll_for(job, clock, 300.0)
+    percents = [percent for _, percent, _ in stalled]
+    assert percents == sorted(percents) and percents[0] >= before
+    # It may finish the short stretch the stall allowance covers, then it holds: no creep at all
+    # across the remaining four minutes, and certainly not the ten points it used to gain.
+    held = [percent for at, percent, _ in stalled if at - stalled[0][0] >= 60.0]
+    assert max(held) == min(held), percents
+    assert max(percents) - before <= 4, (before, percents)
+    assert all(slow for at, _, slow in stalled if at - stalled[0][0] >= 60.0)
+    # Hearing a window again ends the stall at once.
+    context.progress("recognise", 1, 1, "")
+    assert job.overrun(clock.now) is False
+
+
+def test_a_steady_run_never_reports_an_overrun(tmp_path: Path) -> None:
+    """The note is for real delays only: a normal run at a steady rate never shows it."""
+
+    clock = _Clock()
+    job, context = _job_at(tmp_path, clock)
+    seen: list[bool] = []
+    for phase, seconds in (("ingest", 20.0), ("decode", 5.0), ("windows", 2.0)):
+        context.progress(phase, 0, 1, "")
+        seen += [slow for _, _, slow in _poll_for(job, clock, seconds)]
+        context.progress(phase, 1, 1, "")
+    for done in range(0, 451):
+        context.progress("recognise", done, 450, "")
+        seen += [slow for _, _, slow in _poll_for(job, clock, 60.0 / 45)]
+    for phase, seconds in (("hints", 2.0), ("fuse", 5.0), ("present", 1.0)):
+        context.progress(phase, 0, 1, "")
+        seen += [slow for _, _, slow in _poll_for(job, clock, seconds)]
+        context.progress(phase, 1, 1, "")
+    assert seen and not any(seen)

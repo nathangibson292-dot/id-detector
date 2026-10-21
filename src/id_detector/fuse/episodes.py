@@ -435,17 +435,18 @@ def _candidate_recording_specific(identity: IdentityBuildResult, candidate_id: s
 
 
 def _eligible_tracklist_hint(hint: HintRecord) -> bool:
-    # A compiled tracklist line only counts from a trusted source (uploader/pinned/catalogue site).
-    # A position-anchored comment ANSWER/CORRECTION ("ID? -> Artist - Title") counts too: it is only
-    # ever used to CORROBORATE, and corroboration additionally requires the answer to resolve to the
-    # SAME identity work as the audio match, so an off-base answer simply never lines up and cannot
-    # confirm the wrong track.  This is what lets crowd-sourced IDs back up the recogniser.
-    trusted_tracklist_line = hint.kind == "tracklist_line" and (
-        hint.author.is_uploader or hint.is_pinned or hint.connector in {"mixesdb", "1001tl"}
-    )
-    positioned_answer = hint.kind in {"answer", "correction"}
+    # What may CORROBORATE a recognised track: a tracklist line (from anyone — the uploader, a
+    # pinned comment, a catalogue site or a listener who typed the set's tracklist into the
+    # comments) or a comment ANSWER/CORRECTION ("ID? -> Artist - Title").  Corroboration is the
+    # only use: it additionally requires the line to resolve to the SAME identity work as the
+    # audio match, and to sit in reach of that play, so an off-base line simply never lines up and
+    # cannot confirm the wrong track.  The same argument that admits a listener's single answer
+    # admits a listener's whole tracklist (fusion:6); on YouTube that is where most tracklists
+    # are.  A tracklist line never names a track by itself (no hint-only row is made from one) and
+    # never contradicts one: listeners' clocks run tens of seconds off the video, so a line at
+    # the wrong minute would hide the right track.
     return (
-        (trusted_tracklist_line or positioned_answer)
+        hint.kind in {"tracklist_line", "answer", "correction"}
         and hint.mirror_status == "verified"
         and not hint.flags.id_unknown
     )

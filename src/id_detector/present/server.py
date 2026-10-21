@@ -51,7 +51,13 @@ from id_detector.present.exports import (
 )
 from id_detector.present.page import EmbedPlan, plan_embed_from_url
 from id_detector.present.refresh import ensure_fresh_page
-from id_detector.present.theme import PLATFORM_NAMES, head_html, platform_chip, topbar_html
+from id_detector.present.theme import (
+    LIGHT_CSS,
+    PLATFORM_NAMES,
+    head_html,
+    platform_chip,
+    topbar_html,
+)
 from id_detector.providers.base import AppConfig
 from id_detector.rescan import policy_for_trigger, priority_for_trigger
 from id_detector.webapp.jobs import (
@@ -396,6 +402,34 @@ def _conf_mini_html(summary: ProjectedSummary) -> str:
     )
 
 
+def _hero_wave() -> str:
+    """The home hero's backdrop: a wide, quiet equaliser of a mix's energy (decorative only).
+
+    Heights follow a fixed curve rather than randomness, so the page is byte-stable between
+    renders; each bar breathes on its own delay, and stands still under reduced motion.
+    """
+
+    import math
+
+    stops = ((255, 77, 148), (139, 92, 246), (34, 211, 238))  # the brand gradient
+    bars = []
+    count = 56
+    for index in range(count):
+        energy = 0.5 + 0.32 * math.sin(index / 4.1) + 0.18 * math.sin(index / 1.7 + 1.3)
+        height = max(10, min(100, round(energy * 100)))
+        at = index / (count - 1) * 2
+        low, high = stops[int(min(at, 1.999))], stops[int(min(at, 1.999)) + 1]
+        share = at - int(min(at, 1.999))
+        colour = "#" + "".join(
+            f"{round(a + (b - a) * share):02x}" for a, b in zip(low, high, strict=True)
+        )
+        bars.append(f'<i style="--h:{height}%;--d:{(index * 137) % 1100}ms;--c:{colour}"></i>')
+    return f'<div class="hero-wave" aria-hidden="true">{"".join(bars)}</div>'
+
+
+HERO_WAVE = _hero_wave()
+
+
 def _index_html(sets: list[AnalysedSet]) -> bytes:
     """Read-only mode home: the mixes library with no analyse form (Stage 7 index)."""
 
@@ -404,8 +438,10 @@ def _index_html(sets: list[AnalysedSet]) -> bytes:
         + '<main class="home"><header class="hero-home compact"><h1>Analysed sets</h1>'
         '<p class="lede">Every mix analysed under this work root — open one to explore its '
         "tracklist. This server is read-only.</p></header>"
+        + '<section class="library">'
         + _library_stats_html(sets)
         + _mixes_block(sets, allow_new=False)
+        + "</section>"
         + _footer_html()
         + "</main>"
     )
@@ -415,247 +451,437 @@ def _index_html(sets: list[AnalysedSet]) -> bytes:
 # --------------------------------------------------------------------------------------------------
 # Web-app pages (self-contained inline HTML/CSS/JS; no usernames or comment text)
 # --------------------------------------------------------------------------------------------------
-_APP_CSS = """
-:root{--dim:#9a9ab0;--unclear:#a3a3bd;--on-accent:#0a0a0f}
-@media (prefers-color-scheme:light){:root{color-scheme:light;--bg:#f7f7fb;--card:#fff;
---card2:#f0f0f7;--fg:#17171f;--muted:#505064;--dim:#5e5e72;--line:#0000001f;
---line2:#00000038;--pink:#be185d;--violet:#6d28d9;--cyan:#0e7490;--accent:#6d28d9;
---verified:#047857;--likely:#0369a1;--possible:#92400e;--unclear:#52525b;--gap:#be123c;
---ok:#047857;--bad:#be123c;--warn:#92400e;--on-accent:#fff}pre,.jp-wait{background:#eeeeF5}}
-.btn.primary{color:var(--on-accent)}
-button:focus-visible,a:focus-visible,summary:focus-visible,input:focus-visible,textarea:focus-visible{
-outline:3px solid var(--accent);outline-offset:3px}
+_APP_CSS = (
+    """
+.eyebrow{display:inline-flex;align-items:center;gap:10px;font:700 11px/1 var(--display);
+letter-spacing:.16em;text-transform:uppercase;color:var(--dim);margin:0 0 var(--s4)}
 /* home hero + the drop-a-link form */
-.hero-home{padding:44px 0 26px;max-width:760px}
-.hero-home.compact{padding:26px 0 8px}
-.eyebrow{font:700 11px/1 var(--display);letter-spacing:.16em;text-transform:uppercase;
-color:var(--dim);margin:0 0 14px}
-.hero-home h1{font:800 clamp(34px,5.2vw,58px)/1.02 var(--display);letter-spacing:-.035em;
-margin:0 0 14px}
-.lede{color:var(--muted);font-size:15px;max-width:60ch;margin:0 0 22px}
+.hero-home{position:relative;padding:var(--s9) 0 var(--s7);max-width:820px;
+animation:rise var(--t3) var(--ease) both}
+.hero-home.compact{padding:var(--s7) 0 var(--s3)}
+.hero-home h1{font:800 clamp(40px,6.4vw,76px)/.98 var(--display);letter-spacing:-.045em;
+margin:0 0 var(--s5)}
+.hero-home.compact h1{font-size:clamp(30px,4.4vw,44px)}
+.hero-home .grad{padding-right:.04em}
+.lede{color:var(--muted);font-size:16px;line-height:1.6;max-width:58ch;margin:0 0 var(--s7)}
+.lede.reassurance{font-size:13px;color:var(--dim);margin:var(--s4) 0 0}
+.hero-wave{position:absolute;z-index:-1;top:var(--s7);right:calc(-1 * min(340px,30vw));
+width:min(620px,52vw);height:240px;display:flex;align-items:center;gap:4px;opacity:.9;
+pointer-events:none;-webkit-mask-image:linear-gradient(90deg,transparent,#000 30%,#000 70%,
+transparent);mask-image:linear-gradient(90deg,transparent,#000 30%,#000 70%,transparent)}
+.hero-wave i{flex:1;height:var(--h);min-width:2px;border-radius:3px;background:var(--c);
+opacity:.55;transform-origin:center;
+animation:breathe 2.6s ease-in-out var(--d) infinite alternate}
+@keyframes breathe{from{transform:scaleY(.55)}to{transform:scaleY(1)}}
 .dropform{margin:0}
-.urlbox{display:flex;align-items:center;gap:8px;padding:6px 6px 6px 10px;background:var(--card);
-border:1px solid var(--line2);border-radius:16px;
-box-shadow:0 30px 60px -40px rgba(139,92,246,.6);transition:border-color .15s,box-shadow .15s}
+.urlbox{display:flex;align-items:center;gap:var(--s2);padding:7px 7px 7px 10px;
+background:var(--card);border:1px solid var(--line2);border-radius:18px;
+box-shadow:var(--sh2),0 40px 80px -50px #8b5cf6aa;
+transition:border-color var(--t2) var(--ease),box-shadow var(--t2) var(--ease)}
+.urlbox:hover{border-color:var(--line3)}
 .urlbox:focus-within{border-color:var(--accent);
-box-shadow:0 0 0 4px rgba(167,139,250,.18),0 30px 60px -40px rgba(139,92,246,.8)}
-.plat-ind{display:inline-flex;align-items:center;gap:7px;font:600 12px/1 var(--text);
-color:var(--muted);padding:8px 10px;border-radius:10px;background:#ffffff08;white-space:nowrap;
-transition:color .15s}
+box-shadow:0 0 0 4px var(--accent-soft),var(--sh2),0 40px 80px -40px #8b5cf6cc}
+.plat-ind{display:inline-flex;align-items:center;gap:7px;height:36px;
+font:600 12px/1 var(--text);color:var(--muted);padding:0 11px;border-radius:10px;
+background:var(--hover);white-space:nowrap;transition:color var(--t2) var(--ease)}
 .plat-ind.on{color:var(--fg)}
-.urlbox input{flex:1;min-width:0;padding:12px 8px;border:0;background:transparent;color:var(--fg);
-font:15px/1.3 var(--text);outline:none}
+.urlbox input{flex:1;min-width:0;height:48px;padding:0 8px;border:0;background:transparent;
+color:var(--fg);font:16px/1.3 var(--text);outline:none}
 .urlbox input::placeholder{color:var(--dim)}
-.form-error{color:var(--bad);font-weight:600;margin:8px 4px 0}.form-error:empty{display:none}
-.opts{margin-top:12px}
+.urlbox input:focus-visible{outline:none}
+.urlbox .btn svg{width:16px;height:16px}
+.form-error{color:var(--bad);font-weight:600;margin:var(--s3) 4px 0}.form-error:empty{display:none}
+.modes{margin-top:var(--s4)}
+.seg{display:grid;grid-template-columns:1fr 1fr;gap:var(--s3)}
+.segopt{position:relative;cursor:pointer;display:block}
+.segopt input{position:absolute;opacity:0;inset:0;margin:0;cursor:pointer}
+.segopt span{display:block;height:100%;padding:14px 16px;border:1px solid var(--line);
+border-radius:var(--r2);background:var(--card);
+transition:border-color var(--t1) var(--ease),background-color var(--t1) var(--ease),
+box-shadow var(--t2) var(--ease)}
+.segopt:hover span{border-color:var(--line2)}
+.segopt input:checked+span{border-color:var(--accent-line);
+background:linear-gradient(135deg,var(--accent-soft),transparent 70%),var(--card);
+box-shadow:0 0 0 1px var(--accent-line) inset}
+.segopt input:focus-visible+span{outline:2px solid var(--accent);outline-offset:2px}
+.segopt b{display:flex;align-items:center;gap:8px;font-size:14px}
+.mode-dot{width:9px;height:9px;border-radius:50%;border:2px solid var(--line3);flex:none;
+transition:background-color var(--t1),border-color var(--t1)}
+.segopt input:checked+span .mode-dot{border-color:var(--accent);background:var(--accent);
+box-shadow:0 0 0 3px var(--accent-soft)}
+.segopt small,.tog small,.tlbox-h small{display:block;color:var(--muted);font-size:12.5px;
+margin-top:4px;line-height:1.45}
+.opts{margin-top:var(--s3)}
 .opts>summary{list-style:none;cursor:pointer;display:inline-flex;align-items:center;gap:10px;
-font:600 13px/1 var(--text);color:var(--muted);padding:8px 12px;border-radius:9px;
-border:1px solid transparent}
+height:36px;font:600 13px/1 var(--text);color:var(--muted);padding:0 12px;border-radius:10px;
+border:1px solid transparent;transition:color var(--t1),border-color var(--t1),
+background-color var(--t1)}
 .opts>summary::-webkit-details-marker{display:none}
-.opts>summary::before{content:"▸";font-size:11px;transition:transform .15s}
-.opts[open]>summary::before{transform:rotate(90deg)}
-.opts>summary:hover,.opts[open]>summary{color:var(--fg);border-color:var(--line)}
+.opts>summary::before{content:"";width:6px;height:6px;border-right:1.6px solid currentColor;
+border-bottom:1.6px solid currentColor;transform:rotate(-45deg);transition:transform var(--t2)}
+.opts[open]>summary::before{transform:rotate(45deg)}
+.opts>summary:hover,.opts[open]>summary{color:var(--fg);background:var(--hover)}
 .opt-sum{font-weight:500;color:var(--dim)}
-.opt-grid{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-top:10px}
-.seg{grid-column:1/-1;display:grid;grid-template-columns:1fr 1fr;gap:8px}
-.segopt{position:relative;cursor:pointer}
-.segopt input{position:absolute;opacity:0;inset:0}
-.segopt span{display:block;padding:12px 14px;border:1px solid var(--line);border-radius:12px;
-background:var(--card);transition:border-color .12s,background .12s}
-.segopt input:checked+span{border-color:var(--accent);
-background:linear-gradient(135deg,rgba(139,92,246,.18),rgba(34,211,238,.08))}
-.segopt input:focus-visible+span{box-shadow:0 0 0 3px rgba(167,139,250,.3)}
-.segopt b{display:block;font-size:14px}.segopt small,.tog small,.tlbox-h small{display:block;
-color:var(--muted);font-size:12px;margin-top:2px}
-.tog{display:flex;align-items:flex-start;gap:12px;padding:12px 14px;border:1px solid var(--line);
-border-radius:12px;background:var(--card);cursor:pointer}
+.opt-grid{display:grid;grid-template-columns:1fr 1fr;gap:var(--s3);margin-top:var(--s3);
+animation:rise var(--t2) var(--ease) both}
+.tog{position:relative;display:flex;align-items:flex-start;gap:var(--s3);padding:14px 16px;
+border:1px solid var(--line);border-radius:var(--r2);background:var(--card);cursor:pointer}
 .tog input{position:absolute;opacity:0;width:0;height:0}
-.tog b{font-size:13px}
-.sw{flex:none;width:34px;height:20px;border-radius:999px;background:#ffffff1a;position:relative;
-margin-top:1px;transition:background .15s}
-.sw::after{content:"";position:absolute;top:3px;left:3px;width:14px;height:14px;border-radius:50%;
-background:#fff;transition:transform .15s}
+.tog b{font-size:13.5px}
+.sw{flex:none;width:36px;height:22px;border-radius:999px;background:var(--line2);
+position:relative;margin-top:1px;transition:background-color var(--t2) var(--ease)}
+.sw::after{content:"";position:absolute;top:3px;left:3px;width:16px;height:16px;
+border-radius:50%;background:#fff;box-shadow:0 1px 3px #0005;
+transition:transform var(--t2) var(--ease)}
 .tog input:checked~.sw{background:var(--violet)}
 .tog input:checked~.sw::after{transform:translateX(14px)}
-.tog input:focus-visible~.sw{box-shadow:0 0 0 3px rgba(167,139,250,.3)}
-.tlbox{grid-column:1/-1;padding:12px 14px;border:1px solid var(--line);border-radius:12px;
-background:var(--card)}
-.tlbox-h{display:block;margin-bottom:8px}.tlbox-h b{font-size:13px}
-.tlbox textarea{display:block;width:100%;resize:vertical;min-height:66px;padding:10px 12px;
-border:1px solid var(--line);border-radius:9px;background:#ffffff08;color:var(--fg);
-font:12px/1.55 var(--mono);outline:none;transition:border-color .12s,box-shadow .12s}
-.tlbox textarea:focus{border-color:var(--accent);box-shadow:0 0 0 3px rgba(167,139,250,.18)}
+.tog input:focus-visible~.sw{outline:2px solid var(--accent);outline-offset:2px}
+.tlbox{grid-column:1/-1;padding:14px 16px;border:1px solid var(--line);border-radius:var(--r2);
+background:var(--card);display:block}
+.tlbox-h{display:block;margin-bottom:var(--s2)}.tlbox-h b{font-size:13.5px}
+.tlbox textarea{display:block;width:100%;resize:vertical;min-height:84px;padding:10px 12px;
+border:1px solid var(--line);border-radius:10px;background:var(--sunken);color:var(--fg);
+font:12.5px/1.6 var(--mono);outline:none;
+transition:border-color var(--t1),box-shadow var(--t1)}
+.tlbox textarea:focus{border-color:var(--accent);box-shadow:0 0 0 3px var(--accent-soft)}
 .tlbox textarea::placeholder{color:var(--dim)}
 .opt-grid>.tog{grid-column:1/-1}
-.modes{margin-top:14px}
-.consent{grid-column:1/-1;border-color:rgba(251,191,36,.38);background:rgba(251,191,36,.06)}
+.consent{grid-column:1/-1;border-color:color-mix(in srgb,var(--warn) 40%,transparent);
+background:color-mix(in srgb,var(--warn) 6%,var(--card))}
 .consent[hidden]{display:none}
-/* library */
-.stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:12px;
-margin:8px 0 4px}
-.stat{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:14px 16px;
-min-height:78px;display:flex;align-items:center}
-.stat .big{font:800 30px/1 var(--display);letter-spacing:-.03em;font-variant-numeric:tabular-nums}
-.stat small{display:block;color:var(--muted);font-size:12px;margin-top:4px}
-.mixes{list-style:none;padding:0;margin:0;display:grid;
-grid-template-columns:repeat(auto-fill,minmax(280px,1fr));gap:12px}
-.mix{border:1px solid var(--line);border-radius:16px;background:var(--card);overflow:hidden;
-transition:transform .15s,border-color .15s,box-shadow .15s;position:relative}
-.mix::before{content:"";position:absolute;inset:0 0 auto 0;height:3px;background:var(--grad);
-opacity:0;transition:opacity .15s}
-.mix:hover{transform:translateY(-2px);border-color:var(--line2);
-box-shadow:0 20px 40px -24px rgba(139,92,246,.7)}
-.mix:hover::before{opacity:1}
-.mix.failed{padding:16px}.mix.failed::before{opacity:1;background:var(--bad)}
-.mix.failed .st{margin-bottom:10px}
-.mix-link{display:block;padding:16px 16px 14px;color:inherit}
-.mix-link:hover{text-decoration:none}
-.mix-top{display:flex;align-items:center;justify-content:space-between;gap:8px;margin-bottom:12px}
-.mono{font-family:var(--mono);font-variant-numeric:tabular-nums;color:var(--muted);font-size:12px}
-.mix-title{font:700 17px/1.25 var(--display);letter-spacing:-.01em;margin-bottom:10px;
-display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}
-.mix-meta{display:flex;align-items:center;gap:10px;color:var(--muted);font-size:12px}
-.mix-meta b{color:var(--fg)}
-.conf-mini{display:flex;flex:1;height:6px;border-radius:4px;overflow:hidden;background:#ffffff10;
-gap:1px}
-.conf-mini i{display:block;height:100%}
-.conf-text{color:var(--muted);font-size:11px;margin-top:8px}
-.mix-actions{display:flex;justify-content:flex-end;padding:0 12px 12px}.link-danger{border:0;
-background:transparent;color:var(--bad);cursor:pointer;padding:8px;border-radius:8px}
-.c-verified{background:var(--verified)}.c-likely{background:var(--likely)}
-.c-possible{background:var(--possible)}.c-unclear{background:var(--unclear)}
-.go{color:var(--dim);font-size:16px;transition:transform .15s,color .15s}
-.mix:hover .go{color:var(--fg);transform:translateX(3px)}
-.empty{border:1px dashed var(--line2);border-radius:16px;padding:40px 20px;text-align:center;
-color:var(--muted)}
-.empty b{display:block;color:var(--fg);font:700 18px/1.2 var(--display);margin-bottom:6px}
-.acts{list-style:none;padding:0;margin:0;display:flex;flex-direction:column;gap:8px}
-.act{border:1px solid var(--line);border-radius:14px;background:var(--card);overflow:hidden}
-.act-link{display:block;padding:12px 16px;color:inherit}.act-link:hover{text-decoration:none}
-.act-actions{display:flex;justify-content:flex-end;padding:0 12px 10px}
-.act-row{display:flex;align-items:center;gap:12px;min-width:0}
+/* start-up upkeep note */
+#upkeep-status:empty{display:none}
+.upkeep{margin:var(--s6) 0 0}
+.upkeep-note{display:flex;align-items:center;gap:10px;color:var(--dim);font-size:13px;margin:0}
+.upkeep-dot{width:8px;height:8px;border-radius:50%;background:var(--cyan);flex:none;
+animation:blink 1.4s ease-in-out infinite}
+.upkeep-dot.done{background:var(--ok);animation:none}
+.upkeep-box{border:1px solid var(--line);border-radius:var(--r2);background:var(--card);
+font-size:13px;color:var(--muted)}
+.upkeep-box>summary{list-style:none;cursor:pointer;display:flex;align-items:center;gap:10px;
+padding:12px 16px;border-radius:var(--r2)}
+.upkeep-box>summary::-webkit-details-marker{display:none}
+.upkeep-box>summary b{flex:1;min-width:0;font-weight:550;color:var(--fg)}
+.upkeep-more{color:var(--dim);font-size:12px;font-weight:600;white-space:nowrap}
+.upkeep-box[open] .upkeep-more{color:var(--fg)}
+.upkeep-list{margin:0;padding:0 16px 0 34px;display:grid;gap:8px;line-height:1.5}
+.upkeep-foot{margin:12px 16px 14px 34px;color:var(--dim);font-size:12.5px}
+/* activity: what is running now */
+.acts{list-style:none;padding:0;margin:0;display:grid;gap:var(--s3)}
+.act{border:1px solid var(--line);border-radius:var(--r3);background:var(--card);
+overflow:hidden;box-shadow:var(--sh1);display:flex;align-items:center;
+transition:border-color var(--t1) var(--ease)}
+.act:hover{border-color:var(--line2)}
+.act-link{flex:1;min-width:0;display:block;padding:14px 18px;color:inherit}
+.act-link:hover{text-decoration:none}
+.act-actions{padding:0 14px 0 0}
+.act-row{display:flex;align-items:center;gap:var(--s3);min-width:0}
 .act-title{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;
-font-weight:600;font-size:14px}
-.act-phase{color:var(--muted);font-size:12px;margin-top:6px;
-font-variant-numeric:tabular-nums}
-.bar{height:6px;border-radius:4px;background:#ffffff10;overflow:hidden;margin-top:8px}
-.bar>span{display:block;height:100%;background:var(--grad);width:0;transition:width .6s;
-border-radius:4px}
+font-weight:650;font-size:14.5px}
+.act-phase{color:var(--muted);font-size:12.5px;margin-top:8px;font-variant-numeric:tabular-nums}
+.bar{height:6px;border-radius:4px;background:var(--track);overflow:hidden;margin-top:10px}
+.bar>span{display:block;height:100%;background:var(--grad);width:0;border-radius:4px;
+transition:width .8s var(--ease)}
 .act[data-status="failed"] .bar>span{background:var(--bad)}
 .act[data-status="cancelled"] .bar>span{background:var(--dim)}
 .act[data-status="waiting"] .bar>span{background:var(--warn)}
-/* how it works (new-mix page) */
-.how{display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:12px;margin-top:8px}
-.how div{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:16px}
-.how b{display:block;font:700 14px/1.2 var(--display);margin:8px 0 4px}
-.how small{color:var(--muted);font-size:12px}
-.how .n{display:inline-grid;place-items:center;width:26px;height:26px;border-radius:8px;
-background:var(--grad);font:800 12px/1 var(--display)}
+.act[data-status="running"] .bar>span{
+background:linear-gradient(90deg,#ff4d94,#8b5cf6,#22d3ee,#8b5cf6,#ff4d94);
+background-size:200% 100%;animation:flow 2.4s linear infinite}
+.link-danger{border:0;background:transparent;color:var(--muted);cursor:pointer;height:32px;
+padding:0 10px;border-radius:8px;font:600 12.5px/1 var(--text);
+transition:color var(--t1),background-color var(--t1)}
+.link-danger:hover{color:var(--bad);background:color-mix(in srgb,var(--bad) 10%,transparent)}
+/* library */
+.library{animation:fade var(--t3) var(--ease) both}
+.lib-bar{display:flex;align-items:stretch;gap:var(--s4);flex-wrap:wrap;margin:0 0 var(--s5)}
+.stats{display:flex;flex:1 1 auto;background:var(--card);border:1px solid var(--line);
+border-radius:var(--r3);overflow:hidden;box-shadow:var(--sh1)}
+.stat{flex:1;padding:14px 20px;min-width:0;display:flex;align-items:center}
+.stat+.stat{border-left:1px solid var(--line)}
+.stat .big{font:760 26px/1 var(--display);letter-spacing:-.035em;
+font-variant-numeric:tabular-nums;white-space:nowrap}
+.stat small{display:block;color:var(--muted);font-size:12px;margin-top:6px}
+.lib-tools{display:flex;align-items:center;gap:var(--s2);flex:0 1 420px}
+.lib-search{flex:1;display:flex;align-items:center;gap:8px;height:44px;padding:0 14px;
+border:1px solid var(--line2);border-radius:var(--r2);background:var(--card);
+color:var(--dim);transition:border-color var(--t1),box-shadow var(--t1)}
+.lib-search:focus-within{border-color:var(--accent);box-shadow:0 0 0 3px var(--accent-soft)}
+.lib-search svg{width:16px;height:16px;flex:none}
+.lib-search input{flex:1;min-width:0;border:0;background:transparent;color:var(--fg);
+height:100%;outline:none;font-size:14px}
+.lib-search input::placeholder{color:var(--dim)}
+.lib-filter{display:inline-flex;gap:2px;padding:3px;border:1px solid var(--line2);
+border-radius:var(--r2);background:var(--card);height:44px}
+.lib-filter button{border:0;background:transparent;color:var(--muted);border-radius:9px;
+padding:0 12px;font:600 12.5px/1 var(--text);cursor:pointer;
+transition:color var(--t1),background-color var(--t1)}
+.lib-filter button:hover{color:var(--fg)}
+.lib-filter button.on{background:var(--hover2);color:var(--fg)}
+.lib-none{color:var(--muted);text-align:center;padding:var(--s7) 0}
+.lib-none[hidden]{display:none}
+.mixes{list-style:none;padding:0;margin:0;display:grid;
+grid-template-columns:repeat(auto-fill,minmax(300px,1fr));gap:var(--s4)}
+.mix{position:relative;border:1px solid var(--line);border-radius:var(--r3);background:var(--card);
+overflow:hidden;box-shadow:var(--sh1);display:flex;flex-direction:column;
+transition:transform var(--t2) var(--ease),border-color var(--t2) var(--ease),
+box-shadow var(--t2) var(--ease)}
+.mix:hover{transform:translateY(-2px);border-color:var(--line2);box-shadow:var(--sh2),
+0 24px 50px -30px #8b5cf699}
+.mix[hidden]{display:none}
+.mix-link{display:flex;flex-direction:column;flex:1;color:inherit;border-radius:var(--r3)}
+.mix-link:hover{text-decoration:none}
+.mix-link:focus-visible{outline-offset:-2px}
+.mix-strip{position:relative;height:46px;background:var(--sunken);
+border-bottom:1px solid var(--line);
+background-image:repeating-linear-gradient(90deg,transparent 0 calc(10% - 1px),var(--line)
+calc(10% - 1px) 10%)}
+.mix-strip i{position:absolute;top:12px;bottom:12px;border-radius:3px;
+background:color-mix(in srgb,var(--sc) 70%,transparent);--sc:var(--unclear);
+box-shadow:inset 2px 0 0 var(--sc)}
+.mix-strip .s-verified{--sc:var(--verified)}.mix-strip .s-likely{--sc:var(--likely)}
+.mix-strip .s-possible{--sc:var(--possible)}.mix-strip .s-unclear{--sc:var(--unclear)}
+.mix-strip .s-crowd{background:transparent;border:1px dashed var(--accent);box-shadow:none}
+.mix-strip .s-gap{top:0;bottom:0;border-radius:0;box-shadow:none;
+background:repeating-linear-gradient(135deg,color-mix(in srgb,var(--gap) 22%,transparent) 0 4px,
+transparent 4px 8px)}
+.mix:hover .mix-strip i:not(.s-gap){background:var(--sc)}
+.mix-strip.empty::after{content:"";position:absolute;inset:20px 16px;border-radius:3px;
+background:var(--track)}
+.mix-body{padding:16px 18px 18px;display:flex;flex-direction:column;flex:1}
+.mix-top{display:flex;align-items:center;gap:var(--s2);margin-bottom:var(--s3)}
+.mix-top .mono{margin-left:auto}
+.scan-badge{display:inline-flex;align-items:center;height:22px;padding:0 8px;border-radius:6px;
+font:700 10px/1 var(--display);letter-spacing:.1em;text-transform:uppercase;color:var(--muted);
+border:1px solid var(--line2)}
+.scan-badge.deep{color:var(--accent);border-color:var(--accent-line);background:var(--accent-soft)}
+.mono{font-family:var(--mono);font-variant-numeric:tabular-nums;color:var(--muted);font-size:12px}
+.mix-title{font:700 17px/1.3 var(--display);letter-spacing:-.015em;margin-bottom:6px;
+display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden;
+overflow-wrap:anywhere}
+.mix-meta{display:flex;align-items:center;gap:var(--s3);color:var(--muted);font-size:12.5px;
+margin-top:auto;padding-top:var(--s3)}
+.mix-meta>span:first-child{white-space:nowrap}
+.mix-meta{flex-wrap:wrap;row-gap:6px}
+.mix-meta .go{order:2}
+.mix-meta .conf-text{order:3;flex-basis:100%;margin:0}
+.mix-meta b{color:var(--fg)}
+.conf-mini{display:flex;flex:1;height:6px;border-radius:4px;overflow:hidden;background:var(--track);
+gap:2px;min-width:40px}
+.conf-mini i{display:block;height:100%}
+.conf-text{color:var(--muted);font-size:12px;margin-top:2px}
+.mix-actions{position:absolute;top:8px;right:8px;opacity:0;transition:opacity var(--t1)}
+.mix:hover .mix-actions,.mix:focus-within .mix-actions{opacity:1}
+.mix-actions .link-danger{background:var(--raise);border:1px solid var(--line2);height:28px}
+.c-verified{background:var(--verified)}.c-likely{background:var(--likely)}
+.c-possible{background:var(--possible)}.c-unclear{background:var(--unclear)}
+.go{color:var(--dim);font-size:16px;line-height:1;transition:transform var(--t2) var(--ease),
+color var(--t2)}
+.mix:hover .go{color:var(--fg);transform:translateX(3px)}
+.mix.failed{border-color:color-mix(in srgb,var(--bad) 30%,var(--line))}
+.mix.failed::before{content:"";height:3px;background:var(--bad);opacity:.8}
+.mix.failed .mix-actions{position:static;opacity:1;padding:0 12px 12px;display:flex;
+justify-content:flex-end}
+.mix.failed .mix-actions .link-danger{background:transparent;border:0}
+.mix.failed .cause{color:var(--fg);margin:2px 0 6px}
+.empty{border:1px dashed var(--line2);border-radius:var(--r3);padding:var(--s8) var(--s5);
+text-align:center;color:var(--muted);background:linear-gradient(180deg,var(--hover),transparent)}
+.empty b{display:block;color:var(--fg);font:700 19px/1.2 var(--display);margin:var(--s4) 0 6px}
+.empty p{margin:0}
+.empty-eq{display:inline-flex;align-items:flex-end;gap:4px;height:34px}
+.empty-eq i{width:6px;border-radius:3px;background:var(--grad);height:40%;
+animation:eq2 1.4s ease-in-out infinite}
+.empty-eq i:nth-child(2){animation-delay:.2s}.empty-eq i:nth-child(3){animation-delay:.4s}
+.empty-eq i:nth-child(4){animation-delay:.6s}.empty-eq i:nth-child(5){animation-delay:.8s}
+@keyframes eq2{0%,100%{height:30%}50%{height:100%}}
 /* progress page */
-.job-head{display:flex;align-items:flex-start;gap:16px;flex-wrap:wrap;padding:28px 0 18px}
+.job-head{display:flex;align-items:flex-start;gap:var(--s4);flex-wrap:wrap;
+padding:var(--s7) 0 var(--s5)}
 .job-head .titles{flex:1;min-width:0}
-.job-head h1{font:800 clamp(26px,3.6vw,38px)/1.1 var(--display);letter-spacing:-.03em;
-margin:6px 0 6px;overflow-wrap:anywhere}
+.job-head .eyebrow{margin-bottom:var(--s3)}
+.job-head h1{font:780 clamp(28px,4vw,44px)/1.06 var(--display);letter-spacing:-.035em;
+margin:0 0 var(--s3);overflow-wrap:anywhere}
 .job-url{color:var(--muted);font-size:13px;overflow-wrap:anywhere}
-.job-actions{display:flex;align-items:center;gap:10px;padding-top:6px}
-.job-player{background:var(--card);border:1px solid var(--line);border-radius:18px;padding:14px;
-margin:0 0 18px}
-.job-player .jp-label{display:flex;align-items:center;gap:9px;font-size:12.5px;color:var(--muted);
-margin:2px 2px 12px}
-.job-player audio{display:block;width:100%;height:44px;border-radius:12px;outline:none}
-.job-player audio::-webkit-media-controls-panel{background:#1a1a26}
-.job-player .jp-yt{position:relative;width:100%;max-width:560px;aspect-ratio:16/9;
-border-radius:12px;overflow:hidden}
-.job-player .jp-yt iframe{position:absolute;inset:0;width:100%;height:100%;border-radius:0}
-.jp-frame{position:relative}.jp-frame[hidden]{display:none}
-.jp-frame.loading audio{opacity:0}
-.jp-wait{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;
-gap:10px;color:var(--muted);font-size:13px;background:#0c0c13;border-radius:12px;
-border:1px solid var(--line);animation:blink 1.6s ease-in-out infinite}
-.jp-frame:not(.loading) .jp-wait{display:none}
-.jp-fail{color:var(--muted);font-size:13px;padding:14px 16px;border:1px dashed var(--line2);
-border-radius:12px}.jp-fail[hidden]{display:none}.jp-fail b{color:var(--fg)}
-.scan{background:var(--card);border:1px solid var(--line);border-radius:18px;padding:22px 22px 18px;
-position:relative;overflow:hidden}
-.scan::after{content:"";position:absolute;inset:0;pointer-events:none;
-background:linear-gradient(180deg,#ffffff05,transparent)}
-.scan-top{display:flex;align-items:flex-end;gap:22px;flex-wrap:wrap;margin-bottom:16px}
-.pct{font:800 64px/1 var(--display);letter-spacing:-.04em;font-variant-numeric:tabular-nums;
+.job-actions{display:flex;align-items:center;gap:var(--s3);padding-top:2px}
+.scan{position:relative;background:var(--card);border:1px solid var(--line);
+border-radius:var(--r4);padding:var(--s6) var(--s7) var(--s5);box-shadow:var(--sh2);
+overflow:hidden;animation:rise var(--t3) var(--ease) both}
+.scan::before{content:"";position:absolute;inset:-1px -1px auto;height:180px;pointer-events:none;
+background:radial-gradient(60% 100% at 10% 0%,var(--glow1),transparent 70%)}
+.stages{list-style:none;margin:0 0 var(--s6);padding:0;display:grid;
+grid-template-columns:repeat(4,1fr);position:relative}
+.stage{position:relative;display:flex;align-items:center;gap:10px;color:var(--dim);
+font:650 13px/1 var(--display);letter-spacing:-.005em}
+.stage:not(:last-child)::after{content:"";flex:1;height:2px;margin:0 12px 0 2px;border-radius:2px;
+background:var(--track)}
+.stage i{flex:none;width:22px;height:22px;border-radius:50%;border:2px solid var(--line3);
+display:grid;place-items:center;transition:background-color var(--t2),border-color var(--t2)}
+.stage.done{color:var(--fg)}
+.stage.done i{border-color:var(--ok);background:var(--ok)}
+.stage.done i::after{content:"";width:8px;height:4px;border-left:2px solid var(--on-accent);
+border-bottom:2px solid var(--on-accent);transform:translateY(-1px) rotate(-45deg)}
+.stage.done:not(:last-child)::after{background:linear-gradient(90deg,var(--ok),
+color-mix(in srgb,var(--ok) 40%,transparent))}
+.stage.active{color:var(--fg)}
+.stage.active i{border-color:var(--accent);background:var(--accent-soft);
+animation:ringpulse 1.6s ease-out infinite}
+.stage.active i::after{content:"";width:8px;height:8px;border-radius:50%;background:var(--accent)}
+.stage.active:not(:last-child)::after{background:linear-gradient(90deg,var(--accent),
+var(--track) 70%)}
+.stage.failed{color:var(--bad)}.stage.failed i{border-color:var(--bad)}
+.stage.failed i::after{content:"!";font:800 11px/1 var(--display);color:var(--bad)}
+.scan-top{position:relative;display:grid;grid-template-columns:auto minmax(0,1fr) auto;
+align-items:end;gap:var(--s3) var(--s7);margin-bottom:var(--s5)}
+.pct{font:800 76px/.86 var(--display);letter-spacing:-.05em;font-variant-numeric:tabular-nums;
 background:var(--grad);-webkit-background-clip:text;background-clip:text;color:transparent;
-min-width:3ch}
-.pct small{font-size:26px;letter-spacing:0}
-.phase-line{flex:1;min-width:220px}
-.phase-name{font:700 18px/1.2 var(--display);letter-spacing:-.01em}
-.phase-msg{color:var(--muted);font-size:13px;margin-top:3px;min-height:18px}
-.tiles{display:flex;gap:18px;flex-wrap:wrap;color:var(--muted);font-size:12px}
-.tiles b{display:block;color:var(--fg);font:700 18px/1.1 var(--display);
-font-variant-numeric:tabular-nums}
-.cells{display:grid;grid-auto-flow:column;grid-auto-columns:1fr;gap:2px;height:46px;padding:3px;
-background:#0c0c13;border:1px solid var(--line);border-radius:10px}
-.cells i{display:block;border-radius:2px;background:#1a1a26;transition:background .35s,
-box-shadow .35s}
+min-width:3.2ch}
+.pct small{font-size:30px;letter-spacing:0;margin-left:2px}
+.phase-line{min-width:0;padding-bottom:4px}
+.phase-name{font:720 22px/1.15 var(--display);letter-spacing:-.02em}
+.phase-msg{color:var(--muted);font-size:13.5px;margin-top:6px;min-height:20px;
+overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.tiles{display:flex;gap:var(--s7);color:var(--dim);font-size:12px;padding-bottom:4px}
+.tiles span{white-space:nowrap}
+.tiles b{display:block;color:var(--fg);font:700 19px/1.1 var(--display);margin-bottom:4px;
+font-variant-numeric:tabular-nums;letter-spacing:-.01em}
+.pbar{position:relative;height:12px;border-radius:999px;background:var(--track);overflow:hidden;
+box-shadow:inset 0 1px 2px #00000040}
+.pbar>span{position:absolute;inset:0 auto 0 0;width:0;border-radius:999px;
+background:linear-gradient(90deg,#ff4d94,#8b5cf6,#22d3ee,#8b5cf6,#ff4d94);
+background-size:200% 100%;box-shadow:0 0 18px -2px #8b5cf6b3;
+transition:width .9s var(--ease)}
+.scan.running .pbar>span{animation:flow 2.4s linear infinite}
+.scan.running .pbar>span::after{content:"";position:absolute;inset:0;border-radius:inherit;
+background:linear-gradient(90deg,transparent,#ffffff59,transparent);background-size:40% 100%;
+background-repeat:no-repeat;animation:sheen 2s ease-in-out infinite}
+.scan.held .pbar>span{animation:none;filter:saturate(.6)}
+.scan.held .pbar>span::after{display:none}
+@keyframes flow{from{background-position:0 0}to{background-position:-200% 0}}
+@keyframes sheen{from{background-position:-40% 0}to{background-position:140% 0}}
+.cells-wrap{margin-top:var(--s5)}
+.cells-k{display:flex;justify-content:space-between;align-items:center;
+font:700 10.5px/1 var(--display);letter-spacing:.14em;text-transform:uppercase;color:var(--dim);
+margin-bottom:var(--s2)}
+.cells-k span+span{font:600 11.5px/1 var(--mono);letter-spacing:0;text-transform:none}
+.cells{display:grid;grid-auto-flow:column;grid-auto-columns:1fr;gap:2px;height:34px;padding:3px;
+background:var(--sunken);border:1px solid var(--line);border-radius:10px;overflow:hidden}
+.cells i{display:block;border-radius:2px;background:var(--track);
+transition:background-color .35s,box-shadow .35s}
 .cells i.on{background:var(--c);box-shadow:0 0 8px -2px var(--c)}
 .cells i.pop{animation:pop .5s ease-out}
 .cells i.next{animation:next 1s ease-in-out infinite}
 @keyframes pop{0%{background:#fff;box-shadow:0 0 14px #fff}}
-@keyframes next{50%{background:#2a2a3c}}
-.cells.idle{background-image:linear-gradient(90deg,transparent 0%,rgba(139,92,246,.18) 50%,
+@keyframes next{50%{background:var(--line3)}}
+.cells.idle{background-image:linear-gradient(90deg,transparent 0%,var(--accent-soft) 50%,
 transparent 100%);background-size:40% 100%;background-repeat:no-repeat;
 animation:shimmer 1.6s linear infinite}
 @keyframes shimmer{from{background-position:-40% 0}to{background-position:140% 0}}
-.flavour{margin:14px 2px 0;color:var(--muted);font-size:13px;min-height:20px;
+.slow-note{display:flex;gap:6px;flex-wrap:wrap;align-items:baseline;margin:var(--s4) 0 0;
+padding:10px 14px;border-radius:var(--r2);font-size:13px;color:var(--muted);
+border:1px solid color-mix(in srgb,var(--warn) 35%,transparent);
+background:color-mix(in srgb,var(--warn) 7%,transparent);animation:fade var(--t3) both}
+.slow-note b{color:var(--warn);font-weight:650}
+.slow-note[hidden]{display:none}
+.flavour{margin:var(--s4) 0 0;color:var(--muted);font-size:13.5px;min-height:21px;
 transition:opacity .35s}
 .flavour.fade{opacity:0}
-.steps{display:grid;grid-template-columns:repeat(auto-fit,minmax(110px,1fr));gap:8px;margin:14px 0}
-.step{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:12px 12px 10px;
-position:relative;transition:border-color .2s,opacity .2s;opacity:.55}
-.step .k{display:flex;align-items:center;gap:8px;font:700 12px/1 var(--display);
-letter-spacing:.02em}
-.step .k i{display:inline-grid;place-items:center;width:18px;height:18px;border-radius:50%;
-border:1.5px solid var(--dim);font:700 10px/1 var(--mono);color:var(--dim);font-style:normal}
-.step small{display:block;color:var(--dim);font-size:11px;margin-top:5px}
-.step.done{opacity:1}.step.done .k i{background:var(--ok);border-color:var(--ok);color:#0a0a0f}
-.step.active{opacity:1;border-color:var(--accent);
-background:linear-gradient(135deg,rgba(139,92,246,.16),rgba(34,211,238,.06))}
-.step.active .k i{border-color:var(--accent);color:var(--accent);
-animation:ringpulse 1.2s ease-out infinite}
-.step.failed{opacity:1;border-color:var(--bad);background:rgba(251,113,133,.08)}
-.step.failed .k i{border-color:var(--bad);color:var(--bad)}
-@keyframes ringpulse{0%{box-shadow:0 0 0 0 rgba(167,139,250,.55)}
-100%{box-shadow:0 0 0 8px rgba(167,139,250,0)}}
-.outcome{display:none;border-radius:18px;padding:26px;border:1px solid var(--line);
-background:var(--card);position:relative;overflow:hidden;margin:14px 0}
-.outcome.show{display:block;animation:rise .5s ease both}
-.outcome h2{font:800 30px/1.1 var(--display);letter-spacing:-.03em;margin:0 0 6px}
-.outcome p{color:var(--muted);margin:0 0 16px}
-.outcome.ok{border-color:rgba(52,211,153,.35);
-background:linear-gradient(135deg,rgba(52,211,153,.10),var(--card) 60%)}
-.outcome.bad{border-color:rgba(251,113,133,.4);
-background:linear-gradient(135deg,rgba(251,113,133,.10),var(--card) 60%)}
-.outcome .err{font-family:var(--mono);font-size:12px;color:var(--bad);background:#00000033;
-border-radius:8px;padding:10px 12px;margin:0 0 16px;white-space:pre-wrap;overflow-wrap:anywhere}
-.outcome .row{display:flex;gap:10px;align-items:center;flex-wrap:wrap}
+.scan .reassurance{margin:var(--s2) 0 0;color:var(--dim);font-size:12.5px}
+@keyframes ringpulse{0%{box-shadow:0 0 0 0 var(--accent-line)}
+100%{box-shadow:0 0 0 9px transparent}}
+.job-player{background:var(--card);border:1px solid var(--line);border-radius:var(--r3);
+padding:var(--s4) var(--s5);margin:var(--s4) 0 0;box-shadow:var(--sh1)}
+.job-player .jp-label{display:flex;align-items:center;gap:10px;font-size:13px;color:var(--muted);
+margin:0 2px var(--s3)}
+.job-player audio{display:block;width:100%;height:44px;border-radius:var(--r2);outline:none}
+.job-player .jp-yt{position:relative;width:100%;max-width:560px;aspect-ratio:16/9;
+border-radius:var(--r2);overflow:hidden}
+.job-player .jp-yt iframe{position:absolute;inset:0;width:100%;height:100%;border-radius:0}
+.jp-frame{position:relative}.jp-frame[hidden]{display:none}
+.jp-frame.loading audio{opacity:0}
+.jp-wait{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;
+gap:10px;color:var(--muted);font-size:13px;background:var(--sunken);border-radius:var(--r2);
+border:1px solid var(--line);animation:blink 1.6s ease-in-out infinite}
+.jp-frame:not(.loading) .jp-wait{display:none}
+.jp-fail{color:var(--muted);font-size:13px;padding:14px 16px;border:1px dashed var(--line2);
+border-radius:var(--r2)}.jp-fail[hidden]{display:none}.jp-fail b{color:var(--fg)}
+.outcome{display:none;border-radius:var(--r4);padding:var(--s7);border:1px solid var(--line);
+background:var(--card);position:relative;overflow:hidden;box-shadow:var(--sh2)}
+.outcome.show{display:block;animation:rise .45s var(--ease) both}
+.outcome h2{font:800 34px/1.08 var(--display);letter-spacing:-.035em;margin:0 0 var(--s2)}
+.outcome p{color:var(--muted);margin:0 0 var(--s5);font-size:15px;max-width:70ch}
+.outcome.ok{border-color:color-mix(in srgb,var(--ok) 35%,transparent);
+background:radial-gradient(70% 120% at 0% 0%,color-mix(in srgb,var(--ok) 14%,transparent),
+transparent 60%),var(--card)}
+.outcome.bad{border-color:color-mix(in srgb,var(--bad) 40%,transparent);
+background:radial-gradient(70% 120% at 0% 0%,color-mix(in srgb,var(--bad) 13%,transparent),
+transparent 60%),var(--card)}
+.outcome .err{font-family:var(--mono);font-size:12px;color:var(--bad);background:var(--sunken);
+border-radius:8px;padding:10px 12px;margin:0 0 var(--s4);white-space:pre-wrap;
+overflow-wrap:anywhere}
+.outcome .row{display:flex;gap:var(--s3);align-items:center;flex-wrap:wrap}
 .countdown{color:var(--dim);font-size:12px}
 .confetti{position:absolute;inset:0;pointer-events:none;overflow:hidden}
 .confetti i{position:absolute;top:-10px;left:var(--x);width:7px;height:11px;background:var(--c);
 border-radius:2px;opacity:0;animation:fall var(--d) ease-in var(--delay) forwards}
 @keyframes fall{0%{opacity:1;transform:translateY(0) rotate(0)}
 100%{opacity:0;transform:translateY(340px) rotate(var(--r))}}
-details.log{margin-top:16px}
-details.log>summary{cursor:pointer;color:var(--dim);font-size:12px;list-style:none;
-display:inline-flex;align-items:center;gap:6px}
+details.log{margin-top:var(--s5);border:1px solid var(--line);border-radius:var(--r3);
+background:var(--card)}
+details.log>summary{cursor:pointer;color:var(--muted);font-size:13px;font-weight:600;
+list-style:none;display:flex;align-items:center;gap:8px;padding:14px 18px;
+border-radius:var(--r3);transition:color var(--t1)}
+details.log>summary:hover{color:var(--fg)}
 details.log>summary::-webkit-details-marker{display:none}
-details.log>summary::before{content:"▸";font-size:10px}
-details.log[open]>summary::before{content:"▾"}
-pre{white-space:pre-wrap;word-break:break-word;background:#0c0c13;border:1px solid var(--line);
-border-radius:10px;padding:12px;font:12px/1.6 var(--mono);color:var(--muted);max-height:260px;
-overflow:auto;margin:8px 0 0}
-@media (max-width:720px){.hero-home{padding:24px 0 18px}.urlbox{flex-wrap:wrap;padding:8px}
-.urlbox input{flex-basis:100%;order:-1;padding:10px 6px}.urlbox .btn{margin-left:auto}
-.opt-grid,.seg{grid-template-columns:1fr}.pct{font-size:48px}.job-head{padding-top:16px}
-.btn,.link-danger,.opts>summary,.segopt span,.tog{min-height:44px}
+details.log>summary::before{content:"";width:6px;height:6px;border-right:1.6px solid currentColor;
+border-bottom:1.6px solid currentColor;transform:rotate(-45deg);transition:transform var(--t2)}
+details.log[open]>summary::before{transform:rotate(45deg)}
+details.log>.steps,details.log>pre{margin:0 18px 18px}
+.steps{display:grid;grid-template-columns:repeat(auto-fit,minmax(120px,1fr));gap:var(--s2)}
+.step{background:var(--sunken);border:1px solid var(--line);border-radius:var(--r2);
+padding:12px 12px 10px;transition:border-color var(--t2),opacity var(--t2);opacity:.6}
+.step .k{display:flex;align-items:center;gap:8px;font:700 12.5px/1 var(--display)}
+.step .k i{display:inline-grid;place-items:center;width:18px;height:18px;border-radius:50%;
+border:1.5px solid var(--dim);font:700 10px/1 var(--mono);color:var(--dim);font-style:normal}
+.step small{display:block;color:var(--dim);font-size:11.5px;margin-top:6px}
+.step.done{opacity:1}.step.done .k i{background:var(--ok);border-color:var(--ok);
+color:var(--on-accent)}
+.step.active{opacity:1;border-color:var(--accent-line);background:var(--accent-soft)}
+.step.active .k i{border-color:var(--accent);color:var(--accent)}
+.step.failed{opacity:1;border-color:var(--bad);background:color-mix(in srgb,var(--bad) 8%,
+transparent)}
+.step.failed .k i{border-color:var(--bad);color:var(--bad)}
+pre{white-space:pre-wrap;word-break:break-word;background:var(--sunken);
+border:1px solid var(--line);border-radius:10px;padding:12px;font:12px/1.6 var(--mono);
+color:var(--muted);max-height:260px;overflow:auto;margin:8px 0 0}
+pre:empty{display:none}
+@media (max-width:900px){.scan-top{grid-template-columns:auto minmax(0,1fr)}
+.tiles{grid-column:1/-1;gap:var(--s6)}.hero-wave{opacity:.3}}
+@media (max-width:720px){.job-head .titles{flex-basis:100%}
+.hero-home{padding:var(--s7) 0 var(--s5)}
+.hero-home h1{font-size:40px}.lede{font-size:15px;margin-bottom:var(--s5)}
+.hero-wave{right:-40px;width:80vw;height:160px;top:0;opacity:.22}
+.urlbox{flex-wrap:wrap;padding:8px;border-radius:16px}
+.urlbox input{flex-basis:100%;order:-1;padding:0 8px;height:44px}.urlbox .btn{margin-left:auto}
+.opt-grid,.seg{grid-template-columns:1fr}
+.lib-bar{flex-direction:column}.lib-tools{flex:1 1 auto}
+.stats{flex-wrap:wrap}.stat{padding:12px 14px}.stat .big{font-size:22px}
+.mixes{grid-template-columns:1fr}
+.mix-actions{position:static;opacity:1;padding:0 10px 10px;display:flex;
+justify-content:flex-end;margin-top:-6px}
+.mix-actions .link-danger{background:transparent;border:0;min-height:44px}
+.job-head{padding-top:var(--s5)}.scan{padding:var(--s5) var(--s4) var(--s4)}
+.stages{margin-bottom:var(--s5)}.stage{font-size:11.5px;gap:6px;flex-direction:column;
+align-items:flex-start}
+.stage:not(:last-child)::after{position:absolute;left:28px;right:4px;top:10px;margin:0}
+.pct{font-size:56px}.pct small{font-size:22px}.phase-name{font-size:18px}
+.tiles{gap:var(--s5)}.tiles b{font-size:16px}.outcome{padding:var(--s5)}
+.outcome h2{font-size:26px}
+.btn,.link-danger,.opts>summary,.segopt span,.tog,.lib-filter button{min-height:44px}
+.lib-filter{height:auto}
 .tiles{grid-template-columns:1fr 1fr}}
 """
+    + LIGHT_CSS
+)
 
 
 _FORM_JS = """
@@ -769,6 +995,40 @@ _HOME_JS = """
 """
 
 
+#: The library's search box and Free/Deep filter: they only show and hide the cards already on the
+#: page (by their ``data-title`` / ``data-scan``), so nothing is fetched and nothing is stored.
+_LIBRARY_JS = """
+(function(){
+  var search = document.getElementById('lib-search');
+  var cards = document.querySelectorAll('.mixes>.mix'); if(!cards.length) return;
+  var filter = 'all', none = document.getElementById('lib-none');
+  function apply(){
+    var words = (search ? search.value : '').trim().toLowerCase().split(/\\s+/)
+      .filter(function(w){ return w; });
+    var shown = 0;
+    Array.prototype.forEach.call(cards, function(card){
+      var title = card.getAttribute('data-title') || '', scan = card.getAttribute('data-scan');
+      var ok = (filter === 'all' || scan === filter) &&
+        words.every(function(w){ return title.indexOf(w) >= 0; });
+      card.hidden = !ok; if(ok) shown += 1;
+    });
+    if(none) none.hidden = shown > 0;
+  }
+  if(search) search.addEventListener('input', apply);
+  Array.prototype.forEach.call(document.querySelectorAll('.lib-filter button'), function(button){
+    button.addEventListener('click', function(){
+      filter = button.getAttribute('data-filter') || 'all';
+      Array.prototype.forEach.call(document.querySelectorAll('.lib-filter button'), function(b){
+        var on = b === button; b.classList.toggle('on', on);
+        b.setAttribute('aria-pressed', on ? 'true' : 'false');
+      });
+      apply();
+    });
+  });
+})();
+"""
+
+
 _JOB_JS = """
 var STEP_INDEX = {}; STEPS.forEach(function(s, i){ STEP_INDEX[s[0]] = i; });
 var FLAVOUR = {
@@ -813,6 +1073,11 @@ function costSentence(j){
   return "This run's cost record could not be read.";
 }
 var cellCount = 0, lastDone = -1, flavourIx = 0, flavourPhase = '';
+// One cell per clip, but never more than fit the map at a few pixels each (a phone shows fewer).
+function cellTarget(total){
+  var box = document.getElementById('cells'), width = box ? box.clientWidth : 0;
+  return Math.min(total, 240, Math.max(24, Math.floor((width || 960) / 4)));
+}
 var LAST = null, celebrated = false, PROGRESS_MAX = 0;
 function fmt(s){ s = Math.max(0, Math.round(s)); var m = Math.floor(s / 60);
   return m ? (m + 'm ' + (s % 60 < 10 ? '0' : '') + (s % 60) + 's') : (s + 's'); }
@@ -824,7 +1089,7 @@ function colour(t){
 }
 function buildCells(total){
   var box = document.getElementById('cells'); box.innerHTML = ''; box.classList.remove('idle');
-  cellCount = Math.min(total, 240); lastDone = -1;
+  cellCount = cellTarget(total); lastDone = -1;
   for(var i = 0; i < cellCount; i++){
     var c = document.createElement('i'); c.style.setProperty('--c', colour(i / Math.max(1,
   cellCount - 1)));
@@ -842,7 +1107,23 @@ function lightCells(done, total){
   }
   lastDone = lit;
 }
+// The four plain stages: every pipeline phase belongs to one of them.
+var STAGE_OF = {queued: 0, starting: 0, build_index: 0, ingest: 0, decode: 0, windows: 0,
+  recognise: 1, hints: 1, fuse: 2, enrich: 2, present: 2, done: 3};
+function setStages(j){
+  var phase = j.status === 'failed' ? (j.failed_phase || j.phase) : j.phase;
+  var ix = j.status === 'succeeded' ? 4 : (STAGE_OF[phase] !== undefined ? STAGE_OF[phase] : 0);
+  Array.prototype.forEach.call(document.querySelectorAll('.stage'), function(el, i){
+    el.classList.remove('done', 'active', 'failed');
+    el.removeAttribute('aria-current');
+    if(i < ix) el.classList.add('done');
+    else if(i === ix && j.status === 'failed') el.classList.add('failed');
+    else if(i === ix && j.status === 'running'){
+      el.classList.add('active'); el.setAttribute('aria-current', 'step'); }
+  });
+}
 function setSteps(j){
+  setStages(j);
   var phase = j.status === 'failed' ? j.failed_phase : j.phase;
   var ix = STEP_INDEX[phase]; var terminal = j.terminal;
   Array.prototype.forEach.call(document.querySelectorAll('.step'), function(el, i){
@@ -978,6 +1259,13 @@ function render(j){
   PROGRESS_MAX = wallProgress(j, PROGRESS_MAX);
   var pct = PROGRESS_MAX;
   document.getElementById('pct').innerHTML = pct + '<small>%</small>';
+  var fill = document.getElementById('pbar-fill'); if(fill) fill.style.width = pct + '%';
+  // A phase past its expected time holds the bar and says so, calmly, instead of creeping on.
+  var slow = !!j.overrun && !j.terminal;
+  var scan = document.getElementById('scan');
+  scan.classList.toggle('running', j.status === 'running' && !slow);
+  scan.classList.toggle('held', slow);
+  var note = document.getElementById('slow-note'); if(note) note.hidden = !slow;
   var stepIx = STEP_INDEX[j.phase];
   var label = stepIx !== undefined ? STEPS[stepIx][1]
     : (j.phase.charAt(0).toUpperCase() + j.phase.slice(1));
@@ -987,9 +1275,11 @@ function render(j){
   if(j.status === 'queued') msg = 'another analysis is running first';
   document.getElementById('phase-msg').textContent = msg;
   var total = j.windows_total || 0, done = j.windows_done || 0;
-  if(total && total !== cellCount && (cellCount === 0 || Math.min(total,
-  240) !== cellCount)) buildCells(total);
+  if(total && total !== cellCount && (cellCount === 0 || cellTarget(total) !== cellCount))
+    buildCells(total);
   if(total) lightCells(done, total); else document.getElementById('cells').classList.add('idle');
+  var heard = document.getElementById('t-win');
+  if(heard) heard.textContent = total ? done + ' / ' + total + ' clips heard' : '';
   document.getElementById('t-eta').textContent = etaWords(j);
   document.getElementById('t-step').textContent = stepIx !== undefined ?
     (stepIx + 1) + ' of ' + STEPS.length : '—';
@@ -1077,20 +1367,24 @@ def _form_html(prefill: str = "", csrf_token: str = "", *, state: _FormState | N
         '<div class="urlbox">'
         '<span class="plat-ind" id="plat"><span class="pd"></span>'
         '<span id="plat-name">Paste a link</span></span>'
+        '<label class="sr-only" for="url">Mix link or local audio file</label>'
         '<input id="url" name="url" type="text" required autofocus spellcheck="false" '
         f'value="{html.escape(current.url)}" '
         'placeholder="https://soundcloud.com/… — or a local audio file path">'
-        '<button class="btn primary big" type="submit">Analyse</button></div>'
+        '<button class="btn primary big" type="submit">Analyse<svg viewBox="0 0 16 16" '
+        'aria-hidden="true"><path d="M3 8h9M8.5 4.5 12 8l-3.5 3.5" fill="none" '
+        'stroke="currentColor" stroke-width="1.8" stroke-linecap="round" '
+        'stroke-linejoin="round"/></svg></button></div>'
         f'<p class="form-error" id="form-error" role="alert">{html.escape(current.error)}</p>'
         # Step 1 — the only choice most people make, always visible above the fold: Free or Paid.
         '<div class="seg modes" role="radiogroup" aria-label="Mode">'
         f'<label class="segopt"><input type="radio" name="profile" value="free"{free_checked}>'
-        "<span><b>Free scan</b><small>no key needed — identifies tracks and reads the crowd's "
-        "comments</small></span></label>"
+        '<span><b><i class="mode-dot free"></i>Free scan</b><small>no key needed — identifies '
+        "tracks and reads the crowd's comments</small></span></label>"
         f'<label class="segopt"><input type="radio" name="profile" '
         f'value="max_accuracy"{deep_checked}>'
-        "<span><b>Deep scan</b><small>checks more of the set with your configured paid provider; "
-        "provider charges can apply</small></span></label>"
+        '<span><b><i class="mode-dot deep"></i>Deep scan</b><small>checks more of the set '
+        "with your configured paid provider; provider charges can apply</small></span></label>"
         "</div>"
         # Step 2 — everything else, collapsed. Download links default on for both modes; the rest is
         # power-user territory.
@@ -1186,21 +1480,84 @@ def _cost_sentence(
 
 
 def _library_stats_html(sets: list[AnalysedSet]) -> str:
-    """The two useful local-library totals: mixes and tracks identified."""
+    """The library's totals (mixes, tracks identified, music listened to) and its search bar.
+
+    The search and the Free/Deep filter run in the page (``_LIBRARY_JS``) over the cards' own
+    ``data-`` attributes: no request, and nothing to show when there is only one mix.
+    """
 
     if not sets:
         return ""
     summaries = [_set_summary(item) for item in sets]
     tracks = sum(s.tracks for s in summaries if s)
     mixes = len(sets)
+    minutes = sum(s.duration_ms for s in summaries if s) // 60_000
+    hours, rest = divmod(minutes, 60)
+    listened = f"{hours} h {rest:02d} m" if hours else f"{rest} min"
+    tools = ""
+    if mixes > 1:
+        tools = (
+            '<div class="lib-tools" role="search">'
+            '<label class="lib-search"><span class="sr-only">Search your mixes</span>'
+            '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" '
+            'stroke-linecap="round" aria-hidden="true"><circle cx="11" cy="11" r="6.5"/>'
+            '<path d="m16 16 4 4"/></svg>'
+            '<input type="search" id="lib-search" placeholder="Search mixes" autocomplete="off" '
+            'spellcheck="false"></label>'
+            '<div class="lib-filter" role="group" aria-label="Show">'
+            '<button type="button" class="on" data-filter="all" aria-pressed="true">All</button>'
+            '<button type="button" data-filter="free" aria-pressed="false">Free</button>'
+            '<button type="button" data-filter="deep" aria-pressed="false">Deep</button></div>'
+            "</div>"
+        )
     return (
-        '<div class="stats">'
+        '<div class="lib-bar"><div class="stats">'
         f'<div class="stat"><div><span class="big">{mixes}</span>'
         f"<small>mix{'es' if mixes != 1 else ''} analysed</small></div></div>"
         f'<div class="stat"><div><span class="big">{tracks}</span>'
         "<small>tracks identified</small></div></div>"
-        "</div>"
+        f'<div class="stat"><div><span class="big">{html.escape(listened)}</span>'
+        "<small>of music listened to</small></div></div>"
+        f"</div>{tools}</div>"
+        '<p class="lib-none" id="lib-none" hidden>No mix matches that search.</p>'
     )
+
+
+def _set_strip_html(item: AnalysedSet) -> str:
+    """The card's signature: the whole mix as a strip, each identified track a coloured block.
+
+    Read from the same published ``tracklist.json`` as the card's figures, so the strip can only
+    show the rows the result page lists.  Decorative (the card states its figures in words).
+    """
+
+    empty = '<div class="mix-strip empty" aria-hidden="true"></div>'
+    try:
+        document = json.loads(read_text(result_dir(item.media_dir) / "tracklist.json"))
+        duration = int(document.get("duration_ms") or 0)
+        entries = [entry for entry in document.get("entries", ()) if isinstance(entry, dict)]
+    except (OSError, ValueError, TypeError, AttributeError):
+        return empty
+    if duration <= 0:
+        return empty
+    blocks: list[str] = []
+    for entry in entries:
+        try:
+            start = max(0, int(entry.get("start_ms") or 0))
+            end = max(start, int(entry.get("end_ms") or start))
+        except (TypeError, ValueError):
+            continue
+        left = min(100.0, start * 100.0 / duration)
+        width = max(0.35, min(100.0 - left, (end - start) * 100.0 / duration))
+        if entry.get("kind") == "id":
+            kind = "gap"
+        elif entry.get("hint_only"):
+            kind = "crowd"
+        else:
+            kind = str(entry.get("badge") or "unclear")
+            if kind not in BADGE_ORDER:
+                kind = "unclear"
+        blocks.append(f'<i class="s-{kind}" style="left:{left:.2f}%;width:{width:.2f}%"></i>')
+    return f'<div class="mix-strip" aria-hidden="true">{"".join(blocks)}</div>'
 
 
 def _mix_card_html(item: AnalysedSet, csrf_token: str = "") -> str:
@@ -1221,6 +1578,12 @@ def _mix_card_html(item: AnalysedSet, csrf_token: str = "") -> str:
     else:
         meta = '<div class="mix-meta"><span class="go" aria-hidden="true">→</span></div>'
     analysed = datetime.fromtimestamp(item.analysed_at).strftime("%d %b %Y").lstrip("0")
+    deep = bool(summary and summary.achieved == "deep")
+    scan = (
+        '<span class="scan-badge deep">Deep</span>'
+        if deep
+        else '<span class="scan-badge">Free</span>'
+    )
     remove = ""
     if csrf_token:
         remove = (
@@ -1232,11 +1595,14 @@ def _mix_card_html(item: AnalysedSet, csrf_token: str = "") -> str:
             "onclick=\"return confirm('Remove this mix from your library?')\">"
             "Remove</button></form>"
         )
+    search = html.escape(item.title.casefold(), quote=True)
     return (
-        f'<li class="mix"><a class="mix-link" href="{href}">'
-        f'<div class="mix-top">{platform_chip(item.platform)}{duration}</div>'
+        f'<li class="mix" data-title="{search}" data-scan="{"deep" if deep else "free"}">'
+        f'<a class="mix-link" href="{href}">{_set_strip_html(item)}<div class="mix-body">'
+        f'<div class="mix-top">{platform_chip(item.platform)}{scan}{duration}</div>'
         f'<div class="mix-title">{html.escape(item.title)}</div>'
-        f'<div class="conf-text">Analysed {html.escape(analysed)}</div>{meta}</a>{remove}</li>'
+        f'<div class="conf-text">Analysed {html.escape(analysed)}</div>{meta}</div></a>'
+        f"{remove}</li>"
     )
 
 
@@ -1270,13 +1636,15 @@ def _failed_card_html(item: FailedRun, csrf_token: str) -> str:
             '<button class="link-danger" type="submit">Remove</button></form>'
         )
     label = "cancelled" if item.status == "cancelled" else "failed"
+    search = html.escape(item.title.casefold(), quote=True)
     return (
-        f'<li class="mix failed"><span class="st st-{label}">{label}</span>'
+        f'<li class="mix failed" data-title="{search}" data-scan="failed">'
+        f'<div class="mix-body"><div class="mix-top"><span class="st st-{label}">{label}</span>'
+        f'<span class="mono">Tried {html.escape(analysed)}</span></div>'
         f'<div class="mix-title">{html.escape(item.title)}</div>'
-        f'<div class="mix-meta">Tried {html.escape(analysed)}</div>'
-        f'<div class="conf-text">{html.escape(cause + reached)}</div>'
+        f'<div class="conf-text cause">{html.escape(cause + reached)}</div>'
         f'<div class="conf-text">{html.escape(cost)} {html.escape(remedy)}'
-        f"{html.escape(note)}</div>{remove}</li>"
+        f"{html.escape(note)}</div></div>{remove}</li>"
     )
 
 
@@ -1299,7 +1667,10 @@ def _mixes_block(
         if allow_new
         else "<p>Analyse a set from the command line and it will appear here.</p>"
     )
-    return f'<div class="empty"><b>No mixes yet</b>{cta}</div>'
+    return (
+        '<div class="empty"><span class="empty-eq" aria-hidden="true"><i></i><i></i><i></i><i></i>'
+        f"<i></i></span><b>No mixes yet</b>{cta}</div>"
+    )
 
 
 def _activity_item_html(job: Job, csrf_token: str = "") -> str:
@@ -1360,8 +1731,10 @@ def _home_html(
         items = "".join(_activity_item_html(job, csrf_token) for job in active)
         activity = f'<h2 class="sec">Recent analyses</h2><ul class="acts">{items}</ul>'
     body = (
-        topbar_html(back=False, new=True) + '<main class="home"><header class="hero-home">'
-        '<p class="eyebrow">DJ-set track identifier · runs on this machine</p>'
+        topbar_html(back=False, new=True)
+        + '<main class="home"><header class="hero-home">'
+        + HERO_WAVE
+        + '<p class="eyebrow">DJ-set track identifier · runs on this machine</p>'
         '<h1>Drop a mix.<br><span class="grad">Get the tracklist.</span></h1>'
         '<p class="lede">Paste a SoundCloud, YouTube or Mixcloud link. It listens to the set in '
         "short windows, asks the recognition engines what is playing, and hands you a "
@@ -1370,13 +1743,14 @@ def _home_html(
         + '<p class="lede reassurance">You can close this tab while the scan runs.</p>'
         + "</header>"
         + activity
-        + '<h2 class="sec">Your mixes</h2>'
+        + '<section class="library"><h2 class="sec">Your mixes</h2>'
         + _library_stats_html(sets)
         + _mixes_block(sets, csrf_token=csrf_token, failed_runs=failed_runs)
+        + "</section>"
         + _footer_html()
         + "</main>"
     )
-    script = _PROGRESS_JS + _FORM_JS + _HOME_JS
+    script = _PROGRESS_JS + _FORM_JS + _HOME_JS + _LIBRARY_JS
     return _page_shell("ID'er — your mixes", body, script)
 
 
@@ -1504,42 +1878,82 @@ def _outcome_copy_js() -> dict[str, list[str]]:
     return {key: list(value) for key, value in _OUTCOME_COPY.items()}
 
 
+#: The progress page's four plain stages; every pipeline phase belongs to one of them.
+JOB_STAGES: tuple[tuple[str, str], ...] = (
+    ("fetch", "Fetch"),
+    ("listen", "Listen"),
+    ("decide", "Decide"),
+    ("done", "Done"),
+)
+
+
+def _scan_html() -> str:
+    """The live progress card: stage stepper, the percentage and phase, the bar, the tiles, the
+    listening map, and the calm "taking longer than usual" note (shown only on a real overrun)."""
+
+    stages = "".join(
+        f'<li class="stage" data-stage="{key}"><i aria-hidden="true"></i><span>{name}</span></li>'
+        for key, name in JOB_STAGES
+    )
+    return (
+        '<section class="scan" id="scan">'
+        f'<ol class="stages" id="stages" aria-label="Stages">{stages}</ol>'
+        '<div class="scan-top"><div class="pct" id="pct">0<small>%</small></div>'
+        '<div class="phase-line" aria-live="polite"><div class="phase-name" id="phase-name">'
+        'Starting</div><div class="phase-msg" id="phase-msg"></div></div>'
+        '<div class="tiles"><span><b id="t-eta">…</b>time left</span>'
+        '<span><b id="t-elapsed">—</b>elapsed</span>'
+        '<span><b id="t-step">—</b>progress</span></div></div>'
+        '<div class="pbar" id="pbar" aria-hidden="true"><span id="pbar-fill"></span></div>'
+        '<div class="cells-wrap"><div class="cells-k"><span>Listening map</span>'
+        '<span id="t-win"></span></div>'
+        '<div class="cells idle" id="cells" aria-hidden="true"></div></div>'
+        '<p class="slow-note" id="slow-note" role="status" hidden><b>Taking longer than '
+        "usual.</b> <span>Nothing is wrong — the bar is holding until this step finishes."
+        "</span></p>"
+        '<p class="flavour" id="flavour"></p>'
+        '<p class="reassurance">You can close this tab — the scan will keep running.</p>'
+        "</section>"
+    )
+
+
+def _outcome_html() -> str:
+    return (
+        '<section class="outcome" id="outcome"><div class="confetti" id="confetti"></div>'
+        '<h2 id="o-title"></h2><p id="o-sub"></p><pre class="err" id="o-err"></pre>'
+        '<div class="row" id="o-row"></div></section>'
+    )
+
+
+def _steps_html(steps: list[tuple[str, str, str]]) -> str:
+    """Every pipeline step, in order: the detail behind the four stages (inside the log panel)."""
+
+    items = "".join(
+        f'<div class="step" data-step="{html.escape(key)}"><div class="k"><i>{n}</i>'
+        f"{html.escape(name)}</div><small>{html.escape(sub)}</small></div>"
+        for n, (key, name, sub) in enumerate(steps, start=1)
+    )
+    return f'<div class="steps">{items}</div>'
+
+
 def _job_page_html(job: Job, csrf_token: str = "") -> bytes:
     label = html.escape(_job_title(job))
     plan = plan_embed_from_url(job.target)
     platform = plan.kind if plan.kind in ("soundcloud", "youtube", "mixcloud") else "file"
     steps = _job_steps(job)
-    steps_html = "".join(
-        f'<div class="step" data-step="{html.escape(key)}"><div class="k"><i>{n}</i>'
-        f"{html.escape(name)}</div><small>{html.escape(sub)}</small></div>"
-        for n, (key, name, sub) in enumerate(steps, start=1)
-    )
-    tiles = (
-        '<div class="tiles"><span><b id="t-eta">…</b>time left</span>'
-        '<span><b id="t-step">—</b>progress</span></div>'
-    )
     body = (
-        topbar_html(back=True, new=True) + '<main><header class="job-head"><div class="titles">'
-        '<p class="eyebrow" id="eyebrow">Analysing</p>'
+        topbar_html(back=True, new=True) + '<main class="job"><header class="job-head">'
+        '<div class="titles"><p class="eyebrow" id="eyebrow">Analysing</p>'
         f'<h1 id="title">{label}</h1>'
         f"{platform_chip(platform)}</div>"
         '<div class="job-actions"><span class="st" id="status">…</span>'
         '<button class="btn danger" id="cancel" type="button">Cancel</button></div></header>'
+        + _scan_html()
+        + _outcome_html()
         + _job_player_html(plan, job)
-        + '<section class="scan" id="scan" aria-live="polite"><div class="scan-top">'
-        '<div class="pct" id="pct">0<small>%</small></div>'
-        '<div class="phase-line"><div class="phase-name" id="phase-name">Starting</div>'
-        '<div class="phase-msg" id="phase-msg"></div></div>' + tiles + "</div>"
-        '<div class="cells idle" id="cells" aria-hidden="true"></div>'
-        '<p class="flavour" id="flavour"></p>'
-        '<p class="reassurance">You can close this tab — the scan will keep running.</p>'
-        '<details class="elapsed"><summary>Timing details</summary>'
-        '<span><b id="t-elapsed">—</b> elapsed</span></details></section>'
-        '<section class="outcome" id="outcome"><div class="confetti" id="confetti"></div>'
-        '<h2 id="o-title"></h2><p id="o-sub"></p><pre class="err" id="o-err"></pre>'
-        '<div class="row" id="o-row"></div></section>'
-        f'<div class="steps">{steps_html}</div>'
-        '<details class="log"><summary>Show the log</summary><pre id="log"></pre></details>'
+        + '<details class="log"><summary>Steps and log</summary>'
+        + _steps_html(steps)
+        + '<pre id="log"></pre></details>'
         + _footer_html()
         + "</main>"
     )

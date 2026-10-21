@@ -36,7 +36,13 @@ from id_detector.present.exports import (
     build_projection,
     comment_credit_text,
 )
-from id_detector.present.theme import PLATFORM_NAMES, head_html, topbar_html
+from id_detector.present.theme import (
+    LIGHT_CSS,
+    PLATFORM_NAMES,
+    THEME_JS,
+    head_html,
+    topbar_html,
+)
 
 #: Default seek lead-in.  The page exposes a control to change it live; this is the seed value and
 #: the value the seek-correctness test pins.
@@ -48,7 +54,7 @@ UNRESOLVED_CAP_MS = 120_000
 #: Bump when the page's look or behaviour changes: ``present.refresh.ensure_fresh_page`` re-renders
 #: any written page whose ``<meta name="id-detector-page">`` stamp is older, so already-analysed
 #: mixes pick up the new page the next time they are opened (no re-analysis).
-PAGE_VERSION = 27
+PAGE_VERSION = 28
 
 
 # --------------------------------------------------------------------------------------------------
@@ -459,6 +465,13 @@ def _tags_html(entry: dict[str, Any]) -> str:
     return f'<span class="tags">{tag}</span>' if tag else ""
 
 
+#: The small play glyph a row's time button shows on hover (decorative; the button is labelled).
+_PLAY_ICON = (
+    '<svg class="pi" viewBox="0 0 10 10" aria-hidden="true"><path d="M2 1.2v7.6L8.6 5z" '
+    'fill="currentColor"/></svg>'
+)
+
+
 def _track_row_html(
     entry: dict[str, Any],
     platform: str | None = None,
@@ -489,12 +502,13 @@ def _track_row_html(
         f'<td class="time" data-label="Time"><button type="button" class="seek" '
         f'aria-label="Play from {_esc(_format_time(best_start))} — {label}">'
         '<span class="eqi" aria-hidden="true"><i></i><i></i><i></i></span>'
-        f"{_esc(_format_time(best_start))}</button></td>"
+        f"{_PLAY_ICON}{_esc(_format_time(best_start))}</button></td>"
         f'<td class="badge badge-{badge}" data-label="Confidence"><span class="pill">'
         f"{badge_label}</span></td>"
-        f'<td class="label" data-label="Track"><span class="ar">{_esc(entry["artist"])}</span>'
+        f'<td class="label" data-label="Track"><div class="trk">'
+        f'<span class="ar">{_esc(entry["artist"])}</span>'
         f'<span class="sep">—</span><span class="tt">{_esc(entry["title"])}</span>'
-        f"{_tags_html(entry)}{alternatives}</td>"
+        f"{_tags_html(entry)}{alternatives}</div></td>"
         f"{acquire_cell}"
         f'<td class="ops" data-label="Save">{row_actions_html(entry) if not hidden else ""}</td>'
         "</tr>"
@@ -521,8 +535,79 @@ def _gap_row_html(entry: dict[str, Any], *, show_acquire: bool = True) -> str:
     )
 
 
-def _timeline_html(lanes: list[dict[str, Any]], gaps: list[dict[str, Any]]) -> str:
-    parts: list[str] = ['<div class="timeline" aria-hidden="true">']
+#: A timeline segment is labelled in place only when it is at least this wide (percent of the set);
+#: a narrower one would show a few clipped letters, so it relies on its tooltip instead.
+_SEGMENT_LABEL_MIN_PCT = 4.5
+_BADGE_WORDS = {"verified": "Verified", "likely": "Likely", "possible": "Possible"}
+
+
+def _segments(track_entries: list[dict[str, Any]], duration_ms: int) -> list[dict[str, Any]]:
+    """One timeline block per shown track: from its start to its end, cut at the next track.
+
+    The blocks are the mix at a glance — each identified track as a coloured stretch, so the gaps
+    between them (music nothing identified) stay visibly empty rather than being painted over.
+    """
+
+    ordered = sorted(
+        track_entries, key=lambda entry: (int(entry["start_ms"]), str(entry["episode_id"]))
+    )
+    segments: list[dict[str, Any]] = []
+    for index, entry in enumerate(ordered):
+        start = int(entry["start_ms"])
+        end = max(start, int(entry["end_ms"]))
+        following = [int(other["start_ms"]) for other in ordered[index + 1 :]]
+        later = [value for value in following if value > start]
+        if later:
+            end = min(end, later[0])
+        left, width = _band(start, end, duration_ms)
+        crowd = bool(entry.get("hint_only"))
+        badge = "comments" if crowd else str(entry["badge"])
+        word = "From comments" if crowd else _BADGE_WORDS.get(badge, "Unclear")
+        segments.append(
+            {
+                "id": str(entry["episode_id"]),
+                "left": left,
+                "width": width,
+                "badge": str(entry["badge"]),
+                "crowd": crowd,
+                "artist": str(entry["artist"]),
+                "title": str(entry["title"]),
+                "word": word,
+                "span": f"{_format_time(start)} – {_format_time(end)}",
+                "start": _format_time(start),
+            }
+        )
+    return segments
+
+
+def _segments_html(segments: list[dict[str, Any]]) -> str:
+    """The keyboard-reachable track blocks: one tab stop, arrows walk them, Enter plays one."""
+
+    parts = ['<div class="tl-segs" role="group" aria-label="Tracks on the timeline">']
+    for index, seg in enumerate(segments):
+        label = (
+            f"<span>{_esc(seg['title'])}</span>" if seg["width"] >= _SEGMENT_LABEL_MIN_PCT else ""
+        )
+        crowd = ' data-crowd="1"' if seg["crowd"] else ""
+        parts.append(
+            f'<button type="button" class="tl-seg" data-seg="{_esc(seg["id"])}" '
+            f'data-badge="{_esc(seg["badge"])}"{crowd} tabindex="{0 if index == 0 else -1}" '
+            f'style="left:{seg["left"]:.3f}%;width:{seg["width"]:.3f}%" '
+            f'data-title="{_esc(seg["title"])}" data-artist="{_esc(seg["artist"])}" '
+            f'data-word="{_esc(seg["word"])}" data-span="{_esc(seg["span"])}" '
+            f'aria-label="{_esc(seg["start"])} — {_esc(seg["artist"])} — {_esc(seg["title"])}, '
+            f'{_esc(seg["word"].lower())}">{label}</button>'
+        )
+    parts.append("</div>")
+    return "".join(parts)
+
+
+def _timeline_html(
+    lanes: list[dict[str, Any]],
+    gaps: list[dict[str, Any]],
+    segments: list[dict[str, Any]] | None = None,
+) -> str:
+    parts: list[str] = ['<div class="timeline">']
     for gap in gaps:
         # U-F31: "windows", "no-match" and "error" are engine bookkeeping.  What a listener needs
         # from a striped span is which part of the set it covers.
@@ -532,7 +617,7 @@ def _timeline_html(lanes: list[dict[str, Any]], gaps: list[dict[str, Any]]) -> s
         )
         parts.append(
             f'<div class="tl-gap" style="left:{gap["left"]:.3f}%;width:{gap["width"]:.3f}%" '
-            f'title="{_esc(title)}"></div>'
+            f'title="{_esc(title)}" aria-hidden="true"></div>'
         )
     for lane in lanes:
         ext = lane["extent"]
@@ -550,7 +635,7 @@ def _timeline_html(lanes: list[dict[str, Any]], gaps: list[dict[str, Any]]) -> s
         parts.append(
             f'<div class="tl-lane" data-episode-id="{_esc(lane["episode_id"])}" '
             f'data-badge="{_esc(lane["badge"])}"{flags} '
-            f'title="{_esc(title)}">'
+            f'title="{_esc(title)}" aria-hidden="true">'
         )
         if lane.get("comment_confirmed"):
             parts.append(
@@ -580,6 +665,8 @@ def _timeline_html(lanes: list[dict[str, Any]], gaps: list[dict[str, Any]]) -> s
     # Live playhead: an absolutely-positioned vertical line that tracks the embedded player.  It
     # starts hidden and is revealed by the first position event; ``pointer-events:none`` lets clicks
     # fall through to the timeline's click-to-seek handler.
+    parts.append(_segments_html(segments or []))
+    parts.append('<div class="tl-hover" id="tl-hover" aria-hidden="true"></div>')
     parts.append(
         '<div class="playhead" id="playhead" hidden aria-hidden="true">'
         '<span class="playhead-time" id="playhead-time"></span></div>'
@@ -786,252 +873,384 @@ def _embed_html(embed: EmbedPlan, audio_src: str | None = None) -> str:
 
 
 # The page-specific styles; the shared tokens, top bar, buttons and chips come from ``theme``.
-_CSS = """
-:root{--dim:#9a9ab0;--unclear:#a3a3bd;--pi:#a78bfa;--unresolved:#fbbf24;
---extent:#9a9ab0;--on-accent:#0a0a0f}
-@media (prefers-color-scheme:light){:root{color-scheme:light;--bg:#f7f7fb;--card:#fff;
---card2:#f0f0f7;--fg:#17171f;--muted:#505064;--dim:#5e5e72;--line:#0000001f;
---line2:#00000038;--pink:#be185d;--violet:#6d28d9;--cyan:#0e7490;--accent:#6d28d9;
---verified:#047857;--likely:#0369a1;--possible:#92400e;--unclear:#52525b;--gap:#be123c;
---ok:#047857;--bad:#be123c;--warn:#92400e;--on-accent:#fff}}
-.btn.primary{color:var(--on-accent)}
+_CSS = (
+    """
+:root{--pi:#a78bfa;--unresolved:#fbbf24;--extent:#9a9ab0}
 /* hero */
-.hero{padding:26px 0 18px}
-.meta{display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-bottom:12px}
-h1{font:800 clamp(28px,4.2vw,44px)/1.08 var(--display);letter-spacing:-.03em;margin:0 0 20px;
-max-width:24ch}
-.stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:12px}
-.run-banner{border:1px solid var(--possible);border-radius:12px;padding:11px 14px;margin:0 0 14px;
-color:var(--fg);background:color-mix(in srgb,var(--possible) 10%,var(--card))}
-.stat{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:14px 16px;
-display:flex;align-items:center;gap:14px;min-height:84px;position:relative;overflow:hidden}
-.stat::after{content:"";position:absolute;inset:0;pointer-events:none;
-background:linear-gradient(180deg,#ffffff06,transparent)}
-.stat .big{font:800 34px/1 var(--display);letter-spacing:-.03em;font-variant-numeric:tabular-nums}
-.stat small{display:block;color:var(--muted);font-size:12px;margin-top:4px}
-.ring{position:relative;width:56px;height:56px;flex:none}
-.ring svg{width:56px;height:56px;transform:rotate(-90deg)}
-.ring circle{fill:none;stroke-width:3.4}
-.ring .bg{stroke:#ffffff14}
+.hero{padding:var(--s7) 0 var(--s5);animation:rise var(--t3) var(--ease) both}
+.meta{display:flex;gap:var(--s2);flex-wrap:wrap;align-items:center;margin-bottom:var(--s4)}
+h1{font:780 clamp(30px,4.4vw,50px)/1.05 var(--display);letter-spacing:-.035em;
+margin:0 0 var(--s6);max-width:24ch;overflow-wrap:anywhere}
+.run-banner{display:flex;gap:var(--s2);flex-wrap:wrap;align-items:baseline;
+border:1px solid color-mix(in srgb,var(--possible) 45%,transparent);border-radius:var(--r2);
+padding:12px 16px;margin:0 0 var(--s4);color:var(--fg);
+background:color-mix(in srgb,var(--possible) 9%,var(--card))}
+.run-banner b{color:var(--possible)}
+.stats{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));background:var(--card);
+border:1px solid var(--line);border-radius:var(--r3);box-shadow:var(--sh2);overflow:hidden}
+.stat{display:flex;align-items:center;gap:var(--s4);padding:var(--s5) var(--s6);min-height:98px;
+position:relative}
+.stat+.stat{border-left:1px solid var(--line)}
+.stat .big{font:780 38px/1 var(--display);letter-spacing:-.04em;font-variant-numeric:tabular-nums}
+.stat small{display:block;color:var(--muted);font-size:12.5px;margin-top:7px}
+.stat>div>b{font:600 14px/1.3 var(--text);color:var(--fg)}
+.ring{position:relative;width:60px;height:60px;flex:none}
+.ring svg{width:60px;height:60px;transform:rotate(-90deg)}
+.ring circle{fill:none;stroke-width:3.2}
+.ring .bg{stroke:var(--track)}
 .ring .fg{stroke:url(#ringgrad);stroke-linecap:round;stroke-dasharray:var(--p) 100;
-animation:ring 1.1s cubic-bezier(.2,.8,.2,1) both}
+animation:ring 1.1s var(--ease) both}
 @keyframes ring{from{stroke-dasharray:0 100}}
-.ring b{position:absolute;inset:0;display:grid;place-items:center;font:700 13px/1 var(--display);
+.ring b{position:absolute;inset:0;display:grid;place-items:center;font:700 14px/1 var(--display);
 font-variant-numeric:tabular-nums}
-.conf{flex:1}
-.conf-bar{display:flex;height:10px;border-radius:6px;overflow:hidden;background:#ffffff10;gap:2px}
-.conf-bar i{display:block;height:100%;min-width:0}
-.c-verified{background:var(--verified)}.c-likely{background:var(--likely)}
-.c-possible{background:var(--possible)}.c-unclear{background:var(--unclear)}
-.conf-key{display:flex;gap:10px;flex-wrap:wrap;margin-top:8px;font-size:11px;color:var(--muted);
-font-variant-numeric:tabular-nums}
-.conf-key span::before{content:"";display:inline-block;width:7px;height:7px;border-radius:50%;
-margin-right:5px;background:var(--k)}
-.confidence-summary{display:grid;grid-template-columns:auto minmax(100px,220px) auto;gap:10px;
-align-items:center;color:var(--muted);font-size:12px;margin:10px 0 14px}
-.confidence-summary b{color:var(--fg)}
-/* player + exports */
-.player{background:var(--card);border:1px solid var(--line);border-radius:16px;padding:14px;
-margin:18px 0 14px;box-shadow:0 20px 50px -30px rgba(0,0,0,.9)}
-.localplayer{width:100%;display:block;border-radius:10px}
-.player iframe{display:block;border-radius:10px;border:0}
-.yt{aspect-ratio:16/9;width:100%;border-radius:10px;overflow:hidden;background:#000}
-.yt iframe,iframe#yt-player{width:100%;height:100%;aspect-ratio:16/9}
-.fallback{margin-top:10px;font-size:13px;display:flex;align-items:center;gap:10px;flex-wrap:wrap}
-.noembed{padding:18px 6px;color:var(--muted)}
-.setlink{display:inline-flex;align-items:center;gap:6px;color:var(--fg);
-border:1px solid var(--line2);
-border-radius:999px;padding:5px 12px;font-size:12px;font-weight:600;background:#ffffff08}
-.setlink:hover{text-decoration:none;background:#ffffff12}
-.exports{display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin:0 0 6px}
-.exports .lbl{font-size:11px;color:var(--dim);text-transform:uppercase;letter-spacing:.12em;
-font-weight:700;margin-right:4px}
-.xbtn{display:inline-flex;align-items:center;gap:6px;font:600 12px/1 var(--text);color:var(--muted);
-border:1px solid var(--line);border-radius:8px;padding:7px 10px;background:transparent;
-cursor:pointer;transition:color .12s,border-color .12s,background .12s}
-.xbtn:hover{color:var(--fg);border-color:var(--line2);background:#ffffff08;text-decoration:none}
-.xbtn.copy{color:var(--fg);border-color:var(--line2)}
-/* timeline */
-.tl-wrap{background:var(--card);border:1px solid var(--line);border-radius:16px;
-padding:14px 16px 10px;margin:14px 0}
-.tl-head{display:flex;align-items:center;gap:14px;margin-bottom:10px;flex-wrap:wrap}
-.tl-head h2{font:700 12px/1 var(--display);letter-spacing:.14em;text-transform:uppercase;
-color:var(--muted);margin:0;flex:1}
-.controls{font-size:12px;color:var(--muted)}
-.controls summary{cursor:pointer;padding:8px;border-radius:8px}.controls div{display:flex;gap:8px;
-align-items:center;margin-top:8px}
-.controls input{width:64px;padding:5px 8px;border:1px solid var(--line2);border-radius:8px;
-background:#ffffff08;color:var(--fg);font:inherit;font-variant-numeric:tabular-nums;
+/* the deck: transport, timeline, ruler, legend */
+.deck{margin:var(--s5) 0 0;background:var(--card);border:1px solid var(--line);
+border-radius:var(--r4);box-shadow:var(--sh2);padding:var(--s4) var(--s5) var(--s3);
+position:relative}
+@media (min-width:900px) and (min-height:720px){.deck{position:sticky;top:72px;z-index:30;
+box-shadow:var(--sh3)}}
+.transport{display:flex;align-items:center;gap:var(--s3);margin-bottom:var(--s4);min-height:48px}
+.tp-btn{flex:none;display:inline-grid;place-items:center;width:38px;height:38px;border-radius:50%;
+border:1px solid var(--line2);background:var(--hover);color:var(--fg);cursor:pointer;padding:0;
+transition:background-color var(--t1) var(--ease),transform var(--t1) var(--ease),
+border-color var(--t1) var(--ease)}
+.tp-btn:hover{background:var(--hover2);border-color:var(--line3)}
+.tp-btn:active{transform:scale(.96)}
+.tp-btn svg{width:16px;height:16px}
+.tp-play{width:48px;height:48px;border:0;background:var(--grad);color:var(--on-accent);
+box-shadow:0 10px 26px -12px #8b5cf6f2,0 0 0 1px #ffffff26 inset}
+.tp-play:hover{filter:brightness(1.08);background:var(--grad)}
+.tp-play svg{width:18px;height:18px}
+.tp-play .i-pause,.is-playing .tp-play .i-play{display:none}
+.is-playing .tp-play .i-pause{display:block}
+.tp-time{flex:none;font:600 13px/1 var(--mono);font-variant-numeric:tabular-nums;
+color:var(--dim);margin-left:var(--s1)}
+.tp-time b{color:var(--fg);font-weight:600}
+.tp-now{flex:1;min-width:0;display:flex;align-items:center;gap:10px;padding-left:var(--s3);
+border-left:1px solid var(--line);margin-left:var(--s2);min-height:34px}
+.tp-now .k{flex:none;font:700 10px/1 var(--display);letter-spacing:.14em;color:var(--pink);
+padding:5px 7px;border:1px solid color-mix(in srgb,var(--pink) 50%,transparent);border-radius:6px;
+background:color-mix(in srgb,var(--pink) 9%,transparent)}
+.tp-now .l{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-weight:600}
+.tp-now .l small{color:var(--muted);font-weight:500;margin-left:6px}
+.tp-now.idle .k{color:var(--dim);border-color:var(--line2);background:none}
+.tp-now.idle .l{color:var(--dim);font-weight:500}
+.controls{flex:none;font-size:12.5px;color:var(--muted);position:relative}
+.controls>summary{list-style:none;cursor:pointer;display:inline-flex;align-items:center;gap:6px;
+height:34px;padding:0 12px;border-radius:10px;border:1px solid var(--line2);
+transition:background-color var(--t1) var(--ease),color var(--t1) var(--ease)}
+.controls>summary::-webkit-details-marker{display:none}
+.controls>summary:hover,.controls[open]>summary{color:var(--fg);background:var(--hover)}
+.controls>summary svg{width:15px;height:15px}
+.controls>div{position:absolute;right:0;top:calc(100% + 8px);z-index:35;display:flex;gap:8px;
+align-items:center;white-space:nowrap;background:var(--raise);border:1px solid var(--line2);
+border-radius:var(--r2);padding:12px 14px;box-shadow:var(--sh3);animation:fade var(--t2) both}
+.controls input{width:64px;height:34px;padding:0 8px;border:1px solid var(--line2);
+border-radius:8px;background:var(--hover);color:var(--fg);font-variant-numeric:tabular-nums;
 text-align:center}
-.controls input:focus{outline:none;border-color:var(--accent);
-box-shadow:0 0 0 3px rgba(167,139,250,.25)}
-.timeline{position:relative;height:76px;background:#0c0c13;border:1px solid var(--line);
-border-radius:10px;overflow:hidden;cursor:crosshair;
+.controls input:focus{border-color:var(--accent);box-shadow:0 0 0 3px var(--accent-soft)}
+.player{margin:0 0 var(--s3)}
+.player.enhanced .localplayer{display:none}
+.localplayer{width:100%;display:block;height:40px;border-radius:var(--r2)}
+.player iframe{display:block;border-radius:var(--r2);border:0}
+.yt{aspect-ratio:16/9;width:100%;border-radius:var(--r2);overflow:hidden;background:#000}
+.yt iframe,iframe#yt-player{width:100%;height:100%;aspect-ratio:16/9}
+.fallback{margin-top:var(--s2);font-size:13px;display:flex;align-items:center;gap:10px;
+flex-wrap:wrap}
+.player.enhanced .fallback{display:none}
+.noembed{padding:var(--s3) 2px;color:var(--muted)}
+.setlink{display:inline-flex;align-items:center;gap:6px;color:var(--muted);height:28px;
+border:1px solid var(--line2);border-radius:var(--pill);padding:0 12px;font-size:12px;
+font-weight:600;background:transparent;transition:color var(--t1),background-color var(--t1)}
+.setlink:hover{text-decoration:none;color:var(--fg);background:var(--hover)}
+.tl-wrap{position:relative}
+.timeline{position:relative;height:82px;background:var(--sunken);border:1px solid var(--line);
+border-radius:var(--r2);overflow:hidden;cursor:pointer;
 background-image:repeating-linear-gradient(90deg,transparent 0 calc(10% - 1px),
-#ffffff0a calc(10% - 1px) 10%)}
+var(--line) calc(10% - 1px) 10%)}
+.tl-gap{position:absolute;top:0;height:100%;pointer-events:none;
+background:repeating-linear-gradient(135deg,color-mix(in srgb,var(--gap) 26%,transparent) 0 5px,
+transparent 5px 10px)}
+.tl-segs{position:absolute;left:0;right:0;top:18px;height:40px}
+.tl-seg{position:absolute;top:0;height:100%;margin:0;padding:0 6px 0 9px;border:0;
+border-radius:7px;display:flex;align-items:center;min-width:3px;cursor:pointer;color:var(--fg);
+font:600 11.5px/1.2 var(--text);text-align:left;overflow:hidden;white-space:nowrap;
+--sc:var(--unclear);background:color-mix(in srgb,var(--sc) 26%,var(--sunken));
+box-shadow:inset 0 0 0 1px color-mix(in srgb,var(--sc) 50%,transparent);
+transition:background-color var(--t1) var(--ease),box-shadow var(--t2) var(--ease)}
+.tl-seg::before{content:"";position:absolute;left:0;top:0;bottom:0;width:3px;background:var(--sc)}
+.tl-seg span{display:block;overflow:hidden;text-overflow:ellipsis;pointer-events:none}
+.tl-seg[data-badge=verified]{--sc:var(--verified)}.tl-seg[data-badge=likely]{--sc:var(--likely)}
+.tl-seg[data-badge=possible]{--sc:var(--possible)}.tl-seg[data-badge=unclear]{--sc:var(--unclear)}
+.tl-seg[data-crowd="1"]{--sc:var(--accent);background:transparent;
+box-shadow:none;border:1.5px dashed color-mix(in srgb,var(--accent) 75%,transparent)}
+.tl-seg[data-crowd="1"]::before{display:none}
+.tl-seg:hover,.tl-seg.hover,.tl-seg:focus-visible{z-index:3;
+background:color-mix(in srgb,var(--sc) 42%,var(--sunken))}
+.tl-seg:focus-visible{outline:2px solid var(--fg);outline-offset:1px}
+.tl-seg.current{z-index:2;background:color-mix(in srgb,var(--sc) 52%,var(--sunken));
+box-shadow:inset 0 0 0 1.5px var(--sc),0 0 22px -6px var(--sc)}
 .tl-lane{position:absolute;top:0;height:100%;left:0;width:100%;pointer-events:none;
 --lc:var(--unclear)}
 .tl-lane[data-badge="verified"]{--lc:var(--verified)}
 .tl-lane[data-badge="likely"]{--lc:var(--likely)}
 .tl-lane[data-badge="possible"]{--lc:var(--possible)}
 .tl-lane[data-badge="unclear"]{--lc:var(--unclear)}
-.tl-extent{position:absolute;top:22px;height:30px;background:var(--lc);opacity:.22;
-border-radius:5px;transition:opacity .15s}
-.tl-solid{position:absolute;top:24px;height:26px;background:var(--lc);border-radius:4px;
-box-shadow:0 0 12px -3px var(--lc);transition:filter .15s;pointer-events:auto}
-.tl-comment{position:absolute;top:4px;transform:translateX(-2px);z-index:3;white-space:nowrap;
-font:700 8px/1 var(--display);letter-spacing:.04em;text-transform:uppercase;color:var(--accent);
-border:1px solid var(--accent);border-radius:4px;padding:2px 4px;background:#0c0c13}
-.tl-pi{position:absolute;top:22px;height:30px;background:var(--pi);opacity:.4;border-radius:5px}
-.tl-unresolved{position:absolute;top:22px;height:30px;border-radius:5px;opacity:.75;
-background:repeating-linear-gradient(45deg,var(--unresolved),var(--unresolved) 3px,
-transparent 3px,transparent 8px)}
-.tl-gap{position:absolute;top:0;height:100%;pointer-events:none;
-background:repeating-linear-gradient(135deg,rgba(251,113,133,.28) 0 6px,
-rgba(251,113,133,.06) 6px 12px)}
-.tl-lane.current .tl-extent,.tl-lane.hover .tl-extent{opacity:.5}
-.tl-lane.current .tl-solid{box-shadow:0 0 0 2px #fff,0 0 18px var(--lc);z-index:2}
-.tl-lane.hover .tl-solid{filter:brightness(1.35)}
-.playhead{position:absolute;top:0;left:0;height:100%;width:2px;background:var(--pink);z-index:4;
-pointer-events:none;box-shadow:0 0 10px var(--pink),0 0 2px #fff}
-.playhead[hidden]{display:none}
-.playhead-time{position:absolute;top:4px;left:5px;font:700 10px/1.4 var(--mono);
-font-variant-numeric:tabular-nums;background:var(--pink);color:var(--on-accent);border-radius:4px;
-padding:1px 5px;white-space:nowrap;box-shadow:0 2px 8px rgba(0,0,0,.4)}
-.ruler{position:relative;height:18px;margin:4px 2px 0;font:10px/1 var(--mono);color:var(--dim);
-font-variant-numeric:tabular-nums}
-.ruler span{position:absolute;top:2px;transform:translateX(-50%)}
-.ruler span::before{content:"";position:absolute;left:50%;top:-6px;width:1px;height:4px;
-background:var(--dim)}
-.legend{display:flex;gap:6px 14px;flex-wrap:wrap;color:var(--muted);font-size:11px;margin-top:8px;
-padding-top:8px;border-top:1px solid var(--line)}
-.legend span{display:inline-flex;align-items:center;gap:6px}
-.legend span::before{content:"";display:inline-block;width:14px;height:8px;border-radius:2px}
-.lg-solid::before{background:linear-gradient(90deg,var(--verified),var(--likely),var(--possible),
-var(--unclear))}
-.lg-extent::before{background:var(--extent);opacity:.35}
-.lg-pi::before{background:var(--pi);opacity:.6}
-.lg-unresolved::before{background:repeating-linear-gradient(45deg,var(--unresolved),
+.tl-extent{display:none}
+.tl-solid,.tl-pi,.tl-unresolved{position:absolute;top:auto;bottom:9px;height:6px;border-radius:3px}
+.tl-solid{background:var(--lc);opacity:.85}
+.tl-pi{background:var(--pi);opacity:.45}
+.tl-unresolved{opacity:.3;background:repeating-linear-gradient(45deg,var(--unresolved),
 var(--unresolved) 2px,transparent 2px,transparent 5px)}
-.lg-gap::before{background:repeating-linear-gradient(135deg,rgba(251,113,133,.6) 0 3px,
-transparent 3px 6px)}
-.timeline-label{min-height:18px;color:var(--muted);font-size:12px;margin-top:6px}
+.tl-lane.current .tl-solid{opacity:1;box-shadow:0 0 10px var(--lc)}
+.tl-lane.hover .tl-solid{opacity:1;filter:brightness(1.25)}
+.tl-lane[data-crowd="1"] .tl-solid{background:transparent;border:1px dashed var(--lc);opacity:.8}
+.tl-comment{position:absolute;top:3px;transform:translateX(1px);z-index:3;white-space:nowrap;
+font:700 8.5px/1 var(--display);letter-spacing:.06em;text-transform:uppercase;
+color:var(--accent);border:1px solid var(--accent-line);border-radius:4px;padding:2px 4px;
+background:var(--sunken)}
+.tl-hover{position:absolute;top:0;bottom:0;left:0;width:1px;background:var(--line3);z-index:4;
+pointer-events:none;opacity:0;transition:opacity var(--t1)}
+.timeline:hover .tl-hover{opacity:1}
+.playhead{position:absolute;top:0;left:0;height:100%;width:2px;margin-left:-1px;
+background:var(--fg);z-index:5;pointer-events:none;
+box-shadow:0 0 0 1px #00000040,0 0 14px var(--pink)}
+.playhead[hidden]{display:none}
+.playhead-time{position:absolute;top:2px;left:5px;font:700 10px/1.5 var(--mono);
+font-variant-numeric:tabular-nums;background:var(--pink);color:var(--on-accent);
+border-radius:4px;padding:0 5px;white-space:nowrap}
+.tl-tip{position:absolute;left:0;bottom:calc(100% + 10px);z-index:45;transform:translateX(-50%);
+min-width:180px;max-width:min(380px,92vw);background:var(--raise);color:var(--fg);
+border:1px solid var(--line2);border-radius:var(--r2);padding:10px 12px;box-shadow:var(--sh3);
+font-size:12.5px;line-height:1.4;pointer-events:none;opacity:0;
+transition:opacity var(--t1) var(--ease)}
+.tl-tip.show{opacity:1}
+.tl-tip b{display:block;font-weight:650;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.tl-tip span{display:block;color:var(--muted);overflow:hidden;text-overflow:ellipsis;
+white-space:nowrap}
+.tl-tip em{display:flex;gap:8px;align-items:center;margin-top:6px;font-style:normal;
+font:600 11px/1 var(--mono);color:var(--dim);font-variant-numeric:tabular-nums}
+.tl-tip em i{font:700 9.5px/1 var(--display);letter-spacing:.08em;text-transform:uppercase;
+font-style:normal;color:var(--bc);padding:3px 6px;border-radius:5px;
+border:1px solid color-mix(in srgb,var(--bc) 40%,transparent)}
+.ruler{position:relative;height:20px;margin:6px 2px 0;font:10.5px/1 var(--mono);color:var(--dim);
+font-variant-numeric:tabular-nums}
+.ruler span{position:absolute;top:4px;transform:translateX(-50%)}
+.ruler span:first-child{transform:none}
+.ruler span::before{content:"";position:absolute;left:50%;top:-5px;width:1px;height:3px;
+background:var(--line3)}
+.legend{display:flex;gap:6px 14px;flex-wrap:wrap;align-items:center;color:var(--muted);
+font-size:11.5px;margin-top:6px;padding-top:10px;border-top:1px solid var(--line)}
+.legend>span{display:inline-flex;align-items:center;gap:6px}
+.legend>span::before{content:"";display:inline-block;width:14px;height:8px;border-radius:2px}
+.lg-solid::before{background:linear-gradient(90deg,var(--likely),var(--possible),var(--unclear))}
+.lg-gap::before{background:repeating-linear-gradient(135deg,var(--gap) 0 2px,transparent 2px 5px)}
+.legend>.key::before{background:var(--kc);width:8px;height:8px;border-radius:50%}
+.key.k-verified{--kc:var(--verified)}.key.k-likely{--kc:var(--likely)}
+.key.k-possible{--kc:var(--possible)}.key.k-unclear{--kc:var(--unclear)}
+.key.k-crowd::before{background:transparent;border:1.5px dashed var(--accent)}
+.legend .setlink{margin-left:auto}
+/* tracklist header */
+.list-head{display:flex;align-items:center;gap:var(--s3) var(--s5);margin:var(--s8) 0 var(--s3);
+flex-wrap:wrap}
+.list-head h2{font:760 26px/1 var(--display);letter-spacing:-.03em;margin:0}
+.list-head .count{font:600 13px/1 var(--mono);color:var(--dim);margin-left:-8px}
+.hint-k{display:inline-flex;align-items:center;gap:6px;color:var(--dim);font-size:12px}
+.hint-k kbd+kbd{margin-left:-2px}
+.hint-k .dot{width:3px;height:3px;border-radius:50%;background:var(--line3);margin:0 4px}
+.exports{display:flex;gap:6px;flex-wrap:wrap;align-items:center;margin-left:auto}
+.exports .lbl{font:700 10.5px/1 var(--display);color:var(--dim);text-transform:uppercase;
+letter-spacing:.14em;margin-right:4px}
+.xbtn{display:inline-flex;align-items:center;gap:6px;height:32px;font:600 12.5px/1 var(--text);
+color:var(--muted);border:1px solid var(--line);border-radius:9px;padding:0 11px;
+background:transparent;cursor:pointer;text-decoration:none;
+transition:color var(--t1) var(--ease),border-color var(--t1) var(--ease),
+background-color var(--t1) var(--ease)}
+.xbtn:hover{color:var(--fg);border-color:var(--line2);background:var(--hover);
+text-decoration:none}
+.xbtn.copy{color:var(--fg);border-color:var(--line2);background:var(--hover)}
+.xbtn svg{width:14px;height:14px}
+.list-info{display:flex;align-items:center;gap:var(--s3) var(--s6);flex-wrap:wrap;
+margin:0 0 var(--s4);color:var(--muted);font-size:12.5px}
+.glossary{color:var(--muted);font-size:12.5px;margin:0;flex:1 1 360px;max-width:72ch}
+.glossary b{color:var(--fg);font-weight:600}
+.confidence-summary{display:flex;gap:10px;align-items:center;color:var(--muted);font-size:12px;
+margin:0;flex:0 1 auto}
+.confidence-summary b{color:var(--fg);font-weight:600;white-space:nowrap}
+.conf-bar{display:flex;height:8px;width:180px;border-radius:5px;overflow:hidden;
+background:var(--track);gap:2px}
+.conf-bar i{display:block;height:100%;min-width:0}
+.c-verified{background:var(--verified)}.c-likely{background:var(--likely)}
+.c-possible{background:var(--possible)}.c-unclear{background:var(--unclear)}
 /* tracklist */
-.list-head{display:flex;align-items:baseline;gap:14px;margin:26px 0 10px;flex-wrap:wrap}
-.list-head h2{font:800 22px/1 var(--display);letter-spacing:-.02em;margin:0}
-.list-head .hint-k{color:var(--dim);font-size:12px;margin-left:auto}
-.glossary{color:var(--muted);font-size:12px;margin:0}.glossary b{color:var(--fg)}
-.tablewrap{overflow-x:auto;border-radius:16px}
-table{width:100%;border-collapse:separate;border-spacing:0;background:var(--card);
-border:1px solid var(--line);border-radius:16px;overflow:hidden}
-caption{text-align:left;padding:0 0 8px;color:var(--muted);font-size:12px}
-th{font:700 10px/1 var(--display);letter-spacing:.14em;text-transform:uppercase;color:var(--dim);
-white-space:nowrap;padding:12px 12px 10px;text-align:left;border-bottom:1px solid var(--line);
-background:#ffffff04}
-td{padding:11px 12px;border-bottom:1px solid var(--line);vertical-align:middle}
+.tablewrap{border:1px solid var(--line);border-radius:var(--r3);background:var(--card);
+box-shadow:var(--sh2);overflow:hidden}
+table{width:100%;border-collapse:separate;border-spacing:0}
+caption{position:absolute;width:1px;height:1px;overflow:hidden;clip:rect(0,0,0,0);
+white-space:nowrap}
+th{font:700 10.5px/1 var(--display);letter-spacing:.14em;text-transform:uppercase;
+color:var(--dim);white-space:nowrap;padding:14px 14px 12px;text-align:left;
+border-bottom:1px solid var(--line);background:var(--hover)}
+td{padding:12px 14px;border-bottom:1px solid var(--line);vertical-align:middle}
 tbody tr:last-child td{border-bottom:none}
-tr.track{transition:background .12s;animation:rise .45s ease both;cursor:pointer;
-animation-delay:calc(min(var(--i,0),40)*14ms)}
-tr.track:hover td,tr.track:focus-within td{background:#ffffff07}
-button:focus-visible,a:focus-visible,summary:focus-visible,input:focus-visible,textarea:focus-visible{
-outline:3px solid var(--accent);outline-offset:3px}
-tr.track.current td{background:linear-gradient(90deg,rgba(255,61,138,.16),
-rgba(255,61,138,.03) 55%,transparent)}
+tr.track{cursor:pointer;scroll-margin:240px 0 120px}
+tr.track td{transition:background-color var(--t1) var(--ease)}
+tr.track:hover td,tr.track:focus-within td{background:var(--hover)}
+tr.track.current td{background:color-mix(in srgb,var(--pink) 8%,transparent)}
 tr.track.current td:first-child{box-shadow:inset 3px 0 0 var(--pink)}
-.time{font:600 13px/1 var(--mono);font-variant-numeric:tabular-nums;white-space:nowrap;
-color:var(--muted);width:1%}
-tr.track.current .time{color:var(--pink)}
-.time .eqi{display:none;vertical-align:-2px;margin-right:6px}
+.time{width:1%;white-space:nowrap}
+.seek{display:inline-flex;align-items:center;gap:8px;border:0;background:transparent;
+color:var(--muted);padding:7px 9px;margin:-7px -9px;cursor:pointer;border-radius:8px;
+font:600 13px/1 var(--mono);font-variant-numeric:tabular-nums;
+transition:color var(--t1) var(--ease),background-color var(--t1) var(--ease)}
+.seek:hover{color:var(--fg);background:var(--hover2)}
+.seek .pi{width:10px;height:10px;display:none;color:var(--fg)}
+tr.track:hover .seek .pi,.seek:focus-visible .pi{display:block}
+tr.track.current .seek{color:var(--pink)}
+tr.track.current .seek .pi{display:none}
+.time .eqi{display:none}
 tr.track.current .time .eqi{display:inline-flex}
 .eqi{align-items:flex-end;gap:1.5px;height:10px;width:10px}
 .eqi i{display:block;width:2px;height:3px;background:var(--pink);border-radius:1px;
 animation:eq .8s ease-in-out infinite}
 .eqi i:nth-child(2){animation-delay:.2s}.eqi i:nth-child(3){animation-delay:.4s}
 .badge{width:1%;white-space:nowrap}
-.pill{display:inline-block;font:700 10px/1 var(--display);letter-spacing:.1em;
-text-transform:uppercase;padding:5px 8px;border-radius:6px;color:var(--bc);
-background:color-mix(in srgb,var(--bc) 16%,transparent);
-border:1px solid color-mix(in srgb,var(--bc) 35%,transparent)}
+.pill{display:inline-flex;align-items:center;gap:6px;height:22px;
+font:700 10px/1 var(--display);letter-spacing:.09em;text-transform:uppercase;padding:0 8px;
+border-radius:6px;color:var(--bc);background:color-mix(in srgb,var(--bc) 12%,transparent);
+border:1px solid color-mix(in srgb,var(--bc) 30%,transparent)}
+.pill::before{content:"";width:6px;height:6px;border-radius:50%;background:var(--bc)}
 .badge-verified{--bc:var(--verified)}.badge-likely{--bc:var(--likely)}
-.badge-possible{--bc:var(--possible)}.badge-unclear{--bc:var(--unclear)}.badge-gap{--bc:var(--gap)}
+.badge-possible{--bc:var(--possible)}.badge-unclear{--bc:var(--unclear)}
+.badge-gap{--bc:var(--gap)}.badge-comments{--bc:var(--accent)}
 .label{min-width:0}
-.ar{color:var(--muted)}.sep{color:var(--dim);margin:0 6px}.tt{font-weight:600;color:var(--fg)}
-.tags{display:inline-flex;gap:6px;margin-left:10px;vertical-align:1px;flex-wrap:wrap}
-.tag{font:600 10px/1 var(--text);color:var(--dim);border:1px solid var(--line);border-radius:5px;
-padding:3px 6px;letter-spacing:.02em;text-transform:lowercase}
-.tag.ver-verified{color:var(--verified);border-color:rgba(52,211,153,.4)}
-.tag.ver-contested{color:var(--gap);border-color:rgba(251,113,133,.4)}
-.hint{font:700 10px/1 var(--display);background:var(--grad);color:var(--on-accent);
-border-radius:5px;
-padding:3px 6px;letter-spacing:.06em;text-transform:uppercase}
-.alts{margin-top:5px;font-size:12px}
+.trk{display:flex;flex-wrap:wrap;align-items:center;column-gap:8px;row-gap:3px;min-width:0}
+.tt{order:1;flex-basis:100%;font-weight:620;color:var(--fg);font-size:14.5px;letter-spacing:-.005em}
+.ar{order:2;color:var(--muted);font-size:13px}
+.sep{display:none}
+.tags{order:3;display:inline-flex;gap:6px;flex-wrap:wrap}
+.alts{order:4;flex-basis:100%}
+tr.track.current .tt{color:var(--fg)}
+.tag{display:inline-flex;align-items:center;height:19px;font:600 10.5px/1 var(--text);
+color:var(--dim);border:1px solid var(--line2);border-radius:5px;padding:0 6px}
+.tag.ver-verified{color:var(--verified);border-color:color-mix(in srgb,var(--verified) 40%,
+transparent)}
+.tag.ver-contested{color:var(--gap);border-color:color-mix(in srgb,var(--gap) 40%,transparent)}
+.hint{display:inline-flex;align-items:center;height:19px;font:700 9.5px/1 var(--display);
+border-radius:5px;padding:0 6px;letter-spacing:.06em;text-transform:uppercase}
+.hint.crowd{background:none;border:1px dashed var(--accent);color:var(--accent)}
+.hint.engine{background:none;border:1px solid color-mix(in srgb,var(--verified) 55%,transparent);
+color:var(--verified)}
+.hint.comment{background:none;border:1px solid var(--accent-line);color:var(--accent)}
+.alts{margin-top:3px;font-size:12px}
 .alts>summary{cursor:pointer;color:var(--muted);list-style:none;display:inline-flex;
-align-items:center;gap:5px;border:1px solid var(--line);border-radius:6px;padding:3px 8px;
-font-size:11px;font-weight:600}
+align-items:center;gap:5px;height:24px;border:1px solid var(--line);border-radius:6px;
+padding:0 8px;font-size:11.5px;font-weight:600;transition:color var(--t1),border-color var(--t1)}
 .alts>summary::-webkit-details-marker{display:none}
 .alts>summary:hover,.alts[open]>summary{color:var(--fg);border-color:var(--line2)}
-.altlist{margin:8px 0 2px;padding:0 0 0 2px;list-style:none;color:var(--muted)}
-.altlist li{margin:4px 0;display:flex;align-items:center;gap:8px}
+.altlist{margin:8px 0 2px;padding:0;list-style:none;color:var(--muted)}
+.altlist li{margin:5px 0;display:flex;align-items:center;gap:8px}
 .alt-badge{font:700 9px/1 var(--display);letter-spacing:.1em;padding:3px 5px;border-radius:4px;
 color:var(--bc);border:1px solid color-mix(in srgb,var(--bc) 35%,transparent)}
 .acquire{white-space:nowrap;width:1%}
-.acq{display:inline-flex;align-items:center;margin:0 4px 2px 0;font:600 11px/1 var(--text);
-border:1px solid var(--line2);border-radius:6px;padding:5px 8px;color:var(--fg);
-background:#ffffff06}
-.acq:hover{text-decoration:none;background:#ffffff12}
-.acq.free{border-color:rgba(52,211,153,.5);color:var(--verified)}
-.acq.buy,.acq.gate{border-color:rgba(251,191,36,.5);color:var(--possible)}
+.acq{display:inline-flex;align-items:center;height:26px;margin:2px 4px 2px 0;
+font:600 11.5px/1 var(--text);border:1px solid var(--line2);border-radius:7px;padding:0 9px;
+color:var(--fg);background:transparent;transition:background-color var(--t1),border-color var(--t1)}
+.acq:hover{text-decoration:none;background:var(--hover2);border-color:var(--line3)}
+.acq.free{border-color:color-mix(in srgb,var(--verified) 50%,transparent);color:var(--verified)}
+.acq.buy,.acq.gate{border-color:color-mix(in srgb,var(--possible) 50%,transparent);
+color:var(--possible)}
 .acq.none{border:none;color:var(--dim);background:none;padding-left:0}
-.seek{border:0;background:transparent;color:inherit;padding:8px;margin:-8px;cursor:pointer;
-border-radius:7px;font:inherit}
 .ops{width:1%;white-space:nowrap;text-align:right}
-tr.gap td{background:repeating-linear-gradient(135deg,rgba(251,113,133,.05) 0 8px,
-transparent 8px 16px)}
-tr.gap .label{color:var(--muted)}
-tr.gap .tt{color:var(--gap)}
-/* crowd IDs (named in the comments, no audio match): dashed, never drawn as proved evidence */
-.hint.crowd{background:none;border:1px dashed var(--accent);color:var(--accent)}
-.hint.engine{background:none;border:1px solid var(--verified);color:var(--verified)}
-.hint.comment{background:none;border:1px solid var(--accent);color:var(--accent)}
+.ops .pl-actions{gap:4px}
+.ops .pl-like,.ops .pl-add{display:inline-grid;place-items:center;width:30px;height:30px;
+padding:0;border-radius:8px;border:1px solid var(--line2);background:transparent;
+color:var(--muted);font-size:13px;cursor:pointer;
+transition:color var(--t1),background-color var(--t1),border-color var(--t1)}
+.ops .pl-like:hover,.ops .pl-add:hover{color:var(--fg);background:var(--hover2);
+border-color:var(--accent-line)}
+.ops .pl-like.on{color:var(--pink);border-color:color-mix(in srgb,var(--pink) 45%,transparent)}
+@media (hover:hover) and (pointer:fine){tr.track .acq:not(.none){color:var(--muted);
+border-color:var(--line)}
+tr.track:hover .acq.free,tr.track:focus-within .acq.free{color:var(--verified);
+border-color:color-mix(in srgb,var(--verified) 50%,transparent)}
+tr.track:hover .acq.buy,tr.track:focus-within .acq.buy,tr.track:hover .acq.gate,
+tr.track:focus-within .acq.gate{color:var(--possible);
+border-color:color-mix(in srgb,var(--possible) 50%,transparent)}
+tr.track:hover .acq:not(.free):not(.buy):not(.gate):not(.none),
+tr.track:focus-within .acq:not(.free):not(.buy):not(.gate):not(.none){color:var(--fg);
+border-color:var(--line2)}
+tr.track .ops .pl-add,tr.track .ops .pl-like:not(.on){border-color:var(--line)}
+tr.track:hover .ops .pl-add,tr.track:focus-within .ops .pl-add,tr.track:hover .ops .pl-like,
+tr.track:focus-within .ops .pl-like{border-color:var(--line2);color:var(--fg)}}
+tr.gap td{background:repeating-linear-gradient(135deg,color-mix(in srgb,var(--gap) 6%,
+transparent) 0 8px,transparent 8px 16px)}
+tr.gap .time{font:600 13px/1 var(--mono);color:var(--dim);font-variant-numeric:tabular-nums}
+tr.gap .label{color:var(--muted);font-size:13px}
+tr.gap .tt{color:var(--gap);font-weight:600;margin-right:6px}
 tr.track.crowd td:first-child{box-shadow:inset 3px 0 0 transparent;
-border-left:3px dashed rgba(167,139,250,.6)}
-.tl-lane[data-crowd="1"] .tl-extent{display:none}
-.tl-lane[data-crowd="1"] .tl-solid{background:transparent;border:1.5px dashed var(--lc);
-box-shadow:none}
+border-left:3px dashed color-mix(in srgb,var(--accent) 60%,transparent)}
 .lg-crowd::before{background:transparent;border:1.5px dashed var(--accent);height:6px}
-/* the NOW pill in the top bar */
+/* the NOW pill in the top bar (phones: the deck is not sticky there) */
 .now{flex:1;min-width:0;display:flex;align-items:center;gap:10px;justify-content:center;
-font-size:13px;cursor:pointer}
+font-size:13px;cursor:pointer;border:0;background:none;color:var(--fg);padding:0}
 .now[hidden]{display:none}
 .now-k{font:700 10px/1 var(--display);letter-spacing:.14em;color:var(--pink);padding:5px 7px;
-border:1px solid rgba(255,61,138,.5);border-radius:6px;background:rgba(255,61,138,.08)}
+border:1px solid color-mix(in srgb,var(--pink) 50%,transparent);border-radius:6px;
+background:color-mix(in srgb,var(--pink) 9%,transparent)}
 .now-t{font-family:var(--mono);font-variant-numeric:tabular-nums;color:var(--muted)}
 .now-l{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-weight:600}
-@media (max-width:720px){.hint-k{display:none}.stat .big{font-size:28px}.hero{padding-top:14px}
-/* One tile per row on a phone, stated rather than left to auto-fit arithmetic: a 200px minimum in
-   a ~360px content box already gives one column, but saying so means no rounding, zoom level or
-   font-size setting can ever produce a second column that runs off the screen. */
-.stats{grid-template-columns:1fr}
-.exports .lbl{display:none}.tl-wrap{padding:12px}.ruler span:nth-child(even){display:none}
-.tablewrap{overflow:visible}table{display:block;background:transparent;border:0}thead{position:absolute;
+@media (min-width:900px) and (min-height:720px){.now{visibility:hidden}}
+@media (max-width:900px){.hint-k{display:none}}
+@media (max-width:440px){.now-l{display:none}}
+@media (max-width:720px){.hero{padding-top:var(--s5)}.stat .big{font-size:30px}
+/* One tile per row on a phone, stated rather than left to auto-fit arithmetic: no rounding, zoom
+   level or font-size setting can produce a second column that runs off the screen. */
+.stats{grid-template-columns:1fr}.stat{min-height:64px;padding:var(--s3) var(--s5)}
+.stat+.stat{border-left:0;border-top:1px solid var(--line)}
+h1{font-size:30px;margin-bottom:var(--s5)}
+.deck{padding:var(--s3) var(--s3) var(--s2);border-radius:var(--r3)}
+.transport{gap:var(--s2);flex-wrap:wrap}.tp-now{order:5;flex-basis:100%;border-left:0;
+margin-left:0;padding-left:0}.tp-time{margin-left:auto}
+.timeline{height:70px}.tl-segs{top:14px;height:34px}.tl-seg span{display:none}
+.ruler span:nth-child(even){display:none}
+.legend .setlink{margin-left:0}
+.list-head{margin-top:var(--s7)}.list-head h2{font-size:22px}
+.exports .lbl{display:none}.exports{margin-left:0;width:100%}
+.conf-bar{width:140px}
+.tablewrap{overflow:visible;border:0;background:transparent;box-shadow:none}
+table{display:block}thead{position:absolute;
 width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;clip:rect(0,0,0,0);white-space:nowrap;
 border:0}tbody{display:grid;gap:10px}tr.track,tr.gap{display:grid;
 grid-template-columns:auto 1fr auto;
-gap:8px 12px;background:var(--card);border:1px solid var(--line);border-radius:14px;padding:12px}
-td{display:block;padding:0;border:0}.time{grid-column:1}.badge{grid-column:2}.ops{grid-column:3;
+gap:8px 12px;background:var(--card);border:1px solid var(--line);border-radius:var(--r3);
+padding:12px 14px;box-shadow:var(--sh1)}
+tr.track.current{border-color:color-mix(in srgb,var(--pink) 45%,transparent)}
+tr.track.current td{background:none}tr.track.current td:first-child{box-shadow:none}
+td{display:block;padding:0;border:0}tr.track:hover td{background:none}
+.time{grid-column:1}.badge{grid-column:2;align-self:center}.ops{grid-column:3;
 grid-row:1}.label{grid-column:1/-1;grid-row:2}.acquire{grid-column:1/-1;grid-row:3;
 white-space:normal}
+.seek{margin:0}
+.acq{white-space:nowrap}
+.acquire:has(>.acq.none:only-child){display:none}
 /* Every control a thumb has to hit is at least 44x44 CSS px (WCAG 2.5.5 / U-F19-F20): the row's
    seek button, each acquisition chip, the playlist buttons the playlists feature injects, every
    export control, and each disclosure summary. ``inline-flex`` is what makes min-height apply to
    the inline elements (links, summaries) at all. */
-.acq,.seek,.ops button,.ops a,.xbtn,.alts>summary,.controls>summary,.now,#leadin{
+.acq,.seek,.ops button,.ops a,.xbtn,.alts>summary,.controls>summary,.now,#leadin,.tp-btn{
 min-height:44px;min-width:44px;display:inline-flex;align-items:center;justify-content:center}
+.ops .pl-like,.ops .pl-add{width:44px;height:44px}
 .alts>summary,.controls>summary{justify-content:flex-start}
-.exports{gap:10px;flex-wrap:wrap}.xbtn{padding:0 14px}
-.now{font-size:12px}.now-l{max-width:24vw}.confidence-summary{grid-template-columns:1fr}
+.exports{gap:8px;flex-wrap:wrap}.xbtn{padding:0 14px}
+.now{font-size:12px}.now-l{max-width:30vw}.confidence-summary{flex-wrap:wrap}
 .confidence-summary span{display:block}}
+.tl-hover::after{content:attr(data-time);position:absolute;bottom:3px;left:5px;
+font:600 9.5px/1 var(--mono);color:var(--muted);font-variant-numeric:tabular-nums;
+white-space:nowrap}
 """
+    + LIGHT_CSS
+)
 
 
 # The page's own JavaScript: player bindings, playhead/current-row highlight, timeline and real seek
@@ -1043,7 +1262,10 @@ let CURRENT_POSITION_MS = null, PLAYER_DURATION_MS = 0;
 let PINNED_ID = null, PINNED_UNTIL_MS = 0;
 let localAudio = null;  // the fetched-original <audio>, when the page plays locally (the default)
 let scWidget = null, ytPlayer = null, mcWidget = null, ytTimer = null, playTimer = null;
+let LAST_CURRENT_ID = null, USER_SCROLLED_AT = 0;
 const ROW_LABELS = {};
+const REDUCED_MOTION = !!(window.matchMedia &&
+  window.matchMedia('(prefers-reduced-motion: reduce)').matches);
 function ready(fn){ if(document.readyState!=='loading'){fn();}
   else{document.addEventListener('DOMContentLoaded',fn);} }
 function toast(msg){ const t=document.getElementById('toast'); if(!t) return;
@@ -1053,9 +1275,17 @@ function toast(msg){ const t=document.getElementById('toast'); if(!t) return;
 function playheadDuration(){
   return (CONFIG.durationMs > 0) ? CONFIG.durationMs : PLAYER_DURATION_MS;
 }
+function setPlayingState(on){
+  const deck = document.getElementById('deck'); if(!deck) return;
+  deck.classList.toggle('is-playing', !!on);
+  const play = document.getElementById('tp-play');
+  if(play) play.setAttribute('aria-label', on ? 'Pause' : 'Play');
+}
 function markPlaying(){
   document.body.classList.add('playing'); clearTimeout(playTimer);
-  playTimer = setTimeout(function(){ document.body.classList.remove('playing'); }, 1800);
+  if(!localAudio) setPlayingState(true);
+  playTimer = setTimeout(function(){ document.body.classList.remove('playing');
+    if(!localAudio) setPlayingState(false); }, 1800);
 }
 function updatePlayhead(positionMs){
   if(typeof positionMs !== 'number' || isNaN(positionMs)) return;
@@ -1068,6 +1298,8 @@ function updatePlayhead(positionMs){
   head.hidden = false;
   const label = document.getElementById('playhead-time');
   if(label) label.textContent = formatTime(positionMs);
+  const pos = document.getElementById('tp-pos');
+  if(pos) pos.textContent = formatTime(positionMs);
   markPlaying();
   highlightCurrent(positionMs);
 }
@@ -1082,31 +1314,65 @@ function highlightCurrent(positionMs){
     if(positionMs < PINNED_UNTIL_MS){ currentId = PINNED_ID; }
     else { PINNED_ID = null; }
   }
-  document.querySelectorAll('tr.track.current, .tl-lane.current').forEach(function(el){
-    el.classList.remove('current'); });
+  document.querySelectorAll('tr.track.current, .tl-lane.current, .tl-seg.current').forEach(
+    function(el){ el.classList.remove('current'); });
   if(currentId){
     document.querySelectorAll('[data-episode-id="'+currentId+'"]').forEach(function(el){
       if(el.classList.contains('track') || el.classList.contains('tl-lane')){
         el.classList.add('current'); }
     });
+    const seg = document.querySelector('.tl-seg[data-seg="'+currentId+'"]');
+    if(seg) seg.classList.add('current');
   }
   setNowPlaying(currentId, positionMs);
+  if(currentId !== LAST_CURRENT_ID){
+    const previous = LAST_CURRENT_ID; LAST_CURRENT_ID = currentId;
+    if(currentId && previous !== null) followRow(currentId);
+  }
+}
+// Gently bring the playing row into view -- only when it is off screen and the listener has not
+// been scrolling around the list themselves in the last few seconds.
+function followRow(id){
+  if(Date.now() - USER_SCROLLED_AT < 6000) return;
+  const row = document.getElementById(id); if(!row) return;
+  const box = row.getBoundingClientRect();
+  const deck = document.getElementById('deck');
+  const top = (deck && getComputedStyle(deck).position === 'sticky') ?
+    deck.getBoundingClientRect().bottom : 64;
+  if(box.top >= top && box.bottom <= window.innerHeight) return;
+  row.scrollIntoView({block:'center', behavior: REDUCED_MOTION ? 'auto' : 'smooth'});
 }
 function setNowPlaying(id, positionMs){
-  const now = document.getElementById('now'); if(!now) return;
-  if(!id){ now.hidden = true; return; }
-  now.hidden = false;
-  document.getElementById('now-time').textContent = formatTime(positionMs);
-  document.getElementById('now-label').textContent = ROW_LABELS[id] || '';
+  const label = id ? (ROW_LABELS[id] || '') : '';
+  const now = document.getElementById('now');
+  if(now){
+    if(!id){ now.hidden = true; }
+    else {
+      now.hidden = false;
+      document.getElementById('now-time').textContent = formatTime(positionMs);
+      document.getElementById('now-label').textContent = label;
+    }
+  }
+  const deckNow = document.getElementById('tp-now');
+  if(deckNow){
+    deckNow.classList.toggle('idle', !id);
+    const text = document.getElementById('tp-label');
+    if(text) text.textContent = id ? label : 'Press play, or pick a track below';
+  }
 }
 // Player bindings ------------------------------------------------------------
 ready(function(){
   localAudio = document.getElementById('localplayer');
   if(localAudio){
+    const player = localAudio.closest('.player');
+    if(player) player.classList.add('enhanced');
     localAudio.addEventListener('timeupdate', function(){
       updatePlayhead(localAudio.currentTime * 1000); });
     localAudio.addEventListener('loadedmetadata', function(){
       if(localAudio.duration > 0) PLAYER_DURATION_MS = localAudio.duration * 1000; });
+    localAudio.addEventListener('play', function(){ setPlayingState(true); });
+    localAudio.addEventListener('pause', function(){ setPlayingState(false); });
+    localAudio.addEventListener('ended', function(){ setPlayingState(false); });
     return;  // local audio is the player — the platform-widget bindings below are the fallback
   }
   try{
@@ -1173,6 +1439,21 @@ function seekToPositionMs(positionMs){
   if(localAudio){ localAudio.currentTime = Math.max(0, positionMs) / 1000;
     if(localAudio.play){ localAudio.play().catch(function(){}); } return true; }
   return seekPlayerArg(seekArgument(positionMs, 0)); }
+// Play/pause for whichever player the page has.
+function togglePlay(){
+  if(localAudio){
+    if(localAudio.paused){ if(localAudio.play) localAudio.play().catch(function(){}); }
+    else { localAudio.pause(); }
+    return true;
+  }
+  if(scWidget && scWidget.toggle){ scWidget.toggle(); return true; }
+  if(ytPlayer && ytPlayer.getPlayerState){
+    if(ytPlayer.getPlayerState() === 1) ytPlayer.pauseVideo(); else ytPlayer.playVideo();
+    return true;
+  }
+  if(mcWidget && mcWidget.togglePlay){ mcWidget.togglePlay(); return true; }
+  toast('Player not ready — open the set link'); return false;
+}
 // Copy the tracklist as plain text (time, artist — title; ID for a gap) ------
 function tracklistText(){
   return COPY_ENTRIES.map(function(entry){
@@ -1200,20 +1481,8 @@ ready(function(){
     const v = parseFloat(leadin.value);
     LEAD_IN_MS = (isNaN(v) || v<0) ? 0 : Math.round(v * 1000);
   });
-  const timeline = document.querySelector('.timeline');
-  if(timeline){
-    timeline.addEventListener('click', function(e){
-      const rect = timeline.getBoundingClientRect();
-      if(rect.width <= 0) return;
-      const frac = Math.max(0, Math.min(1, (e.clientX - rect.left) / rect.width));
-      const ms = Math.round(frac * playheadDuration());
-      updatePlayhead(ms);
-      if(!seekToPositionMs(ms)){ toast('Player not ready — open the set link'); }
-    });
-  }
-  window.addEventListener('resize', function(){
-    if(CURRENT_POSITION_MS !== null) updatePlayhead(CURRENT_POSITION_MS); });
   const rows = Array.prototype.slice.call(document.querySelectorAll('tr.track'));
+  const goTo = {};
   rows.forEach(function(row){
     const id = row.getAttribute('data-episode-id');
     const ar = row.querySelector('.ar'), tt = row.querySelector('.tt');
@@ -1221,10 +1490,11 @@ ready(function(){
     function go(){
       const ms = parseInt(row.getAttribute('data-best-start-ms'), 10) || 0;
       // Pin THIS row so it reads as playing from the click, even during its lead-in mix-in.
-      PINNED_ID = id; PINNED_UNTIL_MS = ms;
+      PINNED_ID = id; PINNED_UNTIL_MS = ms; LAST_CURRENT_ID = id;
       highlightCurrent(seekTargetMs(ms, LEAD_IN_MS));
       if(!seekToMs(ms)){ toast('Player not ready — open the set link'); }
     }
+    goTo[id] = go;
     const seek = row.querySelector('button.seek');
     if(seek) seek.addEventListener('click', go);
     // Preserve the original whole-row shortcut without hijacking links, playlist buttons,
@@ -1235,27 +1505,191 @@ ready(function(){
       go();
     });
     const lane = document.querySelector('.tl-lane[data-episode-id="'+id+'"]');
-    if(lane){
-      row.addEventListener('mouseenter', function(){ lane.classList.add('hover'); });
-      row.addEventListener('mouseleave', function(){ lane.classList.remove('hover'); });
-    }
+    const seg = document.querySelector('.tl-seg[data-seg="'+id+'"]');
+    row.addEventListener('mouseenter', function(){
+      if(lane) lane.classList.add('hover'); if(seg) seg.classList.add('hover'); });
+    row.addEventListener('mouseleave', function(){
+      if(lane) lane.classList.remove('hover'); if(seg) seg.classList.remove('hover'); });
   });
-  const timelineLabel = document.getElementById('timeline-label');
-  document.querySelectorAll('.tl-solid[data-label]').forEach(function(mark){
-    mark.addEventListener('mouseenter', function(){
-      if(timelineLabel) timelineLabel.textContent = mark.getAttribute('data-label'); });
-    mark.addEventListener('mouseleave', function(){
-      if(timelineLabel) timelineLabel.textContent = 'Move over a marker to see its track.'; });
+  // The timeline: click anywhere to jump exactly there; a track segment chosen from the keyboard
+  // plays that track from its start (with the lead-in), like its row.
+  const timeline = document.querySelector('.timeline');
+  const tip = document.getElementById('tl-tip');
+  const hover = document.getElementById('tl-hover');
+  const segs = Array.prototype.slice.call(document.querySelectorAll('.tl-seg'));
+  function fraction(e){
+    const rect = timeline.getBoundingClientRect();
+    if(rect.width <= 0) return null;
+    return Math.max(0, Math.min(1, (e.clientX - rect.left) / rect.width));
+  }
+  function showTip(seg, x){
+    if(!tip || !seg) return;
+    const wrap = timeline.parentNode.getBoundingClientRect();
+    tip.innerHTML = '';
+    const title = document.createElement('b'); title.textContent = seg.getAttribute('data-title');
+    const artist = document.createElement('span');
+    artist.textContent = seg.getAttribute('data-artist');
+    const meta = document.createElement('em');
+    const badge = document.createElement('i');
+    badge.className = 'badge-' + seg.getAttribute('data-badge');
+    badge.textContent = seg.getAttribute('data-word');
+    meta.appendChild(badge);
+    meta.appendChild(document.createTextNode(seg.getAttribute('data-span')));
+    tip.appendChild(title); tip.appendChild(artist); tip.appendChild(meta);
+    const half = Math.min(190, tip.offsetWidth / 2 || 110);
+    tip.style.left = Math.max(half, Math.min(wrap.width - half, x)) + 'px';
+    tip.classList.add('show');
+  }
+  function hideTip(){ if(tip) tip.classList.remove('show'); }
+  if(timeline){
+    timeline.addEventListener('click', function(e){
+      const frac = fraction(e); if(frac === null) return;
+      const ms = Math.round(frac * playheadDuration());
+      PINNED_ID = null;
+      updatePlayhead(ms);
+      if(!seekToPositionMs(ms)){ toast('Player not ready — open the set link'); }
+    });
+    timeline.addEventListener('mousemove', function(e){
+      const frac = fraction(e); if(frac === null) return;
+      const rect = timeline.getBoundingClientRect();
+      if(hover){ hover.style.transform = 'translateX(' + (frac * rect.width) + 'px)';
+        hover.setAttribute('data-time', formatTime(frac * playheadDuration())); }
+      const seg = e.target.closest ? e.target.closest('.tl-seg') : null;
+      if(seg) showTip(seg, e.clientX - timeline.parentNode.getBoundingClientRect().left);
+      else hideTip();
+    });
+    timeline.addEventListener('mouseleave', hideTip);
+  }
+  segs.forEach(function(seg, index){
+    seg.addEventListener('click', function(e){
+      if(e.detail !== 0) return;  // a pointer click falls through to the exact-position seek
+      e.stopPropagation();
+      const id = seg.getAttribute('data-seg');
+      if(goTo[id]) goTo[id]();
+    });
+    seg.addEventListener('focus', function(){
+      const rect = seg.getBoundingClientRect();
+      const wrap = timeline.parentNode.getBoundingClientRect();
+      showTip(seg, rect.left - wrap.left + rect.width / 2);
+    });
+    seg.addEventListener('blur', hideTip);
+    // One tab stop for the whole strip; arrows walk the tracks (roving tabindex).
+    seg.addEventListener('keydown', function(e){
+      let next = null;
+      if(e.key === 'ArrowRight' || e.key === 'ArrowDown') next = segs[index + 1];
+      else if(e.key === 'ArrowLeft' || e.key === 'ArrowUp') next = segs[index - 1];
+      else if(e.key === 'Home') next = segs[0];
+      else if(e.key === 'End') next = segs[segs.length - 1];
+      if(!next) return;
+      e.preventDefault(); e.stopPropagation();
+      segs.forEach(function(s){ s.tabIndex = -1; });
+      next.tabIndex = 0; next.focus();
+    });
+  });
+  window.addEventListener('resize', function(){
+    if(CURRENT_POSITION_MS !== null) updatePlayhead(CURRENT_POSITION_MS); });
+  // Transport ---------------------------------------------------------------
+  function step(delta){
+    const ids = EPISODE_SPANS.map(function(s){ return s.id; });
+    if(!ids.length) return;
+    const at = ids.indexOf(LAST_CURRENT_ID);
+    const target = at < 0 ? (delta > 0 ? 0 : ids.length - 1)
+      : Math.max(0, Math.min(ids.length - 1, at + delta));
+    if(goTo[ids[target]]) goTo[ids[target]]();
+  }
+  const play = document.getElementById('tp-play');
+  if(play) play.addEventListener('click', togglePlay);
+  const prev = document.getElementById('tp-prev');
+  if(prev) prev.addEventListener('click', function(){ step(-1); });
+  const next = document.getElementById('tp-next');
+  if(next) next.addEventListener('click', function(){ step(1); });
+  // Keyboard: Space plays/pauses, J/K (or arrows on a row) move between tracks, Enter plays the
+  // focused one.  Never while typing, and never instead of a control's own key.
+  function typing(el){
+    if(!el) return false;
+    const tag = el.tagName;
+    return tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT' || el.isContentEditable;
+  }
+  function moveFocus(delta){
+    const buttons = Array.prototype.slice.call(document.querySelectorAll('tr.track button.seek'));
+    if(!buttons.length) return;
+    let at = buttons.indexOf(document.activeElement);
+    if(at < 0){
+      const current = document.querySelector('tr.track.current button.seek');
+      at = current ? buttons.indexOf(current) : (delta > 0 ? -1 : buttons.length);
+    }
+    const target = buttons[Math.max(0, Math.min(buttons.length - 1, at + delta))];
+    target.focus({preventScroll:true});
+    target.scrollIntoView({block:'nearest', behavior: REDUCED_MOTION ? 'auto' : 'smooth'});
+  }
+  document.addEventListener('keydown', function(e){
+    if(e.defaultPrevented || e.ctrlKey || e.metaKey || e.altKey || typing(e.target)) return;
+    const onSeek = e.target.classList && e.target.classList.contains('seek');
+    if(e.key === ' ' || e.code === 'Space'){
+      const control = e.target.closest && e.target.closest('button,a,summary');
+      if(control && !onSeek && !control.classList.contains('tl-seg')) return;
+      e.preventDefault(); togglePlay(); return;
+    }
+    if(e.key === 'j' || e.key === 'J' || (onSeek && e.key === 'ArrowDown')){
+      e.preventDefault(); moveFocus(1); return; }
+    if(e.key === 'k' || e.key === 'K' || (onSeek && e.key === 'ArrowUp')){
+      e.preventDefault(); moveFocus(-1); return; }
+  });
+  ['wheel', 'touchmove'].forEach(function(kind){
+    window.addEventListener(kind, function(){ USER_SCROLLED_AT = Date.now(); }, {passive:true});
+  });
+  document.addEventListener('keydown', function(e){
+    if(['PageUp', 'PageDown', 'Home', 'End'].indexOf(e.key) >= 0) USER_SCROLLED_AT = Date.now();
   });
   const copy = document.getElementById('copy');
   if(copy) copy.addEventListener('click', copyTracklist);
   const now = document.getElementById('now');
   if(now) now.addEventListener('click', function(){
     const row = document.querySelector('tr.track.current');
-    if(row){ row.scrollIntoView({block:'center', behavior:'smooth'}); }
+    if(row){ row.scrollIntoView({block:'center', behavior: REDUCED_MOTION ? 'auto' : 'smooth'}); }
   });
+  setNowPlaying(null, 0);
 });
 """
+
+
+#: Transport and toolbar glyphs (decorative: every button that shows one is labelled).
+_ICON_PLAY = (
+    '<svg class="i-play" viewBox="0 0 16 16" aria-hidden="true">'
+    '<path d="M4.5 2.6v10.8L13 8z" fill="currentColor"/></svg>'
+)
+_ICON_PAUSE = (
+    '<svg class="i-pause" viewBox="0 0 16 16" aria-hidden="true"><rect x="3.5" y="2.5" width="3" '
+    'height="11" rx="1" fill="currentColor"/><rect x="9.5" y="2.5" width="3" height="11" rx="1" '
+    'fill="currentColor"/></svg>'
+)
+_ICON_PREV = (
+    '<svg viewBox="0 0 16 16" aria-hidden="true"><rect x="2.5" y="3" width="2" height="10" '
+    'rx="1" fill="currentColor"/><path d="M13.5 3.2v9.6L5.8 8z" fill="currentColor"/></svg>'
+)
+_ICON_NEXT = (
+    '<svg viewBox="0 0 16 16" aria-hidden="true"><rect x="11.5" y="3" width="2" height="10" '
+    'rx="1" fill="currentColor"/><path d="M2.5 3.2v9.6L10.2 8z" fill="currentColor"/></svg>'
+)
+_ICON_GEAR = (
+    '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" '
+    'stroke-linecap="round" aria-hidden="true"><path d="M4 7h10M18 7h2M4 17h4M12 17h8"/>'
+    '<circle cx="16" cy="7" r="2"/><circle cx="10" cy="17" r="2"/></svg>'
+)
+_ICON_COPY = (
+    '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" '
+    'stroke-linejoin="round" aria-hidden="true"><rect x="8" y="8" width="12" height="12" rx="2.5"/>'
+    '<path d="M16 8V6a2 2 0 0 0-2-2H6a2 2 0 0 0-2 2v8a2 2 0 0 0 2 2h2"/></svg>'
+)
+
+
+def _set_link_html(embed: EmbedPlan) -> str:
+    """A quiet link to the original set, for the deck's legend row."""
+
+    href = _safe_href(embed.link_url)
+    if not href:
+        return ""
+    return f'<a class="setlink" target="_blank" rel="noopener" href="{href}">Open the set ↗</a>'
 
 
 def render_page(
@@ -1397,9 +1831,9 @@ def render_page(
     ).replace("</", "<\\/")
     lead_in_s = f"{lead_in_ms / 1000:g}"
     now_pill = (
-        '<div class="now" id="now" hidden title="Jump to the current track">'
+        '<button type="button" class="now" id="now" hidden title="Jump to the current track">'
         '<span class="now-k">NOW</span><span class="now-t" id="now-time"></span>'
-        '<span class="now-l" id="now-label"></span></div>'
+        '<span class="now-l" id="now-label"></span></button>'
     )
     # Rescans are off by default, so generation is almost always 0 — a meaningless chip. Show it
     # only when someone deliberately ran rescans (generation > 0).
@@ -1422,6 +1856,8 @@ def render_page(
             analysed = ""
     status_banner = _status_banner_html(status, reason, achieved)
 
+    track_count = len(track_entries)
+    segments = _segments(track_entries, duration_ms)
     body = f"""{topbar_html(back=True, new=True, middle=now_pill)}
 <main>
 <header class="hero">
@@ -1437,34 +1873,51 @@ class="pd"></span>{_esc(platform_name)}</span>
 {status_banner}
 {_stats_html(projection, duration_ms)}
 </header>
-<section class="player">{_embed_html(embed, audio_src)}</section>
-<div class="exports">
-  <span class="lbl">Export</span>
-  <button type="button" class="xbtn copy" id="copy">Copy tracklist</button>
-  <a class="xbtn" href="tracklist.cue" download>CUE sheet</a>
-  <a class="xbtn" href="tracklist.md" download>Markdown</a>
-  <a class="xbtn" href="tracklist.json" download>JSON</a>
-</div>
-<section class="tl-wrap">
-<div class="tl-head"><h2>Timeline</h2>
-<details class="controls"><summary>Playback settings</summary><div>
+<section class="deck" id="deck" aria-label="Player and timeline">
+<div class="transport">
+  <button type="button" class="tp-btn" id="tp-prev"
+    aria-label="Previous track">{_ICON_PREV}</button>
+  <button type="button" class="tp-btn tp-play" id="tp-play"
+    aria-label="Play">{_ICON_PLAY}{_ICON_PAUSE}</button>
+  <button type="button" class="tp-btn" id="tp-next" aria-label="Next track">{_ICON_NEXT}</button>
+  <span class="tp-time"><b id="tp-pos">0:00</b> / {_esc(_format_time(duration_ms))}</span>
+  <div class="tp-now idle" id="tp-now" aria-live="off"><span class="k">NOW</span><span
+class="l" id="tp-label">Press play, or pick a track below</span></div>
+  <details class="controls"><summary>{_ICON_GEAR}Playback settings</summary><div>
   <label for="leadin">Lead-in</label>
   <input id="leadin" type="number" min="0" step="1" value="{lead_in_s}"
     aria-label="Seek lead-in in seconds"><span>s before each track</span>
-</div></details></div>
-{_timeline_html(lanes, gap_markers)}
+</div></details>
+</div>
+<div class="player">{_embed_html(embed, audio_src)}</div>
+<div class="tl-wrap">
+{_timeline_html(lanes, gap_markers, segments)}
+<div class="tl-tip" id="tl-tip" aria-hidden="true"></div>
+</div>
 {_ruler_html(duration_ms)}
-<div class="timeline-label" id="timeline-label">Move over a marker to see its track.</div>
 <div class="legend">
   <span class="lg-solid">colour = how sure we are</span>
+  <span class="key k-likely">likely</span><span class="key k-possible">possible</span>
+  <span class="key k-unclear">unclear</span><span class="key k-crowd">from comments</span>
   <span class="lg-gap">striped = nothing identified here</span>
+  {_set_link_html(embed) if audio_src else ""}
 </div>
 </section>
-<div class="list-head"><h2>Tracklist</h2>
-<span class="hint-k">use a time button to play from that track</span></div>
+<div class="list-head"><h2>Tracklist</h2><span class="count">{track_count}</span>
+<span class="hint-k"><kbd>Space</kbd> play / pause<i class="dot"></i><kbd>J</kbd><kbd>K</kbd>
+move<i class="dot"></i><kbd>Enter</kbd> play track</span>
+<div class="exports">
+  <span class="lbl">Export</span>
+  <button type="button" class="xbtn copy" id="copy">{_ICON_COPY}Copy tracklist</button>
+  <a class="xbtn" href="tracklist.cue" download>CUE sheet</a>
+  <a class="xbtn" href="tracklist.md" download>Markdown</a>
+  <a class="xbtn" href="tracklist.json" download>JSON</a>
+</div></div>
+<div class="list-info">
 <p class="glossary"><b>Likely</b> means we are confident. <b>Possible</b> means check it.
 <b>Unclear</b> means the match is weak. <b>ID</b> marks music we could not identify.</p>
 {_confidence_html(projection)}
+</div>
 <div class="tablewrap"><table>
 <caption>Tracklist for {_esc(title)}</caption>
 <thead><tr><th scope="col">Time</th><th scope="col">Confidence</th>
@@ -1479,7 +1932,11 @@ services.</span>
 <span>ID&#39;er</span></footer>
 <div class="toast" id="toast" role="status" aria-live="polite"></div>
 </main>
-<script>
+<script>{_PAGE_JS}</script>
+<script>{PLAYLIST_JS}</script>"""
+    # The page's constants, its shared arithmetic and the theme are one script in the head: the
+    # theme is applied before first paint, and nothing in it touches the document body.
+    head_script = f"""{THEME_JS}
 const CONFIG = {config_js};
 const PLATFORM = CONFIG.platform;
 const EPISODE_SPANS = {episode_spans_js};
@@ -1487,12 +1944,17 @@ const COPY_ENTRIES = {copy_entries_js};
 let LEAD_IN_MS = CONFIG.leadInMs;
 {_SEEK_JS}
 {_PLAYHEAD_JS}
-</script>
-<script>{_PAGE_JS}</script>
-<script>{PLAYLIST_JS}</script>"""
+"""
     stamp = f'<meta name="id-detector-page" content="{PAGE_VERSION}">'
     return (
-        head_html(f"{title} — ID'er", _CSS + PLAYLIST_CSS, stamp) + f"<body>{body}</body></html>\n"
+        head_html(
+            f"{title} — ID'er",
+            _CSS + PLAYLIST_CSS,
+            stamp,
+            theme_script="none",
+            inline_script=head_script,
+        )
+        + f"<body>{body}</body></html>\n"
     )
 
 

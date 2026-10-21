@@ -21,7 +21,9 @@ RecipeName = Literal["free", "deep"]
 #: 5 = one tolerant identity rule (joined/spaced/descriptor/alternative titles, inflection, phonetic
 #: respelling, a dropped letter in a name, initials of a solid name) for hints and crowd labels;
 #: an episode of mostly ambiguous windows is listed only when a comment or a second engine says so.
-FUSION_VERSION = 5
+#: 6 = a listener's comment tracklist line may corroborate a recognised track, as a single comment
+#: answer already could (it still never lists or hides a track by itself).
+FUSION_VERSION = 6
 _FUSION = f"fusion:{FUSION_VERSION}"
 
 
