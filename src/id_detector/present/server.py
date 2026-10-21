@@ -1281,8 +1281,10 @@ function render(j){
   var heard = document.getElementById('t-win');
   if(heard) heard.textContent = total ? done + ' / ' + total + ' clips heard' : '';
   document.getElementById('t-eta').textContent = etaWords(j);
-  document.getElementById('t-step').textContent = stepIx !== undefined ?
-    (stepIx + 1) + ' of ' + STEPS.length : '—';
+  // Counted in the four stages shown above, not the eight pipeline phases underneath.
+  var stageIx = j.status === 'succeeded' ? 3 : STAGE_OF[j.phase];
+  document.getElementById('t-step').textContent = stageIx !== undefined ?
+    (stageIx + 1) + ' of ' + document.querySelectorAll('.stage').length : '—';
   var started = j.started_at, finished = j.finished_at;
   var elapsed = started ? ((finished || Date.now() / 1000) - started) : 0;
   document.getElementById('t-elapsed').textContent = started ? fmt(elapsed) : '—';
@@ -1903,7 +1905,7 @@ def _scan_html() -> str:
         'Starting</div><div class="phase-msg" id="phase-msg"></div></div>'
         '<div class="tiles"><span><b id="t-eta">…</b>time left</span>'
         '<span><b id="t-elapsed">—</b>elapsed</span>'
-        '<span><b id="t-step">—</b>progress</span></div></div>'
+        '<span><b id="t-step">—</b>stage</span></div></div>'
         '<div class="pbar" id="pbar" aria-hidden="true"><span id="pbar-fill"></span></div>'
         '<div class="cells-wrap"><div class="cells-k"><span>Listening map</span>'
         '<span id="t-win"></span></div>'
