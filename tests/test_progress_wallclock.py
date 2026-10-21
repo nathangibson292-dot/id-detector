@@ -525,3 +525,55 @@ def test_a_steady_run_never_reports_an_overrun(tmp_path: Path) -> None:
         seen += [slow for _, _, slow in _poll_for(job, clock, seconds)]
         context.progress(phase, 1, 1, "")
     assert seen and not any(seen)
+
+
+def test_periodic_429_bursts_do_not_make_the_time_left_flip_flop(tmp_path: Path) -> None:
+    """The owner's run (2026-10-21): Shazam answers a burst of 429s about every two minutes, and
+    the window caught in it waits ~40 s.  With a 45 s rate window the time left alternated between
+    two numbers ~2.5x apart on successive samples (4984 s, 1929 s, 3422 s, 1690 s ...).  Sampled
+    once a minute, it must now just count down: each reading within a fifth of the last one."""
+
+    def bursty(into: float) -> float:
+        return 1.5 if into % 120.0 >= 80.0 else 27.0  # ~18.5 windows/min on average
+
+    run = _simulate(tmp_path, windows_total=600, rate_at=bursty)
+    _never_backwards(run)
+    listening = [
+        poll
+        for poll in run.polls
+        if run.recognise_from + 240.0 <= poll.at <= run.recognise_from + 1_500.0
+    ]
+    sampled = listening[:: int(60.0 / POLL_SECONDS)]
+    assert len(sampled) >= 15
+    for earlier, later in zip(sampled, sampled[1:], strict=False):
+        assert not later.estimating, later
+        expected = earlier.eta_seconds - 60.0
+        assert abs(later.eta_seconds - expected) <= 0.2 * earlier.eta_seconds, (earlier, later)
+
+
+def test_a_crawl_far_below_the_expected_rate_shows_the_real_time_and_holds_the_bar(
+    tmp_path: Path,
+) -> None:
+    """Also the owner's run: ten minutes in, a run of 429s dropped recognition from ~20 to ~2.5
+    windows a minute.  Under three windows per 45 s the rate fell back to the 18/min prior, so the
+    page said 18/min, "estimating", ~2000 s left, and the bar climbed 35 % -> 48 % while almost
+    nothing was heard.  The time left must follow the real rate, and the bar must hold."""
+
+    slow_from = 560.0
+    run = _simulate(
+        tmp_path,
+        windows_total=400,
+        rate_at=lambda into: 20.0 if into < slow_from else 2.5,
+    )
+    _never_backwards(run)
+    slowed = run.recognise_from + slow_from
+    crawling = [poll for poll in run.polls if slowed + 240.0 <= poll.at <= slowed + 1_800.0]
+    assert crawling
+    for poll in crawling:
+        assert not poll.estimating, poll
+        assert poll.rate_per_minute <= 4.0, poll
+        windows_left = 400 - 187 - (poll.at - slowed) * 2.5 / 60.0
+        assert poll.eta_seconds >= windows_left / 4.0 * 60.0, poll  # hours, not ~30 minutes
+        # Held where the fast part left it until wall-clock time catches up, never running ahead.
+        assert poll.percent <= max(crawling[0].percent, run.truth(poll) + TOLERANCE_POINTS), poll
+    assert crawling[-1].percent - crawling[0].percent <= 1

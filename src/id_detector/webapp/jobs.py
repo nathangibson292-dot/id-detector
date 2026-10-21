@@ -15,6 +15,7 @@ enter job state — the runner emits only coarse phase messages.
 from __future__ import annotations
 
 import asyncio
+import math
 import threading
 import time
 import uuid
@@ -39,7 +40,11 @@ SHAZAM_RATE_PER_MINUTE = 18
 #: the run average.  Two reasons.  A cache resume completes many windows in one instant, which would
 #: inflate an average for the rest of the run; and the limiter is adaptive, so the rate that
 #: predicts the *remaining* time is the one being achieved now, not the one achieved earlier.
-RECENT_RATE_SECONDS = 45.0
+#: Three minutes, not less: Shazam answers a burst of 429s about every two minutes and each burst
+#: holds the next window back for half a minute or more.  A 45 s window caught a burst on one poll
+#: and missed it on the next, so the time left flip-flopped between two numbers 2.5x apart
+#: (observed 4984 s / 1929 s on alternate samples).  A window longer than that cycle averages it.
+RECENT_RATE_SECONDS = 180.0
 #: A recent rate is trusted once it spans this much listening time with at least this many windows
 #: — or once so many windows have completed that the speed is beyond doubt however short the span
 #: (a warm run that finishes its recognise pass in seconds).  Before that the page says it is still
@@ -74,6 +79,10 @@ _OVERRUN_NOTICE_SECONDS = 20.0
 #: Listening with no new window for this long (or three of the recent window gaps, if longer) is a
 #: stall: the bar holds where the last window left it.
 _STALL_SECONDS = 45.0
+#: The shown time left moves toward a new estimate with this time constant (about two minutes,
+#: one 429-burst cycle), counting down in between.  Not used outside listening, where the
+#: estimate is short and exact.
+_ETA_EASE_SECONDS = 120.0
 #: A phase the tracker does not list (the start-up, or an auxiliary scan) is allowed this long.
 _AUXILIARY_PHASE_SECONDS = 30.0
 #: Expected wall-clock **seconds** for each phase of a cold 60-minute run — the denominator behind
@@ -227,6 +236,14 @@ class Job:
     #: this snapshot and the web process that re-evaluates it at request time.
     progress_value: float = 0.0
     progress_at: float | None = None
+    #: The time left the page shows while listening, and when it was last evaluated: it counts
+    #: down between polls and eases toward the fresh estimate (:data:`_ETA_EASE_SECONDS`), so a
+    #: rate that wobbles with Shazam's 429 bursts does not make the number jump.  Persisted with
+    #: the bar's high-water mark for the same worker/web-process reason.
+    eta_value: float | None = None
+    eta_at: float | None = None
+    #: Whether :attr:`eta_value` rests on a measured rate (else it is the prior's guess).
+    eta_measured: bool = False
     #: ``[time, windows_done]`` samples of the current recognise pass, pruned to the sliding window
     #: (plus one older anchor).  The first sample of a pass already contains every window the cache
     #: completed instantly, so rate differences never count that burst as observed speed.  Rebound,
@@ -290,6 +307,12 @@ class Job:
             end = time.time() if now is None else now
         ticked = last[0] - first[0]
         windows = last[1] - first[1]
+        if end - first[0] >= RECENT_RATE_SECONDS and windows < _RATE_MIN_WINDOWS:
+            # A whole window of listening that heard only a window or two IS a measurement: a
+            # crawl (Shazam answering little but 429s).  Falling back to the prior here showed
+            # 18/min, "estimating" and a bar racing ahead while ~2 windows a minute completed.
+            # At most one window is credited as on its way, so the rate never reads as zero.
+            return max(1.0, windows) * 60.0 / (end - first[0])
         if ticked <= 0 or windows < _RATE_MIN_WINDOWS:
             return None
         # Between two ticks the next window is simply on its way, so one average gap of silence
@@ -338,7 +361,37 @@ class Job:
         now = time.time() if now is None else now
         started = self.phase_started_at
         current = max(0.0, now - started) if started is not None else 0.0
-        return int(round(self._remaining_seconds(current, now)))
+        raw = self._remaining_seconds(current, now)
+        listening = self.phase == "recognise" and self.windows_done < self.windows_total
+        samples = self.rate_samples
+        measured = self.recent_rate_per_minute(now) is not None
+        guessed = self.eta_value is None or self.eta_at is None or not self.eta_measured
+        if not listening or not samples or guessed or not measured:
+            # Nothing to ease from: the first measured rate replaces the prior's guess outright.
+            value = raw
+        else:
+            waited = max(0.0, now - self.eta_at)
+            silence = max(0.0, now - samples[-1][0])
+            gap = 60.0 / self.rate_per_minute(now)
+            # Counting down is for time the work is visibly moving; while the next window is
+            # late the shown time does not shrink.
+            shown = self.eta_value if silence > gap else max(0.0, self.eta_value - waited)
+            # A wobble (the estimate within a quarter of what is shown) is eased over two
+            # minutes; a real change of pace (Shazam halving the rate, or a crawl) within seconds.
+            ratio = raw / shown if shown > 0 else math.inf
+            ease = _ETA_EASE_SECONDS if 0.8 <= ratio <= 1.25 else _ETA_EASE_SECONDS / 6.0
+            # Never smoother than the measurement is old: early in a pass the rate is still
+            # settling, and the shown time follows it rather than the first rough reading.
+            ease = min(ease, max(5.0, now - samples[0][0]))
+            value = shown + (raw - shown) * (1.0 - math.exp(-waited / ease))
+            if silence > gap:
+                value = max(value, shown)
+            if silence > _STALL_SECONDS:
+                # A stall is not a wobble: no window for this long means the time left grows by
+                # the wait itself, at once, on top of the slower rate it implies.
+                value = max(value, raw + silence)
+        self.eta_value, self.eta_at, self.eta_measured = value, now, listening and measured
+        return int(round(value))
 
     # -- wall-clock progress (U-F9) -------------------------------------------------------------
     def _phase_runs(self, phase: str) -> bool:
