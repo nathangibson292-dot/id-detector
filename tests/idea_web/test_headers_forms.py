@@ -609,16 +609,16 @@ def test_one_form_new_redirects_to_it_and_new_mix_focuses_it(tmp_path: Path) -> 
     script = STATIC_JS.decode("utf-8")
     assert "querySelector('.topbar a[href=\"/new\"]')" in script
     assert "event.preventDefault();" in script and "input.focus(); input.select();" in script
-    # The library's Remove confirmation moved out of the markup: no inline handler survives on
-    # a page with a removable mix, and the confirm text rides along as data for the script.
+    # The library's Delete asks first, inside the card's menu: no inline handler survives on a
+    # page with a removable mix, and the post sits behind an in-page Cancel / Delete step.
     parsed = _markup(home.text)
-    assert (
-        parsed.handlers == [] and 'data-confirm="Remove this mix from your library?"' in home.text
-    )
-    assert "hasAttribute('data-confirm')" in script
-    # The legacy card still asks from an inline handler; the served block never carries it.
+    assert parsed.handlers == [] and 'class="mix-menu"' in home.text
+    assert 'class="mm-item mm-ask"' in home.text and 'class="mm-no"' in home.text
+    assert "<b>Delete this mix?</b>" in home.text
+    assert "closest('.mm-ask')" in script and "hasAttribute('data-confirm')" in script
+    # Neither the legacy block nor the served block carries an inline handler any more.
     sets = legacy._discover_sets(tmp_path)
-    assert "onclick" in legacy._mixes_block(sets, csrf_token="tok")
+    assert "onclick" not in legacy._mixes_block(sets, csrf_token="tok")
     served = pages.mixes_block(sets, csrf_token="tok")
     assert "onclick" not in served and _markup(served).handlers == []
 

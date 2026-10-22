@@ -293,6 +293,38 @@ _TERMINAL_FAILURES = frozenset(
 )
 
 
+#: A failed attempt the owner removed from the library while an older result survives: the
+#: attempt's card goes, the result and the journal stay.  The marker names the journal length it
+#: hid, so a later attempt (a new journal entry) shows its own card again.
+ATTEMPT_DISMISSED = "library-dismissed.json"
+
+
+def _attempt_dismissed(media_dir: Path, entries: int) -> bool:
+    marker = media_dir / ATTEMPT_DISMISSED
+    if not path_is_file(marker):
+        return False
+    try:
+        return json.loads(read_text(marker)).get("journal_entries") == entries
+    except (OSError, ValueError, AttributeError):
+        return False
+
+
+def dismiss_failed_attempt(media_dir: Path) -> bool:
+    """Hide this media directory's latest failed attempt from the library; never deletes."""
+
+    journal = media_dir / "invocations.jsonl"
+    try:
+        entries = [line for line in read_text(journal).splitlines() if line.strip()]
+    except OSError:
+        return False
+    if not entries:
+        return False
+    (media_dir / ATTEMPT_DISMISSED).write_text(
+        json.dumps({"journal_entries": len(entries)}), encoding="utf-8"
+    )
+    return True
+
+
 def _discover_failed_runs(work_root: Path) -> list[FailedRun]:
     """Find durable terminal attempts, whether or not an older result exists for the same mix.
 
@@ -311,6 +343,8 @@ def _discover_failed_runs(work_root: Path) -> list[FailedRun]:
         except (OSError, ValueError, IndexError, TypeError):
             continue
         if latest.get("status") not in _TERMINAL_FAILURES:
+            continue
+        if _attempt_dismissed(media_dir, len(entries)):
             continue
         # The record's own keys are authoritative; the directory names are the fallback for a run
         # that failed before ``ingest/source.json`` was written, and must still be well-formed
@@ -684,6 +718,31 @@ color var(--t2)}
 justify-content:flex-end}
 .mix.failed .mix-actions .link-danger{background:transparent;border:0}
 .mix.failed .cause{color:var(--fg);margin:2px 0 6px}
+.mix.failed .mix-top{padding-right:40px}
+.mix-menu{position:absolute;top:8px;right:8px;z-index:3}
+.mix-menu>summary{list-style:none;width:34px;height:34px;display:grid;place-items:center;
+border-radius:10px;border:1px solid var(--line2);color:var(--fg);cursor:pointer;font-size:20px;
+line-height:1;background:color-mix(in srgb,var(--card) 82%,transparent);backdrop-filter:blur(8px);
+transition:background var(--t1)}
+.mix-menu>summary::-webkit-details-marker{display:none}
+.mix-menu>summary:hover,.mix-menu[open]>summary{background:var(--raise)}
+.mm-pop{position:absolute;right:0;top:40px;width:240px;background:var(--card);
+border:1px solid var(--line2);border-radius:var(--r3);box-shadow:var(--sh2);padding:6px;
+animation:rise var(--t2) var(--ease) both}
+.mm-item{display:block;width:100%;border:0;background:transparent;color:var(--bad);
+padding:10px 12px;border-radius:8px;font:inherit;font-size:14px;font-weight:600;cursor:pointer;
+text-align:left}
+.mm-item:hover,.mm-item:focus-visible{background:color-mix(in srgb,var(--bad) 12%,transparent)}
+.mm-confirm{display:none;padding:8px 8px 4px;margin:0}
+.mm-pop.asking .mm-confirm{display:block}.mm-pop.asking .mm-ask{display:none}
+.mm-confirm p{margin:0 0 12px;font-size:13px;line-height:1.45;color:var(--muted)}
+.mm-confirm p b{display:block;color:var(--fg);font-size:14px;margin-bottom:2px}
+.mm-row{display:flex;gap:8px;justify-content:flex-end}
+.mm-no,.mm-yes{min-height:36px;padding:0 14px;border-radius:9px;font:inherit;font-size:13px;
+font-weight:650;cursor:pointer}
+.mm-no{background:transparent;border:1px solid var(--line2);color:var(--fg)}
+.mm-yes{background:var(--bad);border:1px solid var(--bad);color:#fff}
+.mm-yes:hover{filter:brightness(1.08)}
 .empty{border:1px dashed var(--line2);border-radius:var(--r3);padding:var(--s8) var(--s5);
 text-align:center;color:var(--muted);background:linear-gradient(180deg,var(--hover),transparent)}
 .empty b{display:block;color:var(--fg);font:700 19px/1.2 var(--display);margin:var(--s4) 0 6px}
@@ -998,6 +1057,32 @@ _HOME_JS = """
 #: The library's search box and Free/Deep filter: they only show and hide the cards already on the
 #: page (by their ``data-title`` / ``data-scan``), so nothing is fetched and nothing is stored.
 _LIBRARY_JS = """
+(function(){
+  function shut(menu){
+    menu.open = false;
+    var pop = menu.querySelector('.mm-pop'); if(pop) pop.classList.remove('asking');
+  }
+  document.addEventListener('click', function(event){
+    var t = event.target; if(!t || !t.closest) return;
+    var ask = t.closest('.mm-ask');
+    if(ask){
+      var pop = ask.closest('.mm-pop'); pop.classList.add('asking');
+      var no = pop.querySelector('.mm-no'); if(no) no.focus();
+      return;
+    }
+    var cancel = t.closest('.mm-no');
+    if(cancel){
+      var menu = cancel.closest('details'); shut(menu);
+      menu.querySelector('summary').focus(); return;
+    }
+    Array.prototype.forEach.call(document.querySelectorAll('details.mix-menu[open]'),
+      function(menu){ if(!menu.contains(t)) shut(menu); });
+  });
+  document.addEventListener('keydown', function(event){
+    if(event.key !== 'Escape') return;
+    Array.prototype.forEach.call(document.querySelectorAll('details.mix-menu[open]'), shut);
+  });
+})();
 (function(){
   var search = document.getElementById('lib-search');
   var cards = document.querySelectorAll('.mixes>.mix'); if(!cards.length) return;
@@ -1562,6 +1647,34 @@ def _set_strip_html(item: AnalysedSet) -> str:
     return f'<div class="mix-strip" aria-hidden="true">{"".join(blocks)}</div>'
 
 
+#: What the menu's confirm step says will happen, per kind of card.
+_MENU_NOTE = {
+    "mix": "It leaves your library; the files go to the trash folder.",
+    "attempt": "Only this failed try goes; the earlier result stays.",
+}
+
+
+def _card_menu_html(
+    title: str, action: str, fields: dict[str, str], csrf_token: str, *, what: str
+) -> str:
+    """The card's ⋯ menu: Delete, then an in-place Cancel / Delete before anything is posted."""
+
+    hidden = "".join(
+        f'<input type="hidden" name="{html.escape(k)}" value="{html.escape(v)}">'
+        for k, v in {_CSRF_FIELD: csrf_token, **fields}.items()
+    )
+    return (
+        '<details class="mix-menu">'
+        f'<summary aria-label="Options for {html.escape(title, quote=True)}" title="Options">'
+        '<span aria-hidden="true">⋯</span></summary><div class="mm-pop">'
+        '<button type="button" class="mm-item mm-ask">Delete</button>'
+        f'<form class="mm-confirm" method="post" action="{action}">{hidden}'
+        f"<p><b>Delete this {what}?</b>{_MENU_NOTE[what]}</p>"
+        '<div class="mm-row"><button type="button" class="mm-no">Cancel</button>'
+        '<button type="submit" class="mm-yes">Delete</button></div></form></div></details>'
+    )
+
+
 def _mix_card_html(item: AnalysedSet, csrf_token: str = "") -> str:
     href = f"/{html.escape(item.source_key)}/{html.escape(item.media_key)}/present/index.html"
     summary = _set_summary(item)
@@ -1586,17 +1699,12 @@ def _mix_card_html(item: AnalysedSet, csrf_token: str = "") -> str:
         if deep
         else '<span class="scan-badge">Free</span>'
     )
-    remove = ""
-    if csrf_token:
-        remove = (
-            '<form class="mix-actions" method="post" action="/library/remove">'
-            f'<input type="hidden" name="{_CSRF_FIELD}" value="{html.escape(csrf_token)}">'
-            f'<input type="hidden" name="source_key" value="{html.escape(item.source_key)}">'
-            f'<input type="hidden" name="media_key" value="{html.escape(item.media_key)}">'
-            '<button class="link-danger" type="submit" '
-            "onclick=\"return confirm('Remove this mix from your library?')\">"
-            "Remove</button></form>"
-        )
+    keys = {"source_key": item.source_key, "media_key": item.media_key}
+    remove = (
+        _card_menu_html(item.title, "/library/remove", keys, csrf_token, what="mix")
+        if csrf_token
+        else ""
+    )
     search = html.escape(item.title.casefold(), quote=True)
     return (
         f'<li class="mix" data-title="{search}" data-scan="{"deep" if deep else "free"}">'
@@ -1611,8 +1719,9 @@ def _mix_card_html(item: AnalysedSet, csrf_token: str = "") -> str:
 def _failed_card_html(item: FailedRun, csrf_token: str) -> str:
     """A durable failed attempt: when, why it stopped, how far it got and what it cost (U-F15/F33).
 
-    A card for an attempt that sits behind an older result carries no Remove button: the two share
-    one media directory, so deleting the attempt would delete the result the user can still open.
+    A card for an attempt that sits behind an older result never posts to Remove: the two share
+    one media directory, so deleting it would delete the result the user can still open.  Its
+    Delete only hides the attempt (``/library/dismiss-attempt``).
     """
 
     analysed = datetime.fromtimestamp(item.analysed_at).strftime("%d %b %Y").lstrip("0")
@@ -1628,15 +1737,14 @@ def _failed_card_html(item: FailedRun, csrf_token: str) -> str:
         if item.has_result
         else " No result was saved."
     )
-    remove = ""
-    if not item.has_result:
-        remove = (
-            '<form class="mix-actions" method="post" action="/library/remove">'
-            f'<input type="hidden" name="{_CSRF_FIELD}" value="{html.escape(csrf_token)}">'
-            f'<input type="hidden" name="source_key" value="{html.escape(item.source_key)}">'
-            f'<input type="hidden" name="media_key" value="{html.escape(item.media_key)}">'
-            '<button class="link-danger" type="submit">Remove</button></form>'
-        )
+    # With a result behind it, Delete only hides this attempt (its own route); without one the
+    # whole media directory goes to the trash as before.
+    keys = {"source_key": item.source_key, "media_key": item.media_key}
+    remove = (
+        _card_menu_html(item.title, "/library/dismiss-attempt", keys, csrf_token, what="attempt")
+        if item.has_result
+        else _card_menu_html(item.title, "/library/remove", keys, csrf_token, what="mix")
+    )
     label = "cancelled" if item.status == "cancelled" else "failed"
     search = html.escape(item.title.casefold(), quote=True)
     return (

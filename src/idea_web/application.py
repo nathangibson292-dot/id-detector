@@ -695,6 +695,42 @@ def _library_remove(
     return redirect("/")
 
 
+def _library_dismiss_attempt(
+    state: _State, request: Request, raw: bytes | None, viewer: _Viewer
+) -> Response:
+    """Hide a failed attempt whose mix still has an older result; nothing is deleted."""
+
+    bad = bytes_response(HTTPStatus.BAD_REQUEST, b"bad request", TEXT)
+    try:
+        form = _parse_form(raw) if raw is not None else {}
+    except (ValueError, UnicodeDecodeError):
+        form = {}
+    source_key = form.get("source_key", "")
+    media_key = form.get("media_key", "")
+    if (
+        raw is None
+        or not csrf_matches(request, form.get(_CSRF_FIELD), viewer.request_csrf)
+        or not _SHA.fullmatch(source_key)
+        or not _SHA.fullmatch(media_key)
+    ):
+        return bad
+    work_root = state.settings.work_root
+    item = next(
+        (
+            x
+            for x in legacy._discover_failed_runs(work_root)
+            if x.source_key == source_key and x.media_key == media_key and x.has_result
+        ),
+        None,
+    )
+    if item is None:
+        return not_found()
+    target = contained_directory(work_root, item.media_dir)
+    if target is None or not legacy.dismiss_failed_attempt(target):
+        return bad
+    return redirect("/")
+
+
 def _dismiss(
     state: _State, request: Request, route: str, raw: bytes | None, viewer: _Viewer
 ) -> Response:
@@ -830,6 +866,11 @@ def _hosted_post(
             response = not_found()
         else:
             response = _library_remove(state, request, raw, viewer)
+    elif state.active and route == "/library/dismiss-attempt":
+        if not session.account.is_admin:
+            response = not_found()
+        else:
+            response = _library_dismiss_attempt(state, request, raw, viewer)
     elif route == "/playlists" or route.startswith("/playlists/"):
         response = _playlists_post(state, request, route, raw, viewer)
     elif state.active and route.startswith("/jobs/") and route.endswith("/dismiss"):
@@ -936,6 +977,9 @@ def create_app(
         if state.active and route == "/library/remove":
             raw = await read_bounded(request)
             return await run_in_threadpool(_library_remove, state, request, raw, viewer)
+        if state.active and route == "/library/dismiss-attempt":
+            raw = await read_bounded(request)
+            return await run_in_threadpool(_library_dismiss_attempt, state, request, raw, viewer)
         if state.active and route.startswith("/jobs/") and route.endswith("/dismiss"):
             raw = await read_bounded(request)
             return await run_in_threadpool(_dismiss, state, request, route, raw, viewer)

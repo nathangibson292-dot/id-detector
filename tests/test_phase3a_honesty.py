@@ -38,6 +38,7 @@ from id_detector.present.server import (
     _outcome_copy,
     _outcome_copy_js,
     _run_started_at,
+    dismiss_failed_attempt,
     serve_in_background,
 )
 from id_detector.present.theme import BASE_CSS
@@ -607,6 +608,31 @@ def test_bundle_status_and_date_are_frozen_presentation_inputs(tmp_path: Path) -
     snapshot = bundles.load_run_snapshot(item.media_dir, directory=directory)
     assert snapshot.metadata["status"] == "complete"
     assert re.fullmatch(r"[0-9a-f]{64}", directory.name)
+
+
+def test_deleting_a_failed_attempt_hides_only_that_attempt(tmp_path: Path) -> None:
+    """The card's Delete on an attempt behind a result hides the attempt and nothing else: the
+    result, the journal and the money record stay, and a later failure shows its own card."""
+
+    _, _, item, _ = _publish(tmp_path, "garage", collapse=True)
+    journal = item.media_dir / "invocations.jsonl"
+    failed = {"status": "failed", "reason": None, "started_at": "2026-09-10T09:00:00Z"}
+    journal.write_text(json.dumps(failed) + "\n", encoding="utf-8")
+    run = _discover_failed_runs(tmp_path)[0]
+    card = _failed_card_html(run, "csrf")
+    assert run.has_result and 'action="/library/dismiss-attempt"' in card
+    assert "/library/remove" not in card and "Only this failed try goes" in card
+
+    before = journal.read_bytes()
+    assert dismiss_failed_attempt(item.media_dir) is True
+    assert _discover_failed_runs(tmp_path) == []
+    assert journal.read_bytes() == before
+    assert path_is_file(result_dir(item.media_dir) / "index.html")
+    assert [s.media_key for s in _discover_sets(tmp_path)] == [item.media_key]
+
+    with journal.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps({**failed, "started_at": "2026-09-11T09:00:00Z"}) + "\n")
+    assert len(_discover_failed_runs(tmp_path)) == 1  # a new attempt is not pre-hidden
 
 
 def test_a_failed_attempt_is_visible_even_behind_an_older_result(tmp_path: Path) -> None:

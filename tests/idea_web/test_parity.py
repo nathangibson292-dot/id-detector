@@ -11,6 +11,7 @@ escape the work root, third-party links are web URLs only, and the five playlist
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import shutil
 import threading
@@ -715,3 +716,26 @@ def test_the_canonical_result_url_shape_is_served(tmp_path: Path) -> None:
     app = create_app(tmp_path)
     page = request(app, "GET", f"/{source.source_key}/{source.media_key}/present/index.html")
     assert page.status_code == 200 and 'class="pl-actions"' in page.text
+
+
+def test_deleting_a_failed_attempt_behind_a_result_keeps_the_result(tmp_path: Path) -> None:
+    source = _source("soundcloud")
+    media = _seed_work_root(tmp_path, source)
+    (media / "invocations.jsonl").write_text(
+        json.dumps({"status": "failed", "started_at": "2026-09-10T09:00:00Z"}) + "\n",
+        encoding="utf-8",
+    )
+    app = create_app(tmp_path, jobs=LocalJobs(tmp_path))
+    csrf = token(app)
+    fields = {"source_key": source.source_key, "media_key": source.media_key}
+    assert 'action="/library/dismiss-attempt"' in request(app, "GET", "/").text
+    refused = request(app, "POST", "/library/dismiss-attempt", data=fields)
+    assert refused.status_code == 400
+    done = request(app, "POST", "/library/dismiss-attempt", data={**fields, "csrf_token": csrf})
+    assert done.status_code == 303 and media.is_dir()
+    home = request(app, "GET", "/").text
+    assert 'action="/library/dismiss-attempt"' not in home and 'data-scan="failed"' not in home
+    assert f"/{source.source_key}/{source.media_key}/present/index.html" in home
+    # Nothing left to hide: a second post finds no such attempt.
+    again = request(app, "POST", "/library/dismiss-attempt", data={**fields, "csrf_token": csrf})
+    assert again.status_code == 404
