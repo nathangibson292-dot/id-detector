@@ -64,6 +64,54 @@ MAX_RETRIES = 5
 #: runtime knobs.  The CLI/web app override these from ``AppConfig`` (see providers.base).
 DEFAULT_REQUESTS_PER_MINUTE = 18
 DEFAULT_CONCURRENCY = 1
+#: Pause-on-throttle for the Shazam sweep (see :class:`~id_detector.shazam.TokenBucket`).  On
+#: 2026-10-21 Shazam refused nearly everything for ~20 minutes at a time; the old per-window
+#: backoff kept asking (811 of 1518 requests were 429s) and gave up on 101 windows after six tries
+#: each.  Now two throttles in a row pause the whole pool for ~10 s, doubling per throttled probe
+#: up to ~60 s, and the window caught by it is asked again after the pause: its 429s no longer use
+#: up its retries.  Chosen by replaying that day's throttle pattern (tests/test_shazam_throttle_
+#: replay.py and docs/reviews/build-scan-speed.md).
+SHAZAM_THROTTLE_PAUSE_S = 10.0
+SHAZAM_THROTTLE_PAUSE_MAX_S = 60.0
+SHAZAM_THROTTLE_STREAK = 2
+#: No answer at all for this long while paused: Shazam is not coming back within this run, and
+#: every remaining window fails at once WITHOUT sending (the run ends partial, as before).
+SHAZAM_THROTTLE_GIVE_UP_S = 3_600.0
+#: A backstop per window: this many throttled asks of one window and it is left an error.
+MAX_THROTTLE_RETRIES = 120
+
+
+def next_attempt_after_failure(
+    exc: ShazamHTTPError,
+    limiter: Any,
+    *,
+    retry_index: int,
+    throttles: int,
+    max_retries: int,
+) -> tuple[str, float] | None:
+    """What a window does after a failed Shazam attempt: ``None`` = stop (it stays an error), or
+    ``(kind, delay_seconds)`` = ask again after ``delay``.
+
+    ``kind`` is ``"throttle"`` for a 429/503 under a pausing limiter: the shared limiter holds
+    the next attempt until the pool's pause is over, so no per-window sleep is added and the
+    attempt does not use up the window's ``max_retries``.  Everything else is ``"retry"``: the
+    old plan backoff (2 s doubling, capped at 60 s, Retry-After honoured), at most
+    ``max_retries`` times.  Shared by the recognise job runner and the 429 replay proof.
+    """
+
+    if exc.outcome == "throttle_gave_up":
+        return None
+    retryable = exc.status_code == 0 or exc.status_code == 429 or exc.status_code >= 500
+    if not retryable:
+        return None
+    pausing = bool(getattr(limiter, "pauses_on_throttle", False))
+    if pausing and exc.status_code in {429, 503}:
+        if throttles >= MAX_THROTTLE_RETRIES or limiter.gave_up():
+            return None
+        return ("throttle", 0.0)
+    if retry_index >= max_retries:
+        return None
+    return ("retry", retry_delay(retry_index, exc.retry_after))
 
 
 @dataclass(frozen=True)
@@ -382,7 +430,13 @@ async def _run_job(
         )
         if retry_of is not None:
             parent = retry_of
-        for retry_index in range(max_retries + 1):
+        # The limiter paces (and pauses) only the built-in transport; an injected HTTP boundary
+        # bypasses it, so its throttles keep the plain per-window backoff.
+        injected = getattr(adapter, "http_client", None) is not None
+        limiter = None if injected else getattr(adapter, "limiter", None)
+        retry_index = 0
+        throttles = 0
+        while True:
             attempt_id = (
                 journal.prepare(
                     query_id=query.cache_key,
@@ -415,10 +469,22 @@ async def _run_job(
             except ShazamHTTPError as exc:
                 settle(shazam_outcome(exc))
                 last_error = exc
-                retryable = exc.status_code == 0 or exc.status_code == 429 or exc.status_code >= 500
-                if not retryable or retry_index == max_retries:
+                step = next_attempt_after_failure(
+                    exc,
+                    limiter,
+                    retry_index=retry_index,
+                    throttles=throttles,
+                    max_retries=max_retries,
+                )
+                if step is None:
                     break
-                await asyncio.sleep(retry_delay(retry_index, exc.retry_after))
+                kind, delay = step
+                if kind == "throttle":
+                    throttles += 1
+                else:
+                    retry_index += 1
+                if delay > 0:
+                    await asyncio.sleep(delay)
             except DispatchRefused:
                 # The job's claim fence refused this dispatch (cancelled, reclaimed or past its
                 # lease): no request left, and the query must not be recorded as a failure.
@@ -511,7 +577,14 @@ async def recognise_generation(
     worker_count = max(1, concurrency)
     adapter = adapter or ShazamAdapter(
         config,
-        limiter=TokenBucket(rate_per_minute=requests_per_minute, capacity=worker_count),
+        limiter=TokenBucket(
+            rate_per_minute=requests_per_minute,
+            capacity=worker_count,
+            throttle_pause_s=SHAZAM_THROTTLE_PAUSE_S,
+            throttle_pause_max_s=SHAZAM_THROTTLE_PAUSE_MAX_S,
+            throttle_streak=SHAZAM_THROTTLE_STREAK,
+            give_up_after_s=SHAZAM_THROTTLE_GIVE_UP_S,
+        ),
         http_client=http_client,
         process_breaker=process_breaker or ShazamBreaker(),
         running_free=running_free,

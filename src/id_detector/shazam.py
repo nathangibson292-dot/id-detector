@@ -50,6 +50,10 @@ class ShazamHTTPError(RuntimeError):
         super().__init__(message)
 
 
+#: Golden-ratio spacing for the pause jitter (deterministic, so runs and tests are reproducible).
+_GOLDEN = 0.6180339887498949
+
+
 class TokenBucket:
     """A monotonic, lock-protected token bucket that adapts to server throttling (AIMD).
 
@@ -61,6 +65,19 @@ class TokenBucket:
     burst instead of failing windows.  ``capacity`` is how many tokens may accumulate, i.e. how
     many requests may be in flight at once (set it to the worker-pool size).  Callers that pass a
     very high ``rate_per_minute`` (the test transports) simply never leave the ceiling.
+
+    **Pausing on a throttle** (``throttle_pause_s > 0``; the Shazam sweep turns it on, the paid
+    AudD sweep and direct callers keep the plain AIMD above).  Shazam's free endpoint does not
+    only refuse a burst: on 2026-10-21 it refused nearly everything for ~20 minutes at a time,
+    and every request sent meanwhile was a wasted 429 that also counted against the day's request
+    allowance.  So once ``throttle_streak`` throttles arrive in a row with no answer between them,
+    the WHOLE pool pauses: nothing is sent until the pause ends, then a single probe goes alone.
+    A probe that is throttled again doubles the pause (up to ``throttle_pause_max_s``, with a
+    deterministic 0.75x-1.25x jitter so probes never fall into step with a periodic throttle); a
+    probe that is answered ends the pause and the pool resumes at the cut rate, recovering
+    additively as before.  A ``Retry-After`` the server sends is always honoured by the whole
+    pool, even for a single throttle.  ``clock`` is injectable so all of this is provable on a
+    simulated clock.
     """
 
     def __init__(
@@ -72,7 +89,13 @@ class TokenBucket:
         backoff_factor: float = 0.5,
         recover_fraction: float = 0.02,
         penalty_cooldown_s: float = 2.0,
+        throttle_pause_s: float = 0.0,
+        throttle_pause_max_s: float = 60.0,
+        throttle_streak: int = 1,
+        give_up_after_s: float = 3_600.0,
+        clock: Callable[[], float] | None = None,
     ) -> None:
+        self._clock = clock or time.monotonic
         self.max_rate_per_second = rate_per_minute / 60
         floor = min_rate_per_minute if min_rate_per_minute is not None else min(rate_per_minute, 12)
         # Never let the floor reach 0: a 0 admission rate makes acquire()'s delay math divide by
@@ -81,45 +104,111 @@ class TokenBucket:
         self.rate_per_second = self.max_rate_per_second
         self.capacity = capacity
         self.tokens = float(capacity)
-        self.updated = time.monotonic()
+        self.updated = self._clock()
         self.backoff_factor = backoff_factor
         self.recover_step = self.max_rate_per_second * recover_fraction
         self.penalty_cooldown_s = penalty_cooldown_s
         self._last_penalty = float("-inf")
         self._lock = asyncio.Lock()
+        # Pause-on-throttle state (inert while ``throttle_pause_s`` is 0).
+        self.throttle_pause_s = max(0.0, throttle_pause_s)
+        self.throttle_pause_max_s = max(self.throttle_pause_s, throttle_pause_max_s)
+        self.throttle_streak = max(1, throttle_streak)
+        self.give_up_after_s = give_up_after_s
+        self.paused_until = float("-inf")
+        self.throttle_level = 0
+        self._streak = 0
+        self._probing = False
+        self._probe_in_flight = False
+        self._last_answer = self.updated
+        #: Diagnostics: how many pauses began, and their total planned length in seconds.
+        self.pauses = 0
+        self.paused_seconds = 0.0
+
+    @property
+    def pauses_on_throttle(self) -> bool:
+        return self.throttle_pause_s > 0
+
+    def gave_up(self) -> bool:
+        """True once a paused pool has had no answer for ``give_up_after_s``: Shazam is not
+        coming back within this run, so asking again would only spend requests."""
+
+        if not self.pauses_on_throttle or not self._probing:
+            return False
+        return self._clock() - self._last_answer >= self.give_up_after_s
 
     async def acquire(self) -> None:
         while True:
             async with self._lock:
-                now = time.monotonic()
-                self.tokens = min(
-                    self.capacity, self.tokens + (now - self.updated) * self.rate_per_second
-                )
-                self.updated = now
-                if self.tokens >= 1:
-                    self.tokens -= 1
-                    return
-                delay = (1 - self.tokens) / self.rate_per_second
+                now = self._clock()
+                if now < self.paused_until:
+                    delay = self.paused_until - now
+                elif self._probing and self._probe_in_flight:
+                    # One probe at a time while paused: wait for its outcome before sending more.
+                    delay = 0.25
+                else:
+                    self.tokens = min(
+                        self.capacity, self.tokens + (now - self.updated) * self.rate_per_second
+                    )
+                    self.updated = now
+                    if self.tokens >= 1:
+                        self.tokens -= 1
+                        if self._probing:
+                            self._probe_in_flight = True
+                        return
+                    delay = (1 - self.tokens) / self.rate_per_second
             await asyncio.sleep(delay)
 
-    def penalize(self) -> None:
+    def settle(self) -> None:
+        """The admitted request has an outcome (any outcome): the probe slot is free again."""
+
+        self._probe_in_flight = False
+
+    def penalize(self, retry_after: float | None = None) -> None:
         """React to a throttle (HTTP 429/503) by halving the admission rate toward the floor.
 
         A cooldown collapses a burst of concurrent throttles into a single cut, so N in-flight
-        workers all seeing 429 at once do not slam the rate to the floor in one step.
+        workers all seeing 429 at once do not slam the rate to the floor in one step.  With
+        pausing on, a streak of throttles also pauses the pool (see the class docstring); a
+        throttle that arrives while a pause is already running (a request sent before it began)
+        does not lengthen it.
         """
 
-        now = time.monotonic()
-        if now - self._last_penalty < self.penalty_cooldown_s:
+        now = self._clock()
+        if now - self._last_penalty >= self.penalty_cooldown_s:
+            self._last_penalty = now
+            self.rate_per_second = max(
+                self.min_rate_per_second, self.rate_per_second * self.backoff_factor
+            )
+        if not self.pauses_on_throttle:
             return
-        self._last_penalty = now
-        self.rate_per_second = max(
-            self.min_rate_per_second, self.rate_per_second * self.backoff_factor
-        )
+        if retry_after is not None and retry_after > 0 and now + retry_after > self.paused_until:
+            self.paused_seconds += now + retry_after - max(now, self.paused_until)
+            self.paused_until = now + retry_after
+            self._probing = True
+        self._streak += 1
+        if self._streak < self.throttle_streak and not self._probing:
+            return  # an isolated throttle: the rate cut alone handles it
+        if now >= self.paused_until:
+            self.throttle_level += 1
+            pause = min(
+                self.throttle_pause_max_s, self.throttle_pause_s * 2 ** (self.throttle_level - 1)
+            )
+            pause *= 0.75 + 0.5 * ((self.pauses * _GOLDEN) % 1.0)
+            self.paused_until = now + pause
+            self.pauses += 1
+            self.paused_seconds += pause
+        self._probing = True
 
     def recover(self) -> None:
-        """React to a success by nudging the admission rate back up toward the ceiling."""
+        """React to a success by nudging the admission rate back up toward the ceiling; with
+        pausing on, an answer also ends any pause and its probing."""
 
+        if self.pauses_on_throttle:
+            self._last_answer = self._clock()
+            self._probing = False
+            self._streak = 0
+            self.throttle_level = 0
         if self.rate_per_second < self.max_rate_per_second:
             self.rate_per_second = min(
                 self.max_rate_per_second, self.rate_per_second + self.recover_step
@@ -174,7 +263,19 @@ class InjectedHTTPClient(HTTPClientInterface):
             raise ShazamBlocked("shazam_manual_off")
         if method.upper() not in {"GET", "POST"}:
             raise ValueError("injected Shazam transport accepts only GET/POST")
+        if self.limiter.gave_up():
+            # A paused pool that has heard nothing for the give-up period: fail this window
+            # without sending anything (no request, no budget, no journal dispatch).
+            raise ShazamHTTPError(
+                429, "Shazam kept throttling; gave up without sending", outcome="throttle_gave_up"
+            )
         await self.limiter.acquire()
+        try:
+            return await self._send(method, url, **kwargs)
+        finally:
+            self.limiter.settle()
+
+    async def _send(self, method: str, url: str, **kwargs: Any) -> Any:
         await self.on_attempt()
         kwargs.pop("proxy", None)
         timeout = httpx.Timeout(connect=10, write=30, read=60, pool=10)
@@ -191,9 +292,6 @@ class InjectedHTTPClient(HTTPClientInterface):
             raise ShazamHTTPError(0, f"{type(exc).__name__}: {exc}") from exc
         if response.status_code >= 400:
             self.breaker.failure()
-            if response.status_code in {429, 503}:
-                # Shazam is throttling: slow the shared admission rate for the rest of the run.
-                self.limiter.penalize()
             retry_after_value = response.headers.get("Retry-After")
             try:
                 retry_after = float(retry_after_value) if retry_after_value else None
@@ -203,6 +301,10 @@ class InjectedHTTPClient(HTTPClientInterface):
                     retry_after = max(0.0, (retry_at - datetime.now(UTC)).total_seconds())
                 except (TypeError, ValueError):
                     retry_after = None
+            if response.status_code in {429, 503}:
+                # Shazam is throttling: slow (and, for the Shazam sweep, pause) the shared
+                # admission for the rest of the run, honouring its Retry-After.
+                self.limiter.penalize(retry_after)
             raise ShazamHTTPError(
                 response.status_code,
                 f"Shazam HTTP {response.status_code}: {response.text[:500]}",
