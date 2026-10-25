@@ -32,7 +32,7 @@ from id_detector.genre import source, tempo_key, vocab
 from id_detector.genre.lookup import Lookups, SourceEvidence
 
 #: Bump whenever the model use, fusion, BPM or key method changes: saved answers are then redone.
-RESULT_VERSION = 2
+RESULT_VERSION = 3
 STEPS = (
     ("model", "Downloading the genre model (one time)"),
     ("find", "Finding the track"),

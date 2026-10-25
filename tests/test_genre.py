@@ -382,6 +382,24 @@ def test_a_broad_lookup_style_counts_half():
     assert result.ranking[0]["name"] == "Speed Garage"
 
 
+def test_a_style_only_one_lookup_names_and_the_model_rules_out_is_dropped():
+    # Live case: Last.fm's "T2" is also a rock band, so its artist tags said Hard Rock for a
+    # bassline record; the model gave Hard Rock 0.04%.
+    p = _probabilities(UK_Garage=0.34, Bassline=0.21)
+    p[label_index("Rock---Hard Rock")] = 0.0004
+    clash = SourceEvidence(
+        "lastfm",
+        shares={"Rock---Hard Rock": 0.7, "Electronic---Bassline": 0.3},
+        quality=0.5,
+        status="ok",
+    )
+    result = fuse.fuse(p, _evidence("discogs", Bassline=0.6, UK_Garage=0.4), clash)
+    assert "Hard Rock" not in [g["name"] for g in result.ranking]
+    # Two lookups agreeing still count, however little the model heard it.
+    both = fuse.fuse(p, _evidence("discogs", Jungle=1.0), _evidence("lastfm", Jungle=1.0))
+    assert "Jungle" in [g["name"] for g in both.ranking[:3]]
+
+
 def test_lookups_without_evidence_do_not_change_the_answer():
     p = _probabilities(Dubstep=0.5, Grime=0.4)
     none = SourceEvidence("discogs", status="none")

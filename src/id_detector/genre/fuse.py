@@ -12,6 +12,9 @@ The rule, in words (it is also shown on the page):
 3. **Weighted average.**  ``fused = (heard + wD * discogs + wL * lastfm) / (1 + wD + wL)`` where
    ``wD = 0.7 * Discogs match quality`` and ``wL = 0.5 * Last.fm quality`` (track tags 1, artist
    tags 0.5).  With no lookups the answer is the heard share alone.
+4. **Plausibility gate.**  A style only one lookup names, and that the model gives under 5%, is
+   dropped from that lookup: it is usually a name clash (Last.fm's "T2" is also a rock band) or a
+   compilation's style, not this record.  Two lookups agreeing still count whatever was heard.
 
 So agreement adds up (a style both heard and looked up rises), and disagreement shows both: the
 heard favourite and the looked-up favourite each keep their part of the score, with their sources
@@ -49,6 +52,8 @@ BROAD = frozenset(
 BROAD_FACTOR = 0.5
 #: A style counts as "heard" for the source marks when its heard share is at least this.
 HEARD_MARK = 0.08
+#: Below this model probability, a style named by only one lookup is treated as a mismatch.
+IMPLAUSIBLE = 0.05
 
 
 @dataclass
@@ -69,10 +74,9 @@ def heard_shares(probabilities: np.ndarray) -> np.ndarray:
     return squared / total if total > 0 else squared
 
 
-def _lookup_shares(evidence: SourceEvidence) -> dict[str, float]:
+def _lookup_shares(shares: dict[str, float]) -> dict[str, float]:
     weighted = {
-        label: share * (BROAD_FACTOR if label in BROAD else 1.0)
-        for label, share in evidence.shares.items()
+        label: share * (BROAD_FACTOR if label in BROAD else 1.0) for label, share in shares.items()
     }
     total = sum(weighted.values())
     return {k: v / total for k, v in weighted.items()} if total > 0 else {}
@@ -97,9 +101,24 @@ def fuse(
         if weight <= 0:
             continue
         weights[evidence.source] = round(weight, 3)
-        sources.append((evidence.source, _lookup_shares(evidence), weight))
-    denominator = 1.0 + sum(weight for _, _, weight in sources)
+        sources.append((evidence.source, evidence.shares, weight))
     index = {label: i for i, label in enumerate(labels)}
+    named = [set(shares) for _, shares, _ in sources]
+    sources = [
+        (
+            name,
+            _lookup_shares(
+                {
+                    label: share
+                    for label, share in shares.items()
+                    if probs[index[label]] >= IMPLAUSIBLE or sum(label in n for n in named) >= 2
+                }
+            ),
+            weight,
+        )
+        for name, shares, weight in sources
+    ]
+    denominator = 1.0 + sum(weight for _, _, weight in sources)
     fused = heard.copy()
     for _, shares, weight in sources:
         for label, share in shares.items():
