@@ -49,6 +49,7 @@ from id_detector.present.exports import (
     comment_credit_text,
     read_projected_summary,
 )
+from id_detector.present.genre_css import GENRE_CSS
 from id_detector.present.page import EmbedPlan, plan_embed_from_url
 from id_detector.present.refresh import ensure_fresh_page
 from id_detector.present.theme import (
@@ -939,6 +940,7 @@ align-items:flex-start}
 .lib-filter{height:auto}
 .tiles{grid-template-columns:1fr 1fr}}
 """
+    + GENRE_CSS
     + LIGHT_CSS
 )
 

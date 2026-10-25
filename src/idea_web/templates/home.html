@@ -7,6 +7,7 @@ asks the recognition engines what is playing, and hands you a click-to-jump trac
 confidence for every track.</p>
 {{ form | safe }}
 <p class="lede reassurance">You can close this tab while the scan runs.</p>
+{{ genre_entry | safe }}
 </header>
 {{ upkeep | safe }}
 {% if activity %}<h2 class="sec">Recent analyses</h2>{{ activity | safe }}{% endif %}

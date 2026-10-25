@@ -62,3 +62,6 @@ data/corpus/**/media/
 
 # Agent git worktrees (each holds a full checkout and .venv); never commit them.
 .claude/worktrees/
+
+# Downloaded model weights (genre: MTG Discogs-EffNet, CC BY-NC-SA 4.0); fetched on first use.
+models/

@@ -37,7 +37,7 @@ from id_detector.present import server as legacy
 from id_detector.present.bundles import read_bundle_manifest, result_dir
 from id_detector.providers.base import AppConfig
 from id_detector.webapp.jobs import TargetValidationError
-from idea_web import pages
+from idea_web import genre_page, pages
 from idea_web.http import (
     CSS,
     HTML,
@@ -180,6 +180,8 @@ class _State:
     #: Resolved fetched-audio paths per job.  Resolution verifies the download, so it is done once
     #: per job rather than on every 2.5-second status poll.
     audio_paths: dict[str, str] = field(default_factory=dict)
+    #: The Genre page's checker (local mode only), created on first use.
+    genre: Any = None
 
     @property
     def active(self) -> bool:
@@ -255,6 +257,7 @@ def _home_document(state: _State, form_state: legacy._FormState, viewer: _Viewer
         ),
         footer=legacy._footer_html(),
         script_src=pages.SCRIPT_SRC,
+        genre_entry=genre_page.home_entry_html() if state.hosted is None else "",
     )
 
 
@@ -429,6 +432,8 @@ def _get(state: _State, request: Request, viewer: _Viewer) -> Response:
             return not_found()
         body, content_type = asset
         return bytes_response(HTTPStatus.OK, body, content_type, cache=IMMUTABLE)
+    if state.hosted is None and (route == "/genre" or route.startswith("/genre/")):
+        return _genre_get(state, request, route, viewer)
     if route == "/playlists" or route.startswith("/playlists/"):
         # The playlists feature owns its storage and views; the web layer only routes to it.
         from id_detector import playlists
@@ -488,6 +493,91 @@ def _get(state: _State, request: Request, viewer: _Viewer) -> Response:
         policy = content_security_policy(body) if content_type == HTML else None
         return not_modified(etag, cache, policy=policy)
     return deliver(HTTPStatus.OK, body, content_type, cache=cache, etag=etag)
+
+
+_GENRE_CHECK = re.compile(r"/genre/check/([0-9a-f]{16})")
+_GENRE_ART = re.compile(r"/genre/art/([0-9a-f]{24})")
+_ART_TYPES = {".jpg": "image/jpeg", ".png": "image/png", ".webp": "image/webp"}
+
+
+def _genre_service(state: _State) -> Any:
+    if state.genre is None:
+        from id_detector.genre.service import GenreService
+
+        state.genre = GenreService(state.settings.work_root)
+    return state.genre
+
+
+def _genre_document(state: _State, viewer: _Viewer, query: str) -> bytes:
+    from id_detector.genre.lookup import Lookups
+
+    service = _genre_service(state)
+    body = genre_page.body_html(
+        csrf_token=viewer.csrf,
+        query=query,
+        lookups=Lookups.enabled(),
+        model_ready=service.model_ready(),
+        recent=service.recent(),
+    )
+    return (
+        pages.head_html("Genre finder — ID'er")
+        + "<body>"
+        + _topbar(viewer, back=True, new=state.active)
+        + body
+        + legacy._footer_html()
+        + f'</main><script src="{pages.SCRIPT_SRC}"></script></body></html>'
+    ).encode("utf-8")
+
+
+def _genre_get(state: _State, request: Request, route: str, viewer: _Viewer) -> Response:
+    """The Genre page, a check's live status, and a check's saved cover image (local only)."""
+
+    if route == "/genre":
+        query = (parse_qs(request.url.query).get("q") or [""])[0][:500]
+        return html_response(HTTPStatus.OK, _genre_document(state, viewer, query))
+    found = _GENRE_CHECK.fullmatch(route)
+    if found:
+        check = _genre_service(state).get(found.group(1))
+        if check is None:
+            return json_response(HTTPStatus.NOT_FOUND, {"error": "That check has expired."})
+        return json_response(HTTPStatus.OK, check.public())
+    found = _GENRE_ART.fullmatch(route)
+    if found:
+        path = _genre_service(state).artwork_path(found.group(1))
+        if path is None:
+            return not_found()
+        with open(native_path(path), "rb") as handle:
+            body = handle.read()
+        return bytes_response(HTTPStatus.OK, body, _ART_TYPES[path.suffix], cache=IMMUTABLE_PRIVATE)
+    return not_found()
+
+
+def _genre_post(state: _State, request: Request, raw: bytes | None, viewer: _Viewer) -> Response:
+    """Start a genre check: JSON ``{"input": ..., "pick": optional link}`` plus the CSRF token."""
+
+    from id_detector.genre.source import SourceError
+
+    if raw is None:
+        return json_response(HTTPStatus.BAD_REQUEST, {"error": "That was too long."})
+    try:
+        payload = json.loads(raw.decode("utf-8")) if raw else {}
+        if not isinstance(payload, dict):
+            raise ValueError("not an object")
+    except (ValueError, UnicodeDecodeError):
+        return json_response(HTTPStatus.BAD_REQUEST, {"error": "The request could not be read."})
+    if not csrf_matches(request, payload.get(_CSRF_FIELD), viewer.request_csrf):
+        return json_response(
+            HTTPStatus.FORBIDDEN, {"error": "This page expired. Reload it and try again."}
+        )
+    text = payload.get("input")
+    pick = payload.get("pick")
+    if not isinstance(text, str) or (pick is not None and not isinstance(pick, str)):
+        return json_response(HTTPStatus.BAD_REQUEST, {"error": "Type a song or paste a link."})
+    try:
+        check = _genre_service(state).start(text, pick or None)
+    except SourceError as exc:
+        return json_response(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
+    return json_response(HTTPStatus.OK, check.public())
 
 
 def _analyse(
@@ -892,6 +982,7 @@ def create_app(
     job_manager: JobQueueAdapter | None = None,
     hosted: HostedSettings | None = None,
     upkeep_report: Any = None,
+    genre_service: Any = None,
 ) -> FastAPI:
     """Create the one IDea application; local mode changes policy, not routing.
 
@@ -941,6 +1032,7 @@ def create_app(
         templates=templates,
         hosted=hosted_auth,
         upkeep_report=upkeep_report,
+        genre=genre_service,
     )
     app.state.web = state
     app.state.settings = settings
@@ -968,6 +1060,9 @@ def create_app(
                 raw = await read_bounded(request)
             return await run_in_threadpool(_hosted_post, state, request, route, raw, wants_json)
         viewer = state.local_viewer
+        if route == "/genre/check":
+            raw = await read_bounded(request)
+            return await run_in_threadpool(_genre_post, state, request, raw, viewer)
         if route == "/playlists" or route.startswith("/playlists/"):
             raw = await read_bounded(request)
             return await run_in_threadpool(_playlists_post, state, request, route, raw, viewer)

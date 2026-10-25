@@ -21,6 +21,7 @@ from typing import Any
 from id_detector.present import server as legacy
 from id_detector.present import theme
 from id_detector.webapp.jobs import TERMINAL_STATES
+from idea_web import genre_page
 
 _CSRF_FIELD = "csrf_token"
 #: The tracker page's wording for a job that has not started (``render()`` in ``_JOB_JS``).
@@ -316,6 +317,7 @@ STATIC_JS = (
     + legacy._LIBRARY_JS
     + UPKEEP_JS
     + legacy._PLAYER_JS
+    + genre_page.GENRE_JS
     + "(function(){\nif(typeof JOB_ID === 'undefined') return;\n"
     + JOB_JS
     + "})();\n"

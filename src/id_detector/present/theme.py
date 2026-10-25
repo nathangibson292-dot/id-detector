@@ -301,7 +301,10 @@ def head_html(
 def topbar_html(*, back: bool = False, new: bool = True, middle: str = "") -> str:
     """The sticky brand bar.  ``middle`` is an optional centre slot (the result page's NOW pill)."""
 
-    nav = '<a class="btn ghost pl" href="/playlists">Playlists</a>'
+    nav = (
+        '<a class="btn ghost pl" href="/playlists">Playlists</a>'
+        '<a class="btn ghost gn" href="/genre">Genre</a>'
+    )
     if back:
         nav += '<a class="btn ghost hide-sm" href="/">Your mixes</a>'
     nav += THEME_TOGGLE
