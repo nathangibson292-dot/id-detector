@@ -237,8 +237,7 @@
     card.appendChild(whyBlock(r));
     resultBox.appendChild(card);
     resultBox.hidden = false;
-    var heading = resultBox.querySelector('.g-top');
-    if(heading){ heading.setAttribute('tabindex', '-1'); heading.focus({preventScroll: true}); }
+    // No focus move: the result region is aria-live, and a focus ring on the answer reads as a box.
   }
 
   function showFailure(j){
